@@ -197,6 +197,10 @@ pub enum Error {
     #[error("invalid tool parameters: {0}")]
     InvalidToolParams(String),
 
+    /// The LSP returned a `WorkspaceEdit` operation mcpls cannot apply or expose safely.
+    #[error("unsupported workspace edit operation: {0}")]
+    UnsupportedWorkspaceEdit(String),
+
     /// File I/O error occurred.
     #[error("file I/O error for {path:?}: {source}")]
     FileIo {

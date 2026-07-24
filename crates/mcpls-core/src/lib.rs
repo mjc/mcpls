@@ -37,6 +37,8 @@
 
 pub mod bridge;
 pub mod config;
+pub mod edit_planner;
+pub mod edit_policy;
 pub mod error;
 pub mod lsp;
 pub mod mcp;

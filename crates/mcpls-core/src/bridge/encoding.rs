@@ -443,6 +443,13 @@ mod tests {
     }
 
     #[test]
+    fn test_utf16_rejects_surrogate_split() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf16);
+
+        assert!(converter.character_to_byte_offset("😀", 1).is_err());
+    }
+
+    #[test]
     fn test_utf16_encoding_roundtrip() {
         let converter = EncodingConverter::new(PositionEncoding::Utf16);
         let text = "Hello 🌍 world!";
