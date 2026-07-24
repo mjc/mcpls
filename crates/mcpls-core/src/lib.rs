@@ -40,6 +40,7 @@ pub mod config;
 pub mod error;
 pub mod lsp;
 pub mod mcp;
+pub mod project;
 pub mod transport;
 mod util;
 

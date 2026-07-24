@@ -58,6 +58,16 @@ impl BridgeContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_config_ignored: bool,
     ) -> Self {
+        Self::with_registry(translator, subscriptions, ProjectRegistry::new(32))
+    }
+
+    /// Create a handler context with an existing shared project registry.
+    #[must_use]
+    pub const fn with_registry(
+        translator: Arc<Mutex<Translator>>,
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
         Self {
             translator,
             notification_cache,

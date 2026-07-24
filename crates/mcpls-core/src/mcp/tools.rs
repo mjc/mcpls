@@ -322,3 +322,32 @@ mod tests {
         assert!(!properties.contains_key("range"));
     }
 }
+
+/// Parameters for registering a project with the long-lived daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Register a project root under a stable project ID.")]
+pub struct ProjectAddParams {
+    /// Stable project identifier used by subsequent lifecycle tools.
+    #[schemars(description = "Stable project identifier.")]
+    pub project_id: String,
+    /// Existing directory to register as the project root.
+    #[schemars(description = "Absolute or relative path to an existing project directory.")]
+    pub root: String,
+    /// Optional project-specific configuration reserved for actor initialization.
+    #[serde(default)]
+    #[schemars(description = "Optional project-specific configuration.")]
+    pub config: Option<serde_json::Value>,
+}
+
+/// Parameters selecting a registered project.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Select a registered project by stable ID.")]
+pub struct ProjectIdParams {
+    /// Stable project identifier.
+    pub project_id: String,
+}
+
+/// Empty parameters for listing all registered projects.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "List all registered projects.")]
+pub struct ProjectListParams {}

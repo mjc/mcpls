@@ -15,6 +15,7 @@ use rmcp::model::{
     UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
@@ -850,6 +851,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn create_test_server() -> McplsServer {
         create_test_server_with_ignored_flag(false)
