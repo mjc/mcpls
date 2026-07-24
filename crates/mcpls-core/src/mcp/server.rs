@@ -252,12 +252,7 @@ impl McplsServer {
         // longest matching workspace root. Keep the daemon translator as a
         // compatibility fallback for callers that have not registered a
         // project yet.
-        let result = if let Ok(actor) = self
-            .context
-            .project_registry
-            .actor_for_path(&file_path)
-            .await
-        {
+        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
             actor
                 .hover(file_path, line, character)
                 .await
@@ -289,12 +284,7 @@ impl McplsServer {
             character,
         }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
-        let result = if let Ok(actor) = self
-            .context
-            .project_registry
-            .actor_for_path(&file_path)
-            .await
-        {
+        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
             actor
                 .definition(file_path, line, character)
                 .await
