@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::project::ProjectRegistry;
 
 /// Shared context for all tool handlers.
 ///
@@ -20,18 +21,31 @@ pub struct HandlerContext {
     pub translator: Arc<Mutex<Translator>>,
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
+    /// Shared registry for project lifecycle operations.
+    pub project_registry: ProjectRegistry,
 }
 
 impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
+    ) -> Self {
+        Self::with_registry(translator, subscriptions, ProjectRegistry::new(32))
+    }
+
+    /// Create a handler context with an existing shared project registry.
+    #[must_use]
+    pub const fn with_registry(
+        translator: Arc<Mutex<Translator>>,
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
     ) -> Self {
         Self {
             translator,
             subscriptions,
+            project_registry,
         }
     }
 }
