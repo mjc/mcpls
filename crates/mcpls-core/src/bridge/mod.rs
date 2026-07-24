@@ -19,5 +19,5 @@ pub use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult, DefinitionResult,
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, Location, Position2D, Range, ReferencesResult, RenameResult,
-    Symbol, TextEdit, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    SignatureHelpResult, Symbol, TextEdit, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };

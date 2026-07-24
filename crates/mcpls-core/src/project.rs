@@ -8,7 +8,7 @@ use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult, ReferencesResult,
-    RenameResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    RenameResult, SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -490,6 +490,12 @@ enum ProjectRequest {
         character: u32,
         reply: oneshot::Sender<Result<CallHierarchyPrepareResult, String>>,
     },
+    SignatureHelp {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<SignatureHelpResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -882,6 +888,34 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route signature help through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn signature_help(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<SignatureHelpResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::SignatureHelp {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -1067,6 +1101,18 @@ impl ProjectRuntime {
     ) -> Result<CallHierarchyPrepareResult, String> {
         self.translator
             .handle_call_hierarchy_prepare(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn signature_help(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<SignatureHelpResult, String> {
+        self.translator
+            .handle_signature_help(file_path, line, character)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1281,6 +1327,14 @@ async fn handle_project_request(
                     .prepare_call_hierarchy(file_path, line, character)
                     .await,
             );
+        }
+        ProjectRequest::SignatureHelp {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(runtime.signature_help(file_path, line, character).await);
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -1936,6 +1990,25 @@ mod tests {
 
         let result = handle
             .prepare_call_hierarchy(file.display().to_string(), 1, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_signature_help_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .signature_help(file.display().to_string(), 1, 5)
             .await;
 
         assert!(matches!(
