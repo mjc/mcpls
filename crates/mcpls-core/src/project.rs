@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
-use crate::bridge::{Translator, TranslatorTemplate};
+use crate::bridge::{HoverResult, Translator, TranslatorTemplate};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -418,6 +418,12 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
     },
+    Hover {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<HoverResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -496,6 +502,34 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::Activate { root, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a hover request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn hover(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<HoverResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Hover {
+                file_path,
+                line,
+                character,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -639,6 +673,19 @@ async fn run_project_actor(
                         let _ = reply.send(Err(error.to_string()));
                     }
                 }
+            }
+            ProjectRequest::Hover {
+                file_path,
+                line,
+                character,
+                reply,
+            } => {
+                let result = runtime
+                    .translator
+                    .handle_hover(file_path, line, character)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(result);
             }
             ProjectRequest::SetStatus { status, reply } => {
                 state.sync_runtime(&runtime);
@@ -1074,6 +1121,28 @@ mod tests {
             &[root.path().canonicalize().unwrap()]
         );
         assert_eq!(state.open_document_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_semantic_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("outside.rs"), "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .hover(
+                outside.path().join("outside.rs").display().to_string(),
+                0,
+                0,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
     }
 
     #[tokio::test]
