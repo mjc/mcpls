@@ -167,6 +167,7 @@ fn register_servers(
     }
     for (language_id, server) in result.servers {
         let client = server.client().clone();
+        translator.register_server_roots(language_id.clone(), server.workspace_roots().to_vec());
         translator.register_client(language_id.clone(), client);
         translator.register_server(language_id.clone(), server);
     }

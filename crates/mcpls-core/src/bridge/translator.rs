@@ -21,8 +21,8 @@ use tokio::time::Duration;
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
-use crate::error::{Error, Result};
 use crate::config::LspServerConfig;
+use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
@@ -46,8 +46,8 @@ pub struct Translator {
     expected_languages: HashSet<String>,
     /// Configured LSP servers indexed by language ID for on-demand workspace changes.
     lsp_configs: HashMap<String, LspServerConfig>,
-    /// Root currently used by the registered LSP server for each language ID.
-    lsp_roots: HashMap<String, PathBuf>,
+    /// Workspace roots used by the registered LSP server for each language ID.
+    lsp_roots: HashMap<String, Vec<PathBuf>>,
     /// Maximum ancestor/recursive marker search depth.
     heuristics_max_depth: Option<usize>,
 }
@@ -147,7 +147,12 @@ impl Translator {
 
     /// Remember the workspace root for a registered language server.
     pub fn register_server_root(&mut self, language_id: String, root: PathBuf) {
-        self.lsp_roots.insert(language_id, root);
+        self.register_server_roots(language_id, vec![root]);
+    }
+
+    /// Remember the workspace roots for a registered language server.
+    pub fn register_server_roots(&mut self, language_id: String, roots: Vec<PathBuf>) {
+        self.lsp_roots.insert(language_id, roots);
     }
 
     /// Get the document tracker.
@@ -664,12 +669,22 @@ impl Translator {
         let Some(config) = self.lsp_configs.get(&language_id).cloned() else {
             return Ok(());
         };
+
+        // The startup path may still be registering the configured server.
+        // Let get_client_for_file return ServerInitializing instead of racing
+        // it with a second process for the same language.
+        if self.expected_languages.contains(&language_id)
+            && !self.lsp_clients.contains_key(&language_id)
+        {
+            return Ok(());
+        }
+
         let root = self.project_root_for_file(path, &config);
 
         if self
             .lsp_roots
             .get(&language_id)
-            .is_some_and(|existing| existing == &root)
+            .is_some_and(|existing| existing.iter().any(|existing| existing == &root))
             && self.lsp_clients.contains_key(&language_id)
         {
             return Ok(());
