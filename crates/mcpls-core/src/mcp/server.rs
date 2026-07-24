@@ -130,6 +130,7 @@ impl McplsServer {
                 .activate_project(identity.root().as_path().to_path_buf())
                 .await
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            drop(translator);
         }
         let state = self
             .context

@@ -752,6 +752,10 @@ impl ProjectRegistry {
     }
 
     /// Mark a registered project ready after its language servers are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor is unavailable.
     pub async fn mark_ready(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
         let actor = self.actor(id).await?;
         actor

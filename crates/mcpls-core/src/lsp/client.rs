@@ -216,8 +216,9 @@ impl LspClient {
     pub async fn wait_until_quiescent(&self, timeout_duration: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout_duration;
         loop {
-            if let Some(status) = self.server_status.lock().await.clone() {
-                if status.health == "error" {
+            let status = self.server_status.lock().await.clone();
+            if let Some(status) = status {
+                if status.quiescent && status.health == "error" {
                     return Err(Error::LspInitFailed {
                         message: status
                             .message
