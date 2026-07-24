@@ -940,6 +940,10 @@ impl ServerHandler for McplsServer {
         // in the response shape. Currently both return `{"diagnostics":null}` which is
         // ambiguous for clients that need to know whether analysis has run yet.
         let json = if let Some(actor) = self.context.actor_for_path(&path).await {
+            actor
+                .validate_path(path.display().to_string())
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
             let diagnostics = actor
                 .cached_diagnostics(path.display().to_string())
                 .await
@@ -979,7 +983,7 @@ impl ServerHandler for McplsServer {
         // translator as a compatibility fallback for unregistered resources.
         if let Some(actor) = self.context.actor_for_path(&path).await {
             actor
-                .cached_diagnostics(path.display().to_string())
+                .validate_path(path.display().to_string())
                 .await
                 .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         } else {

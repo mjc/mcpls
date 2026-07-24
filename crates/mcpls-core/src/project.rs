@@ -529,6 +529,10 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
+    ValidatePath {
+        file_path: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -1100,6 +1104,24 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Validate that a path belongs to this project's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// path is outside the actor-owned workspace roots.
+    pub async fn validate_path(&self, file_path: String) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ValidatePath { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -1368,6 +1390,13 @@ impl ProjectRuntime {
     fn cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult, String> {
         self.translator
             .handle_cached_diagnostics(file_path)
+            .map_err(|error| error.to_string())
+    }
+
+    fn validate_path(&self, file_path: &str) -> Result<(), String> {
+        self.translator
+            .validate_path(Path::new(file_path))
+            .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
@@ -1642,6 +1671,9 @@ async fn handle_project_request(
         }
         ProjectRequest::CachedDiagnostics { file_path, reply } => {
             let _ = reply.send(runtime.cached_diagnostics(&file_path));
+        }
+        ProjectRequest::ValidatePath { file_path, reply } => {
+            let _ = reply.send(runtime.validate_path(&file_path));
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
