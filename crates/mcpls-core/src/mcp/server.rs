@@ -710,18 +710,20 @@ impl McplsServer {
     )]
     async fn get_server_logs(
         &self,
-        Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
+        Parameters(ServerLogsParams {
+            project_id,
+            limit,
+            min_level,
+        }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_logs(limit, min_level)
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        let project_id = parse_project_id(project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_tool_result(actor.server_logs(limit, min_level).await)
     }
 
     /// Get recent LSP server messages.
@@ -730,18 +732,16 @@ impl McplsServer {
     )]
     async fn get_server_messages(
         &self,
-        Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
+        Parameters(ServerMessagesParams { project_id, limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator.handle_server_messages(limit)
-        };
-
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        let project_id = parse_project_id(project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_tool_result(actor.server_messages(limit).await)
     }
 
     /// Get signature help at a position.
@@ -1054,6 +1054,20 @@ mod tests {
         let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         McplsServer::new(translator, subscriptions)
+    }
+
+    async fn create_test_server_with_project() -> McplsServer {
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(".").unwrap(),
+            ))
+            .await
+            .unwrap();
+        McplsServer::new_with_registry(translator, subscriptions, registry)
     }
 
     #[tokio::test]
@@ -1986,8 +2000,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_default_params() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 50,
             min_level: None,
         });
@@ -2002,8 +2017,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_error_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 10,
             min_level: Some("error".to_string()),
         });
@@ -2019,8 +2035,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_warning_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 100,
             min_level: Some("warning".to_string()),
         });
@@ -2031,8 +2048,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_info_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 50,
             min_level: Some("info".to_string()),
         });
@@ -2043,8 +2061,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_debug_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 20,
             min_level: Some("debug".to_string()),
         });
@@ -2055,8 +2074,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_invalid_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 10,
             min_level: Some("invalid_level".to_string()),
         });
@@ -2067,8 +2087,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_zero_limit() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 0,
             min_level: None,
         });
@@ -2084,8 +2105,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_default_params() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 20 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 20,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
@@ -2097,8 +2121,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_custom_limit() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 5 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 5,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
@@ -2111,8 +2138,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_zero_limit() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 0 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 0,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
@@ -2125,8 +2155,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_large_limit() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 1000 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 1000,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());

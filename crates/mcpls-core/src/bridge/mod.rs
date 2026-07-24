@@ -20,5 +20,6 @@ pub use translator::{
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, Location,
     LocationsResult, OutgoingCallsResult, Position2D, Range, ReferencesResult, RenameResult,
-    SignatureHelpResult, Symbol, TextEdit, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Symbol, TextEdit, Translator,
+    TranslatorTemplate, WorkspaceSymbolResult,
 };

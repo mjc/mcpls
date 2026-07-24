@@ -9,7 +9,8 @@ use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, ReferencesResult,
-    RenameResult, SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
+    TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -532,6 +533,15 @@ enum ProjectRequest {
     ValidatePath {
         file_path: String,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    ServerLogs {
+        limit: usize,
+        min_level: Option<String>,
+        reply: oneshot::Sender<Result<ServerLogsResult, String>>,
+    },
+    ServerMessages {
+        limit: usize,
+        reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
     },
     Restart {
         reply: oneshot::Sender<ProjectState>,
@@ -1122,6 +1132,52 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Return recent logs from this project's language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// requested log filter is invalid.
+    pub async fn server_logs(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ServerLogs {
+                limit,
+                min_level,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Return recent messages from this project's language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or cancels the response.
+    pub async fn server_messages(
+        &self,
+        limit: usize,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ServerMessages { limit, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -1400,6 +1456,22 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn server_logs(
+        &mut self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, String> {
+        self.translator
+            .handle_server_logs(limit, min_level)
+            .map_err(|error| error.to_string())
+    }
+
+    fn server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult, String> {
+        self.translator
+            .handle_server_messages(limit)
+            .map_err(|error| error.to_string())
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -1674,6 +1746,16 @@ async fn handle_project_request(
         }
         ProjectRequest::ValidatePath { file_path, reply } => {
             let _ = reply.send(runtime.validate_path(&file_path));
+        }
+        ProjectRequest::ServerLogs {
+            limit,
+            min_level,
+            reply,
+        } => {
+            let _ = reply.send(runtime.server_logs(limit, min_level));
+        }
+        ProjectRequest::ServerMessages { limit, reply } => {
+            let _ = reply.send(runtime.server_messages(limit));
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
