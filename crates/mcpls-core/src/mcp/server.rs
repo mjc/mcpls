@@ -378,17 +378,23 @@ impl McplsServer {
             new_name,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
+            actor
+                .rename(file_path, line, character, new_name)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
             let mut translator = self.context.translator.lock().await;
             translator
                 .handle_rename(file_path, line, character, new_name)
                 .await
+                .map_err(|error| error.to_string())
         };
 
         match result {
             Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(McpError::internal_error(e, None)),
         }
     }
 
@@ -1203,6 +1209,40 @@ mod tests {
         let result = server
             .get_diagnostics(Parameters(DiagnosticsParams {
                 file_path: file_path.display().to_string(),
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_rename_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .rename_symbol(Parameters(RenameParams {
+                file_path: file_path.display().to_string(),
+                line: 0,
+                character: 0,
+                new_name: "renamed".to_string(),
             }))
             .await;
 
