@@ -2051,9 +2051,8 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or activation fails.
     pub async fn activate(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        let identity = self.identity(id).await?;
-        self.actor(id)
-            .await?
+        let (identity, actor) = self.entry(id).await?;
+        actor
             .activate(identity.root().as_path().to_path_buf())
             .await
             .map_err(ProjectRegistryError::from)
@@ -2155,6 +2154,18 @@ impl ProjectRegistry {
             .await
             .get(id)
             .map(|project| project.actor.clone())
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
+    async fn entry(
+        &self,
+        id: &ProjectId,
+    ) -> Result<(ProjectIdentity, ProjectHandle), ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| (project.identity.clone(), project.actor.clone()))
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 }
