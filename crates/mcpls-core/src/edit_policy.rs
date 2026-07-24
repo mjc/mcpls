@@ -41,6 +41,12 @@ impl EditPolicy {
         Self { mode }
     }
 
+    /// Return the configured operating mode.
+    #[must_use]
+    pub const fn mode(self) -> EditMode {
+        self.mode
+    }
+
     /// Return whether an operation may be applied under this policy.
     #[must_use]
     pub const fn allows(self, operation: EditOperation) -> bool {
@@ -62,6 +68,8 @@ mod tests {
     fn write_mode_requires_explicit_applyable_operations() {
         assert!(EditPolicy::new(EditMode::Write).allows(EditOperation::TextEdit));
         assert!(EditPolicy::new(EditMode::Write).allows(EditOperation::Create));
+        assert!(EditPolicy::new(EditMode::Write).allows(EditOperation::Rename));
+        assert!(EditPolicy::new(EditMode::Write).allows(EditOperation::Delete));
         assert!(!EditPolicy::new(EditMode::Write).allows(EditOperation::Command));
         assert!(!EditPolicy::new(EditMode::Refactor).allows(EditOperation::Create));
         assert!(!EditPolicy::new(EditMode::ReadOnly).allows(EditOperation::TextEdit));
