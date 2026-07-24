@@ -338,6 +338,10 @@ impl ProjectState {
     pub const fn open_document_count(&self) -> usize {
         self.runtime.open_document_count()
     }
+
+    fn sync_runtime(&mut self, runtime: &ProjectRuntime) {
+        self.runtime = runtime.summary();
+    }
 }
 
 /// Project-local state counts and roots owned by an actor.
@@ -525,6 +529,12 @@ struct ProjectRuntime {
     translator: Translator,
 }
 
+impl ProjectRuntime {
+    fn summary(&self) -> ProjectRuntimeSummary {
+        ProjectRuntimeSummary::from_translator(&self.translator)
+    }
+}
+
 /// Spawn a bounded project actor with `Starting` as its initial status.
 #[must_use]
 pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
@@ -551,10 +561,7 @@ pub fn spawn_project_actor_with_translator(
     tokio::spawn(run_project_actor(
         receiver,
         status_tx,
-        ProjectState::new(
-            ProjectStatus::Starting,
-            ProjectRuntimeSummary::from_translator(&runtime.translator),
-        ),
+        ProjectState::new(ProjectStatus::Starting, runtime.summary()),
         runtime,
     ));
     ProjectHandle {
@@ -572,18 +579,18 @@ async fn run_project_actor(
     while let Some(request) = receiver.recv().await {
         match request {
             ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
-                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
+                state.sync_runtime(&runtime);
                 let _ = reply.send(state.clone());
             }
             ProjectRequest::SetStatus { status, reply } => {
-                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
+                state.sync_runtime(&runtime);
                 state.status = status;
                 state.last_error = None;
                 let _ = status_tx.send(status);
                 let _ = reply.send(());
             }
             ProjectRequest::Restart { reply } => {
-                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
+                state.sync_runtime(&runtime);
                 state.status = ProjectStatus::Restarting;
                 state.last_error = None;
                 let _ = status_tx.send(ProjectStatus::Restarting);
@@ -592,14 +599,14 @@ async fn run_project_actor(
                 let _ = reply.send(state.clone());
             }
             ProjectRequest::Fail { message, reply } => {
-                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
+                state.sync_runtime(&runtime);
                 state.status = ProjectStatus::Failed;
                 state.last_error = Some(message);
                 let _ = status_tx.send(ProjectStatus::Failed);
                 let _ = reply.send(());
             }
             ProjectRequest::Shutdown { reply } => {
-                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
+                state.sync_runtime(&runtime);
                 state.status = ProjectStatus::Stopping;
                 state.last_error = None;
                 let _ = status_tx.send(ProjectStatus::Stopping);
@@ -974,10 +981,9 @@ mod tests {
         registry.add(identity.clone()).await.unwrap();
         let duplicate = registry.add(identity).await.unwrap();
         assert_eq!(registry.list().await.len(), 1);
-        assert_eq!(
-            duplicate.query().await.unwrap().status(),
-            ProjectStatus::Starting
-        );
+        let state = duplicate.query().await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Starting);
+        assert_eq!(state.workspace_roots().len(), 1);
 
         registry
             .remove(ProjectId::new("demo").unwrap())
