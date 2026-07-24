@@ -41,6 +41,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod project;
 pub mod transport;
+pub mod workspace_edit;
 
 use std::path::PathBuf;
 use std::sync::Arc;
