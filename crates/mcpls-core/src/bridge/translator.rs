@@ -282,6 +282,30 @@ impl Translator {
         Ok(notification_receivers)
     }
 
+    /// Shut down every language server owned by this translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first language-server shutdown error after attempting to
+    /// stop all owned servers.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        let servers = std::mem::take(&mut self.lsp_servers);
+        self.lsp_clients.clear();
+        self.lsp_roots.clear();
+        self.expected_languages.clear();
+
+        let mut first_error = None;
+        for server in servers.into_values() {
+            if let Err(error) = server.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Get the document tracker.
     #[must_use]
     pub const fn document_tracker(&self) -> &DocumentTracker {

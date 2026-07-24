@@ -1499,6 +1499,13 @@ impl ProjectRuntime {
         }
     }
 
+    async fn shutdown(&mut self) -> Result<(), String> {
+        self.translator
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -1842,6 +1849,10 @@ async fn handle_project_request(
             state.status = ProjectStatus::Stopping;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Stopping);
+            if let Err(error) = runtime.shutdown().await {
+                state.last_error = Some(error);
+            }
+            state.sync_runtime(runtime);
             state.status = ProjectStatus::Stopped;
             let _ = status_tx.send(ProjectStatus::Stopped);
             let _ = reply.send(());
