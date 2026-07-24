@@ -1126,6 +1126,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_activation_uses_configuration_snapshot() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let mut translator = Translator::new();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/rust-analyzer".to_string();
+        translator.set_lsp_configs(vec![config], Some(1));
+        let registry =
+            ProjectRegistry::with_translator_template(2, translator.configuration_template());
+        let id = ProjectId::new("fixture").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let result = registry.activate(&id).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Operation(_)))
+        ));
+        let state = registry.status(&id).await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(
+            state.runtime().configured_language_ids(),
+            &["rust".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn project_registry_keeps_independent_projects_isolated() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
