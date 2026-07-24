@@ -48,6 +48,9 @@ pub enum ProjectIdentityError {
         /// The mismatched path.
         path: PathBuf,
     },
+    /// A registered project root no longer exists on disk.
+    #[error("project root is unavailable: {0}")]
+    ProjectRootUnavailable(ProjectId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -91,7 +94,8 @@ impl CanonicalRoot {
     ///
     /// Returns an error when the path cannot be canonicalized or is not a directory.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ProjectIdentityError> {
-        let canonical = canonicalize(path.as_ref())?;
+        let path = path.as_ref();
+        let canonical = canonicalize(path)?;
 
         if canonical.is_dir() {
             Ok(Self(canonical))
@@ -176,12 +180,19 @@ impl ProjectResolver {
         path: impl AsRef<Path>,
     ) -> Result<&ProjectIdentity, ProjectIdentityError> {
         let path = path.as_ref();
-        let canonical =
-            path.canonicalize()
-                .map_err(|source| ProjectIdentityError::Canonicalize {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+        let canonical = match canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                if let Some(project) = self.projects.iter().find(|project| {
+                    !project.root.as_path().exists() && path.starts_with(project.root.as_path())
+                }) {
+                    return Err(ProjectIdentityError::ProjectRootUnavailable(
+                        project.id.clone(),
+                    ));
+                }
+                return Err(error);
+            }
+        };
 
         self.projects
             .iter()
@@ -343,6 +354,25 @@ mod tests {
         let root = longest_matching_root(Path::new("/workspace/project/nested/src.rs"), &roots);
 
         assert_eq!(root, Some(Path::new("/workspace/project/nested")));
+    }
+
+    #[test]
+    fn resolve_path_reports_deleted_project_root() {
+        let workspace = TempDir::new().unwrap();
+        let root = workspace.path().to_path_buf();
+        let file = root.join("src.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+        let project = ProjectIdentity::new(
+            ProjectId::new("deleted").unwrap(),
+            CanonicalRoot::new(&root).unwrap(),
+        );
+        let project_resolver = ProjectResolver::new([project]).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(matches!(
+            project_resolver.resolve_path(&file),
+            Err(ProjectIdentityError::ProjectRootUnavailable(id)) if id.as_str() == "deleted"
+        ));
     }
 
     #[cfg(unix)]
