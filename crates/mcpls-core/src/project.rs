@@ -426,12 +426,15 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectCompatibilityKey([u8; 32]);
+
 /// Return a conservative fingerprint for the inputs that shape Rust analysis.
 ///
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
 /// unknown rather than compatible. This keeps linked-project reuse fail-closed
 /// until the daemon can resolve the effective toolchain and environment.
-fn rust_project_compatibility_key(root: &Path) -> Option<[u8; 32]> {
+fn rust_project_compatibility_key(root: &Path) -> Option<ProjectCompatibilityKey> {
     const INPUTS: &[&str] = &[
         "rust-toolchain",
         "rust-toolchain.toml",
@@ -463,7 +466,7 @@ fn rust_project_compatibility_key(root: &Path) -> Option<[u8; 32]> {
         }
     }
 
-    (has_toolchain && has_manifest).then(|| hasher.finalize().into())
+    (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
 }
 
 /// Observable lifecycle state for one project actor.
@@ -2221,7 +2224,7 @@ struct ProjectEntry {
     identity: ProjectIdentity,
     actor: ProjectHandle,
     mutation: MutationGate,
-    compatibility_key: Option<[u8; 32]>,
+    compatibility_key: Option<ProjectCompatibilityKey>,
 }
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
