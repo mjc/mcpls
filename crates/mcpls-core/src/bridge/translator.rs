@@ -306,6 +306,9 @@ pub struct TextEdit {
 pub struct DocumentChanges {
     /// URI of the document.
     pub uri: String,
+    /// Expected LSP document version, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i32>,
     /// List of edits to apply.
     pub edits: Vec<TextEdit>,
 }
@@ -1001,6 +1004,7 @@ impl Translator {
                 for (uri, edits) in changes_map {
                     result_changes.push(DocumentChanges {
                         uri: uri.to_string(),
+                        version: None,
                         edits: edits
                             .into_iter()
                             .map(|e| TextEdit {
@@ -1016,18 +1020,26 @@ impl Translator {
             if result_changes.is_empty() {
                 let text_doc_edits = match edit.document_changes {
                     Some(lsp_types::DocumentChanges::Edits(edits)) => edits,
-                    Some(lsp_types::DocumentChanges::Operations(ops)) => ops
-                        .into_iter()
-                        .filter_map(|op| match op {
-                            lsp_types::DocumentChangeOperation::Edit(e) => Some(e),
-                            lsp_types::DocumentChangeOperation::Op(_) => None,
-                        })
-                        .collect(),
+                    Some(lsp_types::DocumentChanges::Operations(ops)) => {
+                        let mut edits = Vec::with_capacity(ops.len());
+                        for operation in ops {
+                            match operation {
+                                lsp_types::DocumentChangeOperation::Edit(edit) => edits.push(edit),
+                                lsp_types::DocumentChangeOperation::Op(_) => {
+                                    return Err(Error::UnsupportedWorkspaceEdit(
+                                        "rename returned a resource operation".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        edits
+                    }
                     None => vec![],
                 };
                 for tde in text_doc_edits {
                     result_changes.push(DocumentChanges {
                         uri: tde.text_document.uri.to_string(),
+                        version: tde.text_document.version,
                         edits: tde
                             .edits
                             .into_iter()
@@ -2178,6 +2190,7 @@ fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
                 }
                 result.push(DocumentChanges {
                     uri: uri.to_string(),
+                    version: None,
                     edits: text_edits,
                 });
             }
