@@ -1570,6 +1570,26 @@ async fn run_project_actor(
     }
 }
 
+fn spawn_notification_forwarders(
+    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    actor_sender: &mpsc::Sender<ProjectRequest>,
+) {
+    for mut receiver in notification_receivers {
+        let sender = actor_sender.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = receiver.recv().await {
+                if sender
+                    .send(ProjectRequest::Notification { notification })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
@@ -1591,20 +1611,7 @@ async fn handle_project_request(
             let _ = status_tx.send(ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
-                    for mut receiver in notification_receivers {
-                        let sender = actor_sender.clone();
-                        tokio::spawn(async move {
-                            while let Some(notification) = receiver.recv().await {
-                                if sender
-                                    .send(ProjectRequest::Notification { notification })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        });
-                    }
+                    spawn_notification_forwarders(notification_receivers, actor_sender);
                     state.sync_runtime(runtime);
                     state.status = ProjectStatus::Ready;
                     let _ = status_tx.send(ProjectStatus::Ready);
