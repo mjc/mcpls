@@ -217,32 +217,21 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - All LSP servers fail to initialize
-/// - MCP server setup fails
-/// - Configuration is invalid
-///
-/// # Graceful Degradation
-///
-/// - **All servers succeed**: Service runs normally
-/// - **Partial success**: Logs warnings for failures, continues with available servers
-/// - **All servers fail**: Returns `Error::AllServersFailedToInit` with details
+/// Returns an error if MCP server setup or the transport fails. Individual
+/// project activation failures are reported through project status instead of
+/// terminating the daemon.
 pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     serve_with(config, Transport::Stdio).await
 }
 
 /// Start the MCPLS server with an explicit transport.
 ///
-/// Performs all shared setup (workspace discovery, LSP spawning, translator
-/// initialization, diagnostic pump tasks) and then delegates to the
-/// appropriate transport runner.
+/// Performs shared setup (workspace discovery, actor registry, and translator
+/// configuration) and then delegates to the appropriate transport runner.
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - All LSP servers fail to initialize
-/// - The MCP server or transport fails to start
-/// - Configuration is invalid
+/// Returns an error if the MCP server or transport fails to start.
 ///
 /// # DNS rebinding protection (HTTP transport)
 ///
