@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
-    DefinitionResult, DiagnosticsResult, HoverResult, ReferencesResult, Translator,
+    DefinitionResult, DiagnosticsResult, HoverResult, ReferencesResult, RenameResult, Translator,
     TranslatorTemplate,
 };
 
@@ -444,6 +444,13 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
+    Rename {
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+        reply: oneshot::Sender<Result<RenameResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -637,6 +644,36 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a rename request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn rename(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<RenameResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Rename {
+                file_path,
+                line,
+                character,
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -732,6 +769,19 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn rename(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<RenameResult, String> {
+        self.translator
+            .handle_rename(file_path, line, character, new_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -792,100 +842,122 @@ async fn run_project_actor(
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
-        match request {
-            ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
-                state.sync_runtime(&runtime);
-                let _ = reply.send(state.clone());
-            }
-            ProjectRequest::Activate { root, reply } => {
-                state.status = ProjectStatus::Starting;
-                state.last_error = None;
-                let _ = status_tx.send(ProjectStatus::Starting);
-                match runtime.translator.activate_project(root).await {
-                    Ok(()) => {
-                        state.sync_runtime(&runtime);
-                        state.status = ProjectStatus::Ready;
-                        let _ = status_tx.send(ProjectStatus::Ready);
-                        let _ = reply.send(Ok(state.clone()));
-                    }
-                    Err(error) => {
-                        state.sync_runtime(&runtime);
-                        state.status = ProjectStatus::Failed;
-                        state.last_error = Some(error.to_string());
-                        let _ = status_tx.send(ProjectStatus::Failed);
-                        let _ = reply.send(Err(error.to_string()));
-                    }
-                }
-            }
-            ProjectRequest::Hover {
-                file_path,
-                line,
-                character,
-                reply,
-            } => {
-                let result = runtime.hover(file_path, line, character).await;
-                let _ = reply.send(result);
-            }
-            ProjectRequest::Definition {
-                file_path,
-                line,
-                character,
-                reply,
-            } => {
-                let result = runtime.definition(file_path, line, character).await;
-                let _ = reply.send(result);
-            }
-            ProjectRequest::References {
-                file_path,
-                line,
-                character,
-                include_declaration,
-                reply,
-            } => {
-                let result = runtime
-                    .references(file_path, line, character, include_declaration)
-                    .await;
-                let _ = reply.send(result);
-            }
-            ProjectRequest::Diagnostics { file_path, reply } => {
-                let result = runtime.diagnostics(file_path).await;
-                let _ = reply.send(result);
-            }
-            ProjectRequest::SetStatus { status, reply } => {
-                state.sync_runtime(&runtime);
-                state.status = status;
-                state.last_error = None;
-                let _ = status_tx.send(status);
-                let _ = reply.send(());
-            }
-            ProjectRequest::Restart { reply } => {
-                state.sync_runtime(&runtime);
-                state.status = ProjectStatus::Restarting;
-                state.last_error = None;
-                let _ = status_tx.send(ProjectStatus::Restarting);
-                state.status = ProjectStatus::Ready;
-                let _ = status_tx.send(ProjectStatus::Ready);
-                let _ = reply.send(state.clone());
-            }
-            ProjectRequest::Fail { message, reply } => {
-                state.sync_runtime(&runtime);
-                state.status = ProjectStatus::Failed;
-                state.last_error = Some(message);
-                let _ = status_tx.send(ProjectStatus::Failed);
-                let _ = reply.send(());
-            }
-            ProjectRequest::Shutdown { reply } => {
-                state.sync_runtime(&runtime);
-                state.status = ProjectStatus::Stopping;
-                state.last_error = None;
-                let _ = status_tx.send(ProjectStatus::Stopping);
-                state.status = ProjectStatus::Stopped;
-                let _ = status_tx.send(ProjectStatus::Stopped);
-                let _ = reply.send(());
-                break;
-            }
+        if handle_project_request(request, &status_tx, &mut state, &mut runtime).await {
+            break;
         }
     }
+}
+
+// This exhaustive dispatcher keeps actor state transitions in one place; each
+// request arm is intentionally small and independently typed.
+#[allow(clippy::too_many_lines)]
+async fn handle_project_request(
+    request: ProjectRequest,
+    status_tx: &watch::Sender<ProjectStatus>,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) -> bool {
+    match request {
+        ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
+            state.sync_runtime(runtime);
+            let _ = reply.send(state.clone());
+        }
+        ProjectRequest::Activate { root, reply } => {
+            state.status = ProjectStatus::Starting;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Starting);
+            match runtime.translator.activate_project(root).await {
+                Ok(()) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Ready;
+                    let _ = status_tx.send(ProjectStatus::Ready);
+                    let _ = reply.send(Ok(state.clone()));
+                }
+                Err(error) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Failed;
+                    state.last_error = Some(error.to_string());
+                    let _ = status_tx.send(ProjectStatus::Failed);
+                    let _ = reply.send(Err(error.to_string()));
+                }
+            }
+        }
+        ProjectRequest::Hover {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(runtime.hover(file_path, line, character).await);
+        }
+        ProjectRequest::Definition {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(runtime.definition(file_path, line, character).await);
+        }
+        ProjectRequest::References {
+            file_path,
+            line,
+            character,
+            include_declaration,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .references(file_path, line, character, include_declaration)
+                    .await,
+            );
+        }
+        ProjectRequest::Diagnostics { file_path, reply } => {
+            let _ = reply.send(runtime.diagnostics(file_path).await);
+        }
+        ProjectRequest::Rename {
+            file_path,
+            line,
+            character,
+            new_name,
+            reply,
+        } => {
+            let _ = reply.send(runtime.rename(file_path, line, character, new_name).await);
+        }
+        ProjectRequest::SetStatus { status, reply } => {
+            state.sync_runtime(runtime);
+            state.status = status;
+            state.last_error = None;
+            let _ = status_tx.send(status);
+            let _ = reply.send(());
+        }
+        ProjectRequest::Restart { reply } => {
+            state.sync_runtime(runtime);
+            state.status = ProjectStatus::Restarting;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Restarting);
+            state.status = ProjectStatus::Ready;
+            let _ = status_tx.send(ProjectStatus::Ready);
+            let _ = reply.send(state.clone());
+        }
+        ProjectRequest::Fail { message, reply } => {
+            state.sync_runtime(runtime);
+            state.status = ProjectStatus::Failed;
+            state.last_error = Some(message);
+            let _ = status_tx.send(ProjectStatus::Failed);
+            let _ = reply.send(());
+        }
+        ProjectRequest::Shutdown { reply } => {
+            state.sync_runtime(runtime);
+            state.status = ProjectStatus::Stopping;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Stopping);
+            state.status = ProjectStatus::Stopped;
+            let _ = status_tx.send(ProjectStatus::Stopped);
+            let _ = reply.send(());
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1382,6 +1454,25 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle.diagnostics(file.display().to_string()).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_rename_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .rename(file.display().to_string(), 0, 0, "renamed".to_string())
+            .await;
 
         assert!(matches!(
             result,
