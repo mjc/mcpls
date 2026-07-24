@@ -621,10 +621,8 @@ impl Translator {
             }
         }
 
-        for root in &self.workspace_roots {
-            if path.starts_with(root) {
-                return root.clone();
-            }
+        if let Some(root) = crate::project::longest_matching_root(path, &self.workspace_roots) {
+            return root.to_path_buf();
         }
 
         start.to_path_buf()

@@ -34,6 +34,20 @@ pub enum ProjectIdentityError {
     /// No registered project contains the requested path.
     #[error("path is not registered to a project: {0}")]
     UnregisteredPath(PathBuf),
+    /// No project selector was supplied.
+    #[error("a project ID or file path is required")]
+    MissingSelector,
+    /// The requested project ID is not registered.
+    #[error("project is not registered: {0}")]
+    ProjectNotFound(ProjectId),
+    /// An explicit project ID does not contain the supplied path.
+    #[error("path {path} does not belong to project {id}")]
+    ProjectPathMismatch {
+        /// The selected project ID.
+        id: ProjectId,
+        /// The mismatched path.
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -77,13 +91,7 @@ impl CanonicalRoot {
     ///
     /// Returns an error when the path cannot be canonicalized or is not a directory.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ProjectIdentityError> {
-        let path = path.as_ref();
-        let canonical =
-            path.canonicalize()
-                .map_err(|source| ProjectIdentityError::Canonicalize {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+        let canonical = canonicalize(path.as_ref())?;
 
         if canonical.is_dir() {
             Ok(Self(canonical))
@@ -183,6 +191,70 @@ impl ProjectResolver {
             .max_by_key(|project| project.root.as_path().components().count())
             .ok_or(ProjectIdentityError::UnregisteredPath(canonical))
     }
+
+    /// Resolve by explicit project ID, optionally checking a file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no selector is supplied, the ID is unknown, or the path
+    /// is outside the selected project root.
+    pub fn resolve(
+        &self,
+        project_id: Option<&ProjectId>,
+        path: Option<&Path>,
+    ) -> Result<&ProjectIdentity, ProjectIdentityError> {
+        match (project_id, path) {
+            (None, None) => Err(ProjectIdentityError::MissingSelector),
+            (None, Some(path)) => self.resolve_path(path),
+            (Some(project_id), None) => self.resolve_id(project_id),
+            (Some(project_id), Some(path)) => {
+                let project = self.resolve_id(project_id)?;
+                let canonical = canonicalize(path)?;
+                if project.root.as_path().exists() && canonical.starts_with(project.root.as_path())
+                {
+                    Ok(project)
+                } else {
+                    Err(ProjectIdentityError::ProjectPathMismatch {
+                        id: project_id.clone(),
+                        path: canonical,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Resolve an explicit project ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectIdentityError::ProjectNotFound`] when the ID is not registered.
+    pub fn resolve_id(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<&ProjectIdentity, ProjectIdentityError> {
+        self.projects
+            .iter()
+            .find(|project| project.id() == project_id)
+            .ok_or_else(|| ProjectIdentityError::ProjectNotFound(project_id.clone()))
+    }
+}
+
+/// Return the registered root with the most path components that contains `path`.
+#[must_use]
+pub fn longest_matching_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a Path> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .map(PathBuf::as_path)
+}
+
+fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
+    path.canonicalize()
+        .map_err(|source| ProjectIdentityError::Canonicalize {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 #[cfg(test)]
@@ -236,6 +308,41 @@ mod tests {
             ProjectResolver::new(projects),
             Err(ProjectIdentityError::DuplicateId(id)) if id.as_str() == "same"
         ));
+    }
+
+    #[test]
+    fn resolve_rejects_explicit_id_and_path_mismatch() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let file = second.path().join("src.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+        let first_id = ProjectId::new("first").unwrap();
+        let projects = [
+            ProjectIdentity::new(first_id.clone(), CanonicalRoot::new(first.path()).unwrap()),
+            ProjectIdentity::new(
+                ProjectId::new("second").unwrap(),
+                CanonicalRoot::new(second.path()).unwrap(),
+            ),
+        ];
+        let project_resolver = ProjectResolver::new(projects).unwrap();
+
+        assert!(matches!(
+            project_resolver.resolve(Some(&first_id), Some(&file)),
+            Err(ProjectIdentityError::ProjectPathMismatch { id, .. }) if id == first_id
+        ));
+    }
+
+    #[test]
+    fn longest_matching_root_uses_path_components() {
+        let roots = vec![
+            PathBuf::from("/workspace/project"),
+            PathBuf::from("/workspace/project/nested"),
+            PathBuf::from("/workspace/project-other"),
+        ];
+
+        let root = longest_matching_root(Path::new("/workspace/project/nested/src.rs"), &roots);
+
+        assert_eq!(root, Some(Path::new("/workspace/project/nested")));
     }
 
     #[cfg(unix)]
