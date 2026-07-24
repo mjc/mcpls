@@ -23,9 +23,11 @@ pub use state::{
 };
 pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
-    Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
-    DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
+    CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult, DefinitionResult,
+    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
+    FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, Location,
+    LocationsResult, OutgoingCallsResult, Position2D, Range, ReferencesResult, RenameResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Symbol, TextEdit, Translator,
     TranslatorTemplate, WorkspaceSymbolResult,
 };
 

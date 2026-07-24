@@ -528,7 +528,11 @@ impl McplsServer {
     )]
     async fn get_server_logs(
         &self,
-        Parameters(ServerLogsParams { limit, min_level }): Parameters<ServerLogsParams>,
+        Parameters(ServerLogsParams {
+            project_id,
+            limit,
+            min_level,
+        }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
         to_tool_result({
             let cache = self.context.notification_cache.lock().await;
@@ -543,7 +547,7 @@ impl McplsServer {
     )]
     async fn get_server_messages(
         &self,
-        Parameters(ServerMessagesParams { limit }): Parameters<ServerMessagesParams>,
+        Parameters(ServerMessagesParams { project_id, limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
         to_tool_result({
             let cache = self.context.notification_cache.lock().await;
@@ -872,6 +876,20 @@ mod tests {
         )
     }
 
+    async fn create_test_server_with_project() -> McplsServer {
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(".").unwrap(),
+            ))
+            .await
+            .unwrap();
+        McplsServer::new_with_registry(translator, subscriptions, registry)
+    }
+
     #[tokio::test]
     async fn test_server_info() {
         let server = create_test_server();
@@ -1178,6 +1196,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_code_actions_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_code_actions(Parameters(CodeActionsParams {
+                file_path: file_path.display().to_string(),
+                start_line: 1,
+                start_character: 5,
+                end_line: 1,
+                end_character: 15,
+                kind_filter: None,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_call_hierarchy_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .prepare_call_hierarchy(Parameters(CallHierarchyPrepareParams {
+                file_path: file_path.display().to_string(),
+                line: 1,
+                character: 5,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_signature_help_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_signature_help(Parameters(SignatureHelpParams {
+                file_path: file_path.display().to_string(),
+                line: 1,
+                character: 5,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_inlay_hints_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_inlay_hints(Parameters(InlayHintsParams {
+                file_path: file_path.display().to_string(),
+                start_line: 1,
+                start_character: 5,
+                end_line: 1,
+                end_character: 15,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_implementation_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .go_to_implementation(Parameters(GoToImplementationParams {
+                file_path: file_path.display().to_string(),
+                line: 1,
+                character: 5,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_type_definition_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .go_to_type_definition(Parameters(GoToTypeDefinitionParams {
+                file_path: file_path.display().to_string(),
+                line: 1,
+                character: 5,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_cached_diagnostics_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                file_path: file_path.display().to_string(),
+            }))
+            .await;
+
+        let response = result.unwrap();
+        assert_eq!(response, r#"{"diagnostics":[]}"#);
+    }
+
+    #[tokio::test]
     async fn test_definition_tool_with_params() {
         let server = create_test_server();
         let params = Parameters(PositionParams {
@@ -1355,6 +1604,76 @@ mod tests {
         let params = Parameters(CallHierarchyCallsParams { item });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_calls_routes_registered_items_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": crate::bridge::path_to_uri(&file_path).to_string(),
+            "range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}},
+            "selectionRange": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}}
+        });
+
+        let result = server
+            .get_incoming_calls(Parameters(CallHierarchyCallsParams { item }))
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_calls_routes_registered_items_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": crate::bridge::path_to_uri(&file_path).to_string(),
+            "range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}},
+            "selectionRange": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}}
+        });
+
+        let result = server
+            .get_outgoing_calls(Parameters(CallHierarchyCallsParams { item }))
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
     }
 
     #[tokio::test]
@@ -1609,8 +1928,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_default_params() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 50,
             min_level: None,
         });
@@ -1625,8 +1945,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_error_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 10,
             min_level: Some("error".to_string()),
         });
@@ -1642,8 +1963,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_warning_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 100,
             min_level: Some("warning".to_string()),
         });
@@ -1654,8 +1976,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_info_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 50,
             min_level: Some("info".to_string()),
         });
@@ -1666,8 +1989,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_debug_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 20,
             min_level: Some("debug".to_string()),
         });
@@ -1678,8 +2002,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_invalid_level() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 10,
             min_level: Some("invalid_level".to_string()),
         });
@@ -1690,8 +2015,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_logs_tool_with_zero_limit() {
-        let server = create_test_server();
+        let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
+            project_id: "project".to_string(),
             limit: 0,
             min_level: None,
         });
@@ -1707,8 +2033,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_default_params() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 20 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 20,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
@@ -1720,8 +2049,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_custom_limit() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 5 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 5,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
@@ -1734,8 +2066,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_zero_limit() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 0 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 0,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());
@@ -1748,8 +2083,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_messages_tool_with_large_limit() {
-        let server = create_test_server();
-        let params = Parameters(ServerMessagesParams { limit: 1000 });
+        let server = create_test_server_with_project().await;
+        let params = Parameters(ServerMessagesParams {
+            project_id: "project".to_string(),
+            limit: 1000,
+        });
 
         let result = server.get_server_messages(params).await;
         assert!(result.is_ok());

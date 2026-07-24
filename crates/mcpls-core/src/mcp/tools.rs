@@ -184,6 +184,11 @@ pub struct CachedDiagnosticsParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting recent LSP server log messages.")]
 pub struct ServerLogsParams {
+    /// Registered project whose language-server logs should be returned.
+    #[schemars(
+        description = "Registered project ID whose language-server logs should be returned."
+    )]
+    pub project_id: String,
     /// Maximum number of log entries to return (default: 50).
     #[schemars(description = "Maximum number of log entries to return (default: 50).")]
     #[serde(default = "default_log_limit")]
@@ -204,6 +209,11 @@ const fn default_log_limit() -> usize {
     description = "Parameters for getting recent LSP server messages (showMessage notifications)."
 )]
 pub struct ServerMessagesParams {
+    /// Registered project whose language-server messages should be returned.
+    #[schemars(
+        description = "Registered project ID whose language-server messages should be returned."
+    )]
+    pub project_id: String,
     /// Maximum number of messages to return (default: 20).
     #[schemars(description = "Maximum number of messages to return (default: 20).")]
     #[serde(default = "default_message_limit")]

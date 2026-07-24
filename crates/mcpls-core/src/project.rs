@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
-    CompletionsResult, DefinitionResult, DiagnosticsResult, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, ReferencesResult, RenameResult, Translator,
+    CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
+    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, ReferencesResult,
+    RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
     TranslatorTemplate, WorkspaceSymbolResult,
 };
 
@@ -475,6 +477,72 @@ enum ProjectRequest {
         limit: u32,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
+    CodeActions {
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+        reply: oneshot::Sender<Result<CodeActionsResult, String>>,
+    },
+    PrepareCallHierarchy {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<CallHierarchyPrepareResult, String>>,
+    },
+    IncomingCalls {
+        item: serde_json::Value,
+        reply: oneshot::Sender<Result<IncomingCallsResult, String>>,
+    },
+    OutgoingCalls {
+        item: serde_json::Value,
+        reply: oneshot::Sender<Result<OutgoingCallsResult, String>>,
+    },
+    SignatureHelp {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<SignatureHelpResult, String>>,
+    },
+    InlayHints {
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        reply: oneshot::Sender<Result<InlayHintsResult, String>>,
+    },
+    GoToImplementation {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<LocationsResult, String>>,
+    },
+    GoToTypeDefinition {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<LocationsResult, String>>,
+    },
+    CachedDiagnostics {
+        file_path: String,
+        reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
+    },
+    ValidatePath {
+        file_path: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    ServerLogs {
+        limit: usize,
+        min_level: Option<String>,
+        reply: oneshot::Sender<Result<ServerLogsResult, String>>,
+    },
+    ServerMessages {
+        limit: usize,
+        reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -805,6 +873,311 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a code-action request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn code_actions(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::CodeActions {
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route call-hierarchy preparation through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn prepare_call_hierarchy(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<CallHierarchyPrepareResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PrepareCallHierarchy {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route incoming call hierarchy requests through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn incoming_calls(
+        &self,
+        item: serde_json::Value,
+    ) -> Result<IncomingCallsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::IncomingCalls { item, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route outgoing call hierarchy requests through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn outgoing_calls(
+        &self,
+        item: serde_json::Value,
+    ) -> Result<OutgoingCallsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::OutgoingCalls { item, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route signature help through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn signature_help(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<SignatureHelpResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::SignatureHelp {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route inlay hints through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn inlay_hints(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<InlayHintsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::InlayHints {
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route implementation lookup through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn go_to_implementation(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<LocationsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::GoToImplementation {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route type-definition lookup through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn go_to_type_definition(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<LocationsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::GoToTypeDefinition {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route cached diagnostics through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn cached_diagnostics(
+        &self,
+        file_path: String,
+    ) -> Result<DiagnosticsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::CachedDiagnostics { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Validate that a path belongs to this project's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// path is outside the actor-owned workspace roots.
+    pub async fn validate_path(&self, file_path: String) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ValidatePath { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Return recent logs from this project's language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// requested log filter is invalid.
+    pub async fn server_logs(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ServerLogs {
+                limit,
+                min_level,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Return recent messages from this project's language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or cancels the response.
+    pub async fn server_messages(
+        &self,
+        limit: usize,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ServerMessages { limit, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -957,6 +1330,145 @@ impl ProjectRuntime {
         self.translator
             .handle_workspace_symbol(query, kind_filter, limit)
             .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn code_actions(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, String> {
+        self.translator
+            .handle_code_actions(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_call_hierarchy(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<CallHierarchyPrepareResult, String> {
+        self.translator
+            .handle_call_hierarchy_prepare(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn incoming_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<IncomingCallsResult, String> {
+        self.translator
+            .handle_incoming_calls(item)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn outgoing_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<OutgoingCallsResult, String> {
+        self.translator
+            .handle_outgoing_calls(item)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn signature_help(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<SignatureHelpResult, String> {
+        self.translator
+            .handle_signature_help(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn inlay_hints(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<InlayHintsResult, String> {
+        self.translator
+            .handle_inlay_hints(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn go_to_implementation(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<LocationsResult, String> {
+        self.translator
+            .handle_implementation(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn go_to_type_definition(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<LocationsResult, String> {
+        self.translator
+            .handle_type_definition(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult, String> {
+        self.translator
+            .handle_cached_diagnostics(file_path)
+            .map_err(|error| error.to_string())
+    }
+
+    fn validate_path(&self, file_path: &str) -> Result<(), String> {
+        self.translator
+            .validate_path(Path::new(file_path))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn server_logs(
+        &mut self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, String> {
+        self.translator
+            .handle_server_logs(limit, min_level)
+            .map_err(|error| error.to_string())
+    }
+
+    fn server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult, String> {
+        self.translator
+            .handle_server_messages(limit)
             .map_err(|error| error.to_string())
     }
 
@@ -1136,6 +1648,114 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.workspace_symbol(query, kind_filter, limit).await);
+        }
+        ProjectRequest::CodeActions {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .code_actions(
+                        file_path,
+                        start_line,
+                        start_character,
+                        end_line,
+                        end_character,
+                        kind_filter,
+                    )
+                    .await,
+            );
+        }
+        ProjectRequest::PrepareCallHierarchy {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .prepare_call_hierarchy(file_path, line, character)
+                    .await,
+            );
+        }
+        ProjectRequest::IncomingCalls { item, reply } => {
+            let _ = reply.send(runtime.incoming_calls(item).await);
+        }
+        ProjectRequest::OutgoingCalls { item, reply } => {
+            let _ = reply.send(runtime.outgoing_calls(item).await);
+        }
+        ProjectRequest::SignatureHelp {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(runtime.signature_help(file_path, line, character).await);
+        }
+        ProjectRequest::InlayHints {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .inlay_hints(
+                        file_path,
+                        start_line,
+                        start_character,
+                        end_line,
+                        end_character,
+                    )
+                    .await,
+            );
+        }
+        ProjectRequest::GoToImplementation {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .go_to_implementation(file_path, line, character)
+                    .await,
+            );
+        }
+        ProjectRequest::GoToTypeDefinition {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .go_to_type_definition(file_path, line, character)
+                    .await,
+            );
+        }
+        ProjectRequest::CachedDiagnostics { file_path, reply } => {
+            let _ = reply.send(runtime.cached_diagnostics(&file_path));
+        }
+        ProjectRequest::ValidatePath { file_path, reply } => {
+            let _ = reply.send(runtime.validate_path(&file_path));
+        }
+        ProjectRequest::ServerLogs {
+            limit,
+            min_level,
+            reply,
+        } => {
+            let _ = reply.send(runtime.server_logs(limit, min_level));
+        }
+        ProjectRequest::ServerMessages { limit, reply } => {
+            let _ = reply.send(runtime.server_messages(limit));
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -1754,6 +2374,137 @@ mod tests {
         let result = handle
             .format_document(file.display().to_string(), 4, true)
             .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_code_action_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .code_actions(file.display().to_string(), 1, 5, 1, 15, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_call_hierarchy_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .prepare_call_hierarchy(file.display().to_string(), 1, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_signature_help_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .signature_help(file.display().to_string(), 1, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_inlay_hints_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .inlay_hints(file.display().to_string(), 1, 5, 1, 15)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_implementation_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .go_to_implementation(file.display().to_string(), 1, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_type_definition_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .go_to_type_definition(file.display().to_string(), 1, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_cached_diagnostics_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle.cached_diagnostics(file.display().to_string()).await;
 
         assert!(matches!(
             result,
