@@ -395,6 +395,26 @@ impl EditPlanStore {
         Ok(plan)
     }
 
+    /// Remove and return a plan for one project, consuming its apply token.
+    ///
+    /// Removing before the filesystem effect makes a plan single-use even
+    /// when the caller retries after a partial commit or process failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanStoreError::NotFound`] for an expired or unknown plan and
+    /// [`PlanStoreError::ProjectMismatch`] when the project does not own it.
+    pub fn take_for_project(
+        &mut self,
+        id: &PlanId,
+        project_id: &str,
+    ) -> Result<EditPlan, PlanStoreError> {
+        let plan = self.get_for_project(id, project_id)?.clone();
+        self.bytes = self.bytes.saturating_sub(plan.estimated_bytes());
+        self.plans.remove(id);
+        Ok(plan)
+    }
+
     /// Remove expired plans using an explicit clock value.
     pub fn purge_expired(&mut self, now: SystemTime) {
         let expired: Vec<_> = self
@@ -518,6 +538,27 @@ mod tests {
         store.insert(second)?;
         assert!(store.get(&first_id).is_none());
         assert!(store.get(&second_id).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn taking_a_plan_consumes_its_single_apply_token() -> Result<(), PlanStoreError> {
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let id = plan.id().clone();
+        store.insert(plan)?;
+
+        assert!(store.take_for_project(&id, "project-a").is_ok());
+        assert!(matches!(
+            store.take_for_project(&id, "project-a"),
+            Err(PlanStoreError::NotFound(_))
+        ));
         Ok(())
     }
 

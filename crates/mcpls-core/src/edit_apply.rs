@@ -7,7 +7,10 @@ use std::time::SystemTime;
 
 use crate::edit_paths::PathSafetyError;
 use crate::edit_paths::WorkspaceBoundary;
-use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource, SnapshotValidationError};
+use crate::edit_plan::{
+    EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
+    SnapshotValidationError,
+};
 
 /// Result of applying one edit plan.
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +36,23 @@ pub fn apply_plan(
     let staged = prepared.stage()?;
     prepared.revalidate(boundary, &staged)?;
     PreparedPlan::commit(&staged)
+}
+
+/// Consume and apply a plan from its owning project store.
+///
+/// # Errors
+///
+/// Returns a project/plan lookup error before applying, or any validation and
+/// filesystem error returned by [`apply_plan`]. The plan is consumed before
+/// the filesystem effect so it cannot be applied twice.
+pub fn apply_stored_plan(
+    store: &mut EditPlanStore,
+    boundary: &WorkspaceBoundary,
+    project_id: &str,
+    plan_id: &PlanId,
+) -> Result<ApplyReport, ApplyError> {
+    let plan = store.take_for_project(plan_id, project_id)?;
+    apply_plan(boundary, &plan)
 }
 
 struct PreparedPlan<'a> {
@@ -114,6 +134,10 @@ impl<'a> PreparedPlan<'a> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ApplyError {
+    /// The selected plan was not owned by the requested project or no longer
+    /// exists in its bounded store.
+    #[error("edit plan lookup failed: {0}")]
+    Store(#[from] PlanStoreError),
     /// The plan cannot be applied safely.
     #[error("edit plan is not safe to apply")]
     UnsafePlan,
@@ -337,5 +361,37 @@ mod tests {
             Err(ApplyError::UnsupportedSource(path)) if path == file
         ));
         assert_eq!(fs::read_to_string(file).unwrap(), "disk\n");
+    }
+
+    #[test]
+    fn stored_application_consumes_the_plan_before_effects() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("stored.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        apply_stored_plan(&mut store, &boundary, "project", &plan_id).unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
+        assert!(matches!(
+            apply_stored_plan(&mut store, &boundary, "project", &plan_id),
+            Err(ApplyError::Store(PlanStoreError::NotFound(_)))
+        ));
     }
 }
