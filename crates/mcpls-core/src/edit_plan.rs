@@ -59,6 +59,27 @@ pub struct FileSnapshot {
     planned_content: String,
 }
 
+/// Failure while validating a preview snapshot before application.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SnapshotValidationError {
+    /// The current content no longer matches the preview hash.
+    #[error("file content changed since preview: {path}")]
+    ContentChanged {
+        /// Affected file path.
+        path: PathBuf,
+    },
+    /// An open document version no longer matches the preview.
+    #[error("document version changed for {path}: expected {expected}, got {actual:?}")]
+    VersionChanged {
+        /// Affected file path.
+        path: PathBuf,
+        /// Version captured by the preview.
+        expected: i32,
+        /// Current document version.
+        actual: Option<i32>,
+    },
+}
+
 impl FileSnapshot {
     /// Capture content and compute its SHA-256 precondition hash.
     #[must_use]
@@ -116,6 +137,34 @@ impl FileSnapshot {
     #[must_use]
     pub fn planned_content(&self) -> &str {
         &self.planned_content
+    }
+
+    /// Validate exact content and an optional open-document version.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed error if either the content hash or captured
+    /// document version differs from the current state.
+    pub fn validate(
+        &self,
+        current_content: &str,
+        current_version: Option<i32>,
+    ) -> Result<(), SnapshotValidationError> {
+        if hash_content(current_content) != self.content_hash {
+            return Err(SnapshotValidationError::ContentChanged {
+                path: self.path.clone(),
+            });
+        }
+        if let Some(expected) = self.version
+            && current_version != Some(expected)
+        {
+            return Err(SnapshotValidationError::VersionChanged {
+                path: self.path.clone(),
+                expected,
+                actual: current_version,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -499,5 +548,26 @@ mod tests {
             Err(PlanStoreError::TooLarge { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn rejects_stale_content_and_document_versions() {
+        let snapshot = FileSnapshot::from_contents(
+            PathBuf::from("src/lib.rs"),
+            SnapshotSource::OpenDocument,
+            Some(7),
+            "before",
+            "after",
+        );
+
+        assert!(matches!(
+            snapshot.validate("changed", Some(7)),
+            Err(SnapshotValidationError::ContentChanged { .. })
+        ));
+        assert!(matches!(
+            snapshot.validate("before", Some(8)),
+            Err(SnapshotValidationError::VersionChanged { expected: 7, .. })
+        ));
+        assert!(snapshot.validate("before", Some(7)).is_ok());
     }
 }
