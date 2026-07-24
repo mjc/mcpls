@@ -1701,7 +1701,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn activate(
+    async fn activate_workspace_roots(
         &mut self,
         roots: Vec<PathBuf>,
     ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
@@ -1867,7 +1867,7 @@ async fn handle_project_request(
             state.status = ProjectStatus::Starting;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Starting);
-            match runtime.activate(roots).await {
+            match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
                     spawn_notification_forwarders(notification_receivers, actor_sender);
                     state.sync_runtime(runtime);
