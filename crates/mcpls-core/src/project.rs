@@ -10,11 +10,16 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, ReferencesResult,
-    RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
-    TranslatorTemplate, WorkspaceSymbolResult,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
+    ReferencesResult, RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
+    Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
+use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
+use crate::edit_paths::WorkspaceBoundary;
+use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
+use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::LspNotification;
+use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -600,6 +605,19 @@ pub enum ProjectActorError {
     Operation(String),
 }
 
+/// Result of consuming and applying one project-owned edit plan.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AppliedEditPlan {
+    /// Opaque identifier of the consumed plan.
+    pub plan_id: PlanId,
+    /// Human-readable operations captured by the preview.
+    pub operations: Vec<String>,
+    /// Unified diff captured by the preview.
+    pub unified_diff: String,
+    /// Files replaced successfully.
+    pub committed_files: Vec<PathBuf>,
+}
+
 enum ProjectRequest {
     Query {
         reply: oneshot::Sender<ProjectState>,
@@ -649,6 +667,13 @@ enum ProjectRequest {
         new_name: String,
         reply: oneshot::Sender<Result<RenameResult, String>>,
     },
+    RenameWorkspaceEdit {
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+        reply: oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
+    },
     Completions {
         file_path: String,
         line: u32,
@@ -665,6 +690,12 @@ enum ProjectRequest {
         tab_size: u32,
         insert_spaces: bool,
         reply: oneshot::Sender<Result<FormatDocumentResult, String>>,
+    },
+    FormatWorkspaceEdit {
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+        reply: oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
     },
     WorkspaceSymbol {
         query: String,
@@ -732,6 +763,28 @@ enum ProjectRequest {
     AddWorkspaceRoot {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
+    },
+    StoreEditPlan {
+        plan: EditPlan,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    TakeEditPlan {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<EditPlan, String>>,
+    },
+    ApplyEditPlan {
+        plan_id: PlanId,
+        project_id: String,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
+    },
+    PreviewEdit {
+        project_id: String,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<PreviewArtifact, String>>,
     },
     ServerLogs {
         limit: usize,
@@ -989,6 +1042,36 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Request a raw LSP workspace edit for a rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actor is closed, the request is cancelled, or
+    /// the actor-owned translator rejects the request.
+    pub async fn rename_workspace_edit(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::RenameWorkspaceEdit {
+                file_path,
+                line,
+                character,
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Route a completion request through this project's actor-owned translator.
     ///
     /// # Errors
@@ -1055,6 +1138,34 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::FormatDocument {
+                file_path,
+                tab_size,
+                insert_spaces,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Request a raw LSP workspace edit for document formatting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actor is closed, the request is cancelled, or
+    /// the actor-owned translator rejects the request.
+    pub async fn format_workspace_edit(
+        &self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<WorkspaceEdit>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::FormatWorkspaceEdit {
                 file_path,
                 tab_size,
                 insert_spaces,
@@ -1376,6 +1487,108 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Store a project-owned workspace edit preview for later application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// bounded plan store rejects the plan.
+    pub async fn store_edit_plan(&self, plan: EditPlan) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::StoreEditPlan { plan, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Preview and store one project-owned LSP workspace edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the edit cannot be safely
+    /// planned, or the bounded plan store rejects the resulting artifact.
+    pub async fn preview_edit(
+        &self,
+        project_id: String,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+        root: PathBuf,
+    ) -> Result<PreviewArtifact, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PreviewEdit {
+                project_id,
+                edit,
+                encoding,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Consume one project-owned workspace edit preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// plan is missing, expired, or owned by another project.
+    pub async fn take_edit_plan(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<EditPlan, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::TakeEditPlan {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Consume and apply one project-owned workspace edit preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the plan is not owned by the
+    /// project, or filesystem validation/application fails.
+    pub async fn apply_edit_plan(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+        root: PathBuf,
+    ) -> Result<AppliedEditPlan, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ApplyEditPlan {
+                plan_id,
+                project_id,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return recent logs from this project's language servers.
     ///
     /// # Errors
@@ -1470,9 +1683,90 @@ impl ProjectHandle {
 
 struct ProjectRuntime {
     translator: Translator,
+    edit_plans: EditPlanStore,
 }
 
 impl ProjectRuntime {
+    fn new(translator: Translator) -> Self {
+        Self {
+            translator,
+            edit_plans: EditPlanStore::for_project(),
+        }
+    }
+
+    fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
+        self.edit_plans
+            .insert(plan)
+            .map_err(|error| error.to_string())
+    }
+
+    fn preview_edit(
+        &mut self,
+        project_id: &str,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+        root: &Path,
+    ) -> Result<PreviewArtifact, String> {
+        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let artifact = preview_workspace_edit(
+            &boundary,
+            project_id,
+            edit,
+            encoding,
+            self.translator.document_tracker(),
+            PreviewLimits::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.edit_plans
+            .insert(artifact.plan.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(artifact)
+    }
+
+    fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
+        self.edit_plans
+            .take_for_project(plan_id, project_id)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn apply_edit_plan(
+        &mut self,
+        plan_id: &PlanId,
+        project_id: &str,
+        root: &Path,
+    ) -> Result<AppliedEditPlan, String> {
+        let plan = self
+            .edit_plans
+            .take_for_project(plan_id, project_id)
+            .map_err(|error| error.to_string())?;
+        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let open_documents = plan
+            .open_document_snapshots()
+            .map(|snapshot| {
+                (
+                    snapshot.path().clone(),
+                    snapshot.version().unwrap_or_default(),
+                    snapshot.planned_content().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let ApplyReport { committed_files } =
+            apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker())
+                .map_err(|error| error.to_string())?;
+        for (path, version, content) in open_documents {
+            self.translator
+                .apply_open_document_content(&path, version, content)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(AppliedEditPlan {
+            plan_id: plan.id().clone(),
+            operations: plan.operations().to_vec(),
+            unified_diff: plan.unified_diff().to_string(),
+            committed_files,
+        })
+    }
+
     async fn hover(
         &mut self,
         file_path: String,
@@ -1530,6 +1824,19 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn rename_workspace_edit(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>, String> {
+        self.translator
+            .request_rename_workspace_edit(file_path, line, character, new_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn completions(
         &mut self,
         file_path: String,
@@ -1561,6 +1868,18 @@ impl ProjectRuntime {
     ) -> Result<FormatDocumentResult, String> {
         self.translator
             .handle_format_document(file_path, tab_size, insert_spaces)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn format_workspace_edit(
+        &mut self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<WorkspaceEdit>, String> {
+        self.translator
+            .request_format_workspace_edit(file_path, tab_size, insert_spaces)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1822,7 +2141,7 @@ pub fn spawn_project_actor_with_translator(
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.clone();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
-    let runtime = ProjectRuntime { translator };
+    let runtime = ProjectRuntime::new(translator);
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
@@ -1970,6 +2289,19 @@ async fn handle_project_request(
         } => {
             let _ = reply.send(runtime.rename(file_path, line, character, new_name).await);
         }
+        ProjectRequest::RenameWorkspaceEdit {
+            file_path,
+            line,
+            character,
+            new_name,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .rename_workspace_edit(file_path, line, character, new_name)
+                    .await,
+            );
+        }
         ProjectRequest::Completions {
             file_path,
             line,
@@ -1995,6 +2327,18 @@ async fn handle_project_request(
             let _ = reply.send(
                 runtime
                     .format_document(file_path, tab_size, insert_spaces)
+                    .await,
+            );
+        }
+        ProjectRequest::FormatWorkspaceEdit {
+            file_path,
+            tab_size,
+            insert_spaces,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .format_workspace_edit(file_path, tab_size, insert_spaces)
                     .await,
             );
         }
@@ -2124,6 +2468,33 @@ async fn handle_project_request(
                     let _ = reply.send(Err(error));
                 }
             }
+        }
+        ProjectRequest::StoreEditPlan { plan, reply } => {
+            let _ = reply.send(runtime.store_edit_plan(plan));
+        }
+        ProjectRequest::PreviewEdit {
+            project_id,
+            edit,
+            encoding,
+            root,
+            reply,
+        } => {
+            let _ = reply.send(runtime.preview_edit(&project_id, edit, encoding, &root));
+        }
+        ProjectRequest::TakeEditPlan {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.take_edit_plan(&plan_id, &project_id));
+        }
+        ProjectRequest::ApplyEditPlan {
+            plan_id,
+            project_id,
+            root,
+            reply,
+        } => {
+            let _ = reply.send(runtime.apply_edit_plan(&plan_id, &project_id, &root).await);
         }
         ProjectRequest::ServerLogs {
             limit,
@@ -2500,6 +2871,56 @@ impl ProjectRegistry {
         actor.restart().await.map_err(ProjectRegistryError::from)
     }
 
+    /// Consume and apply a project-owned edit plan under the registry's
+    /// project mutation gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, the plan is not
+    /// owned by it, or filesystem validation/application fails.
+    pub async fn apply_edit_plan(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<AppliedEditPlan, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .apply_edit_plan(
+                plan_id,
+                id.as_str().to_string(),
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Preview and retain a project-owned LSP workspace edit under the
+    /// registry's project mutation gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, preview
+    /// validation fails, or the bounded plan store rejects the artifact.
+    pub async fn preview_edit(
+        &self,
+        id: &ProjectId,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+    ) -> Result<PreviewArtifact, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .preview_edit(
+                id.as_str().to_string(),
+                edit,
+                encoding,
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
     /// Resolve a file path to the actor owning the longest matching root.
     ///
     /// The registry lock is released before the returned actor is used, so a
@@ -2873,6 +3294,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_routes_raw_rename_edits_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .rename_workspace_edit(file.display().to_string(), 0, 0, "renamed".to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
     async fn project_actor_routes_completion_requests_through_owned_translator() {
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -2919,6 +3359,25 @@ mod tests {
 
         let result = handle
             .format_document(file.display().to_string(), 4, true)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_raw_format_edits_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .format_workspace_edit(file.display().to_string(), 4, true)
             .await;
 
         assert!(matches!(
@@ -3102,6 +3561,32 @@ mod tests {
         );
         let restarted = actor.restart().await.unwrap();
         assert_eq!(restarted.workspace_roots(), state.workspace_roots());
+    }
+
+    #[tokio::test]
+    async fn project_actor_owns_bounded_edit_plans() {
+        let actor = spawn_project_actor(2);
+        let plan = crate::edit_plan::EditPlan::new(
+            "project".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            std::time::Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+
+        actor.store_edit_plan(plan).await.unwrap();
+        let taken = actor
+            .take_edit_plan(plan_id.clone(), "project".to_string())
+            .await
+            .unwrap();
+        assert_eq!(taken.project_id(), "project");
+        assert!(matches!(
+            actor
+                .take_edit_plan(plan_id, "project".to_string())
+                .await,
+            Err(ProjectActorError::Operation(message)) if message.contains("not found")
+        ));
     }
 
     #[tokio::test]

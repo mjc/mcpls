@@ -5,8 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::bridge::DocumentTracker;
 use crate::edit_paths::PathSafetyError;
-use crate::edit_paths::WorkspaceBoundary;
+use crate::edit_paths::{OperationValidationError, ValidatedFileOperation, WorkspaceBoundary};
 use crate::edit_plan::{
     EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
     SnapshotValidationError,
@@ -32,10 +33,34 @@ pub fn apply_plan(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
 ) -> Result<ApplyReport, ApplyError> {
-    let prepared = PreparedPlan::new(boundary, plan)?;
+    apply_plan_internal(boundary, plan, None)
+}
+
+/// Apply a plan while validating open-document snapshots against the
+/// project's in-memory document tracker.
+///
+/// # Errors
+///
+/// Returns the same validation and filesystem errors as [`apply_plan`], and
+/// rejects an open-document snapshot when its tracked content or version is
+/// stale.
+pub fn apply_plan_with_documents(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    documents: &DocumentTracker,
+) -> Result<ApplyReport, ApplyError> {
+    apply_plan_internal(boundary, plan, Some(documents))
+}
+
+fn apply_plan_internal(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    documents: Option<&DocumentTracker>,
+) -> Result<ApplyReport, ApplyError> {
+    let prepared = PreparedPlan::new(boundary, plan, documents)?;
     let staged = prepared.stage()?;
-    prepared.revalidate(boundary, &staged)?;
-    PreparedPlan::commit(&staged)
+    prepared.revalidate(boundary, &staged, documents)?;
+    PreparedPlan::commit(&staged, &prepared.operations)
 }
 
 /// Consume and apply a plan from its owning project store.
@@ -58,10 +83,15 @@ pub fn apply_stored_plan(
 struct PreparedPlan<'a> {
     plan: &'a EditPlan,
     snapshots: Vec<&'a FileSnapshot>,
+    operations: Vec<ValidatedFileOperation>,
 }
 
 impl<'a> PreparedPlan<'a> {
-    fn new(boundary: &WorkspaceBoundary, plan: &'a EditPlan) -> Result<Self, ApplyError> {
+    fn new(
+        boundary: &WorkspaceBoundary,
+        plan: &'a EditPlan,
+        documents: Option<&DocumentTracker>,
+    ) -> Result<Self, ApplyError> {
         if !plan.safe_to_apply() {
             return Err(ApplyError::UnsafePlan);
         }
@@ -72,9 +102,16 @@ impl<'a> PreparedPlan<'a> {
         let snapshots: Vec<_> = plan
             .files()
             .iter()
-            .map(|snapshot| validate_snapshot(boundary, snapshot))
+            .map(|snapshot| validate_snapshot(boundary, snapshot, documents))
             .collect::<Result<_, _>>()?;
-        Ok(Self { plan, snapshots })
+        let operations = boundary
+            .validate_operations(plan.file_operations())
+            .map_err(ApplyError::Operation)?;
+        Ok(Self {
+            plan,
+            snapshots,
+            operations,
+        })
     }
 
     fn stage(&self) -> Result<Vec<StagedFile>, ApplyError> {
@@ -100,20 +137,28 @@ impl<'a> PreparedPlan<'a> {
         &self,
         boundary: &WorkspaceBoundary,
         staged: &[StagedFile],
+        documents: Option<&DocumentTracker>,
     ) -> Result<(), ApplyError> {
         // Revalidate after staging and immediately before the first
         // destructive operation. This rejects a stale plan as one unit.
         for snapshot in &self.snapshots {
-            if let Err(error) = validate_snapshot(boundary, snapshot) {
+            if let Err(error) = validate_snapshot(boundary, snapshot, documents) {
                 cleanup_staged(staged);
                 return Err(error);
             }
         }
+        if let Err(error) = boundary.validate_operations(self.plan.file_operations()) {
+            cleanup_staged(staged);
+            return Err(ApplyError::Operation(error));
+        }
         Ok(())
     }
 
-    fn commit(staged: &[StagedFile]) -> Result<ApplyReport, ApplyError> {
-        let mut committed_files = Vec::with_capacity(staged.len());
+    fn commit(
+        staged: &[StagedFile],
+        operations: &[ValidatedFileOperation],
+    ) -> Result<ApplyReport, ApplyError> {
+        let mut committed_files = Vec::with_capacity(staged.len().saturating_add(operations.len()));
         for (index, file) in staged.iter().enumerate() {
             if let Err(error) = fs::rename(&file.temp, &file.target) {
                 cleanup_staged(&staged[index..]);
@@ -125,8 +170,62 @@ impl<'a> PreparedPlan<'a> {
             }
             committed_files.push(file.target.clone());
         }
+        for operation in operations {
+            let path = apply_resource_operation(operation, &committed_files)?;
+            committed_files.push(path);
+        }
 
         Ok(ApplyReport { committed_files })
+    }
+}
+
+fn apply_resource_operation(
+    operation: &ValidatedFileOperation,
+    committed_files: &[PathBuf],
+) -> Result<PathBuf, ApplyError> {
+    match operation {
+        ValidatedFileOperation::Create { path, overwrite } => {
+            let result = if *overwrite {
+                fs::write(path, [])
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map(|_| ())
+            };
+            result.map_err(|source| ApplyError::Resource {
+                operation: format!("create {}", path.display()),
+                committed_files: committed_files.to_vec(),
+                source,
+            })?;
+            Ok(path.clone())
+        }
+        ValidatedFileOperation::Rename {
+            from,
+            to,
+            overwrite: _,
+        } => {
+            fs::rename(from, to).map_err(|source| ApplyError::Resource {
+                operation: format!("rename {} -> {}", from.display(), to.display()),
+                committed_files: committed_files.to_vec(),
+                source,
+            })?;
+            Ok(to.clone())
+        }
+        ValidatedFileOperation::Delete { path, recursive } => {
+            let result = if *recursive && path.is_dir() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            };
+            result.map_err(|source| ApplyError::Resource {
+                operation: format!("delete {}", path.display()),
+                committed_files: committed_files.to_vec(),
+                source,
+            })?;
+            Ok(path.clone())
+        }
     }
 }
 
@@ -141,6 +240,9 @@ pub enum ApplyError {
     /// The plan cannot be applied safely.
     #[error("edit plan is not safe to apply")]
     UnsafePlan,
+    /// A resource operation failed precondition validation.
+    #[error("workspace edit resource operation is invalid: {0}")]
+    Operation(#[from] OperationValidationError),
     /// The preview is no longer valid because its expiry was reached.
     #[error("edit plan has expired")]
     Expired,
@@ -188,6 +290,17 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
+    /// A resource operation failed after earlier edits committed.
+    #[error("failed to apply {operation} after replacing {committed_files:?}: {source}")]
+    Resource {
+        /// Human-readable operation description.
+        operation: String,
+        /// Files already changed before the failure.
+        committed_files: Vec<PathBuf>,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -199,10 +312,8 @@ struct StagedFile {
 fn validate_snapshot<'a>(
     boundary: &WorkspaceBoundary,
     snapshot: &'a FileSnapshot,
+    documents: Option<&DocumentTracker>,
 ) -> Result<&'a FileSnapshot, ApplyError> {
-    if snapshot.source() != SnapshotSource::Disk {
-        return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
-    }
     let canonical = boundary
         .validate_existing(snapshot.path())
         .map_err(|source| ApplyError::Path {
@@ -215,12 +326,38 @@ fn validate_snapshot<'a>(
             actual: canonical,
         });
     }
+    match snapshot.source() {
+        SnapshotSource::Disk => validate_disk_snapshot(snapshot)?,
+        SnapshotSource::OpenDocument => validate_open_document_snapshot(snapshot, documents)?,
+    }
+    Ok(snapshot)
+}
+
+fn validate_disk_snapshot(snapshot: &FileSnapshot) -> Result<(), ApplyError> {
     let current = fs::read_to_string(snapshot.path()).map_err(|source| ApplyError::Stage {
         path: snapshot.path().clone(),
         source,
     })?;
     snapshot.validate(&current, None)?;
-    Ok(snapshot)
+    Ok(())
+}
+
+fn validate_open_document_snapshot(
+    snapshot: &FileSnapshot,
+    documents: Option<&DocumentTracker>,
+) -> Result<(), ApplyError> {
+    let Some(documents) = documents else {
+        return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
+    };
+    let Some(document) = documents.get(snapshot.path()) else {
+        return Err(ApplyError::Stale(SnapshotValidationError::VersionChanged {
+            path: snapshot.path().clone(),
+            expected: snapshot.version().unwrap_or_default(),
+            actual: None,
+        }));
+    };
+    snapshot.validate(&document.content, Some(document.version))?;
+    Ok(())
 }
 
 fn temporary_path(target: &Path, plan: &EditPlan, index: usize) -> PathBuf {
@@ -245,12 +382,15 @@ fn cleanup_staged(files: &[StagedFile]) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::time::Duration;
 
     use tempfile::TempDir;
 
     use super::*;
+    use crate::bridge::{DocumentTracker, ResourceLimits};
+    use crate::edit_paths::FileOperation;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
 
     #[test]
@@ -361,6 +501,60 @@ mod tests {
             Err(ApplyError::UnsupportedSource(path)) if path == file
         ));
         assert_eq!(fs::read_to_string(file).unwrap(), "disk\n");
+    }
+
+    #[test]
+    fn applies_open_document_snapshot_against_tracked_content() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("open.rs");
+        fs::write(&file, "disk\n").unwrap();
+        let mut documents = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        documents.open(file.clone(), "dirty\n".to_string()).unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::OpenDocument,
+                Some(1),
+                "dirty\n",
+                "updated\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        apply_plan_with_documents(&boundary, &plan, &documents).unwrap();
+
+        assert_eq!(fs::read_to_string(file).unwrap(), "updated\n");
+    }
+
+    #[test]
+    fn applies_validated_resource_operations() {
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("old.rs");
+        let renamed = root.path().join("renamed.rs");
+        fs::write(&old, "content\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            Vec::new(),
+            vec![format!("rename {} -> {}", old.display(), renamed.display())],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_file_operations(vec![FileOperation::Rename {
+            from: old.clone(),
+            to: renamed.clone(),
+            overwrite: false,
+        }]);
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        let report = apply_plan(&boundary, &plan).unwrap();
+
+        assert_eq!(report.committed_files, vec![renamed.clone()]);
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(renamed).unwrap(), "content\n");
     }
 
     #[test]

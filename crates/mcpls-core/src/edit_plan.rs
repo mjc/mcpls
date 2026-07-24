@@ -9,6 +9,31 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::edit_paths::FileOperation;
+
+/// Shared edit safety limits used by preview and project-local plan storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditLimits {
+    /// Maximum number of affected files retained in one project store.
+    pub max_files: usize,
+    /// Maximum number of text edits accepted by preview planning.
+    pub max_edits: usize,
+    /// Maximum combined plan bytes retained by one project store.
+    pub max_bytes: usize,
+    /// Lifetime of a stored plan.
+    pub plan_ttl: Duration,
+}
+
+impl EditLimits {
+    /// Default limits for one long-lived project actor.
+    pub const PROJECT: Self = Self {
+        max_files: 64,
+        max_edits: 4_096,
+        max_bytes: 16 * 1024 * 1024,
+        plan_ttl: Duration::from_secs(15 * 60),
+    };
+}
+
 /// Opaque identifier for one preview/apply transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PlanId(String);
@@ -25,6 +50,31 @@ impl PlanId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Parse an opaque identifier received from an external caller.
+    ///
+    /// The identifier remains opaque to callers; parsing only rejects an
+    /// empty value so a missing plan cannot be confused with a valid token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanIdError::Empty`] when the supplied value is blank.
+    pub fn parse(value: impl Into<String>) -> Result<Self, PlanIdError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            Err(PlanIdError::Empty)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+/// Invalid externally supplied plan identifier.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlanIdError {
+    /// The identifier was empty or only whitespace.
+    #[error("edit plan ID must not be empty")]
+    Empty,
 }
 
 impl Default for PlanId {
@@ -175,6 +225,7 @@ pub struct EditPlan {
     project_id: String,
     files: Vec<FileSnapshot>,
     operations: Vec<String>,
+    file_operations: Vec<FileOperation>,
     unified_diff: String,
     safe_to_apply: bool,
     created_at: SystemTime,
@@ -214,6 +265,7 @@ impl EditPlan {
             project_id,
             files,
             operations,
+            file_operations: Vec::new(),
             unified_diff,
             safe_to_apply,
             created_at,
@@ -240,10 +292,37 @@ impl EditPlan {
         &self.files
     }
 
+    /// Return snapshots whose source is actor-owned open-document state.
+    #[must_use = "iterate the open-document snapshots"]
+    pub fn open_document_snapshots(&self) -> impl Iterator<Item = &FileSnapshot> {
+        self.files
+            .iter()
+            .filter(|snapshot| snapshot.source() == SnapshotSource::OpenDocument)
+    }
+
     /// Return planned file operations and other preview descriptors.
     #[must_use]
     pub fn operations(&self) -> &[String] {
         &self.operations
+    }
+
+    /// Attach validated resource operations to this plan.
+    #[must_use]
+    pub fn with_file_operations(mut self, file_operations: Vec<FileOperation>) -> Self {
+        self.estimated_bytes = self.estimated_bytes.saturating_add(
+            file_operations
+                .iter()
+                .map(file_operation_bytes)
+                .sum::<usize>(),
+        );
+        self.file_operations = file_operations;
+        self
+    }
+
+    /// Return resource operations retained for apply-time revalidation.
+    #[must_use]
+    pub fn file_operations(&self) -> &[FileOperation] {
+        &self.file_operations
     }
 
     /// Return the unified diff for changed text files.
@@ -312,6 +391,13 @@ pub struct EditPlanStore {
 }
 
 impl EditPlanStore {
+    /// Construct the daemon's bounded project-local plan store.
+    #[must_use]
+    pub fn for_project() -> Self {
+        let limits = EditLimits::PROJECT;
+        Self::new(limits.max_files, limits.max_bytes, limits.plan_ttl)
+    }
+
     /// Create a bounded plan store.
     #[must_use]
     pub fn new(max_plans: usize, max_bytes: usize, ttl: Duration) -> Self {
@@ -446,6 +532,18 @@ impl EditPlanStore {
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+fn file_operation_bytes(operation: &FileOperation) -> usize {
+    match operation {
+        FileOperation::Create { path, .. } | FileOperation::Delete { path, .. } => {
+            path.to_string_lossy().len()
+        }
+        FileOperation::Rename { from, to, .. } => from
+            .to_string_lossy()
+            .len()
+            .saturating_add(to.to_string_lossy().len()),
     }
 }
 

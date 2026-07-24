@@ -856,6 +856,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
     use tempfile::TempDir;
 
     fn create_test_server() -> McplsServer {
