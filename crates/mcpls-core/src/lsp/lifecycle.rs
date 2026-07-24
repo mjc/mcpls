@@ -193,6 +193,7 @@ impl std::fmt::Debug for LspServer {
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
+            .field("workspace_roots", &self.workspace_roots)
             .field("notification_rx", &"<channel>")
             .field("_child", &"<process>")
             .finish()
@@ -230,24 +231,21 @@ impl LspServer {
             config.server_config.command, config.server_config.args
         );
 
-        let mut child = Command::new(&config.server_config.command)
-            .args(&config.server_config.args)
-            .current_dir(
-                config
-                    .workspace_roots
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| Error::ServerSpawnFailed {
-                command: config.server_config.command.clone(),
-                source: e,
-            })?;
+        let mut child =
+            Command::new(&config.server_config.command)
+                .args(&config.server_config.args)
+                .current_dir(config.workspace_roots.first().cloned().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                }))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| Error::ServerSpawnFailed {
+                    command: config.server_config.command.clone(),
+                    source: e,
+                })?;
 
         let stdin = child
             .stdin
