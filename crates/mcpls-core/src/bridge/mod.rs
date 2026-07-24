@@ -26,7 +26,7 @@ pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
-    TranslatorTemplate,
+    TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

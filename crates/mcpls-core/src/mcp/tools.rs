@@ -120,6 +120,9 @@ const fn default_insert_spaces() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for searching symbols across the workspace.")]
 pub struct WorkspaceSymbolParams {
+    /// Stable project identifier whose workspace should be searched.
+    #[schemars(description = "Registered project identifier whose workspace should be searched.")]
+    pub project_id: String,
     /// Search query for symbol names (supports partial matching).
     #[schemars(description = "Search query for symbol names (supports partial matching).")]
     pub query: String,

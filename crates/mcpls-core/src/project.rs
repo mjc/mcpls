@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
-use crate::bridge::{Translator, TranslatorTemplate};
+use crate::bridge::{
+    CompletionsResult, DefinitionResult, DiagnosticsResult, DocumentSymbolsResult,
+    FormatDocumentResult, HoverResult, ReferencesResult, RenameResult, Translator,
+    TranslatorTemplate, WorkspaceSymbolResult,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -418,6 +422,59 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
     },
+    Hover {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<HoverResult, String>>,
+    },
+    Definition {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<DefinitionResult, String>>,
+    },
+    References {
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+        reply: oneshot::Sender<Result<ReferencesResult, String>>,
+    },
+    Diagnostics {
+        file_path: String,
+        reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
+    },
+    Rename {
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+        reply: oneshot::Sender<Result<RenameResult, String>>,
+    },
+    Completions {
+        file_path: String,
+        line: u32,
+        character: u32,
+        trigger: Option<String>,
+        reply: oneshot::Sender<Result<CompletionsResult, String>>,
+    },
+    DocumentSymbols {
+        file_path: String,
+        reply: oneshot::Sender<Result<DocumentSymbolsResult, String>>,
+    },
+    FormatDocument {
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+        reply: oneshot::Sender<Result<FormatDocumentResult, String>>,
+    },
+    WorkspaceSymbol {
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+        reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -504,6 +561,250 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a hover request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn hover(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<HoverResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Hover {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a definition request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn definition(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<DefinitionResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Definition {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a references request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn references(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<ReferencesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::References {
+                file_path,
+                line,
+                character,
+                include_declaration,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a diagnostics request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn diagnostics(
+        &self,
+        file_path: String,
+    ) -> Result<DiagnosticsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Diagnostics { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a rename request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn rename(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<RenameResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Rename {
+                file_path,
+                line,
+                character,
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a completion request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn completions(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        trigger: Option<String>,
+    ) -> Result<CompletionsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Completions {
+                file_path,
+                line,
+                character,
+                trigger,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a document-symbol request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn document_symbols(
+        &self,
+        file_path: String,
+    ) -> Result<DocumentSymbolsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::DocumentSymbols { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a document-formatting request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn format_document(
+        &self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<FormatDocumentResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::FormatDocument {
+                file_path,
+                tab_size,
+                insert_spaces,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a workspace-symbol request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn workspace_symbol(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+    ) -> Result<WorkspaceSymbolResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::WorkspaceSymbol {
+                query,
+                kind_filter,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -555,6 +856,110 @@ struct ProjectRuntime {
 }
 
 impl ProjectRuntime {
+    async fn hover(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<HoverResult, String> {
+        self.translator
+            .handle_hover(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn definition(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<DefinitionResult, String> {
+        self.translator
+            .handle_definition(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn references(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<ReferencesResult, String> {
+        self.translator
+            .handle_references(file_path, line, character, include_declaration)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult, String> {
+        self.translator
+            .handle_diagnostics(file_path)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn rename(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<RenameResult, String> {
+        self.translator
+            .handle_rename(file_path, line, character, new_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn completions(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        trigger: Option<String>,
+    ) -> Result<CompletionsResult, String> {
+        self.translator
+            .handle_completions(file_path, line, character, trigger)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn document_symbols(
+        &mut self,
+        file_path: String,
+    ) -> Result<DocumentSymbolsResult, String> {
+        self.translator
+            .handle_document_symbols(file_path)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn format_document(
+        &mut self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<FormatDocumentResult, String> {
+        self.translator
+            .handle_format_document(file_path, tab_size, insert_spaces)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn workspace_symbol(
+        &mut self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+    ) -> Result<WorkspaceSymbolResult, String> {
+        self.translator
+            .handle_workspace_symbol(query, kind_filter, limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -615,72 +1020,167 @@ async fn run_project_actor(
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
-        match request {
-            ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
-                state.sync_runtime(&runtime);
-                let _ = reply.send(state.clone());
-            }
-            ProjectRequest::Activate { root, reply } => {
-                state.status = ProjectStatus::Starting;
-                state.last_error = None;
-                let _ = status_tx.send(ProjectStatus::Starting);
-                match runtime.translator.activate_project(root).await {
-                    Ok(()) => {
-                        state.sync_runtime(&runtime);
-                        state.status = ProjectStatus::Ready;
-                        let _ = status_tx.send(ProjectStatus::Ready);
-                        let _ = reply.send(Ok(state.clone()));
-                    }
-                    Err(error) => {
-                        state.sync_runtime(&runtime);
-                        state.status = ProjectStatus::Failed;
-                        state.last_error = Some(error.to_string());
-                        let _ = status_tx.send(ProjectStatus::Failed);
-                        let _ = reply.send(Err(error.to_string()));
-                    }
-                }
-            }
-            ProjectRequest::SetStatus { status, reply } => {
-                state.sync_runtime(&runtime);
-                state.status = status;
-                state.last_error = None;
-                let _ = status_tx.send(status);
-                let _ = reply.send(());
-            }
-            ProjectRequest::Restart { reply } => {
-                state.sync_runtime(&runtime);
-                state.status = ProjectStatus::Restarting;
-                state.last_error = None;
-                let _ = status_tx.send(ProjectStatus::Restarting);
-                state.status = ProjectStatus::Ready;
-                let _ = status_tx.send(ProjectStatus::Ready);
-                let _ = reply.send(state.clone());
-            }
-            ProjectRequest::Fail { message, reply } => {
-                state.sync_runtime(&runtime);
-                state.status = ProjectStatus::Failed;
-                state.last_error = Some(message);
-                let _ = status_tx.send(ProjectStatus::Failed);
-                let _ = reply.send(());
-            }
-            ProjectRequest::Shutdown { reply } => {
-                state.sync_runtime(&runtime);
-                state.status = ProjectStatus::Stopping;
-                state.last_error = None;
-                let _ = status_tx.send(ProjectStatus::Stopping);
-                state.status = ProjectStatus::Stopped;
-                let _ = status_tx.send(ProjectStatus::Stopped);
-                let _ = reply.send(());
-                break;
-            }
+        if handle_project_request(request, &status_tx, &mut state, &mut runtime).await {
+            break;
         }
     }
+}
+
+// This exhaustive dispatcher keeps actor state transitions in one place; each
+// request arm is intentionally small and independently typed.
+#[allow(clippy::too_many_lines)]
+async fn handle_project_request(
+    request: ProjectRequest,
+    status_tx: &watch::Sender<ProjectStatus>,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) -> bool {
+    match request {
+        ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
+            state.sync_runtime(runtime);
+            let _ = reply.send(state.clone());
+        }
+        ProjectRequest::Activate { root, reply } => {
+            state.status = ProjectStatus::Starting;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Starting);
+            match runtime.translator.activate_project(root).await {
+                Ok(()) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Ready;
+                    let _ = status_tx.send(ProjectStatus::Ready);
+                    let _ = reply.send(Ok(state.clone()));
+                }
+                Err(error) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Failed;
+                    state.last_error = Some(error.to_string());
+                    let _ = status_tx.send(ProjectStatus::Failed);
+                    let _ = reply.send(Err(error.to_string()));
+                }
+            }
+        }
+        ProjectRequest::Hover {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(runtime.hover(file_path, line, character).await);
+        }
+        ProjectRequest::Definition {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(runtime.definition(file_path, line, character).await);
+        }
+        ProjectRequest::References {
+            file_path,
+            line,
+            character,
+            include_declaration,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .references(file_path, line, character, include_declaration)
+                    .await,
+            );
+        }
+        ProjectRequest::Diagnostics { file_path, reply } => {
+            let _ = reply.send(runtime.diagnostics(file_path).await);
+        }
+        ProjectRequest::Rename {
+            file_path,
+            line,
+            character,
+            new_name,
+            reply,
+        } => {
+            let _ = reply.send(runtime.rename(file_path, line, character, new_name).await);
+        }
+        ProjectRequest::Completions {
+            file_path,
+            line,
+            character,
+            trigger,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .completions(file_path, line, character, trigger)
+                    .await,
+            );
+        }
+        ProjectRequest::DocumentSymbols { file_path, reply } => {
+            let _ = reply.send(runtime.document_symbols(file_path).await);
+        }
+        ProjectRequest::FormatDocument {
+            file_path,
+            tab_size,
+            insert_spaces,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .format_document(file_path, tab_size, insert_spaces)
+                    .await,
+            );
+        }
+        ProjectRequest::WorkspaceSymbol {
+            query,
+            kind_filter,
+            limit,
+            reply,
+        } => {
+            let _ = reply.send(runtime.workspace_symbol(query, kind_filter, limit).await);
+        }
+        ProjectRequest::SetStatus { status, reply } => {
+            state.sync_runtime(runtime);
+            state.status = status;
+            state.last_error = None;
+            let _ = status_tx.send(status);
+            let _ = reply.send(());
+        }
+        ProjectRequest::Restart { reply } => {
+            state.sync_runtime(runtime);
+            state.status = ProjectStatus::Restarting;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Restarting);
+            state.status = ProjectStatus::Ready;
+            let _ = status_tx.send(ProjectStatus::Ready);
+            let _ = reply.send(state.clone());
+        }
+        ProjectRequest::Fail { message, reply } => {
+            state.sync_runtime(runtime);
+            state.status = ProjectStatus::Failed;
+            state.last_error = Some(message);
+            let _ = status_tx.send(ProjectStatus::Failed);
+            let _ = reply.send(());
+        }
+        ProjectRequest::Shutdown { reply } => {
+            state.sync_runtime(runtime);
+            state.status = ProjectStatus::Stopping;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Stopping);
+            state.status = ProjectStatus::Stopped;
+            let _ = status_tx.send(ProjectStatus::Stopped);
+            let _ = reply.send(());
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 /// Errors returned by the shared project registry.
 pub enum ProjectRegistryError {
+    /// A project identity operation failed while resolving a request path.
+    #[error(transparent)]
+    Identity(#[from] ProjectIdentityError),
     /// A stable ID was reused for a different canonical root.
     #[error("project ID {id} is already registered for {existing_root}, not {requested_root}")]
     ConflictingProject {
@@ -898,6 +1398,42 @@ impl ProjectRegistry {
             .map_err(ProjectRegistryError::from)
     }
 
+    /// Resolve a file path to the actor owning the longest matching root.
+    ///
+    /// The registry lock is released before the returned actor is used, so a
+    /// slow semantic request cannot block unrelated project registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error when the path cannot be canonicalized or is
+    /// not contained by a registered project.
+    pub async fn actor_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let canonical = canonicalize(path.as_ref())?;
+        self.projects
+            .read()
+            .await
+            .values()
+            .filter(|project| canonical.starts_with(project.identity.root().as_path()))
+            .max_by_key(|project| project.identity.root().as_path().components().count())
+            .map(|project| project.actor.clone())
+            .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
+    }
+
+    /// Resolve a registered project ID to its actor without holding the registry lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not registered.
+    pub async fn actor_for_project(
+        &self,
+        id: &ProjectId,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.actor(id).await
+    }
+
     async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
         self.projects
             .read()
@@ -1074,6 +1610,188 @@ mod tests {
             &[root.path().canonicalize().unwrap()]
         );
         assert_eq!(state.open_document_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_semantic_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("outside.rs"), "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .hover(
+                outside.path().join("outside.rs").display().to_string(),
+                0,
+                0,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_definition_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle.definition(file.display().to_string(), 0, 0).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_references_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .references(file.display().to_string(), 0, 0, false)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_diagnostics_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle.diagnostics(file.display().to_string()).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_rename_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .rename(file.display().to_string(), 0, 0, "renamed".to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_completion_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .completions(file.display().to_string(), 0, 0, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_document_symbol_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle.document_symbols(file.display().to_string()).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_format_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .format_document(file.display().to_string(), 4, true)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn registry_resolves_semantic_paths_to_the_longest_project_actor() {
+        let root = TempDir::new().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let file = nested.join("src.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let outer = ProjectId::new("outer").unwrap();
+        let inner = ProjectId::new("inner").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                outer.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let inner_actor = registry
+            .add(ProjectIdentity::new(
+                inner,
+                CanonicalRoot::new(&nested).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let resolved = registry.actor_for_path(&file).await.unwrap();
+
+        assert_eq!(
+            resolved.query().await.unwrap().workspace_roots(),
+            inner_actor.query().await.unwrap().workspace_roots()
+        );
     }
 
     #[tokio::test]

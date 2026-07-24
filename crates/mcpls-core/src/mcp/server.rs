@@ -388,6 +388,7 @@ impl McplsServer {
     async fn workspace_symbol_search(
         &self,
         Parameters(WorkspaceSymbolParams {
+            project_id,
             query,
             kind_filter,
             limit,
@@ -914,6 +915,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hover_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_hover(Parameters(HoverParams {
+                file_path: file_path.display().to_string(),
+                line: 0,
+                character: 0,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_definition_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_definition(Parameters(DefinitionParams {
+                file_path: file_path.display().to_string(),
+                line: 0,
+                character: 0,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_references_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_references(Parameters(ReferencesParams {
+                file_path: file_path.display().to_string(),
+                line: 0,
+                character: 0,
+                include_declaration: false,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_diagnostics(Parameters(DiagnosticsParams {
+                file_path: file_path.display().to_string(),
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_rename_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .rename_symbol(Parameters(RenameParams {
+                file_path: file_path.display().to_string(),
+                line: 0,
+                character: 0,
+                new_name: "renamed".to_string(),
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_completions_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_completions(Parameters(CompletionsParams {
+                file_path: file_path.display().to_string(),
+                line: 0,
+                character: 0,
+                trigger: None,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_document_symbols_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_document_symbols(Parameters(DocumentSymbolsParams {
+                file_path: file_path.display().to_string(),
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_format_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .format_document(Parameters(FormatDocumentParams {
+                file_path: file_path.display().to_string(),
+                tab_size: 4,
+                insert_spaces: true,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
     async fn test_definition_tool_with_params() {
         let server = create_test_server();
         let params = Parameters(PositionParams {
@@ -1013,6 +1277,7 @@ mod tests {
     async fn test_workspace_symbol_search_tool_with_params() {
         let server = create_test_server();
         let params = Parameters(WorkspaceSymbolParams {
+            project_id: "missing".to_string(),
             query: "User".to_string(),
             kind_filter: None,
             limit: 100,
