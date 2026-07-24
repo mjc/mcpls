@@ -842,6 +842,36 @@ mod tests {
         assert!(registry.list().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn project_registry_keeps_independent_projects_isolated() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        let first = ProjectIdentity::new(
+            ProjectId::new("first").unwrap(),
+            CanonicalRoot::new(first_root.path()).unwrap(),
+        );
+        let second = ProjectIdentity::new(
+            ProjectId::new("second").unwrap(),
+            CanonicalRoot::new(second_root.path()).unwrap(),
+        );
+        let registry = ProjectRegistry::new(2);
+        registry.add(first).await.unwrap();
+        registry.add(second).await.unwrap();
+
+        registry
+            .restart(&ProjectId::new("first").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .status(&ProjectId::new("second").unwrap())
+                .await
+                .unwrap()
+                .status(),
+            ProjectStatus::Starting
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_path_canonicalizes_symlink_aliases() {
