@@ -504,6 +504,19 @@ mod tests {
         assert_eq!(handle.status().borrow().clone(), ProjectStatus::Ready);
     }
 
+    #[tokio::test]
+    async fn project_actor_shutdown_publishes_stopped_and_closes_requests() {
+        let handle = spawn_project_actor(1);
+
+        handle.shutdown().await.unwrap();
+
+        assert_eq!(handle.status().borrow().clone(), ProjectStatus::Stopped);
+        assert!(matches!(
+            handle.set_status(ProjectStatus::Ready).await,
+            Err(ProjectActorError::Closed)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_path_canonicalizes_symlink_aliases() {
