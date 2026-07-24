@@ -216,6 +216,12 @@ impl LspClient {
     pub async fn wait_until_quiescent(&self, timeout_duration: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout_duration;
         loop {
+            // Register before reading the status so a concurrent update cannot
+            // land between the read and the wait and leave us asleep.
+            let notified = self.server_status_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let status = self.server_status.lock().await.clone();
             if let Some(status) = status {
                 if status.quiescent && status.health == "error" {
@@ -230,7 +236,6 @@ impl LspClient {
                 }
             }
 
-            let notified = self.server_status_notify.notified();
             tokio::time::timeout_at(deadline, notified)
                 .await
                 .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?;
