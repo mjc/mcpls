@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
-    DefinitionResult, DiagnosticsResult, HoverResult, ReferencesResult, RenameResult, Translator,
-    TranslatorTemplate,
+    CompletionsResult, DefinitionResult, DiagnosticsResult, HoverResult, ReferencesResult,
+    RenameResult, Translator, TranslatorTemplate,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -451,6 +451,13 @@ enum ProjectRequest {
         new_name: String,
         reply: oneshot::Sender<Result<RenameResult, String>>,
     },
+    Completions {
+        file_path: String,
+        line: u32,
+        character: u32,
+        trigger: Option<String>,
+        reply: oneshot::Sender<Result<CompletionsResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -674,6 +681,36 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a completion request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn completions(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        trigger: Option<String>,
+    ) -> Result<CompletionsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Completions {
+                file_path,
+                line,
+                character,
+                trigger,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -778,6 +815,19 @@ impl ProjectRuntime {
     ) -> Result<RenameResult, String> {
         self.translator
             .handle_rename(file_path, line, character, new_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn completions(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        trigger: Option<String>,
+    ) -> Result<CompletionsResult, String> {
+        self.translator
+            .handle_completions(file_path, line, character, trigger)
             .await
             .map_err(|error| error.to_string())
     }
@@ -922,6 +972,19 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.rename(file_path, line, character, new_name).await);
+        }
+        ProjectRequest::Completions {
+            file_path,
+            line,
+            character,
+            trigger,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .completions(file_path, line, character, trigger)
+                    .await,
+            );
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -1472,6 +1535,25 @@ mod tests {
 
         let result = handle
             .rename(file.display().to_string(), 0, 0, "renamed".to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_completion_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .completions(file.display().to_string(), 0, 0, None)
             .await;
 
         assert!(matches!(
