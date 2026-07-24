@@ -517,6 +517,10 @@ enum ProjectRequest {
         character: u32,
         reply: oneshot::Sender<Result<LocationsResult, String>>,
     },
+    CachedDiagnostics {
+        file_path: String,
+        reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -1025,6 +1029,27 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route cached diagnostics through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn cached_diagnostics(
+        &self,
+        file_path: String,
+    ) -> Result<DiagnosticsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::CachedDiagnostics { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -1267,6 +1292,12 @@ impl ProjectRuntime {
         self.translator
             .handle_type_definition(file_path, line, character)
             .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult, String> {
+        self.translator
+            .handle_cached_diagnostics(file_path)
             .map_err(|error| error.to_string())
     }
 
@@ -1532,6 +1563,9 @@ async fn handle_project_request(
                     .go_to_type_definition(file_path, line, character)
                     .await,
             );
+        }
+        ProjectRequest::CachedDiagnostics { file_path, reply } => {
+            let _ = reply.send(runtime.cached_diagnostics(&file_path));
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -2264,6 +2298,23 @@ mod tests {
         let result = handle
             .go_to_type_definition(file.display().to_string(), 1, 5)
             .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_cached_diagnostics_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle.cached_diagnostics(file.display().to_string()).await;
 
         assert!(matches!(
             result,
