@@ -258,17 +258,19 @@ pub struct EditPlanStore {
     plans: HashMap<PlanId, EditPlan>,
     max_plans: usize,
     max_bytes: usize,
+    ttl: Duration,
     bytes: usize,
 }
 
 impl EditPlanStore {
     /// Create a bounded plan store.
     #[must_use]
-    pub fn new(max_plans: usize, max_bytes: usize, _ttl: Duration) -> Self {
+    pub fn new(max_plans: usize, max_bytes: usize, ttl: Duration) -> Self {
         Self {
             plans: HashMap::new(),
             max_plans: max_plans.max(1),
             max_bytes: max_bytes.max(1),
+            ttl,
             bytes: 0,
         }
     }
@@ -279,14 +281,16 @@ impl EditPlanStore {
     ///
     /// Returns [`PlanStoreError::TooLarge`] when the plan cannot fit even in
     /// an empty store.
-    pub fn insert(&mut self, plan: EditPlan) -> Result<(), PlanStoreError> {
+    pub fn insert(&mut self, mut plan: EditPlan) -> Result<(), PlanStoreError> {
         if plan.estimated_bytes() > self.max_bytes {
             return Err(PlanStoreError::TooLarge {
                 limit: self.max_bytes,
                 actual: plan.estimated_bytes(),
             });
         }
-        self.purge_expired(SystemTime::now());
+        let now = SystemTime::now();
+        self.purge_expired(now);
+        plan.expires_at = now.checked_add(self.ttl).unwrap_or(now);
         if let Some(previous) = self.plans.remove(plan.id()) {
             self.bytes = self.bytes.saturating_sub(previous.estimated_bytes());
         }
@@ -367,6 +371,12 @@ impl EditPlanStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.plans.is_empty()
+    }
+
+    /// Return the currently accounted approximate bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -459,6 +469,35 @@ mod tests {
         store.insert(second)?;
         assert!(store.get(&first_id).is_none());
         assert!(store.get(&second_id).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn enforces_store_ttl_and_byte_limit() -> Result<(), PlanStoreError> {
+        let mut expired = EditPlanStore::new(2, 1024, Duration::ZERO);
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let id = plan.id().clone();
+        expired.insert(plan)?;
+        assert!(expired.get(&id).is_none());
+
+        let mut bounded = EditPlanStore::new(2, 1, Duration::from_secs(60));
+        let large = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            vec!["too large".to_string()],
+            true,
+            Duration::from_secs(60),
+        );
+        assert!(matches!(
+            bounded.insert(large),
+            Err(PlanStoreError::TooLarge { .. })
+        ));
         Ok(())
     }
 }
