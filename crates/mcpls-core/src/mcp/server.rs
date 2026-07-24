@@ -498,22 +498,28 @@ impl McplsServer {
     async fn workspace_symbol_search(
         &self,
         Parameters(WorkspaceSymbolParams {
+            project_id,
             query,
             kind_filter,
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
-        let result = {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_workspace_symbol(query, kind_filter, limit)
-                .await
-        };
+        let project_id = parse_project_id(project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .workspace_symbol(query, kind_filter, limit)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(McpError::internal_error(e, None)),
         }
     }
 
@@ -1462,6 +1468,7 @@ mod tests {
     async fn test_workspace_symbol_search_tool_with_params() {
         let server = create_test_server();
         let params = Parameters(WorkspaceSymbolParams {
+            project_id: "missing".to_string(),
             query: "User".to_string(),
             kind_filter: None,
             limit: 100,

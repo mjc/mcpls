@@ -8,7 +8,7 @@ use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use crate::bridge::{
     CompletionsResult, DefinitionResult, DiagnosticsResult, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, ReferencesResult, RenameResult, Translator,
-    TranslatorTemplate,
+    TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -469,6 +469,12 @@ enum ProjectRequest {
         insert_spaces: bool,
         reply: oneshot::Sender<Result<FormatDocumentResult, String>>,
     },
+    WorkspaceSymbol {
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+        reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -771,6 +777,34 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a workspace-symbol request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn workspace_symbol(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+    ) -> Result<WorkspaceSymbolResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::WorkspaceSymbol {
+                query,
+                kind_filter,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -910,6 +944,18 @@ impl ProjectRuntime {
     ) -> Result<FormatDocumentResult, String> {
         self.translator
             .handle_format_document(file_path, tab_size, insert_spaces)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn workspace_symbol(
+        &mut self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+    ) -> Result<WorkspaceSymbolResult, String> {
+        self.translator
+            .handle_workspace_symbol(query, kind_filter, limit)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1082,6 +1128,14 @@ async fn handle_project_request(
                     .format_document(file_path, tab_size, insert_spaces)
                     .await,
             );
+        }
+        ProjectRequest::WorkspaceSymbol {
+            query,
+            kind_filter,
+            limit,
+            reply,
+        } => {
+            let _ = reply.send(runtime.workspace_symbol(query, kind_filter, limit).await);
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -1366,6 +1420,18 @@ impl ProjectRegistry {
             .max_by_key(|project| project.identity.root().as_path().components().count())
             .map(|project| project.actor.clone())
             .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
+    }
+
+    /// Resolve a registered project ID to its actor without holding the registry lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not registered.
+    pub async fn actor_for_project(
+        &self,
+        id: &ProjectId,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.actor(id).await
     }
 
     async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {

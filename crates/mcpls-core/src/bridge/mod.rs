@@ -19,5 +19,5 @@ pub use translator::{
     Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
     DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
-    TranslatorTemplate,
+    TranslatorTemplate, WorkspaceSymbolResult,
 };
