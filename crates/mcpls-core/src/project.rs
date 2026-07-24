@@ -1506,6 +1506,20 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn restart(&mut self) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+        let Some(root) = self.translator.workspace_roots().first().cloned() else {
+            return Ok(Vec::new());
+        };
+        if self.translator.configured_language_ids().is_empty() {
+            return Ok(Vec::new());
+        }
+        self.shutdown().await?;
+        self.translator
+            .activate_project(root)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -1833,9 +1847,22 @@ async fn handle_project_request(
             state.status = ProjectStatus::Restarting;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Restarting);
-            state.status = ProjectStatus::Ready;
-            let _ = status_tx.send(ProjectStatus::Ready);
-            let _ = reply.send(state.clone());
+            match runtime.restart().await {
+                Ok(notification_receivers) => {
+                    spawn_notification_forwarders(notification_receivers, actor_sender);
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Ready;
+                    let _ = status_tx.send(ProjectStatus::Ready);
+                    let _ = reply.send(state.clone());
+                }
+                Err(error) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Failed;
+                    state.last_error = Some(error);
+                    let _ = status_tx.send(ProjectStatus::Failed);
+                    let _ = reply.send(state.clone());
+                }
+            }
         }
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
