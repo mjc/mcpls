@@ -29,57 +29,85 @@ pub fn apply_plan(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
 ) -> Result<ApplyReport, ApplyError> {
-    if !plan.safe_to_apply() {
-        return Err(ApplyError::UnsafePlan);
-    }
-    if plan.is_expired(SystemTime::now()) {
-        return Err(ApplyError::Expired);
+    let prepared = PreparedPlan::new(boundary, plan)?;
+    let staged = prepared.stage()?;
+    prepared.revalidate(boundary, &staged)?;
+    PreparedPlan::commit(&staged)
+}
+
+struct PreparedPlan<'a> {
+    plan: &'a EditPlan,
+    snapshots: Vec<&'a FileSnapshot>,
+}
+
+impl<'a> PreparedPlan<'a> {
+    fn new(boundary: &WorkspaceBoundary, plan: &'a EditPlan) -> Result<Self, ApplyError> {
+        if !plan.safe_to_apply() {
+            return Err(ApplyError::UnsafePlan);
+        }
+        if plan.is_expired(SystemTime::now()) {
+            return Err(ApplyError::Expired);
+        }
+
+        let snapshots: Vec<_> = plan
+            .files()
+            .iter()
+            .map(|snapshot| validate_snapshot(boundary, snapshot))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { plan, snapshots })
     }
 
-    let snapshots: Vec<_> = plan
-        .files()
-        .iter()
-        .map(|snapshot| validate_snapshot(boundary, snapshot))
-        .collect::<Result<_, _>>()?;
-    let mut staged = Vec::with_capacity(snapshots.len());
-    for (index, snapshot) in snapshots.iter().enumerate() {
-        let temp_path = temporary_path(snapshot.path(), plan, index);
-        if let Err(error) = stage_file(&temp_path, snapshot) {
-            cleanup_staged(&staged);
-            return Err(ApplyError::Stage {
-                path: temp_path,
-                source: error,
+    fn stage(&self) -> Result<Vec<StagedFile>, ApplyError> {
+        let mut staged = Vec::with_capacity(self.snapshots.len());
+        for (index, snapshot) in self.snapshots.iter().enumerate() {
+            let temp_path = temporary_path(snapshot.path(), self.plan, index);
+            if let Err(error) = stage_file(&temp_path, snapshot) {
+                cleanup_staged(&staged);
+                return Err(ApplyError::Stage {
+                    path: temp_path,
+                    source: error,
+                });
+            }
+            staged.push(StagedFile {
+                target: snapshot.path().clone(),
+                temp: temp_path,
             });
         }
-        staged.push(StagedFile {
-            target: snapshot.path().clone(),
-            temp: temp_path,
-        });
+        Ok(staged)
     }
 
-    // Revalidate after staging and immediately before the first destructive
-    // operation. This rejects a stale plan as one unit.
-    for snapshot in &snapshots {
-        if let Err(error) = validate_snapshot(boundary, snapshot) {
-            cleanup_staged(&staged);
-            return Err(error);
+    fn revalidate(
+        &self,
+        boundary: &WorkspaceBoundary,
+        staged: &[StagedFile],
+    ) -> Result<(), ApplyError> {
+        // Revalidate after staging and immediately before the first
+        // destructive operation. This rejects a stale plan as one unit.
+        for snapshot in &self.snapshots {
+            if let Err(error) = validate_snapshot(boundary, snapshot) {
+                cleanup_staged(staged);
+                return Err(error);
+            }
         }
+        Ok(())
     }
 
-    let mut committed_files = Vec::with_capacity(staged.len());
-    for (index, file) in staged.iter().enumerate() {
-        if let Err(error) = fs::rename(&file.temp, &file.target) {
-            cleanup_staged(&staged[index..]);
-            return Err(ApplyError::Commit {
-                path: file.target.clone(),
-                committed_files,
-                source: error,
-            });
+    fn commit(staged: &[StagedFile]) -> Result<ApplyReport, ApplyError> {
+        let mut committed_files = Vec::with_capacity(staged.len());
+        for (index, file) in staged.iter().enumerate() {
+            if let Err(error) = fs::rename(&file.temp, &file.target) {
+                cleanup_staged(&staged[index..]);
+                return Err(ApplyError::Commit {
+                    path: file.target.clone(),
+                    committed_files,
+                    source: error,
+                });
+            }
+            committed_files.push(file.target.clone());
         }
-        committed_files.push(file.target.clone());
-    }
 
-    Ok(ApplyReport { committed_files })
+        Ok(ApplyReport { committed_files })
+    }
 }
 
 /// Errors returned while applying an edit plan.
