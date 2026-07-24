@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
@@ -1920,6 +1920,7 @@ pub enum ProjectRegistryError {
 struct ProjectEntry {
     identity: ProjectIdentity,
     actor: ProjectHandle,
+    mutation: std::sync::Arc<Mutex<()>>,
 }
 
 /// Process-wide registry of project identities and their actor handles.
@@ -1997,6 +1998,7 @@ impl ProjectRegistry {
             ProjectEntry {
                 identity,
                 actor: actor.clone(),
+                mutation: std::sync::Arc::new(Mutex::new(())),
             },
         );
         drop(projects);
@@ -2022,14 +2024,18 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let actor = self
+        let entry = self
             .projects
             .write()
             .await
             .remove(&id)
-            .ok_or(ProjectRegistryError::ProjectNotFound(id))?
-            .actor;
-        actor.shutdown().await.map_err(ProjectRegistryError::from)
+            .ok_or(ProjectRegistryError::ProjectNotFound(id))?;
+        let _mutation = entry.mutation.lock().await;
+        entry
+            .actor
+            .shutdown()
+            .await
+            .map_err(ProjectRegistryError::from)
     }
 
     /// Query a project's actor state without holding the registry lock during the await.
@@ -2051,7 +2057,8 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or activation fails.
     pub async fn activate(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        let (identity, actor) = self.entry(id).await?;
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
         actor
             .activate(identity.root().as_path().to_path_buf())
             .await
@@ -2105,11 +2112,9 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor is unavailable.
     pub async fn restart(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        self.actor(id)
-            .await?
-            .restart()
-            .await
-            .map_err(ProjectRegistryError::from)
+        let (_, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor.restart().await.map_err(ProjectRegistryError::from)
     }
 
     /// Resolve a file path to the actor owning the longest matching root.
@@ -2160,12 +2165,19 @@ impl ProjectRegistry {
     async fn entry(
         &self,
         id: &ProjectId,
-    ) -> Result<(ProjectIdentity, ProjectHandle), ProjectRegistryError> {
+    ) -> Result<(ProjectIdentity, ProjectHandle, std::sync::Arc<Mutex<()>>), ProjectRegistryError>
+    {
         self.projects
             .read()
             .await
             .get(id)
-            .map(|project| (project.identity.clone(), project.actor.clone()))
+            .map(|project| {
+                (
+                    project.identity.clone(),
+                    project.actor.clone(),
+                    project.mutation.clone(),
+                )
+            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 }
@@ -2783,6 +2795,33 @@ mod tests {
                 .status(),
             ProjectStatus::Starting
         );
+    }
+
+    #[tokio::test]
+    async fn project_registry_serializes_restart_and_remove() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let id = ProjectId::new("race").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let restart_registry = registry.clone();
+        let remove_registry = registry.clone();
+        let restart_id = id.clone();
+        let remove_id = id.clone();
+        let (restart, remove) = tokio::join!(
+            restart_registry.restart(&restart_id),
+            remove_registry.remove(remove_id),
+        );
+
+        assert!(restart.is_ok() || matches!(restart, Err(ProjectRegistryError::Actor(_))));
+        assert!(remove.is_ok());
+        assert!(registry.list().await.is_empty());
     }
 
     #[tokio::test]
