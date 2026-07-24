@@ -63,9 +63,9 @@ pub fn apply_text_edits(
 
     spans.sort_by_key(|(start, end, _)| (*start, *end));
     for pair in spans.windows(2) {
-        let (_, previous_end, _) = pair[0];
+        let (previous_start, previous_end, _) = pair[0];
         let (start, end, _) = pair[1];
-        if start < previous_end || start == pair[0].0 {
+        if start <= previous_start || start < previous_end {
             return Err(EditPlanError::Overlapping { start, end });
         }
     }
@@ -156,6 +156,27 @@ mod tests {
         assert!(matches!(
             apply_text_edits("abcd", &edits, PositionEncoding::Utf8),
             Err(EditPlanError::Overlapping { .. })
+        ));
+    }
+
+    #[test]
+    fn preserves_crlf_when_editing_before_line_break() -> Result<(), EditPlanError> {
+        let edits = [edit(Position::new(0, 0), Position::new(0, 1), "A")];
+
+        assert_eq!(
+            apply_text_edits("a\r\nb", &edits, PositionEncoding::Utf8)?,
+            "A\r\nb"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_utf8_byte_offset_inside_character() {
+        let edits = [edit(Position::new(0, 1), Position::new(0, 2), "x")];
+
+        assert!(matches!(
+            apply_text_edits("😀", &edits, PositionEncoding::Utf8),
+            Err(EditPlanError::InvalidPosition { .. })
         ));
     }
 }
