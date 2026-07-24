@@ -127,6 +127,11 @@ impl EncodingConverter {
                         "Character offset {character_offset} exceeds text length {text_len}"
                     ));
                 }
+                if !text.is_char_boundary(byte_offset) {
+                    return Err(format!(
+                        "Character offset {character_offset} is not a UTF-8 boundary"
+                    ));
+                }
                 Ok(byte_offset)
             }
             PositionEncoding::Utf16 => {
@@ -264,6 +269,13 @@ mod tests {
 
         let byte_offset = converter.character_to_byte_offset(text, 8).unwrap();
         assert_eq!(byte_offset, 10);
+    }
+
+    #[test]
+    fn test_utf16_rejects_surrogate_split() {
+        let converter = EncodingConverter::new(PositionEncoding::Utf16);
+
+        assert!(converter.character_to_byte_offset("😀", 1).is_err());
     }
 
     #[test]
