@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
-    CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticsResult,
-    DocumentSymbolsResult, FormatDocumentResult, HoverResult, ReferencesResult, RenameResult,
-    Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
+    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult, ReferencesResult,
+    RenameResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -484,6 +484,12 @@ enum ProjectRequest {
         kind_filter: Option<String>,
         reply: oneshot::Sender<Result<CodeActionsResult, String>>,
     },
+    PrepareCallHierarchy {
+        file_path: String,
+        line: u32,
+        character: u32,
+        reply: oneshot::Sender<Result<CallHierarchyPrepareResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -848,6 +854,34 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route call-hierarchy preparation through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn prepare_call_hierarchy(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<CallHierarchyPrepareResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PrepareCallHierarchy {
+                file_path,
+                line,
+                character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -1021,6 +1055,18 @@ impl ProjectRuntime {
                 end_character,
                 kind_filter,
             )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_call_hierarchy(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<CallHierarchyPrepareResult, String> {
+        self.translator
+            .handle_call_hierarchy_prepare(file_path, line, character)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1221,6 +1267,18 @@ async fn handle_project_request(
                         end_character,
                         kind_filter,
                     )
+                    .await,
+            );
+        }
+        ProjectRequest::PrepareCallHierarchy {
+            file_path,
+            line,
+            character,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .prepare_call_hierarchy(file_path, line, character)
                     .await,
             );
         }
@@ -1859,6 +1917,25 @@ mod tests {
 
         let result = handle
             .code_actions(file.display().to_string(), 1, 5, 1, 15, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_call_hierarchy_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .prepare_call_hierarchy(file.display().to_string(), 1, 5)
             .await;
 
         assert!(matches!(
