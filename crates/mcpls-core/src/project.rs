@@ -1,8 +1,10 @@
 //! Project identity and canonical path routing primitives.
 
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
@@ -422,6 +424,56 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// Return a conservative fingerprint for the inputs that shape Rust analysis.
+///
+/// A missing explicit toolchain or Cargo manifest is deliberately treated as
+/// unknown rather than compatible. This keeps linked-project reuse fail-closed
+/// until the daemon can resolve the effective toolchain and environment.
+fn rust_project_compatibility_key(root: &Path) -> Option<[u8; 32]> {
+    const INPUTS: &[&str] = &[
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".cargo/config",
+        ".cargo/config.toml",
+    ];
+
+    let mut hasher = Sha256::new();
+    let mut has_toolchain = false;
+    let mut has_manifest = false;
+    for relative in INPUTS {
+        let path = root.join(relative);
+        match std::fs::read(&path) {
+            Ok(contents) => {
+                has_toolchain |=
+                    *relative == "rust-toolchain" || *relative == "rust-toolchain.toml";
+                has_manifest |= *relative == "Cargo.toml";
+                hasher.update(relative.as_bytes());
+                hasher.update((contents.len() as u64).to_le_bytes());
+                hasher.update(contents);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                hasher.update(relative.as_bytes());
+                hasher.update([0]);
+            }
+            Err(_) => return None,
+        }
+    }
+
+    (has_toolchain && has_manifest).then(|| hasher.finalize().into())
+}
+
+fn compatible_rust_projects(left: &ProjectIdentity, right: &ProjectIdentity) -> bool {
+    let Some(left_key) = rust_project_compatibility_key(left.root.as_path()) else {
+        return false;
+    };
+    let Some(right_key) = rust_project_compatibility_key(right.root.as_path()) else {
+        return false;
+    };
+    left_key == right_key
 }
 
 /// Observable lifecycle state for one project actor.
@@ -2248,7 +2300,10 @@ impl ProjectRegistry {
                 project
                     .identity
                     .repository_identity()
-                    .is_some_and(|existing| existing == repository)
+                    .is_some_and(|existing| {
+                        existing == repository
+                            && compatible_rust_projects(&project.identity, &identity)
+                    })
             })
         });
         if let Some(existing) = shared {
@@ -3068,6 +3123,14 @@ mod tests {
             format!("gitdir: {}\n", worktree_git_dir.display()),
         )
         .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        }
         let main_repository = GitRepositoryIdentity::discover(repository.path())
             .unwrap()
             .unwrap();
@@ -3106,6 +3169,77 @@ mod tests {
             linked_actor.query().await.unwrap().workspace_roots().len(),
             2
         );
+        registry
+            .remove(ProjectId::new("linked").unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_keeps_linked_worktrees_with_different_toolchains_isolated() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            worktree.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly\"\n",
+        )
+        .unwrap();
+        let main_repository = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let linked_repository = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+        let registry = ProjectRegistry::new(2);
+
+        let main_actor = registry
+            .add(
+                ProjectIdentity::new(
+                    ProjectId::new("main").unwrap(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(main_repository),
+            )
+            .await
+            .unwrap();
+        let linked_actor = registry
+            .add(
+                ProjectIdentity::new(
+                    ProjectId::new("linked").unwrap(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_repository),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(main_actor.query().await.unwrap().workspace_roots().len(), 1);
+        assert_eq!(
+            linked_actor.query().await.unwrap().workspace_roots().len(),
+            1
+        );
+        registry
+            .remove(ProjectId::new("main").unwrap())
+            .await
+            .unwrap();
         registry
             .remove(ProjectId::new("linked").unwrap())
             .await
