@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -28,7 +28,8 @@ use super::tools::{
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
 use crate::project::{
-    CanonicalRoot, ProjectHandle, ProjectId, ProjectIdentity, ProjectRegistry, ProjectState,
+    CanonicalRoot, GitRepositoryIdentity, ProjectHandle, ProjectId, ProjectIdentity,
+    ProjectRegistry, ProjectState,
 };
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
@@ -62,10 +63,11 @@ fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpErro
     })
 }
 
-fn project_state_json(id: &ProjectId, root: &Path, state: &ProjectState) -> serde_json::Value {
+fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde_json::Value {
     serde_json::json!({
-        "project_id": id.as_str(),
-        "root": root,
+        "project_id": identity.id().as_str(),
+        "root": identity.root().as_path(),
+        "repository_root": identity.repository_identity().map(GitRepositoryIdentity::common_dir),
         "status": format!("{:?}", state.status()),
         "last_error": state.last_error(),
         "configured_language_servers": state.runtime().configured_language_ids(),
@@ -129,7 +131,15 @@ impl McplsServer {
         let id = parse_project_id(project_id)?;
         let canonical_root = CanonicalRoot::new(&root)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let identity = ProjectIdentity::new(id.clone(), canonical_root);
+        let repository = GitRepositoryIdentity::discover(canonical_root.as_path())
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let identity = repository.map_or_else(
+            || ProjectIdentity::new(id.clone(), canonical_root.clone()),
+            |repository| {
+                ProjectIdentity::new(id.clone(), canonical_root.clone())
+                    .with_repository_identity(repository)
+            },
+        );
         let actor = self
             .context
             .project_registry
@@ -140,7 +150,7 @@ impl McplsServer {
             .query()
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&id, identity.root().as_path(), &state))
+        encode_json(&project_state_json(&identity, &state))
     }
 
     /// Activate a registered project and wait for its language servers to load.
@@ -164,7 +174,7 @@ impl McplsServer {
             .activate(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&id, identity.root().as_path(), &state))
+        encode_json(&project_state_json(&identity, &state))
     }
 
     /// List all registered projects without waiting on project actors.
@@ -180,6 +190,7 @@ impl McplsServer {
                 serde_json::json!({
                     "project_id": project.id().as_str(),
                     "root": project.root().as_path(),
+                    "repository_root": project.repository_identity().map(GitRepositoryIdentity::common_dir),
                 })
             })
             .collect();
@@ -205,7 +216,7 @@ impl McplsServer {
             .status(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&id, identity.root().as_path(), &state))
+        encode_json(&project_state_json(&identity, &state))
     }
 
     /// Remove a project and shut down its actor.
@@ -245,7 +256,7 @@ impl McplsServer {
             .restart(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&id, identity.root().as_path(), &state))
+        encode_json(&project_state_json(&identity, &state))
     }
 
     /// Refresh one project actor's observable state.
@@ -267,7 +278,7 @@ impl McplsServer {
             .refresh(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&id, identity.root().as_path(), &state))
+        encode_json(&project_state_json(&identity, &state))
     }
 
     /// Get hover information at a position in a file.

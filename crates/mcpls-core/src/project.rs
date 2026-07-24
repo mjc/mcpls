@@ -122,18 +122,149 @@ impl CanonicalRoot {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+/// Errors raised while resolving Git repository metadata.
+pub enum GitRepositoryIdentityError {
+    /// The supplied root cannot be canonicalized.
+    #[error("failed to canonicalize Git root {path}: {source}")]
+    Canonicalize {
+        /// Root that could not be canonicalized.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A `.git` file does not contain a valid `gitdir:` declaration.
+    #[error("invalid Git metadata file: {path}")]
+    InvalidGitFile {
+        /// Metadata file path.
+        path: PathBuf,
+    },
+    /// Git metadata points at a directory that no longer exists.
+    #[error("Git metadata directory is unavailable: {path}")]
+    MissingGitDirectory {
+        /// Missing metadata directory.
+        path: PathBuf,
+    },
+    /// A Git metadata file could not be read.
+    #[error("failed to read Git metadata file {path}: {source}")]
+    ReadMetadata {
+        /// Metadata file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Canonical common Git directory shared by a checkout and linked worktrees.
+pub struct GitRepositoryIdentity(PathBuf);
+
+impl GitRepositoryIdentity {
+    /// Resolve the common Git directory for a checkout, linked worktree, or bare repository.
+    ///
+    /// Returns `Ok(None)` for a non-Git directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or stale Git metadata.
+    pub fn discover(root: impl AsRef<Path>) -> Result<Option<Self>, GitRepositoryIdentityError> {
+        let root = root.as_ref();
+        let canonical_root =
+            root.canonicalize()
+                .map_err(|source| GitRepositoryIdentityError::Canonicalize {
+                    path: root.to_path_buf(),
+                    source,
+                })?;
+        let git_entry = canonical_root.join(".git");
+
+        if git_entry.is_dir() {
+            return Ok(Some(Self(git_entry.canonicalize().map_err(|source| {
+                GitRepositoryIdentityError::Canonicalize {
+                    path: git_entry.clone(),
+                    source,
+                }
+            })?)));
+        }
+
+        if git_entry.is_file() {
+            let metadata = std::fs::read_to_string(&git_entry).map_err(|source| {
+                GitRepositoryIdentityError::ReadMetadata {
+                    path: git_entry.clone(),
+                    source,
+                }
+            })?;
+            let target = metadata
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("gitdir:"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GitRepositoryIdentityError::InvalidGitFile {
+                    path: git_entry.clone(),
+                })?;
+            let git_dir = {
+                let target = PathBuf::from(target);
+                if target.is_absolute() {
+                    target
+                } else {
+                    canonical_root.join(target)
+                }
+            };
+            let git_dir = git_dir
+                .canonicalize()
+                .map_err(|_| GitRepositoryIdentityError::MissingGitDirectory { path: git_dir })?;
+            let common_dir = git_dir.join("commondir");
+            if common_dir.is_file() {
+                let relative = std::fs::read_to_string(&common_dir).map_err(|source| {
+                    GitRepositoryIdentityError::ReadMetadata {
+                        path: common_dir.clone(),
+                        source,
+                    }
+                })?;
+                let common = git_dir.join(relative.trim());
+                return Ok(Some(Self(common.canonicalize().map_err(|_| {
+                    GitRepositoryIdentityError::MissingGitDirectory { path: common }
+                })?)));
+            }
+            return Ok(Some(Self(git_dir)));
+        }
+
+        if canonical_root.join("HEAD").is_file()
+            && canonical_root.join("config").is_file()
+            && canonical_root.join("objects").is_dir()
+        {
+            return Ok(Some(Self(canonical_root)));
+        }
+
+        Ok(None)
+    }
+
+    /// Return the canonical common Git directory.
+    #[must_use]
+    pub fn common_dir(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Stable project ID paired with its canonical root.
 pub struct ProjectIdentity {
     id: ProjectId,
     root: CanonicalRoot,
+    repository: Option<GitRepositoryIdentity>,
 }
 
 impl ProjectIdentity {
     /// Pair a stable project ID with its canonical root.
     #[must_use]
     pub const fn new(id: ProjectId, root: CanonicalRoot) -> Self {
-        Self { id, root }
+        Self {
+            id,
+            root,
+            repository: None,
+        }
     }
 
     /// Return the stable project ID.
@@ -146,6 +277,19 @@ impl ProjectIdentity {
     #[must_use]
     pub const fn root(&self) -> &CanonicalRoot {
         &self.root
+    }
+
+    /// Attach the shared Git repository identity for this checkout.
+    #[must_use]
+    pub fn with_repository_identity(mut self, repository: GitRepositoryIdentity) -> Self {
+        self.repository = Some(repository);
+        self
+    }
+
+    /// Return the shared Git repository identity, when this root is Git-backed.
+    #[must_use]
+    pub const fn repository_identity(&self) -> Option<&GitRepositoryIdentity> {
+        self.repository.as_ref()
     }
 }
 
@@ -2191,6 +2335,52 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn git_identity_resolves_main_checkout_and_linked_worktree() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+
+        let main_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let worktree_identity = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(main_identity.common_dir(), git_dir.canonicalize().unwrap());
+        assert_eq!(worktree_identity, main_identity);
+    }
+
+    #[test]
+    fn git_identity_distinguishes_non_git_and_stale_metadata() {
+        let plain = TempDir::new().unwrap();
+        assert!(
+            GitRepositoryIdentity::discover(plain.path())
+                .unwrap()
+                .is_none()
+        );
+
+        let stale = TempDir::new().unwrap();
+        fs::write(stale.path().join(".git"), "gitdir: /missing/worktree\n").unwrap();
+        assert!(matches!(
+            GitRepositoryIdentity::discover(stale.path()),
+            Err(GitRepositoryIdentityError::MissingGitDirectory { .. })
+        ));
+    }
 
     #[test]
     fn resolve_path_selects_longest_registered_root() {
