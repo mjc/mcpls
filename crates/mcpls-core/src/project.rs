@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
@@ -1523,10 +1522,6 @@ impl ProjectHandle {
     }
 }
 
-const EDIT_PLAN_MAX_COUNT: usize = 64;
-const EDIT_PLAN_MAX_BYTES: usize = 16 * 1024 * 1024;
-const EDIT_PLAN_TTL: Duration = Duration::from_secs(15 * 60);
-
 struct ProjectRuntime {
     translator: Translator,
     edit_plans: EditPlanStore,
@@ -1536,7 +1531,7 @@ impl ProjectRuntime {
     fn new(translator: Translator) -> Self {
         Self {
             translator,
-            edit_plans: EditPlanStore::new(EDIT_PLAN_MAX_COUNT, EDIT_PLAN_MAX_BYTES, EDIT_PLAN_TTL),
+            edit_plans: EditPlanStore::for_project(),
         }
     }
 

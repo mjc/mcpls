@@ -312,6 +312,12 @@ pub struct EditPlanStore {
 }
 
 impl EditPlanStore {
+    /// Construct the daemon's bounded project-local plan store.
+    #[must_use]
+    pub fn for_project() -> Self {
+        Self::new(64, 16 * 1024 * 1024, Duration::from_secs(15 * 60))
+    }
+
     /// Create a bounded plan store.
     #[must_use]
     pub fn new(max_plans: usize, max_bytes: usize, ttl: Duration) -> Self {
