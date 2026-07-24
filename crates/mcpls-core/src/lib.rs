@@ -50,15 +50,17 @@ pub mod workspace_edit;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(test)]
 use bridge::resources::make_uri;
 use bridge::{ResourceSubscriptions, Translator};
 pub use config::ServerConfig;
 pub use error::Error;
-use lsp::{LspNotification, LspServer, ServerInitConfig};
+#[cfg(test)]
+use lsp::LspNotification;
+#[cfg(test)]
 use rmcp::model::ResourceUpdatedNotificationParam;
 use tokio::sync::{Mutex, OnceCell};
-use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
 pub use transport::Transport;
@@ -83,6 +85,7 @@ use transport::run_stdio;
 /// All cache writes acquire `Arc<Mutex<Translator>>`, which is the same lock used
 /// by every MCP tool call. Splitting `NotificationCache` into its own `Arc<RwLock>`
 /// would eliminate this contention. Tracked as a P2 follow-up.
+#[cfg(test)]
 pub(crate) async fn diagnostics_pump(
     _lang: String,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
@@ -162,23 +165,6 @@ pub(crate) async fn diagnostics_pump(
 ///
 /// Takes ownership of the `ServerInitResult`, extracts `notification_rx` from each server
 /// before registration, and returns a map of language-id to receiver for the pump tasks.
-fn register_servers(
-    mut result: lsp::ServerInitResult,
-    translator: &mut bridge::Translator,
-) -> std::collections::HashMap<String, tokio::sync::mpsc::Receiver<lsp::LspNotification>> {
-    let mut receivers = std::collections::HashMap::new();
-    for (lang, server) in &mut result.servers {
-        receivers.insert(lang.clone(), server.take_notification_rx());
-    }
-    for (language_id, server) in result.servers {
-        let client = server.client().clone();
-        translator.register_server_roots(language_id.clone(), server.workspace_roots().to_vec());
-        translator.register_client(language_id.clone(), client);
-        translator.register_server(language_id.clone(), server);
-    }
-    receivers
-}
-
 /// Resolve workspace roots from config or current directory.
 ///
 /// If no workspace roots are provided in the configuration, this function
@@ -297,79 +283,18 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     translator.set_workspace_roots(validation_roots);
     translator.set_lsp_configs(config.lsp_servers.clone(), max_depth);
 
-    let applicable_configs: Vec<ServerInitConfig> = config
-        .lsp_servers
-        .iter()
-        .filter_map(|lsp_config| {
-            let should_spawn = workspace_roots
-                .iter()
-                .any(|root| lsp_config.should_spawn(root, max_depth));
-
-            if !should_spawn {
-                info!(
-                    "Skipping LSP server '{}' ({}): no project markers found",
-                    lsp_config.language_id, lsp_config.command
-                );
-                return None;
-            }
-
-            Some(ServerInitConfig {
-                server_config: lsp_config.clone(),
-                workspace_roots: workspace_roots.clone(),
-                initialization_options: lsp_config.initialization_options.clone(),
-                notification_tx: None,
-            })
-        })
-        .collect();
-
-    info!(
-        "Attempting to spawn {} applicable LSP server(s)...",
-        applicable_configs.len()
-    );
-
-    // Mark applicable languages as "expected" so a tool call that arrives while
-    // its server is still initializing gets a clear "still initializing" error
-    // (instead of "no server configured"), telling the caller to wait and retry.
-    let expected_languages: std::collections::HashSet<String> = applicable_configs
-        .iter()
-        .map(|c| c.server_config.language_id.clone())
-        .collect();
-    translator.set_expected_languages(expected_languages);
-
-    // Shared state, built BEFORE LSP initialization so the MCP server can answer
-    // `initialize` immediately. LSP servers (which can take minutes to initialize
-    // on a large solution, e.g. a 130-project Unity .sln via OmniSharp) are spawned
-    // in a background task and registered into this shared translator once ready.
-    // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
-    // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
+    // The daemon translator is retained as a compatibility shell. Project actors
+    // own all configured LSP processes; starting a second global batch here would
+    // duplicate every server when a project is explicitly activated.
     let translator_template = translator.configuration_template();
     let translator = Arc::new(Mutex::new(translator));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
-
-    // Cancellation for pump tasks: send `true` to request shutdown.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-    if applicable_configs.is_empty() {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
-    } else {
-        info!(
-            "Spawning {} LSP server(s) in the background...",
-            applicable_configs.len()
-        );
-        spawn_lsp_servers_background(
-            applicable_configs,
-            Arc::clone(&translator),
-            Arc::clone(&subscriptions),
-            Arc::clone(&peer_cell),
-            cancel_rx.clone(),
-        );
-    }
-
-    info!("Starting MCP server with rmcp...");
     let project_registry =
         project::ProjectRegistry::with_translator_template(32, translator_template);
+
+    info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new_with_registry(
         Arc::clone(&translator),
         Arc::clone(&subscriptions),
@@ -386,84 +311,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg).await,
     };
 
-    // Signal background pump tasks to exit.
-    let _ = cancel_tx.send(true);
-
     info!("MCPLS server shutting down");
     result
-}
-
-/// Spawn the applicable LSP servers in a background task and register them into
-/// the shared `translator` once ready.
-///
-/// This intentionally does NOT block the caller: `serve_with` starts the MCP
-/// server immediately so its `initialize` handshake returns before slow language
-/// servers (e.g. `OmniSharp` on a large Unity solution, which can take minutes to
-/// load) finish initializing. Tool calls that arrive before a server has
-/// registered return a `ServerInitializing` error telling the caller to wait and
-/// retry. If every server fails, the "expected languages" set is cleared so those
-/// calls fall back to a plain "no server configured" error instead.
-fn spawn_lsp_servers_background(
-    applicable_configs: Vec<ServerInitConfig>,
-    translator: Arc<Mutex<Translator>>,
-    subscriptions: Arc<ResourceSubscriptions>,
-    peer_cell: Arc<OnceCell<rmcp::Peer<rmcp::RoleServer>>>,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    tokio::spawn(async move {
-        let result = LspServer::spawn_batch(&applicable_configs).await;
-
-        if result.all_failed() {
-            error!(
-                "All {} configured LSP server(s) failed to initialize",
-                result.failure_count()
-            );
-            for failure in &result.failures {
-                error!("Server initialization failed: {}", failure);
-            }
-            // No server will register; stop reporting "still initializing".
-            translator.lock().await.clear_expected_languages();
-            return;
-        }
-
-        if result.partial_success() {
-            warn!(
-                "Partial server initialization: {} succeeded, {} failed",
-                result.server_count(),
-                result.failure_count()
-            );
-            for failure in &result.failures {
-                error!("Server initialization failed: {}", failure);
-            }
-        }
-
-        let server_count = result.server_count();
-        let notification_receivers = {
-            let mut t = translator.lock().await;
-            let receivers = register_servers(result, &mut t);
-            // Background initialization has completed; stop reporting "still
-            // initializing" (especially for languages whose server failed to
-            // spawn on partial success, which would otherwise return
-            // ServerInitializing forever instead of NoServerForLanguage).
-            t.clear_expected_languages();
-            receivers
-        };
-        info!("Proceeding with {} LSP server(s)", server_count);
-
-        // Start diagnostics pump tasks now that servers are registered.
-        let mut pumps: JoinSet<()> = JoinSet::new();
-        for (lang, rx) in notification_receivers {
-            pumps.spawn(diagnostics_pump(
-                lang,
-                rx,
-                Arc::clone(&translator),
-                Arc::clone(&subscriptions),
-                Arc::clone(&peer_cell),
-                cancel_rx.clone(),
-            ));
-        }
-        while pumps.join_next().await.is_some() {}
-    });
 }
 
 #[cfg(test)]
