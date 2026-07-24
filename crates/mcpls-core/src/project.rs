@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
+use crate::bridge::Translator;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 /// Errors raised while constructing or routing project identities.
@@ -295,13 +297,15 @@ pub enum ProjectStatus {
 pub struct ProjectState {
     status: ProjectStatus,
     last_error: Option<String>,
+    runtime: ProjectRuntimeSummary,
 }
 
 impl ProjectState {
-    const fn new(status: ProjectStatus) -> Self {
+    const fn new(status: ProjectStatus, runtime: ProjectRuntimeSummary) -> Self {
         Self {
             status,
             last_error: None,
+            runtime,
         }
     }
 
@@ -315,6 +319,68 @@ impl ProjectState {
     #[must_use]
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Return the project-local runtime summary owned by the actor.
+    #[must_use]
+    pub const fn runtime(&self) -> &ProjectRuntimeSummary {
+        &self.runtime
+    }
+
+    /// Return the canonical workspace roots owned by this project actor.
+    #[must_use]
+    pub fn workspace_roots(&self) -> &[PathBuf] {
+        self.runtime.workspace_roots()
+    }
+
+    /// Return the number of open documents owned by this project actor.
+    #[must_use]
+    pub const fn open_document_count(&self) -> usize {
+        self.runtime.open_document_count()
+    }
+}
+
+/// Project-local state counts and roots owned by an actor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectRuntimeSummary {
+    workspace_roots: Vec<PathBuf>,
+    configured_language_ids: Vec<String>,
+    active_language_ids: Vec<String>,
+    open_document_count: usize,
+}
+
+impl ProjectRuntimeSummary {
+    fn from_translator(translator: &Translator) -> Self {
+        Self {
+            workspace_roots: translator.workspace_roots().to_vec(),
+            configured_language_ids: translator.configured_language_ids(),
+            active_language_ids: translator.active_language_ids(),
+            open_document_count: translator.open_document_count(),
+        }
+    }
+
+    /// Return the workspace roots owned by the actor.
+    #[must_use]
+    pub fn workspace_roots(&self) -> &[PathBuf] {
+        &self.workspace_roots
+    }
+
+    /// Return configured language IDs.
+    #[must_use]
+    pub fn configured_language_ids(&self) -> &[String] {
+        &self.configured_language_ids
+    }
+
+    /// Return active language IDs.
+    #[must_use]
+    pub fn active_language_ids(&self) -> &[String] {
+        &self.active_language_ids
+    }
+
+    /// Return the number of open documents.
+    #[must_use]
+    pub const fn open_document_count(&self) -> usize {
+        self.open_document_count
     }
 }
 
@@ -455,15 +521,41 @@ impl ProjectHandle {
     }
 }
 
+struct ProjectRuntime {
+    translator: Translator,
+}
+
 /// Spawn a bounded project actor with `Starting` as its initial status.
 #[must_use]
 pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
+    spawn_project_actor_with_translator(capacity, Translator::new())
+}
+
+/// Spawn an actor whose translator is configured for one canonical project root.
+#[must_use]
+pub fn spawn_project_actor_for_root(capacity: usize, root: &CanonicalRoot) -> ProjectHandle {
+    let mut translator = Translator::new();
+    translator.set_workspace_roots(vec![root.as_path().to_path_buf()]);
+    spawn_project_actor_with_translator(capacity, translator)
+}
+
+/// Spawn an actor with translator state owned exclusively by that actor.
+#[must_use]
+pub fn spawn_project_actor_with_translator(
+    capacity: usize,
+    translator: Translator,
+) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
+    let runtime = ProjectRuntime { translator };
     tokio::spawn(run_project_actor(
         receiver,
         status_tx,
-        ProjectState::new(ProjectStatus::Starting),
+        ProjectState::new(
+            ProjectStatus::Starting,
+            ProjectRuntimeSummary::from_translator(&runtime.translator),
+        ),
+        runtime,
     ));
     ProjectHandle {
         sender,
@@ -475,19 +567,23 @@ async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     status_tx: watch::Sender<ProjectStatus>,
     mut state: ProjectState,
+    runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
         match request {
             ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
+                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
                 let _ = reply.send(state.clone());
             }
             ProjectRequest::SetStatus { status, reply } => {
+                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
                 state.status = status;
                 state.last_error = None;
                 let _ = status_tx.send(status);
                 let _ = reply.send(());
             }
             ProjectRequest::Restart { reply } => {
+                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
                 state.status = ProjectStatus::Restarting;
                 state.last_error = None;
                 let _ = status_tx.send(ProjectStatus::Restarting);
@@ -496,12 +592,14 @@ async fn run_project_actor(
                 let _ = reply.send(state.clone());
             }
             ProjectRequest::Fail { message, reply } => {
+                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
                 state.status = ProjectStatus::Failed;
                 state.last_error = Some(message);
                 let _ = status_tx.send(ProjectStatus::Failed);
                 let _ = reply.send(());
             }
             ProjectRequest::Shutdown { reply } => {
+                state.runtime = ProjectRuntimeSummary::from_translator(&runtime.translator);
                 state.status = ProjectStatus::Stopping;
                 state.last_error = None;
                 let _ = status_tx.send(ProjectStatus::Stopping);
@@ -592,7 +690,7 @@ impl ProjectRegistry {
             ));
         }
 
-        let actor = spawn_project_actor(self.actor_capacity);
+        let actor = spawn_project_actor_for_root(self.actor_capacity, identity.root());
         projects.insert(
             identity.id().clone(),
             ProjectEntry {
@@ -847,6 +945,21 @@ mod tests {
         let state = handle.query().await.unwrap();
         assert_eq!(state.status(), ProjectStatus::Failed);
         assert_eq!(state.last_error(), Some("rust-analyzer exited"));
+    }
+
+    #[tokio::test]
+    async fn project_actor_owns_project_workspace_state() {
+        let root = TempDir::new().unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let state = handle.query().await.unwrap();
+
+        assert_eq!(
+            state.workspace_roots(),
+            &[root.path().canonicalize().unwrap()]
+        );
+        assert_eq!(state.open_document_count(), 0);
     }
 
     #[tokio::test]

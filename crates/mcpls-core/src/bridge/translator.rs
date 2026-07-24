@@ -75,6 +75,34 @@ impl Translator {
         self.workspace_roots = roots;
     }
 
+    /// Return the workspace roots owned by this translator.
+    #[must_use]
+    pub fn workspace_roots(&self) -> &[PathBuf] {
+        &self.workspace_roots
+    }
+
+    /// Return configured language IDs in deterministic order.
+    #[must_use]
+    pub fn configured_language_ids(&self) -> Vec<String> {
+        let mut languages: Vec<_> = self.lsp_configs.keys().cloned().collect();
+        languages.sort();
+        languages
+    }
+
+    /// Return active language IDs in deterministic order.
+    #[must_use]
+    pub fn active_language_ids(&self) -> Vec<String> {
+        let mut languages: Vec<_> = self.lsp_clients.keys().cloned().collect();
+        languages.sort();
+        languages
+    }
+
+    /// Return the number of open documents tracked by this translator.
+    #[must_use]
+    pub fn open_document_count(&self) -> usize {
+        self.document_tracker.open_paths().count()
+    }
+
     /// Mark the set of languages whose LSP servers are expected (configured +
     /// applicable) but may still be initializing in the background.
     pub fn set_expected_languages(&mut self, languages: HashSet<String>) {
