@@ -212,9 +212,7 @@ impl GitRepositoryIdentity {
                     canonical_root.join(target)
                 }
             };
-            let git_dir = git_dir
-                .canonicalize()
-                .map_err(|_| GitRepositoryIdentityError::MissingGitDirectory { path: git_dir })?;
+            let git_dir = canonicalize_git_metadata(git_dir)?;
             let common_dir = git_dir.join("commondir");
             if common_dir.is_file() {
                 let relative = std::fs::read_to_string(&common_dir).map_err(|source| {
@@ -224,9 +222,7 @@ impl GitRepositoryIdentity {
                     }
                 })?;
                 let common = git_dir.join(relative.trim());
-                return Ok(Some(Self(common.canonicalize().map_err(|_| {
-                    GitRepositoryIdentityError::MissingGitDirectory { path: common }
-                })?)));
+                return Ok(Some(Self(canonicalize_git_metadata(common)?)));
             }
             return Ok(Some(Self(git_dir)));
         }
@@ -246,6 +242,11 @@ impl GitRepositoryIdentity {
     pub fn common_dir(&self) -> &Path {
         &self.0
     }
+}
+
+fn canonicalize_git_metadata(path: PathBuf) -> Result<PathBuf, GitRepositoryIdentityError> {
+    path.canonicalize()
+        .map_err(|_| GitRepositoryIdentityError::MissingGitDirectory { path })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
