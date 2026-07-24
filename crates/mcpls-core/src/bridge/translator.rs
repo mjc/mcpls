@@ -188,10 +188,30 @@ impl Translator {
         &mut self,
         root: PathBuf,
     ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
+        self.activate_project_with_roots(vec![root]).await
+    }
+
+    /// Activate configured language servers for a linked set of workspace roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured server applies, a server cannot be
+    /// started, or project loading does not reach a ready state in time.
+    pub async fn activate_project_with_roots(
+        &mut self,
+        roots: Vec<PathBuf>,
+    ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
+        if roots.is_empty() {
+            return Err(Error::NoServerConfigured);
+        }
         let configs: Vec<_> = self
             .lsp_configs
             .values()
-            .filter(|config| config.should_spawn(&root, self.heuristics_max_depth))
+            .filter(|config| {
+                roots
+                    .iter()
+                    .any(|root| config.should_spawn(root, self.heuristics_max_depth))
+            })
             .cloned()
             .collect();
 
@@ -205,7 +225,9 @@ impl Translator {
             let same_root = self
                 .lsp_roots
                 .get(language_id)
-                .is_some_and(|roots| roots.iter().any(|existing| existing == &root))
+                .is_some_and(|existing_roots| {
+                    roots.iter().all(|root| existing_roots.contains(root))
+                })
                 && self.lsp_clients.contains_key(language_id);
 
             if same_root {
@@ -226,7 +248,7 @@ impl Translator {
         }
 
         if pending.is_empty() {
-            self.set_workspace_roots(vec![root]);
+            self.set_workspace_roots(roots);
             return Ok(Vec::new());
         }
 
@@ -240,7 +262,7 @@ impl Translator {
             .iter()
             .map(|config| ServerInitConfig {
                 server_config: config.clone(),
-                workspace_roots: vec![root.clone()],
+                workspace_roots: roots.clone(),
                 initialization_options: config.initialization_options.clone(),
                 notification_tx: None,
             })
@@ -268,7 +290,7 @@ impl Translator {
                 .await?;
         }
 
-        self.set_workspace_roots(vec![root.clone()]);
+        self.set_workspace_roots(roots);
         let mut notification_receivers = Vec::new();
         for (language_id, mut server) in result.servers {
             let client = server.client().clone();
@@ -304,6 +326,29 @@ impl Translator {
         }
 
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Add a linked workspace root, restarting active servers with all roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when active servers cannot be restarted for the
+    /// expanded root set.
+    pub async fn add_workspace_root(
+        &mut self,
+        root: PathBuf,
+    ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
+        if self.workspace_roots.contains(&root) {
+            return Ok(Vec::new());
+        }
+        let mut roots = self.workspace_roots.clone();
+        roots.push(root);
+        if self.lsp_clients.is_empty() || self.lsp_configs.is_empty() {
+            self.set_workspace_roots(roots);
+            return Ok(Vec::new());
+        }
+        self.shutdown().await?;
+        self.activate_project_with_roots(roots).await
     }
 
     /// Get the document tracker.

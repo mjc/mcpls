@@ -570,6 +570,10 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
     },
+    ActivateWorkspaceRoots {
+        roots: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<ProjectState, String>>,
+    },
     Hover {
         file_path: String,
         line: u32,
@@ -680,6 +684,10 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    AddWorkspaceRoot {
+        root: PathBuf,
+        reply: oneshot::Sender<Result<ProjectState, String>>,
+    },
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
@@ -770,6 +778,27 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::Activate { root, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Activate the actor-owned language servers for all linked workspace roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or language-server activation
+    /// fails.
+    pub async fn activate_workspace_roots(
+        &self,
+        roots: Vec<PathBuf>,
+    ) -> Result<ProjectState, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ActivateWorkspaceRoots { roots, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -1281,6 +1310,27 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Add a compatible linked-project root to this actor's workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// language servers cannot be restarted with the expanded root set.
+    pub async fn add_workspace_root(
+        &self,
+        root: PathBuf,
+    ) -> Result<ProjectState, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::AddWorkspaceRoot { root, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return recent logs from this project's language servers.
     ///
     /// # Errors
@@ -1651,16 +1701,37 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn activate(
+        &mut self,
+        roots: Vec<PathBuf>,
+    ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+        self.translator
+            .activate_project_with_roots(roots)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn add_workspace_root(
+        &mut self,
+        root: PathBuf,
+    ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+        self.translator
+            .add_workspace_root(root)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn restart(&mut self) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
-        let Some(root) = self.translator.workspace_roots().first().cloned() else {
+        let roots = self.translator.workspace_roots().to_vec();
+        if roots.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         if self.translator.configured_language_ids().is_empty() {
             return Ok(Vec::new());
         }
         self.shutdown().await?;
         self.translator
-            .activate_project(root)
+            .activate_project_with_roots(roots)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1789,6 +1860,27 @@ async fn handle_project_request(
                     state.last_error = Some(error.to_string());
                     let _ = status_tx.send(ProjectStatus::Failed);
                     let _ = reply.send(Err(error.to_string()));
+                }
+            }
+        }
+        ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
+            state.status = ProjectStatus::Starting;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Starting);
+            match runtime.activate(roots).await {
+                Ok(notification_receivers) => {
+                    spawn_notification_forwarders(notification_receivers, actor_sender);
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Ready;
+                    let _ = status_tx.send(ProjectStatus::Ready);
+                    let _ = reply.send(Ok(state.clone()));
+                }
+                Err(error) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Failed;
+                    state.last_error = Some(error.clone());
+                    let _ = status_tx.send(ProjectStatus::Failed);
+                    let _ = reply.send(Err(error));
                 }
             }
         }
@@ -1967,6 +2059,27 @@ async fn handle_project_request(
         ProjectRequest::ValidatePath { file_path, reply } => {
             let _ = reply.send(runtime.validate_path(&file_path));
         }
+        ProjectRequest::AddWorkspaceRoot { root, reply } => {
+            state.status = ProjectStatus::Restarting;
+            state.last_error = None;
+            let _ = status_tx.send(ProjectStatus::Restarting);
+            match runtime.add_workspace_root(root).await {
+                Ok(notification_receivers) => {
+                    spawn_notification_forwarders(notification_receivers, actor_sender);
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Ready;
+                    let _ = status_tx.send(ProjectStatus::Ready);
+                    let _ = reply.send(Ok(state.clone()));
+                }
+                Err(error) => {
+                    state.sync_runtime(runtime);
+                    state.status = ProjectStatus::Failed;
+                    state.last_error = Some(error.clone());
+                    let _ = status_tx.send(ProjectStatus::Failed);
+                    let _ = reply.send(Err(error));
+                }
+            }
+        }
         ProjectRequest::ServerLogs {
             limit,
             min_level,
@@ -2099,7 +2212,7 @@ impl ProjectRegistry {
         }
     }
 
-    /// Add a project, returning its existing actor when the ID is already present.
+    /// Add a project, sharing an actor with a compatible linked worktree.
     ///
     /// # Errors
     ///
@@ -2128,6 +2241,56 @@ impl ProjectRegistry {
             return Err(ProjectRegistryError::DuplicateRoot(
                 identity.root().as_path().to_path_buf(),
             ));
+        }
+
+        let shared = identity.repository_identity().and_then(|repository| {
+            projects.values().find(|project| {
+                project
+                    .identity
+                    .repository_identity()
+                    .is_some_and(|existing| existing == repository)
+            })
+        });
+        if let Some(existing) = shared {
+            let actor = existing.actor.clone();
+            let mutation = existing.mutation.clone();
+            drop(projects);
+
+            let mutation_guard = mutation.lock().await;
+            actor
+                .add_workspace_root(identity.root().as_path().to_path_buf())
+                .await?;
+
+            let mut projects = self.projects.write().await;
+            if let Some(existing) = projects.get(identity.id()) {
+                if existing.identity.root() != identity.root() {
+                    return Err(ProjectRegistryError::ConflictingProject {
+                        id: identity.id().clone(),
+                        existing_root: existing.identity.root().as_path().to_path_buf(),
+                        requested_root: identity.root().as_path().to_path_buf(),
+                    });
+                }
+                return Ok(existing.actor.clone());
+            }
+            if projects
+                .values()
+                .any(|project| project.identity.root() == identity.root())
+            {
+                return Err(ProjectRegistryError::DuplicateRoot(
+                    identity.root().as_path().to_path_buf(),
+                ));
+            }
+            projects.insert(
+                identity.id().clone(),
+                ProjectEntry {
+                    identity,
+                    actor: actor.clone(),
+                    mutation: mutation.clone(),
+                },
+            );
+            drop(projects);
+            drop(mutation_guard);
+            return Ok(actor);
         }
 
         let actor = self.translator_template.as_deref().map_or_else(
@@ -2165,24 +2328,36 @@ impl ProjectRegistry {
         projects
     }
 
-    /// Remove a project and ask its actor to shut down after releasing the registry lock.
+    /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let entry = self
+        let (actor, mutation) = self
             .projects
+            .read()
+            .await
+            .get(&id)
+            .map(|entry| (entry.actor.clone(), entry.mutation.clone()))
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        let mutation_guard = mutation.lock().await;
+        self.projects
             .write()
             .await
             .remove(&id)
             .ok_or(ProjectRegistryError::ProjectNotFound(id))?;
-        let _mutation = entry.mutation.lock().await;
-        entry
-            .actor
-            .shutdown()
+        let has_linked_projects = self
+            .projects
+            .read()
             .await
-            .map_err(ProjectRegistryError::from)
+            .values()
+            .any(|entry| std::sync::Arc::ptr_eq(&entry.mutation, &mutation));
+        drop(mutation_guard);
+        if has_linked_projects {
+            return Ok(());
+        }
+        actor.shutdown().await.map_err(ProjectRegistryError::from)
     }
 
     /// Query a project's actor state without holding the registry lock during the await.
@@ -2206,10 +2381,18 @@ impl ProjectRegistry {
     pub async fn activate(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
         let (identity, actor, mutation) = self.entry(id).await?;
         let _mutation = mutation.lock().await;
-        actor
-            .activate(identity.root().as_path().to_path_buf())
-            .await
-            .map_err(ProjectRegistryError::from)
+        let roots = actor.query().await?.workspace_roots().to_vec();
+        if roots.len() > 1 {
+            actor
+                .activate_workspace_roots(roots)
+                .await
+                .map_err(ProjectRegistryError::from)
+        } else {
+            actor
+                .activate(identity.root().as_path().to_path_buf())
+                .await
+                .map_err(ProjectRegistryError::from)
+        }
     }
 
     /// Mark a registered project ready after its language servers are loaded.
@@ -2838,6 +3021,95 @@ mod tests {
         let result = actor.server_logs(10, None).await.unwrap();
         assert_eq!(result.logs.len(), 1);
         assert_eq!(result.logs[0].message, "project log");
+    }
+
+    #[tokio::test]
+    async fn project_actor_can_add_a_linked_workspace_root() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let first_root = CanonicalRoot::new(first.path()).unwrap();
+        let second_root = CanonicalRoot::new(second.path()).unwrap();
+        let actor = spawn_project_actor_for_root(2, &first_root);
+
+        let state = actor
+            .add_workspace_root(second_root.as_path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(state.workspace_roots().len(), 2);
+        assert!(
+            state
+                .workspace_roots()
+                .contains(&first_root.as_path().to_path_buf())
+        );
+        assert!(
+            state
+                .workspace_roots()
+                .contains(&second_root.as_path().to_path_buf())
+        );
+        let restarted = actor.restart().await.unwrap();
+        assert_eq!(restarted.workspace_roots(), state.workspace_roots());
+    }
+
+    #[tokio::test]
+    async fn registry_shares_actor_for_linked_git_worktrees() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        let main_repository = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let linked_repository = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+        let registry = ProjectRegistry::new(2);
+        let main_id = ProjectId::new("main").unwrap();
+        let linked_id = ProjectId::new("linked").unwrap();
+
+        let main_actor = registry
+            .add(
+                ProjectIdentity::new(main_id, CanonicalRoot::new(repository.path()).unwrap())
+                    .with_repository_identity(main_repository),
+            )
+            .await
+            .unwrap();
+        let linked_actor = registry
+            .add(
+                ProjectIdentity::new(linked_id, CanonicalRoot::new(worktree.path()).unwrap())
+                    .with_repository_identity(linked_repository),
+            )
+            .await
+            .unwrap();
+
+        let main_state = main_actor.query().await.unwrap();
+        let linked_state = linked_actor.query().await.unwrap();
+        assert_eq!(main_state.workspace_roots(), linked_state.workspace_roots());
+        assert_eq!(main_state.workspace_roots().len(), 2);
+
+        registry
+            .remove(ProjectId::new("main").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            linked_actor.query().await.unwrap().workspace_roots().len(),
+            2
+        );
+        registry
+            .remove(ProjectId::new("linked").unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
