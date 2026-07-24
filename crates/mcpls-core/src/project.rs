@@ -728,6 +728,9 @@ async fn run_project_actor(
 #[non_exhaustive]
 /// Errors returned by the shared project registry.
 pub enum ProjectRegistryError {
+    /// A project identity operation failed while resolving a request path.
+    #[error(transparent)]
+    Identity(#[from] ProjectIdentityError),
     /// A stable ID was reused for a different canonical root.
     #[error("project ID {id} is already registered for {existing_root}, not {requested_root}")]
     ConflictingProject {
@@ -945,6 +948,30 @@ impl ProjectRegistry {
             .map_err(ProjectRegistryError::from)
     }
 
+    /// Resolve a file path to the actor owning the longest matching root.
+    ///
+    /// The registry lock is released before the returned actor is used, so a
+    /// slow semantic request cannot block unrelated project registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error when the path cannot be canonicalized or is
+    /// not contained by a registered project.
+    pub async fn actor_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let canonical = canonicalize(path.as_ref())?;
+        self.projects
+            .read()
+            .await
+            .values()
+            .filter(|project| canonical.starts_with(project.identity.root().as_path()))
+            .max_by_key(|project| project.identity.root().as_path().components().count())
+            .map(|project| project.actor.clone())
+            .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
+    }
+
     async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
         self.projects
             .read()
@@ -1143,6 +1170,39 @@ mod tests {
             result,
             Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
         ));
+    }
+
+    #[tokio::test]
+    async fn registry_resolves_semantic_paths_to_the_longest_project_actor() {
+        let root = TempDir::new().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let file = nested.join("src.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let outer = ProjectId::new("outer").unwrap();
+        let inner = ProjectId::new("inner").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                outer.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let inner_actor = registry
+            .add(ProjectIdentity::new(
+                inner,
+                CanonicalRoot::new(&nested).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let resolved = registry.actor_for_path(&file).await.unwrap();
+
+        assert_eq!(
+            resolved.query().await.unwrap().workspace_roots(),
+            inner_actor.query().await.unwrap().workspace_roots()
+        );
     }
 
     #[tokio::test]
