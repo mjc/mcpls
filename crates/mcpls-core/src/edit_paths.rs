@@ -34,6 +34,76 @@ pub enum PathSafetyError {
     RootTarget(PathBuf),
 }
 
+/// A filesystem operation that can be validated before it is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOperation {
+    /// Create a file or directory at `path`.
+    Create {
+        /// Destination path.
+        path: PathBuf,
+        /// Permit replacing an existing destination.
+        overwrite: bool,
+    },
+    /// Move an existing path to `to`.
+    Rename {
+        /// Existing source path.
+        from: PathBuf,
+        /// Destination path.
+        to: PathBuf,
+        /// Permit replacing an existing destination.
+        overwrite: bool,
+    },
+    /// Delete an existing path.
+    Delete {
+        /// Path to remove.
+        path: PathBuf,
+        /// Permit deleting a directory recursively.
+        recursive: bool,
+    },
+}
+
+/// Errors raised when a file operation fails its preconditions.
+#[derive(Debug, thiserror::Error)]
+pub enum OperationValidationError {
+    /// One of the operation paths crossed the workspace boundary.
+    #[error("unsafe operation path: {0}")]
+    Path(#[from] PathSafetyError),
+    /// A destination already exists and overwrite was not enabled.
+    #[error("operation destination already exists: {0}")]
+    DestinationExists(PathBuf),
+    /// A directory delete requires the recursive flag.
+    #[error("directory delete requires recursive=true: {0}")]
+    RecursiveDeleteRequired(PathBuf),
+}
+
+/// Canonical paths for an operation that passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedFileOperation {
+    /// Validated create destination.
+    Create {
+        /// Canonical destination path.
+        path: PathBuf,
+        /// Whether an existing destination may be replaced.
+        overwrite: bool,
+    },
+    /// Validated rename source and destination.
+    Rename {
+        /// Canonical source path.
+        from: PathBuf,
+        /// Canonical destination path.
+        to: PathBuf,
+        /// Whether an existing destination may be replaced.
+        overwrite: bool,
+    },
+    /// Validated delete target.
+    Delete {
+        /// Canonical target path.
+        path: PathBuf,
+        /// Whether recursive deletion is allowed.
+        recursive: bool,
+    },
+}
+
 /// Canonical workspace boundary used by preview and apply validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBoundary {
@@ -108,6 +178,56 @@ impl WorkspaceBoundary {
             .map_err(|_| PathSafetyError::MissingParent(parent.clone()))?;
         let canonical_parent = self.validate_canonical(canonical_parent)?;
         Ok(canonical_parent.join(name))
+    }
+
+    /// Validate all paths and preconditions for one file operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a path leaves the workspace or an operation
+    /// precondition such as overwrite or recursive deletion is not met.
+    pub fn validate_operation(
+        &self,
+        operation: &FileOperation,
+    ) -> Result<ValidatedFileOperation, OperationValidationError> {
+        match operation {
+            FileOperation::Create { path, overwrite } => {
+                let path = self.validate_target(path)?;
+                if path.exists() && !overwrite {
+                    return Err(OperationValidationError::DestinationExists(path));
+                }
+                Ok(ValidatedFileOperation::Create {
+                    path,
+                    overwrite: *overwrite,
+                })
+            }
+            FileOperation::Rename {
+                from,
+                to,
+                overwrite,
+            } => {
+                let from = self.validate_existing(from)?;
+                let to = self.validate_target(to)?;
+                if to.exists() && !overwrite {
+                    return Err(OperationValidationError::DestinationExists(to));
+                }
+                Ok(ValidatedFileOperation::Rename {
+                    from,
+                    to,
+                    overwrite: *overwrite,
+                })
+            }
+            FileOperation::Delete { path, recursive } => {
+                let path = self.validate_existing(path)?;
+                if path.is_dir() && !recursive {
+                    return Err(OperationValidationError::RecursiveDeleteRequired(path));
+                }
+                Ok(ValidatedFileOperation::Delete {
+                    path,
+                    recursive: *recursive,
+                })
+            }
+        }
     }
 
     fn resolve_input(&self, path: &Path) -> PathBuf {
@@ -197,6 +317,49 @@ mod tests {
         assert!(matches!(
             boundary.validate_target(link.join("new.rs")),
             Err(PathSafetyError::OutsideWorkspace { .. })
+        ));
+    }
+
+    #[test]
+    fn validates_operation_preconditions_after_containment() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("source.rs");
+        let existing = root.path().join("existing.rs");
+        fs::write(&source, "source").unwrap();
+        fs::write(&existing, "existing").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        assert!(matches!(
+            boundary.validate_operation(&FileOperation::Create {
+                path: existing.clone(),
+                overwrite: false,
+            }),
+            Err(OperationValidationError::DestinationExists(path)) if path == existing
+        ));
+        assert!(matches!(
+            boundary.validate_operation(&FileOperation::Rename {
+                from: source.clone(),
+                to: existing.clone(),
+                overwrite: true,
+            }),
+            Ok(ValidatedFileOperation::Rename { from, to, .. })
+                if from == source && to == existing
+        ));
+    }
+
+    #[test]
+    fn requires_recursive_directory_deletes() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("nested");
+        fs::create_dir(&directory).unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        assert!(matches!(
+            boundary.validate_operation(&FileOperation::Delete {
+                path: directory.clone(),
+                recursive: false,
+            }),
+            Err(OperationValidationError::RecursiveDeleteRequired(path)) if path == directory
         ));
     }
 }
