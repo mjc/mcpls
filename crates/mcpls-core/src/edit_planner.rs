@@ -179,4 +179,18 @@ mod tests {
             Err(EditPlanError::InvalidPosition { .. })
         ));
     }
+
+    #[test]
+    fn applies_utf32_edits_with_combining_text_and_eof() -> Result<(), EditPlanError> {
+        let edits = [
+            edit(Position::new(0, 1), Position::new(0, 2), "X"),
+            edit(Position::new(1, 1), Position::new(1, 1), "!"),
+        ];
+
+        assert_eq!(
+            apply_text_edits("e\u{301}😀\nZ", &edits, PositionEncoding::Utf32)?,
+            "eX😀\nZ!"
+        );
+        Ok(())
+    }
 }
