@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
-    CompletionsResult, DefinitionResult, DiagnosticsResult, DocumentSymbolsResult, HoverResult,
-    ReferencesResult, RenameResult, Translator, TranslatorTemplate,
+    CompletionsResult, DefinitionResult, DiagnosticsResult, DocumentSymbolsResult,
+    FormatDocumentResult, HoverResult, ReferencesResult, RenameResult, Translator,
+    TranslatorTemplate,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -462,6 +463,12 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<DocumentSymbolsResult, String>>,
     },
+    FormatDocument {
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+        reply: oneshot::Sender<Result<FormatDocumentResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -736,6 +743,34 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a document-formatting request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn format_document(
+        &self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<FormatDocumentResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::FormatDocument {
+                file_path,
+                tab_size,
+                insert_spaces,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -863,6 +898,18 @@ impl ProjectRuntime {
     ) -> Result<DocumentSymbolsResult, String> {
         self.translator
             .handle_document_symbols(file_path)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn format_document(
+        &mut self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<FormatDocumentResult, String> {
+        self.translator
+            .handle_format_document(file_path, tab_size, insert_spaces)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1023,6 +1070,18 @@ async fn handle_project_request(
         }
         ProjectRequest::DocumentSymbols { file_path, reply } => {
             let _ = reply.send(runtime.document_symbols(file_path).await);
+        }
+        ProjectRequest::FormatDocument {
+            file_path,
+            tab_size,
+            insert_spaces,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .format_document(file_path, tab_size, insert_spaces)
+                    .await,
+            );
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -1610,6 +1669,25 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle.document_symbols(file.display().to_string()).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_format_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .format_document(file.display().to_string(), 4, true)
+            .await;
 
         assert!(matches!(
             result,
