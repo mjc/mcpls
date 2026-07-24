@@ -934,29 +934,32 @@ impl ServerHandler for McplsServer {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
-        {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
-
         let lsp_uri = crate::bridge::path_to_uri(&path);
 
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
         // in the response shape. Currently both return `{"diagnostics":null}` which is
         // ambiguous for clients that need to know whether analysis has run yet.
-        let diagnostics = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .notification_cache()
-                .get_diagnostics(lsp_uri.as_str())
-                .cloned()
+        let json = if let Some(actor) = self.context.actor_for_path(&path).await {
+            let diagnostics = actor
+                .cached_diagnostics(path.display().to_string())
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            serde_json::to_string(&diagnostics)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?
+        } else {
+            let diagnostics = {
+                let translator = self.context.translator.lock().await;
+                translator
+                    .validate_path(&path)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                translator
+                    .notification_cache()
+                    .get_diagnostics(lsp_uri.as_str())
+                    .cloned()
+            };
+            serde_json::to_string(&diagnostics)
+                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?
         };
-
-        let json = serde_json::to_string(&diagnostics)
-            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
 
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             json,
@@ -972,8 +975,14 @@ impl ServerHandler for McplsServer {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Enforce workspace-root containment (same invariant as every LSP tool).
-        {
+        // Registered projects own containment validation. Keep the daemon
+        // translator as a compatibility fallback for unregistered resources.
+        if let Some(actor) = self.context.actor_for_path(&path).await {
+            actor
+                .cached_diagnostics(path.display().to_string())
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        } else {
             let translator = self.context.translator.lock().await;
             translator
                 .validate_path(&path)
