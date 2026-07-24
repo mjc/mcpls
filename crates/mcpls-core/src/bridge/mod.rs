@@ -16,8 +16,8 @@ pub use notifications::{
 pub use resources::ResourceSubscriptions;
 pub use state::{DocumentState, DocumentTracker, path_to_uri, uri_to_path};
 pub use translator::{
-    Completion, CompletionsResult, DefinitionResult, Diagnostic, DiagnosticSeverity,
-    DiagnosticsResult, DocumentChanges, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    Location, Position2D, Range, ReferencesResult, RenameResult, Symbol, TextEdit, Translator,
-    TranslatorTemplate, WorkspaceSymbolResult,
+    CodeActionsResult, Completion, CompletionsResult, DefinitionResult, Diagnostic,
+    DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
+    FormatDocumentResult, HoverResult, Location, Position2D, Range, ReferencesResult, RenameResult,
+    Symbol, TextEdit, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };

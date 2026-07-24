@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
-    CompletionsResult, DefinitionResult, DiagnosticsResult, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, ReferencesResult, RenameResult, Translator,
-    TranslatorTemplate, WorkspaceSymbolResult,
+    CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticsResult,
+    DocumentSymbolsResult, FormatDocumentResult, HoverResult, ReferencesResult, RenameResult,
+    Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -475,6 +475,15 @@ enum ProjectRequest {
         limit: u32,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
+    CodeActions {
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+        reply: oneshot::Sender<Result<CodeActionsResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -805,6 +814,40 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a code-action request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn code_actions(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::CodeActions {
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -956,6 +999,28 @@ impl ProjectRuntime {
     ) -> Result<WorkspaceSymbolResult, String> {
         self.translator
             .handle_workspace_symbol(query, kind_filter, limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn code_actions(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, String> {
+        self.translator
+            .handle_code_actions(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
             .await
             .map_err(|error| error.to_string())
     }
@@ -1136,6 +1201,28 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.workspace_symbol(query, kind_filter, limit).await);
+        }
+        ProjectRequest::CodeActions {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .code_actions(
+                        file_path,
+                        start_line,
+                        start_character,
+                        end_line,
+                        end_character,
+                        kind_filter,
+                    )
+                    .await,
+            );
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -1753,6 +1840,25 @@ mod tests {
 
         let result = handle
             .format_document(file.display().to_string(), 4, true)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_code_action_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .code_actions(file.display().to_string(), 1, 5, 1, 15, None)
             .await;
 
         assert!(matches!(
