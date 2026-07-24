@@ -16,7 +16,7 @@ use lsp_types::{
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::Duration;
+use tokio::{sync::mpsc, time::Duration};
 
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
@@ -184,7 +184,10 @@ impl Translator {
     ///
     /// Returns an error when no configured server applies, a server cannot be
     /// started, or project loading does not reach a ready state in time.
-    pub async fn activate_project(&mut self, root: PathBuf) -> Result<()> {
+    pub async fn activate_project(
+        &mut self,
+        root: PathBuf,
+    ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
         let configs: Vec<_> = self
             .lsp_configs
             .values()
@@ -224,7 +227,7 @@ impl Translator {
 
         if pending.is_empty() {
             self.set_workspace_roots(vec![root]);
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let expected_languages = pending
@@ -266,17 +269,17 @@ impl Translator {
         }
 
         self.set_workspace_roots(vec![root.clone()]);
+        let mut notification_receivers = Vec::new();
         for (language_id, mut server) in result.servers {
             let client = server.client().clone();
             let roots = server.workspace_roots().to_vec();
-            let mut notifications = server.take_notification_rx();
-            tokio::spawn(async move { while notifications.recv().await.is_some() {} });
+            notification_receivers.push(server.take_notification_rx());
             self.register_server_roots(language_id.clone(), roots);
             self.register_client(language_id.clone(), client);
             self.register_server(language_id, server);
         }
         self.clear_expected_languages();
-        Ok(())
+        Ok(notification_receivers)
     }
 
     /// Get the document tracker.
