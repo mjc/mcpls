@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
@@ -14,6 +15,7 @@ use crate::bridge::{
     RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
     TranslatorTemplate, WorkspaceSymbolResult,
 };
+use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::lsp::LspNotification;
 
 #[derive(Debug, thiserror::Error)]
@@ -733,6 +735,15 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
     },
+    StoreEditPlan {
+        plan: EditPlan,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    TakeEditPlan {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<EditPlan, String>>,
+    },
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
@@ -1376,6 +1387,50 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Store a project-owned workspace edit preview for later application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// bounded plan store rejects the plan.
+    pub async fn store_edit_plan(&self, plan: EditPlan) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::StoreEditPlan { plan, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Consume one project-owned workspace edit preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// plan is missing, expired, or owned by another project.
+    pub async fn take_edit_plan(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<EditPlan, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::TakeEditPlan {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return recent logs from this project's language servers.
     ///
     /// # Errors
@@ -1468,11 +1523,35 @@ impl ProjectHandle {
     }
 }
 
+const EDIT_PLAN_MAX_COUNT: usize = 64;
+const EDIT_PLAN_MAX_BYTES: usize = 16 * 1024 * 1024;
+const EDIT_PLAN_TTL: Duration = Duration::from_secs(15 * 60);
+
 struct ProjectRuntime {
     translator: Translator,
+    edit_plans: EditPlanStore,
 }
 
 impl ProjectRuntime {
+    fn new(translator: Translator) -> Self {
+        Self {
+            translator,
+            edit_plans: EditPlanStore::new(EDIT_PLAN_MAX_COUNT, EDIT_PLAN_MAX_BYTES, EDIT_PLAN_TTL),
+        }
+    }
+
+    fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
+        self.edit_plans
+            .insert(plan)
+            .map_err(|error| error.to_string())
+    }
+
+    fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
+        self.edit_plans
+            .take_for_project(plan_id, project_id)
+            .map_err(|error| error.to_string())
+    }
+
     async fn hover(
         &mut self,
         file_path: String,
@@ -1822,7 +1901,7 @@ pub fn spawn_project_actor_with_translator(
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.clone();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
-    let runtime = ProjectRuntime { translator };
+    let runtime = ProjectRuntime::new(translator);
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
@@ -2124,6 +2203,16 @@ async fn handle_project_request(
                     let _ = reply.send(Err(error));
                 }
             }
+        }
+        ProjectRequest::StoreEditPlan { plan, reply } => {
+            let _ = reply.send(runtime.store_edit_plan(plan));
+        }
+        ProjectRequest::TakeEditPlan {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.take_edit_plan(&plan_id, &project_id));
         }
         ProjectRequest::ServerLogs {
             limit,
@@ -3102,6 +3191,32 @@ mod tests {
         );
         let restarted = actor.restart().await.unwrap();
         assert_eq!(restarted.workspace_roots(), state.workspace_roots());
+    }
+
+    #[tokio::test]
+    async fn project_actor_owns_bounded_edit_plans() {
+        let actor = spawn_project_actor(2);
+        let plan = crate::edit_plan::EditPlan::new(
+            "project".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            std::time::Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+
+        actor.store_edit_plan(plan).await.unwrap();
+        let taken = actor
+            .take_edit_plan(plan_id.clone(), "project".to_string())
+            .await
+            .unwrap();
+        assert_eq!(taken.project_id(), "project");
+        assert!(matches!(
+            actor
+                .take_edit_plan(plan_id, "project".to_string())
+                .await,
+            Err(ProjectActorError::Operation(message)) if message.contains("not found")
+        ));
     }
 
     #[tokio::test]
