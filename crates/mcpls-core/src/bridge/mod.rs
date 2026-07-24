@@ -18,7 +18,7 @@ pub use state::{DocumentState, DocumentTracker, path_to_uri, uri_to_path};
 pub use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult, DefinitionResult,
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, InlayHintsResult, Location, Position2D, Range,
-    ReferencesResult, RenameResult, SignatureHelpResult, Symbol, TextEdit, Translator,
+    FormatDocumentResult, HoverResult, InlayHintsResult, Location, LocationsResult, Position2D,
+    Range, ReferencesResult, RenameResult, SignatureHelpResult, Symbol, TextEdit, Translator,
     TranslatorTemplate, WorkspaceSymbolResult,
 };
