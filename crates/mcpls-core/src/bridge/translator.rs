@@ -52,6 +52,14 @@ pub struct Translator {
     heuristics_max_depth: Option<usize>,
 }
 
+/// Configuration snapshot used to construct an isolated project translator.
+#[derive(Debug, Clone, Default)]
+pub struct TranslatorTemplate {
+    extension_map: HashMap<String, String>,
+    lsp_configs: Vec<LspServerConfig>,
+    heuristics_max_depth: Option<usize>,
+}
+
 impl Translator {
     /// Create a new translator.
     #[must_use]
@@ -67,6 +75,16 @@ impl Translator {
             lsp_configs: HashMap::new(),
             lsp_roots: HashMap::new(),
             heuristics_max_depth: None,
+        }
+    }
+
+    /// Capture configuration without carrying live clients, servers, or documents.
+    #[must_use]
+    pub fn configuration_template(&self) -> TranslatorTemplate {
+        TranslatorTemplate {
+            extension_map: self.extension_map.clone(),
+            lsp_configs: self.lsp_configs.values().cloned().collect(),
+            heuristics_max_depth: self.heuristics_max_depth,
         }
     }
 
@@ -287,6 +305,17 @@ impl Translator {
     // Initialize and shutdown are now handled by LspServer in lifecycle.rs
 
     // Future implementation will use LspServer instead of LspClient directly
+}
+
+impl TranslatorTemplate {
+    /// Build a fresh translator configured for one project root.
+    #[must_use]
+    pub fn translator_for_root(&self, root: PathBuf) -> Translator {
+        let mut translator = Translator::new().with_extensions(self.extension_map.clone());
+        translator.set_workspace_roots(vec![root]);
+        translator.set_lsp_configs(self.lsp_configs.clone(), self.heuristics_max_depth);
+        translator
+    }
 }
 
 impl Default for Translator {
