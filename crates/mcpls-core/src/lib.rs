@@ -38,6 +38,7 @@ pub mod config;
 pub mod error;
 pub mod lsp;
 pub mod mcp;
+pub(crate) mod project;
 pub mod transport;
 
 use std::path::PathBuf;
