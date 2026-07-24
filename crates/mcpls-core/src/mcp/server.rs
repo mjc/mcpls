@@ -37,6 +37,17 @@ fn encode_json<T: Serialize>(value: &T) -> Result<String, McpError> {
     serde_json::to_string(value).map_err(|error| McpError::internal_error(error.to_string(), None))
 }
 
+fn encode_tool_result<T, E>(result: Result<T, E>) -> Result<String, McpError>
+where
+    T: Serialize,
+    E: std::fmt::Display,
+{
+    result.map_or_else(
+        |error| Err(McpError::internal_error(error.to_string(), None)),
+        |value| encode_json(&value),
+    )
+}
+
 fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpError> {
     let uri = item
         .get("uri")
@@ -638,11 +649,7 @@ impl McplsServer {
                 .map_err(|error| error.to_string())
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        encode_tool_result(result)
     }
 
     /// Get outgoing calls (callees).
@@ -667,11 +674,7 @@ impl McplsServer {
                 .map_err(|error| error.to_string())
         };
 
-        match result {
-            Ok(value) => serde_json::to_string(&value)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
-        }
+        encode_tool_result(result)
     }
 
     /// Get cached diagnostics for a file.

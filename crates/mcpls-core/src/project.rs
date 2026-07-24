@@ -922,6 +922,11 @@ impl ProjectHandle {
     }
 
     /// Route incoming call hierarchy requests through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
     pub async fn incoming_calls(
         &self,
         item: serde_json::Value,
@@ -938,6 +943,11 @@ impl ProjectHandle {
     }
 
     /// Route outgoing call hierarchy requests through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
     pub async fn outgoing_calls(
         &self,
         item: serde_json::Value,
