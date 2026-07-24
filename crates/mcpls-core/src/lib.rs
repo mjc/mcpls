@@ -358,7 +358,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     }
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new(Arc::clone(&translator), Arc::clone(&subscriptions));
+    let project_registry = project::ProjectRegistry::new(32);
+    let mcp_server = mcp::McplsServer::new_with_registry(
+        Arc::clone(&translator),
+        Arc::clone(&subscriptions),
+        project_registry,
+    );
     info!("MCPLS server initialized successfully");
 
     let result = match transport {

@@ -26,7 +26,7 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
-use crate::project::{CanonicalRoot, ProjectId, ProjectIdentity};
+use crate::project::{CanonicalRoot, ProjectId, ProjectIdentity, ProjectRegistry};
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
@@ -51,6 +51,21 @@ impl McplsServer {
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
         let context = Arc::new(HandlerContext::new(translator, subscriptions));
+        Self { context }
+    }
+
+    /// Create a server with an explicitly shared project registry.
+    #[must_use]
+    pub fn new_with_registry(
+        translator: Arc<Mutex<Translator>>,
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
+        let context = Arc::new(HandlerContext::with_registry(
+            translator,
+            subscriptions,
+            project_registry,
+        ));
         Self { context }
     }
 
@@ -917,6 +932,28 @@ mod tests {
                 .unwrap()
                 .contains("demo")
         );
+    }
+
+    #[tokio::test]
+    async fn test_server_can_share_an_injected_registry() {
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = crate::project::ProjectRegistry::new(2);
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry.clone());
+        let root = TempDir::new().unwrap();
+        registry
+            .add(crate::project::ProjectIdentity::new(
+                crate::project::ProjectId::new("shared").unwrap(),
+                crate::project::CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let listed = server
+            .project_list(Parameters(ProjectListParams::default()))
+            .await
+            .unwrap();
+        assert!(listed.contains("shared"));
     }
 
     #[tokio::test]
