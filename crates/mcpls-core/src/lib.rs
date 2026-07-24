@@ -35,6 +35,7 @@
 
 pub mod bridge;
 pub mod config;
+pub mod edit_paths;
 pub mod edit_plan;
 pub mod edit_planner;
 pub mod edit_policy;
