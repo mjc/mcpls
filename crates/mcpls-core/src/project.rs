@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
-use crate::bridge::Translator;
+use crate::bridge::{Translator, TranslatorTemplate};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -398,6 +398,9 @@ pub enum ProjectActorError {
     /// The actor dropped a response before replying.
     #[error("project actor cancelled the request")]
     Cancelled,
+    /// The actor operation failed after it started.
+    #[error("project actor operation failed: {0}")]
+    Operation(String),
 }
 
 enum ProjectRequest {
@@ -410,6 +413,10 @@ enum ProjectRequest {
     },
     Refresh {
         reply: oneshot::Sender<ProjectState>,
+    },
+    Activate {
+        root: PathBuf,
+        reply: oneshot::Sender<Result<ProjectState, String>>,
     },
     Restart {
         reply: oneshot::Sender<ProjectState>,
@@ -477,6 +484,24 @@ impl ProjectHandle {
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
+    /// Activate the actor-owned language servers for its project root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or language-server activation
+    /// fails.
+    pub async fn activate(&self, root: PathBuf) -> Result<ProjectState, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Activate { root, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
     }
 
     /// Restart the project actor's managed services.
@@ -549,6 +574,19 @@ pub fn spawn_project_actor_for_root(capacity: usize, root: &CanonicalRoot) -> Pr
     spawn_project_actor_with_translator(capacity, translator)
 }
 
+/// Spawn an actor using a configuration snapshot from the daemon translator.
+#[must_use]
+pub fn spawn_project_actor_for_root_with_template(
+    capacity: usize,
+    root: &CanonicalRoot,
+    template: &TranslatorTemplate,
+) -> ProjectHandle {
+    spawn_project_actor_with_translator(
+        capacity,
+        template.translator_for_root(root.as_path().to_path_buf()),
+    )
+}
+
 /// Spawn an actor with translator state owned exclusively by that actor.
 #[must_use]
 pub fn spawn_project_actor_with_translator(
@@ -574,13 +612,33 @@ async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     status_tx: watch::Sender<ProjectStatus>,
     mut state: ProjectState,
-    runtime: ProjectRuntime,
+    mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
         match request {
             ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
                 state.sync_runtime(&runtime);
                 let _ = reply.send(state.clone());
+            }
+            ProjectRequest::Activate { root, reply } => {
+                state.status = ProjectStatus::Starting;
+                state.last_error = None;
+                let _ = status_tx.send(ProjectStatus::Starting);
+                match runtime.translator.activate_project(root).await {
+                    Ok(()) => {
+                        state.sync_runtime(&runtime);
+                        state.status = ProjectStatus::Ready;
+                        let _ = status_tx.send(ProjectStatus::Ready);
+                        let _ = reply.send(Ok(state.clone()));
+                    }
+                    Err(error) => {
+                        state.sync_runtime(&runtime);
+                        state.status = ProjectStatus::Failed;
+                        state.last_error = Some(error.to_string());
+                        let _ = status_tx.send(ProjectStatus::Failed);
+                        let _ = reply.send(Err(error.to_string()));
+                    }
+                }
             }
             ProjectRequest::SetStatus { status, reply } => {
                 state.sync_runtime(&runtime);
@@ -654,6 +712,7 @@ struct ProjectEntry {
 pub struct ProjectRegistry {
     projects: std::sync::Arc<RwLock<HashMap<ProjectId, ProjectEntry>>>,
     actor_capacity: usize,
+    translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
 }
 
 impl ProjectRegistry {
@@ -663,6 +722,17 @@ impl ProjectRegistry {
         Self {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
             actor_capacity: actor_capacity.max(1),
+            translator_template: None,
+        }
+    }
+
+    /// Create a registry whose actors inherit only the daemon translator's configuration.
+    #[must_use]
+    pub fn with_translator_template(actor_capacity: usize, template: TranslatorTemplate) -> Self {
+        Self {
+            projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            actor_capacity: actor_capacity.max(1),
+            translator_template: Some(std::sync::Arc::new(template)),
         }
     }
 
@@ -697,7 +767,16 @@ impl ProjectRegistry {
             ));
         }
 
-        let actor = spawn_project_actor_for_root(self.actor_capacity, identity.root());
+        let actor = self.translator_template.as_deref().map_or_else(
+            || spawn_project_actor_for_root(self.actor_capacity, identity.root()),
+            |template| {
+                spawn_project_actor_for_root_with_template(
+                    self.actor_capacity,
+                    identity.root(),
+                    template,
+                )
+            },
+        );
         projects.insert(
             identity.id().clone(),
             ProjectEntry {
@@ -749,6 +828,34 @@ impl ProjectRegistry {
             .query()
             .await
             .map_err(ProjectRegistryError::from)
+    }
+
+    /// Activate a registered project's actor-owned language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or activation fails.
+    pub async fn activate(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
+        let identity = self.identity(id).await?;
+        self.actor(id)
+            .await?
+            .activate(identity.root().as_path().to_path_buf())
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Mark a registered project ready after its language servers are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor is unavailable.
+    pub async fn mark_ready(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
+        let actor = self.actor(id).await?;
+        actor
+            .set_status(ProjectStatus::Ready)
+            .await
+            .map_err(ProjectRegistryError::from)?;
+        actor.query().await.map_err(ProjectRegistryError::from)
     }
 
     /// Return a registered project's identity without waiting on its actor.
@@ -970,6 +1077,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_activation_owns_lsp_failure_state() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/rust-analyzer".to_string();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![config], Some(1));
+        let handle = spawn_project_actor_with_translator(2, translator);
+
+        let result = handle.activate(root.path().to_path_buf()).await;
+
+        assert!(matches!(result, Err(ProjectActorError::Operation(_))));
+        let state = handle.query().await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(
+            state.runtime().configured_language_ids(),
+            &["rust".to_string()]
+        );
+        assert!(state.last_error().is_some());
+    }
+
+    #[tokio::test]
     async fn project_registry_adds_lists_and_removes_without_duplicate_actors() {
         let root = TempDir::new().unwrap();
         let identity = ProjectIdentity::new(
@@ -990,6 +1123,43 @@ mod tests {
             .await
             .unwrap();
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_activation_uses_configuration_snapshot() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let mut translator = Translator::new();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/rust-analyzer".to_string();
+        translator.set_lsp_configs(vec![config], Some(1));
+        let registry =
+            ProjectRegistry::with_translator_template(2, translator.configuration_template());
+        let id = ProjectId::new("fixture").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let result = registry.activate(&id).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Operation(_)))
+        ));
+        let state = registry.status(&id).await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(
+            state.runtime().configured_language_ids(),
+            &["rust".to_string()]
+        );
     }
 
     #[tokio::test]

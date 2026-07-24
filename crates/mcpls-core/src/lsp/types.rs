@@ -7,6 +7,18 @@ pub use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParam
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// rust-analyzer's server health and background-work status.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerStatusParams {
+    /// Overall server health.
+    pub health: String,
+    /// Whether background work is complete.
+    pub quiescent: bool,
+    /// Optional human-readable status message.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 /// JSON-RPC 2.0 request message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -93,6 +105,8 @@ pub enum LspNotification {
     LogMessage(LogMessageParams),
     /// window/showMessage
     ShowMessage(ShowMessageParams),
+    /// rust-analyzer experimental/serverStatus.
+    ServerStatus(ServerStatusParams),
     /// $/progress
     Progress {
         /// Progress token (string or number).
@@ -166,6 +180,17 @@ impl LspNotification {
                     && let Ok(parsed) = serde_json::from_value(p)
                 {
                     return Self::ShowMessage(parsed);
+                }
+                Self::Other {
+                    method: Cow::Owned(method.to_string()),
+                    params: None,
+                }
+            }
+            "experimental/serverStatus" => {
+                if let Some(p) = params
+                    && let Ok(parsed) = serde_json::from_value(p)
+                {
+                    return Self::ServerStatus(parsed);
                 }
                 Self::Other {
                     method: Cow::Owned(method.to_string()),
@@ -252,6 +277,23 @@ mod tests {
         assert!(serialized.contains("\"jsonrpc\":\"2.0\""));
         assert!(serialized.contains("\"method\":\"initialized\""));
         assert!(!serialized.contains("\"id\""));
+    }
+
+    #[test]
+    fn test_server_status_notification() {
+        let notification = LspNotification::parse(
+            "experimental/serverStatus",
+            Some(json!({"health": "ok", "quiescent": true})),
+        );
+
+        assert!(matches!(
+            notification,
+            LspNotification::ServerStatus(ServerStatusParams {
+                health,
+                quiescent: true,
+                message: None,
+            }) if health == "ok"
+        ));
     }
 
     #[test]
