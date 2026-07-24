@@ -1,9 +1,9 @@
 //! Project identity and canonical path routing primitives.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -514,6 +514,157 @@ async fn run_project_actor(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+/// Errors returned by the shared project registry.
+pub enum ProjectRegistryError {
+    /// A project with this stable ID is already registered.
+    #[error("project is already registered: {0}")]
+    DuplicateProject(ProjectId),
+    /// A different project already owns this canonical root.
+    #[error("project root is already registered: {0}")]
+    DuplicateRoot(PathBuf),
+    /// No project with this stable ID is registered.
+    #[error("project is not registered: {0}")]
+    ProjectNotFound(ProjectId),
+    /// The project actor could not service the request.
+    #[error(transparent)]
+    Actor(#[from] ProjectActorError),
+}
+
+struct ProjectEntry {
+    identity: ProjectIdentity,
+    actor: ProjectHandle,
+}
+
+/// Process-wide registry of project identities and their actor handles.
+#[derive(Clone)]
+pub struct ProjectRegistry {
+    projects: std::sync::Arc<RwLock<HashMap<ProjectId, ProjectEntry>>>,
+    actor_capacity: usize,
+}
+
+impl ProjectRegistry {
+    /// Create an empty registry with a bounded actor queue capacity.
+    #[must_use]
+    pub fn new(actor_capacity: usize) -> Self {
+        Self {
+            projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            actor_capacity: actor_capacity.max(1),
+        }
+    }
+
+    /// Add a project, returning its existing actor when the ID is already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::DuplicateRoot`] when another project owns the root.
+    pub async fn add(
+        &self,
+        identity: ProjectIdentity,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let mut projects = self.projects.write().await;
+        if let Some(existing) = projects.get(identity.id()) {
+            let actor = existing.actor.clone();
+            drop(projects);
+            return Ok(actor);
+        }
+        if projects
+            .values()
+            .any(|project| project.identity.root() == identity.root())
+        {
+            return Err(ProjectRegistryError::DuplicateRoot(
+                identity.root().as_path().to_path_buf(),
+            ));
+        }
+
+        let actor = spawn_project_actor(self.actor_capacity);
+        projects.insert(
+            identity.id().clone(),
+            ProjectEntry {
+                identity,
+                actor: actor.clone(),
+            },
+        );
+        drop(projects);
+        Ok(actor)
+    }
+
+    /// List registered project identities without waiting on any actor.
+    pub async fn list(&self) -> Vec<ProjectIdentity> {
+        self.projects
+            .read()
+            .await
+            .values()
+            .map(|project| project.identity.clone())
+            .collect()
+    }
+
+    /// Remove a project and ask its actor to shut down after releasing the registry lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor cannot shut down.
+    pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
+        let actor = self
+            .projects
+            .write()
+            .await
+            .remove(&id)
+            .ok_or(ProjectRegistryError::ProjectNotFound(id))?
+            .actor;
+        actor.shutdown().await.map_err(ProjectRegistryError::from)
+    }
+
+    /// Query a project's actor state without holding the registry lock during the await.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor is unavailable.
+    pub async fn status(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
+        self.actor(id)
+            .await?
+            .query()
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Refresh a project's actor state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor is unavailable.
+    pub async fn refresh(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
+        self.actor(id)
+            .await?
+            .refresh()
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Restart a project's actor-managed services.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor is unavailable.
+    pub async fn restart(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
+        self.actor(id)
+            .await?
+            .restart()
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| project.actor.clone())
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -665,6 +816,30 @@ mod tests {
         let state = handle.query().await.unwrap();
         assert_eq!(state.status(), ProjectStatus::Failed);
         assert_eq!(state.last_error(), Some("rust-analyzer exited"));
+    }
+
+    #[tokio::test]
+    async fn project_registry_adds_lists_and_removes_without_duplicate_actors() {
+        let root = TempDir::new().unwrap();
+        let identity = ProjectIdentity::new(
+            ProjectId::new("demo").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+        let registry = ProjectRegistry::new(4);
+
+        registry.add(identity.clone()).await.unwrap();
+        let duplicate = registry.add(identity).await.unwrap();
+        assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(
+            duplicate.query().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
+
+        registry
+            .remove(ProjectId::new("demo").unwrap())
+            .await
+            .unwrap();
+        assert!(registry.list().await.is_empty());
     }
 
     #[cfg(unix)]
