@@ -290,6 +290,34 @@ pub enum ProjectStatus {
     Failed,
 }
 
+/// Observable project state, including the most recent failure detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectState {
+    status: ProjectStatus,
+    last_error: Option<String>,
+}
+
+impl ProjectState {
+    const fn new(status: ProjectStatus) -> Self {
+        Self {
+            status,
+            last_error: None,
+        }
+    }
+
+    /// Return the current lifecycle status.
+    #[must_use]
+    pub const fn status(&self) -> ProjectStatus {
+        self.status
+    }
+
+    /// Return the most recent actor failure, if one was recorded.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+}
+
 /// Errors returned when a project actor cannot service a request.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -303,8 +331,21 @@ pub enum ProjectActorError {
 }
 
 enum ProjectRequest {
+    Query {
+        reply: oneshot::Sender<ProjectState>,
+    },
     SetStatus {
         status: ProjectStatus,
+        reply: oneshot::Sender<()>,
+    },
+    Refresh {
+        reply: oneshot::Sender<ProjectState>,
+    },
+    Restart {
+        reply: oneshot::Sender<ProjectState>,
+    },
+    Fail {
+        message: String,
         reply: oneshot::Sender<()>,
     },
     Shutdown {
@@ -326,6 +367,20 @@ impl ProjectHandle {
         self.status.clone()
     }
 
+    /// Query the actor's current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped or drops the response.
+    pub async fn query(&self) -> Result<ProjectState, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Query { reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
     /// Change the actor's observable lifecycle state.
     ///
     /// # Errors
@@ -335,6 +390,51 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::SetStatus { status, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
+    /// Refresh the actor's current state without mutating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped or drops the response.
+    pub async fn refresh(&self) -> Result<ProjectState, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Refresh { reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
+    /// Restart the project actor's managed services.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped or drops the response.
+    pub async fn restart(&self) -> Result<ProjectState, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Restart { reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
+    /// Record a failure and expose it through [`ProjectState::last_error`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped or drops the response.
+    pub async fn fail(&self, message: impl Into<String>) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Fail {
+                message: message.into(),
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -360,7 +460,11 @@ impl ProjectHandle {
 pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
-    tokio::spawn(run_project_actor(receiver, status_tx));
+    tokio::spawn(run_project_actor(
+        receiver,
+        status_tx,
+        ProjectState::new(ProjectStatus::Starting),
+    ));
     ProjectHandle {
         sender,
         status: status_rx,
@@ -370,15 +474,38 @@ pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     status_tx: watch::Sender<ProjectStatus>,
+    mut state: ProjectState,
 ) {
     while let Some(request) = receiver.recv().await {
         match request {
+            ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
+                let _ = reply.send(state.clone());
+            }
             ProjectRequest::SetStatus { status, reply } => {
+                state.status = status;
+                state.last_error = None;
                 let _ = status_tx.send(status);
                 let _ = reply.send(());
             }
+            ProjectRequest::Restart { reply } => {
+                state.status = ProjectStatus::Restarting;
+                state.last_error = None;
+                let _ = status_tx.send(ProjectStatus::Restarting);
+                state.status = ProjectStatus::Ready;
+                let _ = status_tx.send(ProjectStatus::Ready);
+                let _ = reply.send(state.clone());
+            }
+            ProjectRequest::Fail { message, reply } => {
+                state.status = ProjectStatus::Failed;
+                state.last_error = Some(message);
+                let _ = status_tx.send(ProjectStatus::Failed);
+                let _ = reply.send(());
+            }
             ProjectRequest::Shutdown { reply } => {
+                state.status = ProjectStatus::Stopping;
+                state.last_error = None;
                 let _ = status_tx.send(ProjectStatus::Stopping);
+                state.status = ProjectStatus::Stopped;
                 let _ = status_tx.send(ProjectStatus::Stopped);
                 let _ = reply.send(());
                 break;
@@ -515,6 +642,29 @@ mod tests {
             handle.set_status(ProjectStatus::Ready).await,
             Err(ProjectActorError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_exposes_typed_query_refresh_restart_and_failure() {
+        let handle = spawn_project_actor(4);
+
+        assert_eq!(
+            handle.query().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
+        assert_eq!(
+            handle.refresh().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
+        assert_eq!(
+            handle.restart().await.unwrap().status(),
+            ProjectStatus::Ready
+        );
+
+        handle.fail("rust-analyzer exited").await.unwrap();
+        let state = handle.query().await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(state.last_error(), Some("rust-analyzer exited"));
     }
 
     #[cfg(unix)]
