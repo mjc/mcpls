@@ -27,9 +27,8 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
-use crate::edit_apply::apply_plan;
-use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::PlanId;
+use crate::project::AppliedEditPlan;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectHandle, ProjectId, ProjectIdentity,
     ProjectRegistry, ProjectState,
@@ -76,6 +75,16 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
+    })
+}
+
+fn applied_edit_plan_json(result: &AppliedEditPlan, project_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "plan_id": result.plan_id.as_str(),
+        "committed_files": result.committed_files,
+        "operations": result.operations,
+        "unified_diff": result.unified_diff,
     })
 }
 
@@ -266,22 +275,11 @@ impl McplsServer {
             .actor_for_project(&id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let plan = actor
-            .take_edit_plan(plan_id, project_id)
+        let result = actor
+            .apply_edit_plan(plan_id, project_id, identity.root().as_path().to_path_buf())
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let boundary = WorkspaceBoundary::new(identity.root().as_path())
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let report = apply_plan(&boundary, &plan)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-
-        encode_json(&serde_json::json!({
-            "project_id": id.as_str(),
-            "plan_id": plan.id().as_str(),
-            "committed_files": report.committed_files,
-            "operations": plan.operations(),
-            "unified_diff": plan.unified_diff(),
-        }))
+        encode_json(&applied_edit_plan_json(&result, id.as_str()))
     }
 
     /// Restart the language-server actor for one project.

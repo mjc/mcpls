@@ -14,6 +14,8 @@ use crate::bridge::{
     RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
     TranslatorTemplate, WorkspaceSymbolResult,
 };
+use crate::edit_apply::{ApplyReport, apply_plan};
+use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::lsp::LspNotification;
 
@@ -601,6 +603,19 @@ pub enum ProjectActorError {
     Operation(String),
 }
 
+/// Result of consuming and applying one project-owned edit plan.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AppliedEditPlan {
+    /// Opaque identifier of the consumed plan.
+    pub plan_id: PlanId,
+    /// Human-readable operations captured by the preview.
+    pub operations: Vec<String>,
+    /// Unified diff captured by the preview.
+    pub unified_diff: String,
+    /// Files replaced successfully.
+    pub committed_files: Vec<PathBuf>,
+}
+
 enum ProjectRequest {
     Query {
         reply: oneshot::Sender<ProjectState>,
@@ -742,6 +757,12 @@ enum ProjectRequest {
         plan_id: PlanId,
         project_id: String,
         reply: oneshot::Sender<Result<EditPlan, String>>,
+    },
+    ApplyEditPlan {
+        plan_id: PlanId,
+        project_id: String,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
     },
     ServerLogs {
         limit: usize,
@@ -1430,6 +1451,34 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Consume and apply one project-owned workspace edit preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the plan is not owned by the
+    /// project, or filesystem validation/application fails.
+    pub async fn apply_edit_plan(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+        root: PathBuf,
+    ) -> Result<AppliedEditPlan, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ApplyEditPlan {
+                plan_id,
+                project_id,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return recent logs from this project's language servers.
     ///
     /// # Errors
@@ -1545,6 +1594,27 @@ impl ProjectRuntime {
         self.edit_plans
             .take_for_project(plan_id, project_id)
             .map_err(|error| error.to_string())
+    }
+
+    fn apply_edit_plan(
+        &mut self,
+        plan_id: &PlanId,
+        project_id: &str,
+        root: &Path,
+    ) -> Result<AppliedEditPlan, String> {
+        let plan = self
+            .edit_plans
+            .take_for_project(plan_id, project_id)
+            .map_err(|error| error.to_string())?;
+        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let ApplyReport { committed_files } =
+            apply_plan(&boundary, &plan).map_err(|error| error.to_string())?;
+        Ok(AppliedEditPlan {
+            plan_id: plan.id().clone(),
+            operations: plan.operations().to_vec(),
+            unified_diff: plan.unified_diff().to_string(),
+            committed_files,
+        })
     }
 
     async fn hover(
@@ -2208,6 +2278,14 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.take_edit_plan(&plan_id, &project_id));
+        }
+        ProjectRequest::ApplyEditPlan {
+            plan_id,
+            project_id,
+            root,
+            reply,
+        } => {
+            let _ = reply.send(runtime.apply_edit_plan(&plan_id, &project_id, &root));
         }
         ProjectRequest::ServerLogs {
             limit,
