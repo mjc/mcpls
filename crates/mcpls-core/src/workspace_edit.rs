@@ -93,11 +93,7 @@ pub fn normalize(edit: WorkspaceEdit) -> Result<NormalizedWorkspaceEdit, Normali
                 version: None,
                 edits: edits
                     .into_iter()
-                    .map(|edit| NormalizedTextEdit {
-                        range: edit.range,
-                        new_text: edit.new_text,
-                        annotation_id: None,
-                    })
+                    .map(|edit| normalize_text_edit(OneOf::Left(edit)))
                     .collect(),
             }
         }));
@@ -124,22 +120,24 @@ fn normalize_text_document_edit(edit: lsp_types::TextDocumentEdit) -> EditOperat
     EditOperation::Text {
         uri: edit.text_document.uri,
         version: edit.text_document.version,
-        edits: edit
-            .edits
-            .into_iter()
-            .map(|edit| match edit {
-                OneOf::Left(edit) => NormalizedTextEdit {
-                    range: edit.range,
-                    new_text: edit.new_text,
-                    annotation_id: None,
-                },
-                OneOf::Right(edit) => NormalizedTextEdit {
-                    range: edit.text_edit.range,
-                    new_text: edit.text_edit.new_text,
-                    annotation_id: Some(edit.annotation_id),
-                },
-            })
-            .collect(),
+        edits: edit.edits.into_iter().map(normalize_text_edit).collect(),
+    }
+}
+
+fn normalize_text_edit(
+    edit: OneOf<lsp_types::TextEdit, lsp_types::AnnotatedTextEdit>,
+) -> NormalizedTextEdit {
+    match edit {
+        OneOf::Left(edit) => NormalizedTextEdit {
+            range: edit.range,
+            new_text: edit.new_text,
+            annotation_id: None,
+        },
+        OneOf::Right(edit) => NormalizedTextEdit {
+            range: edit.text_edit.range,
+            new_text: edit.text_edit.new_text,
+            annotation_id: Some(edit.annotation_id),
+        },
     }
 }
 
@@ -204,10 +202,13 @@ mod tests {
                     uri,
                     version: Some(4),
                 },
-                edits: vec![OneOf::Left(TextEdit::new(
-                    Range::new(Position::new(0, 0), Position::new(0, 0)),
-                    "documentChanges".to_string(),
-                ))],
+                edits: vec![OneOf::Right(lsp_types::AnnotatedTextEdit {
+                    text_edit: TextEdit::new(
+                        Range::new(Position::new(0, 0), Position::new(0, 0)),
+                        "documentChanges".to_string(),
+                    ),
+                    annotation_id: "annotated".to_string(),
+                })],
             }])),
             change_annotations: None,
         };
@@ -223,8 +224,9 @@ mod tests {
             &normalized.operations[1],
             EditOperation::Text {
                 version: Some(4),
+                edits,
                 ..
-            }
+            } if edits[0].annotation_id.as_deref() == Some("annotated")
         ));
     }
 
