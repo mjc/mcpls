@@ -8,6 +8,7 @@
 //! 5. Graceful shutdown sequence
 
 use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
@@ -248,21 +249,43 @@ impl LspServer {
             config.server_config.command, config.server_config.args
         );
 
-        let mut child =
-            Command::new(&config.server_config.command)
-                .args(&config.server_config.args)
-                .current_dir(config.workspace_roots.first().cloned().unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                }))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| Error::ServerSpawnFailed {
-                    command: config.server_config.command.clone(),
-                    source: e,
-                })?;
+        let workspace_root = config
+            .workspace_roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let project_env = load_project_environment(&workspace_root).await;
+        let command = resolve_command(&config.server_config.command, project_env.as_ref());
+        let mut child_command = Command::new(command);
+        child_command
+            .args(&config.server_config.args)
+            .current_dir(&workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        if let Some(project_env) = project_env {
+            child_command.env_clear().envs(env::vars());
+            for (key, value) in project_env {
+                match value {
+                    Some(value) => {
+                        child_command.env(key, value);
+                    }
+                    None => {
+                        child_command.env_remove(key);
+                    }
+                }
+            }
+        }
+        child_command.envs(&config.server_config.env);
+
+        let mut child = child_command
+            .spawn()
+            .map_err(|e| Error::ServerSpawnFailed {
+                command: config.server_config.command.clone(),
+                source: e,
+            })?;
 
         let stdin = child
             .stdin
@@ -574,6 +597,98 @@ impl LspServer {
 
         result
     }
+}
+
+/// Load a project's environment from direnv, falling back to its flake.
+async fn load_project_environment(
+    root: &std::path::Path,
+) -> Option<HashMap<String, Option<String>>> {
+    if root.join(".envrc").is_file()
+        && let Some(environment) = command_environment("direnv", ["export", "json"], root).await
+    {
+        info!("Loaded LSP environment from direnv: {}", root.display());
+        return Some(environment);
+    }
+
+    let root_string = root.to_str()?;
+    if root.join("flake.nix").is_file()
+        && let Some(environment) =
+            command_environment("nix", ["develop", root_string, "-c", "env"], root).await
+    {
+        info!(
+            "Loaded LSP environment from nix develop: {}",
+            root.display()
+        );
+        return Some(environment);
+    }
+
+    None
+}
+
+async fn command_environment<I, S>(
+    command: &str,
+    args: I,
+    root: &std::path::Path,
+) -> Option<HashMap<String, Option<String>>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = Command::new(command)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    if command == "direnv" {
+        serde_json::from_slice(&output.stdout).ok()
+    } else {
+        Some(
+            output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| {
+                    let separator = line.iter().position(|byte| *byte == b'=')?;
+                    let (key, value) = line.split_at(separator);
+                    Some((
+                        String::from_utf8(key.to_vec()).ok()?,
+                        Some(String::from_utf8(value[1..].to_vec()).ok()?),
+                    ))
+                })
+                .collect(),
+        )
+    }
+}
+
+fn resolve_command(
+    command: &str,
+    project_env: Option<&HashMap<String, Option<String>>>,
+) -> PathBuf {
+    let command_path = PathBuf::from(command);
+    if command_path.is_absolute() || command_path.components().count() > 1 {
+        return command_path;
+    }
+
+    let current_path = env::var("PATH").ok();
+    let project_path = project_env
+        .and_then(|environment| environment.get("PATH"))
+        .and_then(Option::as_deref);
+    for path in [current_path.as_deref(), project_path]
+        .into_iter()
+        .flatten()
+    {
+        for directory in env::split_paths(path) {
+            let candidate = directory.join(command);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    command_path
 }
 
 #[cfg(test)]
