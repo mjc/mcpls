@@ -466,16 +466,6 @@ fn rust_project_compatibility_key(root: &Path) -> Option<[u8; 32]> {
     (has_toolchain && has_manifest).then(|| hasher.finalize().into())
 }
 
-fn compatible_rust_projects(left: &ProjectIdentity, right: &ProjectIdentity) -> bool {
-    let Some(left_key) = rust_project_compatibility_key(left.root.as_path()) else {
-        return false;
-    };
-    let Some(right_key) = rust_project_compatibility_key(right.root.as_path()) else {
-        return false;
-    };
-    left_key == right_key
-}
-
 /// Observable lifecycle state for one project actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2231,6 +2221,7 @@ struct ProjectEntry {
     identity: ProjectIdentity,
     actor: ProjectHandle,
     mutation: MutationGate,
+    compatibility_key: Option<[u8; 32]>,
 }
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
@@ -2273,6 +2264,7 @@ impl ProjectRegistry {
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
         let mut projects = self.projects.write().await;
         if let Some(existing) = projects.get(identity.id()) {
             if existing.identity.root() != identity.root() {
@@ -2302,7 +2294,8 @@ impl ProjectRegistry {
                     .repository_identity()
                     .is_some_and(|existing| {
                         existing == repository
-                            && compatible_rust_projects(&project.identity, &identity)
+                            && compatibility_key.is_some()
+                            && project.compatibility_key == compatibility_key
                     })
             })
         });
@@ -2341,6 +2334,7 @@ impl ProjectRegistry {
                     identity,
                     actor: actor.clone(),
                     mutation: mutation.clone(),
+                    compatibility_key,
                 },
             );
             drop(projects);
@@ -2364,6 +2358,7 @@ impl ProjectRegistry {
                 identity,
                 actor: actor.clone(),
                 mutation: std::sync::Arc::new(Mutex::new(())),
+                compatibility_key,
             },
         );
         drop(projects);
