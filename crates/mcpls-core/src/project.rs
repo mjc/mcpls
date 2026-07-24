@@ -7,8 +7,9 @@ use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
-    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult, ReferencesResult,
-    RenameResult, SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult, InlayHintsResult,
+    ReferencesResult, RenameResult, SignatureHelpResult, Translator, TranslatorTemplate,
+    WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -496,6 +497,14 @@ enum ProjectRequest {
         character: u32,
         reply: oneshot::Sender<Result<SignatureHelpResult, String>>,
     },
+    InlayHints {
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        reply: oneshot::Sender<Result<InlayHintsResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -916,6 +925,38 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route inlay hints through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn inlay_hints(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<InlayHintsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::InlayHints {
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -1113,6 +1154,26 @@ impl ProjectRuntime {
     ) -> Result<SignatureHelpResult, String> {
         self.translator
             .handle_signature_help(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn inlay_hints(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<InlayHintsResult, String> {
+        self.translator
+            .handle_inlay_hints(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+            )
             .await
             .map_err(|error| error.to_string())
     }
@@ -1335,6 +1396,26 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.signature_help(file_path, line, character).await);
+        }
+        ProjectRequest::InlayHints {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .inlay_hints(
+                        file_path,
+                        start_line,
+                        start_character,
+                        end_line,
+                        end_character,
+                    )
+                    .await,
+            );
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -2009,6 +2090,25 @@ mod tests {
 
         let result = handle
             .signature_help(file.display().to_string(), 1, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_inlay_hints_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .inlay_hints(file.display().to_string(), 1, 5, 1, 15)
             .await;
 
         assert!(matches!(
