@@ -538,7 +538,19 @@ impl McplsServer {
             kind_filter,
         }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
+            actor
+                .code_actions(
+                    file_path,
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                    kind_filter,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        } else {
             let mut translator = self.context.translator.lock().await;
             translator
                 .handle_code_actions(
@@ -550,12 +562,13 @@ impl McplsServer {
                     kind_filter,
                 )
                 .await
+                .map_err(|error| error.to_string())
         };
 
         match result {
             Ok(value) => serde_json::to_string(&value)
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
-            Err(e) => Err(McpError::internal_error(e.to_string(), None)),
+            Err(e) => Err(McpError::internal_error(e, None)),
         }
     }
 
@@ -1367,6 +1380,42 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 tab_size: 4,
                 insert_spaces: true,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_code_actions_routes_registered_paths_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        let result = server
+            .get_code_actions(Parameters(CodeActionsParams {
+                file_path: file_path.display().to_string(),
+                start_line: 1,
+                start_character: 5,
+                end_line: 1,
+                end_character: 15,
+                kind_filter: None,
             }))
             .await;
 
