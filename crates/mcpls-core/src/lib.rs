@@ -146,7 +146,9 @@ pub(crate) async fn diagnostics_pump(
                         t.notification_cache_mut()
                             .store_message(m.typ.into(), m.message);
                     }
-                    LspNotification::Progress { .. } | LspNotification::Other { .. } => {}
+                    LspNotification::Progress { .. }
+                    | LspNotification::ServerStatus(_)
+                    | LspNotification::Other { .. } => {}
                 }
             }
         }

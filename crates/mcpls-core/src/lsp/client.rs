@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, trace, warn};
@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
+    ServerStatusParams,
 };
 
 /// JSON-RPC protocol version.
@@ -57,6 +58,11 @@ pub struct LspClient {
 
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
+
+    /// Latest server status notification, when the server provides one.
+    server_status: Arc<Mutex<Option<ServerStatusParams>>>,
+    /// Wakes waiters when a server status notification arrives.
+    server_status_notify: Arc<Notify>,
 }
 
 impl Clone for LspClient {
@@ -71,6 +77,8 @@ impl Clone for LspClient {
             request_counter: Arc::clone(&self.request_counter),
             command_tx: self.command_tx.clone(),
             receiver_task: None,
+            server_status: Arc::clone(&self.server_status),
+            server_status_notify: Arc::clone(&self.server_status_notify),
         }
     }
 }
@@ -109,6 +117,8 @@ impl LspClient {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
             receiver_task: None,
+            server_status: Arc::new(Mutex::new(None)),
+            server_status_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -128,6 +138,8 @@ impl LspClient {
             command_rx,
             pending_requests,
             None,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Notify::new()),
         ));
 
         Self {
@@ -136,6 +148,8 @@ impl LspClient {
             request_counter,
             command_tx,
             receiver_task: Some(receiver_task),
+            server_status: Arc::new(Mutex::new(None)),
+            server_status_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -153,12 +167,16 @@ impl LspClient {
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
         let (command_tx, command_rx) = mpsc::channel(100);
+        let server_status = Arc::new(Mutex::new(None));
+        let server_status_notify = Arc::new(Notify::new());
 
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
             pending_requests,
             Some(notification_tx),
+            Arc::clone(&server_status),
+            Arc::clone(&server_status_notify),
         ));
 
         Self {
@@ -167,6 +185,8 @@ impl LspClient {
             request_counter,
             command_tx,
             receiver_task: Some(receiver_task),
+            server_status,
+            server_status_notify,
         }
     }
 
@@ -179,6 +199,41 @@ impl LspClient {
     /// Get the current server state.
     pub async fn state(&self) -> super::ServerState {
         *self.state.lock().await
+    }
+
+    pub(crate) async fn set_ready(&self) {
+        *self.state.lock().await = super::ServerState::Ready;
+    }
+
+    /// Wait until the server reports that its background work is quiescent.
+    ///
+    /// Servers without the experimental status notification are considered
+    /// ready after initialization and should not call this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns a timeout or a server-health error when readiness is not reached.
+    pub async fn wait_until_quiescent(&self, timeout_duration: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        loop {
+            if let Some(status) = self.server_status.lock().await.clone() {
+                if status.health == "error" {
+                    return Err(Error::LspInitFailed {
+                        message: status
+                            .message
+                            .unwrap_or_else(|| "language server reported an error".to_string()),
+                    });
+                }
+                if status.quiescent {
+                    return Ok(());
+                }
+            }
+
+            let notified = self.server_status_notify.notified();
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?;
+        }
     }
 
     /// Send request and wait for response with timeout.
@@ -348,6 +403,8 @@ impl LspClient {
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
+        server_status: Arc<Mutex<Option<ServerStatusParams>>>,
+        server_status_notify: Arc<Notify>,
     ) -> Result<()> {
         debug!("Message loop started");
         let result = Self::message_loop_inner(
@@ -355,6 +412,8 @@ impl LspClient {
             &mut command_rx,
             &pending_requests,
             notification_tx.as_ref(),
+            &server_status,
+            &server_status_notify,
         )
         .await;
         if let Err(ref e) = result {
@@ -370,6 +429,8 @@ impl LspClient {
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        server_status: &Arc<Mutex<Option<ServerStatusParams>>>,
+        server_status_notify: &Arc<Notify>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -452,6 +513,11 @@ impl LspClient {
 
                             // Parse notification into typed variant
                             let typed = LspNotification::parse(&notification.method, notification.params);
+
+                            if let LspNotification::ServerStatus(status) = &typed {
+                                *server_status.lock().await = Some(status.clone());
+                                server_status_notify.notify_waiters();
+                            }
 
                             // Forward to notification handler if sender is available
                             if let Some(tx) = notification_tx {

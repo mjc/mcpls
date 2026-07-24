@@ -751,6 +751,16 @@ impl ProjectRegistry {
             .map_err(ProjectRegistryError::from)
     }
 
+    /// Mark a registered project ready after its language servers are loaded.
+    pub async fn mark_ready(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
+        let actor = self.actor(id).await?;
+        actor
+            .set_status(ProjectStatus::Ready)
+            .await
+            .map_err(ProjectRegistryError::from)?;
+        actor.query().await.map_err(ProjectRegistryError::from)
+    }
+
     /// Return a registered project's identity without waiting on its actor.
     ///
     /// # Errors

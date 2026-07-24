@@ -109,6 +109,37 @@ impl McplsServer {
         encode_json(&project_state_json(&id, identity.root().as_path(), &state))
     }
 
+    /// Activate a registered project and wait for its language servers to load.
+    #[tool(
+        description = "Activate a registered project. Blocks until its applicable language servers finish loading and are ready for code intelligence."
+    )]
+    async fn project_activate(
+        &self,
+        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let identity = self
+            .context
+            .project_registry
+            .identity(&id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        {
+            let mut translator = self.context.translator.lock().await;
+            translator
+                .activate_project(identity.root().as_path().to_path_buf())
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        }
+        let state = self
+            .context
+            .project_registry
+            .mark_ready(&id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        encode_json(&project_state_json(&id, identity.root().as_path(), &state))
+    }
+
     /// List all registered projects without waiting on project actors.
     #[tool(description = "List registered projects and their canonical roots.")]
     async fn project_list(

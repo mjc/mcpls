@@ -155,6 +155,112 @@ impl Translator {
         self.lsp_roots.insert(language_id, roots);
     }
 
+    /// Activate one project and wait for its applicable language servers to be ready.
+    ///
+    /// This is the explicit project boundary used by the `project_activate`
+    /// MCP tool. A server is not exposed to code-intelligence requests until
+    /// its initialization completes; rust-analyzer additionally has to report
+    /// that its background project load is quiescent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured server applies, a server cannot be
+    /// started, or project loading does not reach a ready state in time.
+    pub async fn activate_project(&mut self, root: PathBuf) -> Result<()> {
+        let configs: Vec<_> = self
+            .lsp_configs
+            .values()
+            .filter(|config| config.should_spawn(&root, self.heuristics_max_depth))
+            .cloned()
+            .collect();
+
+        if configs.is_empty() {
+            return Err(Error::NoServerConfigured);
+        }
+
+        let mut pending = Vec::new();
+        for config in &configs {
+            let language_id = &config.language_id;
+            let same_root = self
+                .lsp_roots
+                .get(language_id)
+                .is_some_and(|roots| roots.iter().any(|existing| existing == &root))
+                && self.lsp_clients.contains_key(language_id);
+
+            if same_root {
+                if let Some(server) = self.lsp_servers.get(language_id) {
+                    server
+                        .wait_until_quiescent(Duration::from_secs(config.timeout_seconds))
+                        .await?;
+                }
+                continue;
+            }
+
+            if let Some(server) = self.lsp_servers.remove(language_id) {
+                let _ = server.shutdown().await;
+            }
+            self.lsp_clients.remove(language_id);
+            self.lsp_roots.remove(language_id);
+            pending.push(config.clone());
+        }
+
+        if pending.is_empty() {
+            self.set_workspace_roots(vec![root]);
+            return Ok(());
+        }
+
+        let expected_languages = pending
+            .iter()
+            .map(|config| config.language_id.clone())
+            .collect();
+        self.set_expected_languages(expected_languages);
+
+        let server_configs = pending
+            .iter()
+            .map(|config| ServerInitConfig {
+                server_config: config.clone(),
+                workspace_roots: vec![root.clone()],
+                initialization_options: config.initialization_options.clone(),
+                notification_tx: None,
+            })
+            .collect::<Vec<_>>();
+        let result = LspServer::spawn_batch(&server_configs).await;
+
+        if result.all_failed() {
+            self.clear_expected_languages();
+            let message = result
+                .failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::LspInitFailed { message });
+        }
+
+        for server in result.servers.values() {
+            let timeout = pending
+                .iter()
+                .find(|config| config.language_id == server.client().language_id())
+                .map_or(30, |config| config.timeout_seconds);
+            server
+                .wait_until_quiescent(Duration::from_secs(timeout))
+                .await?;
+        }
+
+        self.set_workspace_roots(vec![root.clone()]);
+        for (language_id, mut server) in result.servers {
+            let client = server.client().clone();
+            let roots = server.workspace_roots().to_vec();
+            let mut notifications = server.take_notification_rx();
+            tokio::spawn(async move { while notifications.recv().await.is_some() {} });
+            self.register_server_roots(language_id.clone(), roots);
+            self.register_client(language_id.clone(), client);
+            self.register_server(language_id, server);
+        }
+        self.clear_expected_languages();
+        Ok(())
+    }
+
     /// Get the document tracker.
     #[must_use]
     pub const fn document_tracker(&self) -> &DocumentTracker {
@@ -664,6 +770,19 @@ impl Translator {
         start.to_path_buf()
     }
 
+    async fn wait_for_language_ready(&self, language_id: &str) -> Result<()> {
+        let Some(client) = self.lsp_clients.get(language_id) else {
+            return Ok(());
+        };
+        let timeout = self
+            .lsp_configs
+            .get(language_id)
+            .map_or(30, |config| config.timeout_seconds);
+        client
+            .wait_until_quiescent(Duration::from_secs(timeout))
+            .await
+    }
+
     async fn ensure_client_for_file(&mut self, path: &Path) -> Result<()> {
         let language_id = detect_language(path, &self.extension_map);
         let Some(config) = self.lsp_configs.get(&language_id).cloned() else {
@@ -679,6 +798,8 @@ impl Translator {
             return Ok(());
         }
 
+        self.wait_for_language_ready(&language_id).await?;
+
         let root = self.project_root_for_file(path, &config);
 
         if self
@@ -690,6 +811,12 @@ impl Translator {
             return Ok(());
         }
 
+        if let Some(server) = self.lsp_servers.remove(&language_id) {
+            let _ = server.shutdown().await;
+        }
+        self.lsp_clients.remove(&language_id);
+        self.lsp_roots.remove(&language_id);
+
         let mut server = LspServer::spawn(ServerInitConfig {
             server_config: config.clone(),
             workspace_roots: vec![root.clone()],
@@ -697,6 +824,9 @@ impl Translator {
             notification_tx: None,
         })
         .await?;
+        server
+            .wait_until_quiescent(Duration::from_secs(config.timeout_seconds))
+            .await?;
         let client = server.client().clone();
         let _ = server.take_notification_rx();
         self.register_client(language_id.clone(), client);
@@ -1317,6 +1447,7 @@ impl Translator {
                     Error::ServerInitializing(lang.clone())
                 })
         })?;
+        self.wait_for_language_ready(client.language_id()).await?;
 
         let params = LspWorkspaceSymbolParams {
             query,
