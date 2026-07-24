@@ -2662,6 +2662,30 @@ impl ProjectRegistry {
         actor.restart().await.map_err(ProjectRegistryError::from)
     }
 
+    /// Consume and apply a project-owned edit plan under the registry's
+    /// project mutation gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, the plan is not
+    /// owned by it, or filesystem validation/application fails.
+    pub async fn apply_edit_plan(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<AppliedEditPlan, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .apply_edit_plan(
+                plan_id,
+                id.as_str().to_string(),
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
     /// Resolve a file path to the actor owning the longest matching root.
     ///
     /// The registry lock is released before the returned actor is used, so a

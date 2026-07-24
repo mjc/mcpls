@@ -263,20 +263,10 @@ impl McplsServer {
         let id = parse_project_id(project_id.clone())?;
         let plan_id = PlanId::parse(plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let identity = self
+        let result = self
             .context
             .project_registry
-            .identity(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = actor
-            .apply_edit_plan(plan_id, project_id, identity.root().as_path().to_path_buf())
+            .apply_edit_plan(&id, plan_id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         encode_json(&applied_edit_plan_json(&result, id.as_str()))
