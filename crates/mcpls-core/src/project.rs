@@ -518,9 +518,6 @@ async fn run_project_actor(
 #[non_exhaustive]
 /// Errors returned by the shared project registry.
 pub enum ProjectRegistryError {
-    /// A project with this stable ID is already registered.
-    #[error("project is already registered: {0}")]
-    DuplicateProject(ProjectId),
     /// A different project already owns this canonical root.
     #[error("project root is already registered: {0}")]
     DuplicateRoot(PathBuf),
@@ -592,12 +589,15 @@ impl ProjectRegistry {
 
     /// List registered project identities without waiting on any actor.
     pub async fn list(&self) -> Vec<ProjectIdentity> {
-        self.projects
+        let mut projects: Vec<_> = self
+            .projects
             .read()
             .await
             .values()
             .map(|project| project.identity.clone())
-            .collect()
+            .collect();
+        projects.sort_by(|left, right| left.id().cmp(right.id()));
+        projects
     }
 
     /// Remove a project and ask its actor to shut down after releasing the registry lock.
@@ -627,6 +627,20 @@ impl ProjectRegistry {
             .query()
             .await
             .map_err(ProjectRegistryError::from)
+    }
+
+    /// Return a registered project's identity without waiting on its actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered.
+    pub async fn identity(&self, id: &ProjectId) -> Result<ProjectIdentity, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| project.identity.clone())
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
     /// Refresh a project's actor state.

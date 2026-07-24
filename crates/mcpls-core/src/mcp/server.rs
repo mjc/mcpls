@@ -12,6 +12,7 @@ use rmcp::model::{
     UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
@@ -26,6 +27,14 @@ use super::tools::{
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
 use crate::project::{CanonicalRoot, ProjectId, ProjectIdentity};
+
+fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
+    ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
+}
+
+fn encode_json<T: Serialize>(value: &T) -> Result<String, McpError> {
+    serde_json::to_string(value).map_err(|error| McpError::internal_error(error.to_string(), None))
+}
 
 /// MCP server that exposes LSP capabilities as tools.
 #[derive(Clone)]
@@ -55,8 +64,7 @@ impl McplsServer {
             config: _,
         }): Parameters<ProjectAddParams>,
     ) -> Result<String, McpError> {
-        let id = ProjectId::new(project_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let id = parse_project_id(project_id)?;
         let canonical_root = CanonicalRoot::new(&root)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let identity = ProjectIdentity::new(id.clone(), canonical_root);
@@ -70,12 +78,11 @@ impl McplsServer {
             .query()
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        serde_json::to_string(&serde_json::json!({
+        encode_json(&serde_json::json!({
             "project_id": id.as_str(),
             "root": identity.root().as_path(),
             "status": format!("{:?}", state.status()),
         }))
-        .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     /// List all registered projects without waiting on project actors.
@@ -94,8 +101,7 @@ impl McplsServer {
                 })
             })
             .collect();
-        serde_json::to_string(&result)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))
+        encode_json(&result)
     }
 
     /// Return the current state for one registered project.
@@ -104,20 +110,25 @@ impl McplsServer {
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
     ) -> Result<String, McpError> {
-        let id = ProjectId::new(project_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let id = parse_project_id(project_id)?;
+        let identity = self
+            .context
+            .project_registry
+            .identity(&id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let state = self
             .context
             .project_registry
             .status(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        serde_json::to_string(&serde_json::json!({
+        encode_json(&serde_json::json!({
             "project_id": id.as_str(),
+            "root": identity.root().as_path(),
             "status": format!("{:?}", state.status()),
             "last_error": state.last_error(),
         }))
-        .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     /// Remove a project and shut down its actor.
@@ -126,18 +137,16 @@ impl McplsServer {
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
     ) -> Result<String, McpError> {
-        let id = ProjectId::new(project_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let id = parse_project_id(project_id)?;
         self.context
             .project_registry
             .remove(id.clone())
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        serde_json::to_string(&serde_json::json!({
+        encode_json(&serde_json::json!({
             "project_id": id.as_str(),
             "removed": true,
         }))
-        .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     /// Restart the language-server actor for one project.
@@ -146,19 +155,17 @@ impl McplsServer {
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
     ) -> Result<String, McpError> {
-        let id = ProjectId::new(project_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let id = parse_project_id(project_id)?;
         let state = self
             .context
             .project_registry
             .restart(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        serde_json::to_string(&serde_json::json!({
+        encode_json(&serde_json::json!({
             "project_id": id.as_str(),
             "status": format!("{:?}", state.status()),
         }))
-        .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     /// Refresh one project actor's observable state.
@@ -167,20 +174,18 @@ impl McplsServer {
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
     ) -> Result<String, McpError> {
-        let id = ProjectId::new(project_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let id = parse_project_id(project_id)?;
         let state = self
             .context
             .project_registry
             .refresh(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        serde_json::to_string(&serde_json::json!({
+        encode_json(&serde_json::json!({
             "project_id": id.as_str(),
             "status": format!("{:?}", state.status()),
             "last_error": state.last_error(),
         }))
-        .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     /// Get hover information at a position in a file.
@@ -860,6 +865,15 @@ mod tests {
             .await
             .unwrap();
         assert!(added.contains("demo"));
+        let duplicate = server
+            .project_add(Parameters(ProjectAddParams {
+                project_id: "demo".to_string(),
+                root: root.path().display().to_string(),
+                config: Some(serde_json::json!({"ignored": true})),
+            }))
+            .await
+            .unwrap();
+        assert!(duplicate.contains("demo"));
 
         let listed = server
             .project_list(Parameters(ProjectListParams::default()))
@@ -874,6 +888,21 @@ mod tests {
             .await
             .unwrap();
         assert!(status.contains("Starting"));
+
+        let restarted = server
+            .project_restart_lsp(Parameters(ProjectIdParams {
+                project_id: "demo".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(restarted.contains("Ready"));
+        let refreshed = server
+            .project_refresh(Parameters(ProjectIdParams {
+                project_id: "demo".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(refreshed.contains("Ready"));
 
         server
             .project_remove(Parameters(ProjectIdParams {
