@@ -23,10 +23,13 @@ use super::tools::{
     DocumentSymbolsParams, FormatDocumentParams, GoToImplementationParams,
     GoToTypeDefinitionParams, HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams,
     ProjectListParams, ReferencesParams, RenameParams, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, WorkspaceSymbolParams,
+    SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::edit_apply::apply_plan;
+use crate::edit_paths::WorkspaceBoundary;
+use crate::edit_plan::PlanId;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectHandle, ProjectId, ProjectIdentity,
     ProjectRegistry, ProjectState,
@@ -234,6 +237,50 @@ impl McplsServer {
         encode_json(&serde_json::json!({
             "project_id": id.as_str(),
             "removed": true,
+        }))
+    }
+
+    /// Apply a previously previewed, project-owned workspace edit plan.
+    #[tool(
+        description = "Apply one previously previewed workspace edit plan by its project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced."
+    )]
+    async fn workspace_edit_apply(
+        &self,
+        Parameters(WorkspaceEditApplyParams {
+            project_id,
+            plan_id,
+        }): Parameters<WorkspaceEditApplyParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id.clone())?;
+        let plan_id = PlanId::parse(plan_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let identity = self
+            .context
+            .project_registry
+            .identity(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let plan = actor
+            .take_edit_plan(plan_id, project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let boundary = WorkspaceBoundary::new(identity.root().as_path())
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let report = apply_plan(&boundary, &plan)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        encode_json(&serde_json::json!({
+            "project_id": id.as_str(),
+            "plan_id": plan.id().as_str(),
+            "committed_files": report.committed_files,
+            "operations": plan.operations(),
+            "unified_diff": plan.unified_diff(),
         }))
     }
 
@@ -1052,6 +1099,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
     use tempfile::TempDir;
 
     fn create_test_server() -> McplsServer {
@@ -1149,6 +1197,62 @@ mod tests {
                 .unwrap()
                 .contains("demo")
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_edit_apply_consumes_project_owned_plan() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        std::fs::write(&file, "before\n").unwrap();
+
+        let registry = ProjectRegistry::new(2);
+        let identity = ProjectIdentity::new(
+            ProjectId::new("project").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+        let actor = registry.add(identity).await.unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file,
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace src.rs".to_string()],
+            true,
+            std::time::Duration::from_secs(60),
+        );
+        let plan_id = plan.id().as_str().to_string();
+        actor.store_edit_plan(plan).await.unwrap();
+
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let result = server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_string(),
+                plan_id: plan_id.clone(),
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["project_id"], "project");
+        assert_eq!(result["plan_id"], plan_id);
+        assert_eq!(result["committed_files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "after\n"
+        );
+
+        let second = server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_string(),
+                plan_id,
+            }))
+            .await;
+        assert!(second.is_err());
     }
 
     #[tokio::test]

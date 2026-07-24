@@ -11,5 +11,6 @@ pub use server::McplsServer;
 pub use tools::{
     CallHierarchyCallsParams, CallHierarchyPrepareParams, CompletionsParams, DefinitionParams,
     DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams, ProjectAddParams,
-    ProjectIdParams, ProjectListParams, ReferencesParams, RenameParams, WorkspaceSymbolParams,
+    ProjectIdParams, ProjectListParams, ReferencesParams, RenameParams, WorkspaceEditApplyParams,
+    WorkspaceSymbolParams,
 };

@@ -353,6 +353,16 @@ pub struct ProjectIdParams {
     pub project_id: String,
 }
 
+/// Parameters applying one project-owned workspace edit plan.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Apply one previously previewed project-owned workspace edit plan.")]
+pub struct WorkspaceEditApplyParams {
+    /// Stable project identifier that owns the plan.
+    pub project_id: String,
+    /// Opaque plan identifier returned by the preview flow.
+    pub plan_id: String,
+}
+
 /// Empty parameters for listing all registered projects.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List all registered projects.")]

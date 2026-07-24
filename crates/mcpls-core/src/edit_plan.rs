@@ -25,6 +25,27 @@ impl PlanId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Parse an opaque identifier received from an external caller.
+    ///
+    /// The identifier remains opaque to callers; parsing only rejects an
+    /// empty value so a missing plan cannot be confused with a valid token.
+    pub fn parse(value: impl Into<String>) -> Result<Self, PlanIdError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            Err(PlanIdError::Empty)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+/// Invalid externally supplied plan identifier.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlanIdError {
+    /// The identifier was empty or only whitespace.
+    #[error("edit plan ID must not be empty")]
+    Empty,
 }
 
 impl Default for PlanId {
