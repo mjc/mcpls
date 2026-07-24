@@ -54,6 +54,7 @@ use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use bridge::resources::make_uri;
 use bridge::{NotificationCache, ResourceSubscriptions, Translator};
 pub use config::{ProjectConfigTrust, ServerConfig};
@@ -417,9 +418,8 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 
 /// Start the MCPLS server with an explicit transport.
 ///
-/// Performs all shared setup (workspace discovery, LSP spawning, translator
-/// initialization, diagnostic pump tasks) and then delegates to the
-/// appropriate transport runner.
+/// Performs shared setup (workspace discovery, actor registry, and translator
+/// configuration) and then delegates to the appropriate transport runner.
 ///
 /// # Errors
 ///

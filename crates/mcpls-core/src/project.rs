@@ -12,6 +12,7 @@ use crate::bridge::{
     RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
     TranslatorTemplate, WorkspaceSymbolResult,
 };
+use crate::lsp::LspNotification;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -542,6 +543,9 @@ enum ProjectRequest {
     ServerMessages {
         limit: usize,
         reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
+    },
+    Notification {
+        notification: LspNotification,
     },
     Restart {
         reply: oneshot::Sender<ProjectState>,
@@ -1472,6 +1476,29 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn notification(&mut self, notification: LspNotification) {
+        match notification {
+            LspNotification::PublishDiagnostics(params) => {
+                self.translator.notification_cache_mut().store_diagnostics(
+                    &params.uri,
+                    params.version,
+                    params.diagnostics,
+                );
+            }
+            LspNotification::LogMessage(params) => self
+                .translator
+                .notification_cache_mut()
+                .store_log(params.typ.into(), params.message),
+            LspNotification::ShowMessage(params) => self
+                .translator
+                .notification_cache_mut()
+                .store_message(params.typ.into(), params.message),
+            LspNotification::Progress { .. }
+            | LspNotification::ServerStatus(_)
+            | LspNotification::Other { .. } => {}
+        }
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -1511,10 +1538,12 @@ pub fn spawn_project_actor_with_translator(
     translator: Translator,
 ) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
+    let actor_sender = sender.clone();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let runtime = ProjectRuntime { translator };
     tokio::spawn(run_project_actor(
         receiver,
+        actor_sender,
         status_tx,
         ProjectState::new(ProjectStatus::Starting, runtime.summary()),
         runtime,
@@ -1527,14 +1556,37 @@ pub fn spawn_project_actor_with_translator(
 
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
+    actor_sender: mpsc::Sender<ProjectRequest>,
     status_tx: watch::Sender<ProjectStatus>,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
-        if handle_project_request(request, &status_tx, &mut state, &mut runtime).await {
+        if handle_project_request(request, &actor_sender, &status_tx, &mut state, &mut runtime)
+            .await
+        {
             break;
         }
+    }
+}
+
+fn spawn_notification_forwarders(
+    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    actor_sender: &mpsc::Sender<ProjectRequest>,
+) {
+    for mut receiver in notification_receivers {
+        let sender = actor_sender.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = receiver.recv().await {
+                if sender
+                    .send(ProjectRequest::Notification { notification })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -1543,6 +1595,7 @@ async fn run_project_actor(
 #[allow(clippy::too_many_lines)]
 async fn handle_project_request(
     request: ProjectRequest,
+    actor_sender: &mpsc::Sender<ProjectRequest>,
     status_tx: &watch::Sender<ProjectStatus>,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
@@ -1557,7 +1610,8 @@ async fn handle_project_request(
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
-                Ok(()) => {
+                Ok(notification_receivers) => {
+                    spawn_notification_forwarders(notification_receivers, actor_sender);
                     state.sync_runtime(runtime);
                     state.status = ProjectStatus::Ready;
                     let _ = status_tx.send(ProjectStatus::Ready);
@@ -1756,6 +1810,9 @@ async fn handle_project_request(
         }
         ProjectRequest::ServerMessages { limit, reply } => {
             let _ = reply.send(runtime.server_messages(limit));
+        }
+        ProjectRequest::Notification { notification } => {
+            runtime.notification(notification);
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -2510,6 +2567,24 @@ mod tests {
             result,
             Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
         ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_owns_notification_cache_for_server_logs() {
+        let actor = spawn_project_actor(2);
+        let notification = LspNotification::parse(
+            "window/logMessage",
+            Some(serde_json::json!({"type": 3, "message": "project log"})),
+        );
+        actor
+            .sender
+            .send(ProjectRequest::Notification { notification })
+            .await
+            .unwrap();
+
+        let result = actor.server_logs(10, None).await.unwrap();
+        assert_eq!(result.logs.len(), 1);
+        assert_eq!(result.logs[0].message, "project log");
     }
 
     #[tokio::test]
