@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -35,6 +35,18 @@ fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
 
 fn encode_json<T: Serialize>(value: &T) -> Result<String, McpError> {
     serde_json::to_string(value).map_err(|error| McpError::internal_error(error.to_string(), None))
+}
+
+fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpError> {
+    let uri = item
+        .get("uri")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("call hierarchy item is missing uri", None))?
+        .parse::<lsp_types::Uri>()
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+    crate::bridge::uri_to_path(&uri).ok_or_else(|| {
+        McpError::invalid_params("call hierarchy item uri must be an absolute file URI", None)
+    })
 }
 
 fn project_state_json(id: &ProjectId, root: &Path, state: &ProjectState) -> serde_json::Value {
@@ -612,9 +624,18 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        let path = call_hierarchy_item_path(&item)?;
+        let result = if let Some(actor) = self.context.actor_for_path(&path).await {
+            actor
+                .incoming_calls(item)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_incoming_calls(item).await
+            translator
+                .handle_incoming_calls(item)
+                .await
+                .map_err(|error| error.to_string())
         };
 
         match result {
@@ -632,9 +653,18 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let result = {
+        let path = call_hierarchy_item_path(&item)?;
+        let result = if let Some(actor) = self.context.actor_for_path(&path).await {
+            actor
+                .outgoing_calls(item)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
             let mut translator = self.context.translator.lock().await;
-            translator.handle_outgoing_calls(item).await
+            translator
+                .handle_outgoing_calls(item)
+                .await
+                .map_err(|error| error.to_string())
         };
 
         match result {
@@ -1831,6 +1861,76 @@ mod tests {
         let params = Parameters(CallHierarchyCallsParams { item });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_calls_routes_registered_items_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": crate::bridge::path_to_uri(&file_path).to_string(),
+            "range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}},
+            "selectionRange": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}}
+        });
+
+        let result = server
+            .get_incoming_calls(Parameters(CallHierarchyCallsParams { item }))
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_calls_routes_registered_items_to_project_actor() {
+        let project_root = TempDir::new().unwrap();
+        let unrelated_root = TempDir::new().unwrap();
+        let file_path = project_root.path().join("src.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(project_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let item = serde_json::json!({
+            "name": "test_function",
+            "kind": 12,
+            "uri": crate::bridge::path_to_uri(&file_path).to_string(),
+            "range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}},
+            "selectionRange": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 10}}
+        });
+
+        let result = server
+            .get_outgoing_calls(Parameters(CallHierarchyCallsParams { item }))
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("outside workspace"), "{error}");
     }
 
     #[tokio::test]

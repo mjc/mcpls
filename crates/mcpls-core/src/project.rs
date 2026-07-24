@@ -7,9 +7,9 @@ use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
-    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult, InlayHintsResult,
-    LocationsResult, ReferencesResult, RenameResult, SignatureHelpResult, Translator,
-    TranslatorTemplate, WorkspaceSymbolResult,
+    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, ReferencesResult,
+    RenameResult, SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -491,6 +491,14 @@ enum ProjectRequest {
         character: u32,
         reply: oneshot::Sender<Result<CallHierarchyPrepareResult, String>>,
     },
+    IncomingCalls {
+        item: serde_json::Value,
+        reply: oneshot::Sender<Result<IncomingCallsResult, String>>,
+    },
+    OutgoingCalls {
+        item: serde_json::Value,
+        reply: oneshot::Sender<Result<OutgoingCallsResult, String>>,
+    },
     SignatureHelp {
         file_path: String,
         line: u32,
@@ -913,6 +921,38 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route incoming call hierarchy requests through this project's actor-owned translator.
+    pub async fn incoming_calls(
+        &self,
+        item: serde_json::Value,
+    ) -> Result<IncomingCallsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::IncomingCalls { item, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route outgoing call hierarchy requests through this project's actor-owned translator.
+    pub async fn outgoing_calls(
+        &self,
+        item: serde_json::Value,
+    ) -> Result<OutgoingCallsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::OutgoingCalls { item, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Route signature help through this project's actor-owned translator.
     ///
     /// # Errors
@@ -1239,6 +1279,26 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn incoming_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<IncomingCallsResult, String> {
+        self.translator
+            .handle_incoming_calls(item)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn outgoing_calls(
+        &mut self,
+        item: serde_json::Value,
+    ) -> Result<OutgoingCallsResult, String> {
+        self.translator
+            .handle_outgoing_calls(item)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn signature_help(
         &mut self,
         file_path: String,
@@ -1511,6 +1571,12 @@ async fn handle_project_request(
                     .prepare_call_hierarchy(file_path, line, character)
                     .await,
             );
+        }
+        ProjectRequest::IncomingCalls { item, reply } => {
+            let _ = reply.send(runtime.incoming_calls(item).await);
+        }
+        ProjectRequest::OutgoingCalls { item, reply } => {
+            let _ = reply.send(runtime.outgoing_calls(item).await);
         }
         ProjectRequest::SignatureHelp {
             file_path,
