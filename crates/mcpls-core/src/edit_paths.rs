@@ -176,7 +176,7 @@ impl WorkspaceBoundary {
         let parent = Self::nearest_existing_parent(&supplied)?;
         let canonical_parent = fs::canonicalize(&parent)
             .map_err(|_| PathSafetyError::MissingParent(parent.clone()))?;
-        let canonical_parent = self.validate_canonical(canonical_parent)?;
+        let canonical_parent = self.validate_canonical_parent(canonical_parent)?;
         Ok(canonical_parent.join(name))
     }
 
@@ -230,6 +230,25 @@ impl WorkspaceBoundary {
         }
     }
 
+    /// Validate every operation in a plan without performing filesystem I/O
+    /// beyond the required metadata and canonicalization checks.
+    ///
+    /// The returned vector preserves the input order, allowing callers to
+    /// apply only the exact sequence that passed the same boundary check.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first path or precondition error encountered.
+    pub fn validate_operations(
+        &self,
+        operations: &[FileOperation],
+    ) -> Result<Vec<ValidatedFileOperation>, OperationValidationError> {
+        operations
+            .iter()
+            .map(|operation| self.validate_operation(operation))
+            .collect()
+    }
+
     fn resolve_input(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
@@ -253,14 +272,27 @@ impl WorkspaceBoundary {
     }
 
     fn validate_canonical(&self, canonical: PathBuf) -> Result<PathBuf, PathSafetyError> {
+        let canonical = self.validate_contained(canonical)?;
+        if canonical == self.root {
+            return Err(PathSafetyError::RootTarget(canonical));
+        }
+        Ok(canonical)
+    }
+
+    fn validate_canonical_parent(&self, canonical: PathBuf) -> Result<PathBuf, PathSafetyError> {
+        let canonical = self.validate_contained(canonical)?;
+        if !canonical.is_dir() {
+            return Err(PathSafetyError::SpecialFile(canonical));
+        }
+        Ok(canonical)
+    }
+
+    fn validate_contained(&self, canonical: PathBuf) -> Result<PathBuf, PathSafetyError> {
         if !canonical.starts_with(&self.root) {
             return Err(PathSafetyError::OutsideWorkspace {
                 root: self.root.clone(),
                 path: canonical,
             });
-        }
-        if canonical == self.root {
-            return Err(PathSafetyError::RootTarget(canonical));
         }
         let metadata = fs::metadata(&canonical)
             .map_err(|_| PathSafetyError::MissingParent(canonical.clone()))?;
@@ -360,6 +392,37 @@ mod tests {
                 recursive: false,
             }),
             Err(OperationValidationError::RecursiveDeleteRequired(path)) if path == directory
+        ));
+    }
+
+    #[test]
+    fn validates_operation_batches_in_input_order() {
+        let root = TempDir::new().unwrap();
+        let first = root.path().join("first.rs");
+        let second = root.path().join("second.rs");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let operations = [
+            FileOperation::Rename {
+                from: first.clone(),
+                to: root.path().join("renamed.rs"),
+                overwrite: false,
+            },
+            FileOperation::Delete {
+                path: second.clone(),
+                recursive: false,
+            },
+        ];
+
+        let validated = boundary.validate_operations(&operations).unwrap();
+
+        assert!(matches!(
+            &validated[..],
+            [
+                ValidatedFileOperation::Rename { from, .. },
+                ValidatedFileOperation::Delete { path, .. }
+            ] if from == &first && path == &second
         ));
     }
 }
