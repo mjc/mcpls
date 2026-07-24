@@ -27,7 +27,9 @@ use super::tools::{
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, Translator};
-use crate::project::{CanonicalRoot, ProjectId, ProjectIdentity, ProjectRegistry, ProjectState};
+use crate::project::{
+    CanonicalRoot, ProjectHandle, ProjectId, ProjectIdentity, ProjectRegistry, ProjectState,
+};
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
@@ -80,6 +82,15 @@ pub struct McplsServer {
 
 #[tool_router]
 impl McplsServer {
+    async fn actor_for_project(&self, value: String) -> Result<ProjectHandle, McpError> {
+        let project_id = parse_project_id(value)?;
+        self.context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))
+    }
+
     /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
     pub fn new(
@@ -527,13 +538,7 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
-        let project_id = parse_project_id(project_id)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&project_id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let actor = self.actor_for_project(project_id).await?;
         let result = actor
             .workspace_symbol(query, kind_filter, limit)
             .await
@@ -716,13 +721,7 @@ impl McplsServer {
             min_level,
         }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
-        let project_id = parse_project_id(project_id)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&project_id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let actor = self.actor_for_project(project_id).await?;
         encode_tool_result(actor.server_logs(limit, min_level).await)
     }
 
@@ -734,13 +733,7 @@ impl McplsServer {
         &self,
         Parameters(ServerMessagesParams { project_id, limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
-        let project_id = parse_project_id(project_id)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&project_id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let actor = self.actor_for_project(project_id).await?;
         encode_tool_result(actor.server_messages(limit).await)
     }
 
