@@ -518,6 +518,16 @@ async fn run_project_actor(
 #[non_exhaustive]
 /// Errors returned by the shared project registry.
 pub enum ProjectRegistryError {
+    /// A stable ID was reused for a different canonical root.
+    #[error("project ID {id} is already registered for {existing_root}, not {requested_root}")]
+    ConflictingProject {
+        /// The conflicting stable ID.
+        id: ProjectId,
+        /// The root currently owned by the ID.
+        existing_root: PathBuf,
+        /// The newly requested root.
+        requested_root: PathBuf,
+    },
     /// A different project already owns this canonical root.
     #[error("project root is already registered: {0}")]
     DuplicateRoot(PathBuf),
@@ -562,6 +572,13 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let mut projects = self.projects.write().await;
         if let Some(existing) = projects.get(identity.id()) {
+            if existing.identity.root() != identity.root() {
+                return Err(ProjectRegistryError::ConflictingProject {
+                    id: identity.id().clone(),
+                    existing_root: existing.identity.root().as_path().to_path_buf(),
+                    requested_root: identity.root().as_path().to_path_buf(),
+                });
+            }
             let actor = existing.actor.clone();
             drop(projects);
             return Ok(actor);
@@ -884,6 +901,32 @@ mod tests {
                 .status(),
             ProjectStatus::Starting
         );
+    }
+
+    #[tokio::test]
+    async fn project_registry_rejects_conflicting_duplicate_ids() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("same").unwrap(),
+                CanonicalRoot::new(first_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let result = registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("same").unwrap(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectRegistryError::ConflictingProject { id, .. }) if id.as_str() == "same"
+        ));
     }
 
     #[cfg(unix)]
