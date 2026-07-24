@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
-use crate::bridge::{DefinitionResult, HoverResult, Translator, TranslatorTemplate};
+use crate::bridge::{
+    DefinitionResult, HoverResult, ReferencesResult, Translator, TranslatorTemplate,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -430,6 +432,13 @@ enum ProjectRequest {
         character: u32,
         reply: oneshot::Sender<Result<DefinitionResult, String>>,
     },
+    References {
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+        reply: oneshot::Sender<Result<ReferencesResult, String>>,
+    },
     Restart {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -572,6 +581,36 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a references request through this project's actor-owned translator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn references(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<ReferencesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::References {
+                file_path,
+                line,
+                character,
+                include_declaration,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -623,6 +662,43 @@ struct ProjectRuntime {
 }
 
 impl ProjectRuntime {
+    async fn hover(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<HoverResult, String> {
+        self.translator
+            .handle_hover(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn definition(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<DefinitionResult, String> {
+        self.translator
+            .handle_definition(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn references(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<ReferencesResult, String> {
+        self.translator
+            .handle_references(file_path, line, character, include_declaration)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
@@ -714,11 +790,7 @@ async fn run_project_actor(
                 character,
                 reply,
             } => {
-                let result = runtime
-                    .translator
-                    .handle_hover(file_path, line, character)
-                    .await
-                    .map_err(|error| error.to_string());
+                let result = runtime.hover(file_path, line, character).await;
                 let _ = reply.send(result);
             }
             ProjectRequest::Definition {
@@ -727,11 +799,19 @@ async fn run_project_actor(
                 character,
                 reply,
             } => {
+                let result = runtime.definition(file_path, line, character).await;
+                let _ = reply.send(result);
+            }
+            ProjectRequest::References {
+                file_path,
+                line,
+                character,
+                include_declaration,
+                reply,
+            } => {
                 let result = runtime
-                    .translator
-                    .handle_definition(file_path, line, character)
-                    .await
-                    .map_err(|error| error.to_string());
+                    .references(file_path, line, character, include_declaration)
+                    .await;
                 let _ = reply.send(result);
             }
             ProjectRequest::SetStatus { status, reply } => {
@@ -1229,6 +1309,25 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle.definition(file.display().to_string(), 0, 0).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_references_requests_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .references(file.display().to_string(), 0, 0, false)
+            .await;
 
         assert!(matches!(
             result,
