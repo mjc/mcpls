@@ -339,6 +339,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // in a background task and registered into this shared translator once ready.
     // Blocking the MCP handshake on LSP init makes slow servers exceed the client's
     // initialize-request timeout (Claude Code: ~60s) -> "Request timed out".
+    let translator_template = translator.configuration_template();
     let translator = Arc::new(Mutex::new(translator));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
@@ -364,7 +365,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     }
 
     info!("Starting MCP server with rmcp...");
-    let project_registry = project::ProjectRegistry::new(32);
+    let project_registry =
+        project::ProjectRegistry::with_translator_template(32, translator_template);
     let mcp_server = mcp::McplsServer::new_with_registry(
         Arc::clone(&translator),
         Arc::clone(&subscriptions),

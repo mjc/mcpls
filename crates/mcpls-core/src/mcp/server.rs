@@ -124,18 +124,10 @@ impl McplsServer {
             .identity(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .activate_project(identity.root().as_path().to_path_buf())
-                .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            drop(translator);
-        }
         let state = self
             .context
             .project_registry
-            .mark_ready(&id)
+            .activate(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         encode_json(&project_state_json(&id, identity.root().as_path(), &state))
@@ -973,6 +965,50 @@ mod tests {
                 .unwrap()
                 .contains("demo")
         );
+    }
+
+    #[tokio::test]
+    async fn test_project_activate_uses_actor_runtime() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let mut translator = Translator::new();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/rust-analyzer".to_string();
+        translator.set_lsp_configs(vec![config], Some(1));
+        let template = translator.configuration_template();
+        let translator = Arc::new(Mutex::new(translator));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let registry = ProjectRegistry::with_translator_template(2, template);
+        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+
+        server
+            .project_add(Parameters(ProjectAddParams {
+                project_id: "fixture".to_string(),
+                root: root.path().display().to_string(),
+                config: None,
+            }))
+            .await
+            .unwrap();
+
+        let result = server
+            .project_activate(Parameters(ProjectIdParams {
+                project_id: "fixture".to_string(),
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let state = server
+            .project_status(Parameters(ProjectIdParams {
+                project_id: "fixture".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(state.contains("Failed"));
+        assert!(state.contains("rust"));
     }
 
     #[tokio::test]
