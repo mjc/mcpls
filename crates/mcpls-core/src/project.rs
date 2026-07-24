@@ -1920,8 +1920,10 @@ pub enum ProjectRegistryError {
 struct ProjectEntry {
     identity: ProjectIdentity,
     actor: ProjectHandle,
-    mutation: std::sync::Arc<Mutex<()>>,
+    mutation: MutationGate,
 }
+
+type MutationGate = std::sync::Arc<Mutex<()>>;
 
 /// Process-wide registry of project identities and their actor handles.
 #[derive(Clone)]
@@ -2165,8 +2167,7 @@ impl ProjectRegistry {
     async fn entry(
         &self,
         id: &ProjectId,
-    ) -> Result<(ProjectIdentity, ProjectHandle, std::sync::Arc<Mutex<()>>), ProjectRegistryError>
-    {
+    ) -> Result<(ProjectIdentity, ProjectHandle, MutationGate), ProjectRegistryError> {
         self.projects
             .read()
             .await
