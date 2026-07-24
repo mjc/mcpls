@@ -176,6 +176,7 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
+    workspace_roots: Vec<PathBuf>,
     /// Receiver for push notifications from the LSP server.
     ///
     /// Extract this before registering the server to receive real-time
@@ -231,6 +232,13 @@ impl LspServer {
 
         let mut child = Command::new(&config.server_config.command)
             .args(&config.server_config.args)
+            .current_dir(
+                config
+                    .workspace_roots
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -266,6 +274,7 @@ impl LspServer {
             client,
             capabilities,
             position_encoding,
+            workspace_roots: config.workspace_roots,
             notification_rx,
             _child: child,
         })
@@ -427,6 +436,12 @@ impl LspServer {
     #[must_use]
     pub fn position_encoding(&self) -> PositionEncodingKind {
         self.position_encoding.clone()
+    }
+
+    /// Get workspace roots used to initialize this server.
+    #[must_use]
+    pub fn workspace_roots(&self) -> &[PathBuf] {
+        &self.workspace_roots
     }
 
     /// Get client for making requests.
@@ -726,6 +741,7 @@ mod tests {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            workspace_roots: vec![],
             notification_rx: mock_notification_rx,
             _child: mock_child,
         };
@@ -814,6 +830,7 @@ mod tests {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            workspace_roots: vec![],
             notification_rx: mock_notification_rx1,
             _child: mock_child1,
         };
@@ -862,6 +879,7 @@ mod tests {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            workspace_roots: vec![],
             notification_rx: mock_notification_rx,
             _child: mock_child,
         };
@@ -924,6 +942,7 @@ mod tests {
                 client,
                 capabilities: lsp_types::ServerCapabilities::default(),
                 position_encoding: PositionEncodingKind::UTF8,
+                workspace_roots: vec![],
                 notification_rx: mock_notification_rx,
                 _child: mock_child,
             };
@@ -973,6 +992,7 @@ mod tests {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
+            workspace_roots: vec![],
             notification_rx: mock_notification_rx1,
             _child: mock_child1,
         };
@@ -1011,6 +1031,7 @@ mod tests {
             client: client2,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF16,
+            workspace_roots: vec![],
             notification_rx: mock_notification_rx2,
             _child: mock_child2,
         };

@@ -279,7 +279,13 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let max_depth = Some(config.workspace.heuristics_max_depth);
 
     let mut translator = Translator::new().with_extensions(extension_map);
-    translator.set_workspace_roots(workspace_roots.clone());
+    let validation_roots = if config.workspace.roots.is_empty() {
+        Vec::new()
+    } else {
+        workspace_roots.clone()
+    };
+    translator.set_workspace_roots(validation_roots);
+    translator.set_lsp_configs(config.lsp_servers.clone(), max_depth);
 
     let applicable_configs: Vec<ServerInitConfig> = config
         .lsp_servers

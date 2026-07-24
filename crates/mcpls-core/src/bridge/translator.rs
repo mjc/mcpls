@@ -22,7 +22,8 @@ use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::error::{Error, Result};
-use crate::lsp::{LspClient, LspServer};
+use crate::config::LspServerConfig;
+use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 #[derive(Debug)]
@@ -43,6 +44,12 @@ pub struct Translator {
     /// have finished initializing yet (background init). Used to return a clear
     /// "still initializing" error instead of "no server configured".
     expected_languages: HashSet<String>,
+    /// Configured LSP servers indexed by language ID for on-demand workspace changes.
+    lsp_configs: HashMap<String, LspServerConfig>,
+    /// Root currently used by the registered LSP server for each language ID.
+    lsp_roots: HashMap<String, PathBuf>,
+    /// Maximum ancestor/recursive marker search depth.
+    heuristics_max_depth: Option<usize>,
 }
 
 impl Translator {
@@ -57,6 +64,9 @@ impl Translator {
             workspace_roots: vec![],
             extension_map: HashMap::new(),
             expected_languages: HashSet::new(),
+            lsp_configs: HashMap::new(),
+            lsp_roots: HashMap::new(),
+            heuristics_max_depth: None,
         }
     }
 
@@ -69,6 +79,15 @@ impl Translator {
     /// applicable) but may still be initializing in the background.
     pub fn set_expected_languages(&mut self, languages: HashSet<String>) {
         self.expected_languages = languages;
+    }
+
+    /// Configure LSP server definitions used for lazy project-root switches.
+    pub fn set_lsp_configs(&mut self, configs: Vec<LspServerConfig>, max_depth: Option<usize>) {
+        self.lsp_configs = configs
+            .into_iter()
+            .map(|config| (config.language_id.clone(), config))
+            .collect();
+        self.heuristics_max_depth = max_depth;
     }
 
     /// Clear the expected-languages set (e.g. after background init failed).
@@ -96,6 +115,11 @@ impl Translator {
     /// Register an LSP server for a language.
     pub fn register_server(&mut self, language_id: String, server: LspServer) {
         self.lsp_servers.insert(language_id, server);
+    }
+
+    /// Remember the workspace root for a registered language server.
+    pub fn register_server_root(&mut self, language_id: String, root: PathBuf) {
+        self.lsp_roots.insert(language_id, root);
     }
 
     /// Get the document tracker.
@@ -584,6 +608,59 @@ impl Translator {
         })
     }
 
+    fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> PathBuf {
+        let start = path.parent().unwrap_or(path);
+
+        if let Some(heuristics) = &config.heuristics
+            && !heuristics.project_markers.is_empty()
+        {
+            for ancestor in start.ancestors() {
+                if heuristics.is_applicable(ancestor) {
+                    return ancestor.to_path_buf();
+                }
+            }
+        }
+
+        for root in &self.workspace_roots {
+            if path.starts_with(root) {
+                return root.clone();
+            }
+        }
+
+        start.to_path_buf()
+    }
+
+    async fn ensure_client_for_file(&mut self, path: &Path) -> Result<()> {
+        let language_id = detect_language(path, &self.extension_map);
+        let Some(config) = self.lsp_configs.get(&language_id).cloned() else {
+            return Ok(());
+        };
+        let root = self.project_root_for_file(path, &config);
+
+        if self
+            .lsp_roots
+            .get(&language_id)
+            .is_some_and(|existing| existing == &root)
+            && self.lsp_clients.contains_key(&language_id)
+        {
+            return Ok(());
+        }
+
+        let mut server = LspServer::spawn(ServerInitConfig {
+            server_config: config.clone(),
+            workspace_roots: vec![root.clone()],
+            initialization_options: config.initialization_options.clone(),
+            notification_tx: None,
+        })
+        .await?;
+        let client = server.client().clone();
+        let _ = server.take_notification_rx();
+        self.register_client(language_id.clone(), client);
+        self.register_server(language_id.clone(), server);
+        self.register_server_root(language_id, root);
+        Ok(())
+    }
+
     /// Parse and validate a file URI, returning the validated path.
     ///
     /// # Errors
@@ -635,6 +712,7 @@ impl Translator {
     ) -> Result<HoverResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -683,6 +761,7 @@ impl Translator {
     ) -> Result<DefinitionResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -744,6 +823,7 @@ impl Translator {
     ) -> Result<ReferencesResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -791,6 +871,17 @@ impl Translator {
     pub async fn handle_diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
+        let language_id = detect_language(&validated_path, &self.extension_map);
+
+        if self
+            .lsp_servers
+            .get(&language_id)
+            .is_some_and(|server| server.capabilities().diagnostic_provider.is_none())
+        {
+            return self.handle_cached_diagnostics(&file_path);
+        }
+
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -854,6 +945,7 @@ impl Translator {
     ) -> Result<RenameResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -950,6 +1042,7 @@ impl Translator {
     ) -> Result<CompletionsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1012,6 +1105,7 @@ impl Translator {
     ) -> Result<DocumentSymbolsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1062,6 +1156,7 @@ impl Translator {
     ) -> Result<FormatDocumentResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1230,6 +1325,7 @@ impl Translator {
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1320,6 +1416,7 @@ impl Translator {
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1368,6 +1465,7 @@ impl Translator {
 
         // Parse and validate the URI
         let path = self.parse_file_uri(&lsp_item.uri)?;
+        self.ensure_client_for_file(&path).await?;
         let client = self.get_client_for_file(&path)?;
 
         let params = CallHierarchyIncomingCallsParams {
@@ -1417,6 +1515,7 @@ impl Translator {
 
         // Parse and validate the URI
         let path = self.parse_file_uri(&lsp_item.uri)?;
+        self.ensure_client_for_file(&path).await?;
         let client = self.get_client_for_file(&path)?;
 
         let params = CallHierarchyOutgoingCallsParams {
@@ -1576,6 +1675,7 @@ impl Translator {
     ) -> Result<SignatureHelpResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1649,6 +1749,7 @@ impl Translator {
     ) -> Result<LocationsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1691,6 +1792,7 @@ impl Translator {
     ) -> Result<LocationsResult> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
@@ -1737,6 +1839,7 @@ impl Translator {
 
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
+        self.ensure_client_for_file(&validated_path).await?;
         let client = self.get_client_for_file(&validated_path)?;
         let uri = self
             .document_tracker
