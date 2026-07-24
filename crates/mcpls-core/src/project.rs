@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use tokio::sync::{mpsc, oneshot, watch};
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 /// Errors raised while constructing or routing project identities.
@@ -268,6 +270,123 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
         })
 }
 
+/// Observable lifecycle state for one project actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProjectStatus {
+    /// The actor exists but its language servers are not ready.
+    Starting,
+    /// The project can accept requests.
+    Ready,
+    /// The project is available with at least one degraded component.
+    Degraded,
+    /// The project is replacing or restarting a language server.
+    Restarting,
+    /// The actor is draining work before shutdown.
+    Stopping,
+    /// The actor has stopped and accepts no new requests.
+    Stopped,
+    /// The project failed and requires recovery or explicit restart.
+    Failed,
+}
+
+/// Errors returned when a project actor cannot service a request.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProjectActorError {
+    /// The actor request channel has closed.
+    #[error("project actor is closed")]
+    Closed,
+    /// The actor dropped a response before replying.
+    #[error("project actor cancelled the request")]
+    Cancelled,
+}
+
+enum ProjectRequest {
+    SetStatus {
+        status: ProjectStatus,
+        reply: oneshot::Sender<()>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// Cloneable handle for querying and controlling one project actor.
+#[derive(Clone)]
+pub struct ProjectHandle {
+    sender: mpsc::Sender<ProjectRequest>,
+    status: watch::Receiver<ProjectStatus>,
+}
+
+impl ProjectHandle {
+    /// Subscribe to lifecycle changes for this project.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<ProjectStatus> {
+        self.status.clone()
+    }
+
+    /// Change the actor's observable lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped or drops the response.
+    pub async fn set_status(&self, status: ProjectStatus) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::SetStatus { status, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
+    /// Stop the actor after publishing `Stopped`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has already stopped or drops the response.
+    pub async fn shutdown(&self) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::Shutdown { reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+}
+
+/// Spawn a bounded project actor with `Starting` as its initial status.
+#[must_use]
+pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
+    let (sender, receiver) = mpsc::channel(capacity.max(1));
+    let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
+    tokio::spawn(run_project_actor(receiver, status_tx));
+    ProjectHandle {
+        sender,
+        status: status_rx,
+    }
+}
+
+async fn run_project_actor(
+    mut receiver: mpsc::Receiver<ProjectRequest>,
+    status_tx: watch::Sender<ProjectStatus>,
+) {
+    while let Some(request) = receiver.recv().await {
+        match request {
+            ProjectRequest::SetStatus { status, reply } => {
+                let _ = status_tx.send(status);
+                let _ = reply.send(());
+            }
+            ProjectRequest::Shutdown { reply } => {
+                let _ = status_tx.send(ProjectStatus::Stopping);
+                let _ = status_tx.send(ProjectStatus::Stopped);
+                let _ = reply.send(());
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -373,6 +492,16 @@ mod tests {
             project_resolver.resolve_path(&file),
             Err(ProjectIdentityError::ProjectRootUnavailable(id)) if id.as_str() == "deleted"
         ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_reports_status_transitions() {
+        let handle = spawn_project_actor(4);
+
+        assert_eq!(handle.status().borrow().clone(), ProjectStatus::Starting);
+        handle.set_status(ProjectStatus::Ready).await.unwrap();
+
+        assert_eq!(handle.status().borrow().clone(), ProjectStatus::Ready);
     }
 
     #[cfg(unix)]
