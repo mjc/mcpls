@@ -97,6 +97,8 @@ struct ProjectLspCapabilitiesResponse {
 struct DaemonSnapshot {
     project_counts: ProjectStatusCounts,
     actor_groups: usize,
+    persistence_configured: bool,
+    shutting_down: bool,
 }
 
 fn actor_group_states(actor_group_roots: Vec<Vec<PathBuf>>) -> Vec<ActorGroupState> {
@@ -231,6 +233,8 @@ impl McplsServer {
                 .project_registry
                 .total_actor_group_count()
                 .await,
+            persistence_configured: self.context.project_registry.persistence_configured().await,
+            shutting_down: self.context.project_registry.is_shutting_down(),
         }
     }
 
@@ -530,6 +534,8 @@ impl McplsServer {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
             "status": if snapshot.project_counts.failed == 0 { "healthy" } else { "degraded" },
+            "lifecycle": if snapshot.shutting_down { "shutting_down" } else { "running" },
+            "persistence": { "configured": snapshot.persistence_configured },
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
         }))
@@ -545,6 +551,8 @@ impl McplsServer {
         encode_json(&serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
+            "lifecycle": if snapshot.shutting_down { "shutting_down" } else { "running" },
+            "persistence": { "configured": snapshot.persistence_configured },
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
         }))
@@ -1784,6 +1792,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(health["status"], "healthy");
+        assert_eq!(health["lifecycle"], "running");
+        assert_eq!(health["persistence"]["configured"], false);
         assert_eq!(health["projects"]["starting"], 0);
         assert_eq!(health["actor_groups"], 0);
 
@@ -1805,6 +1815,8 @@ mod tests {
         )
         .unwrap();
         assert!(status["uptime_seconds"].is_number());
+        assert_eq!(status["lifecycle"], "running");
+        assert_eq!(status["persistence"]["configured"], false);
         assert_eq!(status["projects"]["starting"], 1);
         assert_eq!(status["actor_groups"], 1);
     }

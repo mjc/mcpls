@@ -4031,6 +4031,18 @@ impl ProjectRegistry {
         counts
     }
 
+    /// Return whether durable project registration is configured.
+    #[must_use]
+    pub async fn persistence_configured(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Return whether the registry is draining during daemon shutdown.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.lifecycle.shutting_down.load(Ordering::Acquire)
+    }
+
     /// Count actor groups without awaiting any actor request.
     #[must_use]
     pub async fn total_actor_group_count(&self) -> usize {
