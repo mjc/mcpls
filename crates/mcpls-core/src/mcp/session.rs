@@ -13,6 +13,20 @@ use crate::bridge::resources::make_uri;
 use crate::bridge::{ResourceSubscriptions, uri_to_path};
 use crate::project::{ProjectEvent, ProjectHandle, ProjectId};
 
+const PROJECT_STATUS_PREFIX: &str = "mcpls-project-status:///";
+
+/// Encode a project identity as a subscribable MCP status resource URI.
+pub fn project_status_resource_uri(project_id: &ProjectId) -> String {
+    format!("{PROJECT_STATUS_PREFIX}{project_id}")
+}
+
+/// Decode a project status resource URI into its stable project identity.
+pub fn parse_project_status_resource_uri(uri: &str) -> Option<ProjectId> {
+    uri.strip_prefix(PROJECT_STATUS_PREFIX)
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .and_then(|value| ProjectId::new(value.to_string()).ok())
+}
+
 /// Convert an LSP file URI from a diagnostics event into the MCP resource URI
 /// used by `resources/subscribe`.
 pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
@@ -21,10 +35,12 @@ pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
     make_uri(&path).ok()
 }
 
-fn event_resource_uri(event: &ProjectEvent) -> Option<String> {
+fn event_resource_uri(project_id: &ProjectId, event: &ProjectEvent) -> Option<String> {
     match event {
         ProjectEvent::DiagnosticsUpdated { uri, .. } => diagnostics_resource_uri(uri),
-        ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => None,
+        ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => {
+            Some(project_status_resource_uri(project_id))
+        }
     }
 }
 
@@ -99,11 +115,18 @@ impl SessionEventSink {
         tasks.remove(&project_id);
 
         let subscriptions = Arc::clone(&self.subscriptions);
+        let event_project_id = project_id.clone();
         let task = tokio::spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(event) => {
-                        if forward_event(&subscriptions, notifier.as_ref(), &event).await
+                        if forward_event(
+                            &subscriptions,
+                            notifier.as_ref(),
+                            &event_project_id,
+                            &event,
+                        )
+                        .await
                             == ForwardOutcome::Disconnect
                         {
                             break;
@@ -123,9 +146,10 @@ impl SessionEventSink {
 async fn forward_event(
     subscriptions: &ResourceSubscriptions,
     notifier: &dyn SessionNotifier,
+    project_id: &ProjectId,
     event: &ProjectEvent,
 ) -> ForwardOutcome {
-    let Some(resource_uri) = event_resource_uri(event) else {
+    let Some(resource_uri) = event_resource_uri(project_id, event) else {
         return ForwardOutcome::Continue;
     };
     if !subscriptions.contains(&resource_uri).await {
@@ -160,7 +184,10 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{SessionEventSink, SessionNotifier};
-    use super::{diagnostics_resource_uri, event_resource_uri};
+    use super::{
+        diagnostics_resource_uri, event_resource_uri, parse_project_status_resource_uri,
+        project_status_resource_uri,
+    };
     use crate::project::{ProjectEvent, ProjectId, ProjectStatus};
 
     struct TestNotifier(mpsc::UnboundedSender<String>);
@@ -191,12 +218,20 @@ mod tests {
 
     #[test]
     fn lifecycle_events_do_not_map_to_file_resources() {
+        let project_id = ProjectId::new("a").unwrap();
         assert_eq!(
-            event_resource_uri(&ProjectEvent::StatusChanged {
-                status: ProjectStatus::Ready,
-                last_error: None,
-            }),
-            None
+            event_resource_uri(
+                &project_id,
+                &ProjectEvent::StatusChanged {
+                    status: ProjectStatus::Ready,
+                    last_error: None,
+                },
+            ),
+            Some("mcpls-project-status:///a".to_string())
+        );
+        assert_eq!(
+            parse_project_status_resource_uri(&project_status_resource_uri(&project_id)),
+            Some(project_id)
         );
     }
 

@@ -17,6 +17,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
+use super::session::{parse_project_status_resource_uri, project_status_resource_uri};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
@@ -1118,7 +1119,7 @@ impl ServerHandler for McplsServer {
             .open_document_paths()
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let resources: Vec<_> = open_documents
+        let mut resources: Vec<_> = open_documents
             .into_iter()
             .filter_map(|(project_id, path)| {
                 let uri = make_uri(&path)
@@ -1140,6 +1141,22 @@ impl ServerHandler for McplsServer {
             })
             .collect();
 
+        resources.extend(
+            self.context
+                .project_registry
+                .list()
+                .await
+                .into_iter()
+                .map(|identity| {
+                    let project_id = identity.id().clone();
+                    let uri = project_status_resource_uri(&project_id);
+                    let raw = RawResource::new(uri, format!("{project_id}:status"))
+                        .with_mime_type("application/json")
+                        .with_description(format!("Lifecycle status for project {project_id}"));
+                    rmcp::model::Annotated::new(raw, None)
+                }),
+        );
+
         Ok(ListResourcesResult::with_all_items(resources))
     }
 
@@ -1148,6 +1165,26 @@ impl ServerHandler for McplsServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
+        if let Some(project_id) = parse_project_status_resource_uri(&request.uri) {
+            let identity = self
+                .context
+                .project_registry
+                .identity(&project_id)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            let state = self
+                .context
+                .project_registry
+                .status(&project_id)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            let json = encode_json(&project_state_json(&identity, &state))?;
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                json,
+                request.uri,
+            )]));
+        }
+
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -1181,6 +1218,24 @@ impl ServerHandler for McplsServer {
         request: SubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        if let Some(project_id) = parse_project_status_resource_uri(&request.uri) {
+            let actor = self
+                .context
+                .project_registry
+                .actor_for_project(&project_id)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            self.context
+                .subscriptions
+                .subscribe(request.uri)
+                .await
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            self.context
+                .event_sink
+                .attach(project_id, &actor, context.peer);
+            return Ok(());
+        }
+
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
@@ -1217,7 +1272,9 @@ impl ServerHandler for McplsServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         // Parse the URI for consistency with subscribe validation.
-        parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        if parse_project_status_resource_uri(&request.uri).is_none() {
+            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        }
         self.context.subscriptions.unsubscribe(&request.uri).await;
         Ok(())
     }
