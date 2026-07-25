@@ -3111,30 +3111,36 @@ fn spawn_notification_forwarders(
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     generation: u64,
 ) {
-    for mut receiver in notification_receivers {
+    for receiver in notification_receivers {
         let sender = actor_sender.clone();
-        tokio::spawn(async move {
-            while let Some(notification) = receiver.recv().await {
-                let Some(sender) = sender.upgrade() else {
-                    break;
-                };
-                if sender
-                    .send(ProjectRequest::Notification {
-                        generation,
-                        notification,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            if let Some(sender) = sender.upgrade() {
-                let _ = sender
-                    .send(ProjectRequest::ServerExited { generation })
-                    .await;
-            }
-        });
+        tokio::spawn(forward_lsp_notifications(receiver, sender, generation));
+    }
+}
+
+async fn forward_lsp_notifications(
+    mut receiver: mpsc::Receiver<LspNotification>,
+    sender: mpsc::WeakSender<ProjectRequest>,
+    generation: u64,
+) {
+    while let Some(notification) = receiver.recv().await {
+        let Some(sender) = sender.upgrade() else {
+            break;
+        };
+        if sender
+            .send(ProjectRequest::Notification {
+                generation,
+                notification,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    if let Some(sender) = sender.upgrade() {
+        let _ = sender
+            .send(ProjectRequest::ServerExited { generation })
+            .await;
     }
 }
 
