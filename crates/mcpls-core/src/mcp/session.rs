@@ -236,33 +236,13 @@ impl SessionEventSink {
         drop(event_tx);
         let task = tokio::spawn(async move {
             while let Some(queued_event) = event_rx.recv().await {
-                let (outcome, removed_event) = match queued_event {
-                    QueuedEvent::Event(event) => {
-                        let outcome = forward_event(
-                            &subscriptions,
-                            notifier.as_ref(),
-                            &event_project_id,
-                            &event,
-                        )
-                        .await;
-                        let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
-                            && event.belongs_to(&event_project_id);
-                        (outcome, removed.then_some(event))
-                    }
-                    QueuedEvent::Lagged { skipped } => {
-                        tracing::warn!(
-                            skipped,
-                            "session actor event sink lagged; notifying polling resync"
-                        );
-                        let outcome = notify_subscribed_resource(
-                            &subscriptions,
-                            notifier.as_ref(),
-                            project_events_resource_uri(&event_project_id),
-                        )
-                        .await;
-                        (outcome, None)
-                    }
-                };
+                let (outcome, removed_event) = forward_queued_event(
+                    queued_event,
+                    &subscriptions,
+                    notifier.as_ref(),
+                    &event_project_id,
+                )
+                .await;
                 if let Some(event) = removed_event {
                     cleanup_removed_project_subscriptions(
                         &subscriptions,
@@ -279,6 +259,35 @@ impl SessionEventSink {
             }
         });
         tasks.insert(project_id, task);
+    }
+}
+
+async fn forward_queued_event(
+    queued_event: QueuedEvent,
+    subscriptions: &ResourceSubscriptions,
+    notifier: &dyn SessionNotifier,
+    project_id: &ProjectId,
+) -> (ForwardOutcome, Option<ProjectEvent>) {
+    match queued_event {
+        QueuedEvent::Event(event) => {
+            let outcome = forward_event(subscriptions, notifier, project_id, &event).await;
+            let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
+                && event.belongs_to(project_id);
+            (outcome, removed.then_some(event))
+        }
+        QueuedEvent::Lagged { skipped } => {
+            tracing::warn!(
+                skipped,
+                "session actor event sink lagged; notifying polling resync"
+            );
+            let outcome = notify_subscribed_resource(
+                subscriptions,
+                notifier,
+                project_events_resource_uri(project_id),
+            )
+            .await;
+            (outcome, None)
+        }
     }
 }
 
