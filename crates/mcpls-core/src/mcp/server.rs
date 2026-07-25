@@ -97,9 +97,10 @@ struct ProjectLspCapabilitiesResponse {
     servers: Vec<ProjectServerCapability>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct DaemonPersistenceSnapshot {
     configured: bool,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,10 +214,14 @@ impl DaemonHealth {
     }
 }
 
-const fn health_status(counts: ProjectStatusCounts) -> DaemonHealth {
+const fn health_status(counts: ProjectStatusCounts, persistence_error: bool) -> DaemonHealth {
     if counts.failed > 0 {
         DaemonHealth::Failed
-    } else if counts.degraded > 0 || counts.restarting > 0 || counts.stopping > 0 {
+    } else if persistence_error
+        || counts.degraded > 0
+        || counts.restarting > 0
+        || counts.stopping > 0
+    {
         DaemonHealth::Degraded
     } else {
         DaemonHealth::Healthy
@@ -305,6 +310,7 @@ impl McplsServer {
             project_summaries: projects.summaries,
             persistence: DaemonPersistenceSnapshot {
                 configured: self.context.project_registry.persistence_configured(),
+                last_error: self.context.project_registry.persistence_error().await,
             },
             transport: (*self.context.transport).clone(),
             session_count: self.context.session_count().await,
@@ -620,7 +626,11 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
-            "status": health_status(snapshot.project_counts).as_str(),
+            "status": health_status(
+                snapshot.project_counts,
+                snapshot.persistence.last_error.is_some(),
+            )
+            .as_str(),
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,

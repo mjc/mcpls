@@ -4086,6 +4086,7 @@ pub struct ProjectRegistry {
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
+    persistence_error: std::sync::Arc<RwLock<Option<String>>>,
     lifecycle: std::sync::Arc<RegistryLifecycle>,
     shutdown_timeout: Duration,
 }
@@ -4282,6 +4283,7 @@ impl ProjectRegistry {
             actor_capacity: actor_capacity.max(1),
             translator_template: translator_template.map(std::sync::Arc::new),
             persistence: None,
+            persistence_error: std::sync::Arc::new(RwLock::new(None)),
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
             shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
         }
@@ -4330,7 +4332,9 @@ impl ProjectRegistry {
             })
             .collect::<Vec<_>>();
         projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
-        save_persisted_state(store, projects).await
+        let result = save_persisted_state(store, projects).await;
+        *self.persistence_error.write().await = result.as_ref().err().map(ToString::to_string);
+        result
     }
 
     /// Restore valid registrations from the attached store.
@@ -4346,7 +4350,16 @@ impl ProjectRegistry {
         let Some(store) = self.persistence.clone() else {
             return Ok(0);
         };
-        let state = load_persisted_state(store).await?;
+        let state = match load_persisted_state(store).await {
+            Ok(state) => {
+                *self.persistence_error.write().await = None;
+                state
+            }
+            Err(error) => {
+                *self.persistence_error.write().await = Some(error.to_string());
+                return Err(error.into());
+            }
+        };
         let mut restored = 0;
         for persisted in state.projects {
             let Ok(id) = persisted.project_id() else {
@@ -4625,6 +4638,11 @@ impl ProjectRegistry {
     #[must_use]
     pub const fn persistence_configured(&self) -> bool {
         self.persistence.is_some()
+    }
+
+    /// Return the most recent persistence error, if any.
+    pub async fn persistence_error(&self) -> Option<String> {
+        self.persistence_error.read().await.clone()
     }
 
     /// Return whether the registry is draining during daemon shutdown.
