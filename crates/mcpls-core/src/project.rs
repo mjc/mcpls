@@ -3332,14 +3332,7 @@ impl ProjectRegistry {
             .iter()
             .map(PersistedProject::from_identity)
             .collect::<Vec<_>>();
-        tokio::task::spawn_blocking(move || store.save(&projects))
-            .await
-            .map_err(|error| {
-                crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(
-                    format!("persistence task failed: {error}"),
-                ))
-            })??;
-        Ok(())
+        save_persisted_state(store, projects).await
     }
 
     /// Restore valid registrations from the attached store.
@@ -3355,13 +3348,7 @@ impl ProjectRegistry {
         let Some(store) = self.persistence.clone() else {
             return Ok(0);
         };
-        let state = tokio::task::spawn_blocking(move || store.load())
-            .await
-            .map_err(|error| {
-                crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(
-                    format!("persistence task failed: {error}"),
-                ))
-            })??;
+        let state = load_persisted_state(store).await?;
         let mut restored = 0;
         for persisted in state.projects {
             let Ok(id) = persisted.project_id() else {
@@ -3871,6 +3858,33 @@ fn compatible_project<'a>(
                 existing == repository && project.compatibility_key == Some(compatibility_key)
             })
     })
+}
+
+async fn save_persisted_state(
+    store: std::sync::Arc<ProjectRegistrationStore>,
+    projects: Vec<PersistedProject>,
+) -> Result<(), ProjectRegistryError> {
+    tokio::task::spawn_blocking(move || store.save(&projects))
+        .await
+        .map_err(|error| {
+            crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(format!(
+                "persistence task failed: {error}"
+            )))
+        })??;
+    Ok(())
+}
+
+async fn load_persisted_state(
+    store: std::sync::Arc<ProjectRegistrationStore>,
+) -> Result<crate::project_persistence::ProjectRegistrationState, ProjectRegistryError> {
+    tokio::task::spawn_blocking(move || store.load())
+        .await
+        .map_err(|error| {
+            crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(format!(
+                "persistence task failed: {error}"
+            )))
+        })?
+        .map_err(ProjectRegistryError::from)
 }
 
 #[cfg(test)]
