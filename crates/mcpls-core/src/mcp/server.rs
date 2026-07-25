@@ -1087,6 +1087,294 @@ mod tests {
         McplsServer::new_with_registry(subscriptions, registry)
     }
 
+    #[cfg(unix)]
+    const CONCURRENCY_LSP: &str = r#"#!/usr/bin/env python3
+import json
+import fcntl
+import os
+import pathlib
+import sys
+import time
+
+counter = pathlib.Path(os.environ["MCPLS_SPAWN_COUNTER"])
+block_root = pathlib.Path(os.environ.get("MCPLS_BLOCK_ROOT", ""))
+entered = pathlib.Path(os.environ.get("MCPLS_GATE_ENTERED", ""))
+release = pathlib.Path(os.environ.get("MCPLS_GATE_RELEASE", ""))
+with counter.open("a+") as counter_file:
+    fcntl.flock(counter_file, fcntl.LOCK_EX)
+    counter_file.seek(0)
+    value = int(counter_file.read() or "0")
+    counter_file.seek(0)
+    counter_file.truncate()
+    counter_file.write(str(value + 1))
+    counter_file.flush()
+    fcntl.flock(counter_file, fcntl.LOCK_UN)
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-8"}
+        }})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"health": "ok", "quiescent": True}})
+    elif method == "textDocument/documentSymbol":
+        if block_root and pathlib.Path.cwd() == block_root:
+            entered.write_text("entered")
+            while not release.exists():
+                time.sleep(0.001)
+        send({"jsonrpc": "2.0", "id": message["id"], "result": []})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"#;
+
+    #[cfg(unix)]
+    fn write_concurrency_lsp(
+        root: &std::path::Path,
+        counter: &std::path::Path,
+        block_root: Option<&std::path::Path>,
+        entered: Option<&std::path::Path>,
+        release: Option<&std::path::Path>,
+    ) -> crate::config::LspServerConfig {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = root.join("concurrency-lsp.py");
+        std::fs::write(&script, CONCURRENCY_LSP).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        if let Some(block_root) = block_root {
+            env.insert(
+                "MCPLS_BLOCK_ROOT".to_string(),
+                block_root.display().to_string(),
+            );
+        }
+        if let Some(entered) = entered {
+            env.insert(
+                "MCPLS_GATE_ENTERED".to_string(),
+                entered.display().to_string(),
+            );
+        }
+        if let Some(release) = release {
+            env.insert(
+                "MCPLS_GATE_RELEASE".to_string(),
+                release.display().to_string(),
+            );
+        }
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = script.display().to_string();
+        config.env = env;
+        config.heuristics = None;
+        config
+    }
+
+    #[cfg(unix)]
+    fn concurrency_template(
+        config: crate::config::LspServerConfig,
+    ) -> crate::bridge::TranslatorTemplate {
+        let mut source = Translator::new().with_extensions(std::collections::HashMap::from([(
+            "rs".to_string(),
+            "rust".to_string(),
+        )]));
+        source.set_lsp_configs(vec![config], Some(3));
+        source.configuration_template()
+    }
+
+    #[cfg(unix)]
+    fn write_rust_fixture(root: &std::path::Path) -> std::path::PathBuf {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        file
+    }
+
+    #[cfg(unix)]
+    fn project_params(project_id: &str) -> Parameters<ProjectIdParams> {
+        Parameters(ProjectIdParams {
+            project_id: project_id.to_string(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn project_add_params(
+        project_id: &str,
+        root: &std::path::Path,
+    ) -> Parameters<ProjectAddParams> {
+        Parameters(ProjectAddParams {
+            project_id: project_id.to_string(),
+            root: root.display().to_string(),
+            config: None,
+        })
+    }
+
+    #[cfg(unix)]
+    fn document_symbols_params(path: &std::path::Path) -> Parameters<DocumentSymbolsParams> {
+        Parameters(DocumentSymbolsParams {
+            file_path: path.display().to_string(),
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_sessions_share_one_project_actor_and_lsp_process() {
+        let root = TempDir::new().unwrap();
+        let file = write_rust_fixture(root.path());
+        let counter = root.path().join("spawn-count");
+        let config = write_concurrency_lsp(root.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let first_session = server.for_session();
+        let second_session = server.for_session();
+
+        let add_first = first_session.project_add(project_add_params("shared", root.path()));
+        let add_second = second_session.project_add(project_add_params("shared", root.path()));
+        let (first, second) = tokio::join!(add_first, add_second);
+        first.unwrap();
+        second.unwrap();
+
+        let activate_first = first_session.project_activate(project_params("shared"));
+        let activate_second = second_session.project_activate(project_params("shared"));
+        let (first, second) = tokio::join!(activate_first, activate_second);
+        first.unwrap();
+        second.unwrap();
+
+        let status = first_session
+            .project_status(project_params("shared"))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["status"], "Ready");
+        assert_eq!(status["actor_groups"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
+        assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_project_does_not_delay_other_project_and_removal_keeps_it_ready() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        write_rust_fixture(first_root.path());
+        write_rust_fixture(second_root.path());
+        let counter = first_root.path().join("spawn-count");
+        let entered = first_root.path().join("request-entered");
+        let release = first_root.path().join("request-release");
+        let config = write_concurrency_lsp(
+            first_root.path(),
+            &counter,
+            Some(first_root.path()),
+            Some(&entered),
+            Some(&release),
+        );
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let (first_activation, second_activation) = tokio::join!(
+            server.project_activate(Parameters(ProjectIdParams {
+                project_id: first_id.as_str().to_string(),
+            })),
+            server.project_activate(Parameters(ProjectIdParams {
+                project_id: second_id.as_str().to_string(),
+            })),
+        );
+        first_activation.unwrap();
+        second_activation.unwrap();
+
+        let blocked_server = server.for_session();
+        let first_file = first_root.path().join("src/main.rs");
+        let blocked = tokio::spawn(async move {
+            blocked_server
+                .get_document_symbols(document_symbols_params(&first_file))
+                .await
+        });
+        while !entered.exists() {
+            tokio::task::yield_now().await;
+        }
+
+        let second_file = second_root.path().join("src/main.rs");
+        let second_result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.get_document_symbols(document_symbols_params(&second_file)),
+        )
+        .await;
+        assert!(
+            second_result.is_ok(),
+            "independent project request timed out"
+        );
+        let second_result = second_result.unwrap().unwrap();
+        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
+        assert_eq!(second_result["symbols"], serde_json::json!([]));
+
+        std::fs::write(&release, "release").unwrap();
+        blocked.await.unwrap().unwrap();
+
+        server
+            .project_remove(project_params(first_id.as_str()))
+            .await
+            .unwrap();
+        let second_status = server
+            .project_status(project_params(second_id.as_str()))
+            .await
+            .unwrap();
+        let second_status: serde_json::Value = serde_json::from_str(&second_status).unwrap();
+        assert_eq!(second_status["status"], "Ready");
+        assert_eq!(std::fs::read_to_string(counter).unwrap(), "2");
+    }
+
     #[tokio::test]
     async fn test_server_info() {
         let server = create_test_server();
