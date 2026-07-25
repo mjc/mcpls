@@ -2275,23 +2275,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn rename_and_format_wrappers_apply_stored_lsp_plans_without_re_requesting() {
-        use std::collections::HashMap;
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = TempDir::new().unwrap();
-        let source = root.path().join("src.rs");
-        let sibling = root.path().join("other.rs");
-        let counter = root.path().join("request-count");
-        fs::write(&source, "old_name\n").unwrap();
-        fs::write(&sibling, "old_name();\n").unwrap();
-
-        let lsp = root.path().join("fake-edit-lsp.py");
-        fs::write(
-            &lsp,
-            r##"#!/usr/bin/env python3
+    const FAKE_EDIT_LSP: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import pathlib
@@ -2359,9 +2343,24 @@ while True:
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
-"##,
-        )
-        .unwrap();
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_and_format_wrappers_apply_stored_lsp_plans_without_re_requesting() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("src.rs");
+        let sibling = root.path().join("other.rs");
+        let counter = root.path().join("request-count");
+        fs::write(&source, "old_name\n").unwrap();
+        fs::write(&sibling, "old_name();\n").unwrap();
+
+        let lsp = root.path().join("fake-edit-lsp.py");
+        fs::write(&lsp, FAKE_EDIT_LSP).unwrap();
         let mut permissions = fs::metadata(&lsp).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&lsp, permissions).unwrap();
