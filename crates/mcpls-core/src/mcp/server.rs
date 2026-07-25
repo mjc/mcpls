@@ -463,22 +463,16 @@ impl McplsServer {
             character,
         }): Parameters<HoverParams>,
     ) -> Result<String, McpError> {
-        // Registered projects own their translator and are selected by the
-        // longest matching workspace root. Keep the daemon translator as a
-        // compatibility fallback for callers that have not registered a
-        // project yet.
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .hover(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_hover(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .hover(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -499,18 +493,16 @@ impl McplsServer {
             character,
         }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .definition(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_definition(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .definition(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -532,18 +524,16 @@ impl McplsServer {
             include_declaration,
         }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .references(file_path, line, character, include_declaration)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_references(file_path, line, character, include_declaration)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .references(file_path, line, character, include_declaration)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -560,18 +550,16 @@ impl McplsServer {
         &self,
         Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .diagnostics(file_path)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_diagnostics(file_path)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .diagnostics(file_path)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -1589,6 +1577,24 @@ mod tests {
         // This should return an error (no LSP server configured)
         let result = server.get_hover(params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn semantic_tools_reject_unregistered_paths_without_global_fallback() {
+        let server = create_test_server();
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("unregistered.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let error = server
+            .get_hover(Parameters(HoverParams {
+                file_path: file.display().to_string(),
+                line: 1,
+                character: 1,
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("path is not registered"), "{error}");
     }
 
     #[tokio::test]
