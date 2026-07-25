@@ -106,9 +106,9 @@ pub(crate) async fn run_stdio(
 /// Binds `cfg.bind`, mounts the MCP service at `cfg.path` (and `/`), and
 /// serves until `Ctrl-C` or `SIGTERM` is received.
 ///
-/// Each HTTP session receives its own `McplsServer` clone. The shared
-/// `Arc<Mutex<Translator>>` inside is the same across all sessions, so LSP
-/// state is still global per process.
+/// Each HTTP session receives its own `McplsServer` clone. The project registry
+/// inside those clones is shared, so project actors and LSP state remain
+/// daemon-scoped rather than being recreated per HTTP session.
 ///
 /// # Note
 ///

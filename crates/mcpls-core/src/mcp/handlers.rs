@@ -13,9 +13,9 @@ use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
 
 /// Shared context for all tool handlers.
 ///
-/// Holds the translator and subscription state. The MCP peer handle is not
-/// stored here because resource-update notifications are sent by the pump
-/// tasks in `lib.rs`, which own their own `Arc<OnceCell<Peer<RoleServer>>>`.
+/// Holds project routing and subscription state. Language-server translators
+/// live inside project actors; the MCP peer handle is not stored here because
+/// resource-update notifications are sent by the transport layer.
 pub struct HandlerContext {
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
