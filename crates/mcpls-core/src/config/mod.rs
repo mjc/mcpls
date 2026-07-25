@@ -7,6 +7,7 @@ mod server;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 pub use server::{DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, ServerHeuristics};
@@ -61,6 +62,14 @@ impl Default for DaemonConfig {
             state_file: None,
             shutdown_timeout_seconds: default_shutdown_timeout_seconds(),
         }
+    }
+}
+
+impl DaemonConfig {
+    /// Return the configured project shutdown deadline.
+    #[must_use]
+    pub const fn shutdown_timeout(&self) -> Duration {
+        Duration::from_secs(self.shutdown_timeout_seconds)
     }
 }
 
