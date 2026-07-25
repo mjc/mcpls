@@ -471,7 +471,10 @@ struct ProjectCompatibilityKey([u8; 32]);
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
 /// unknown rather than compatible. This keeps linked-project reuse fail-closed
 /// until the daemon can resolve the effective toolchain and environment.
-fn rust_project_compatibility_key(root: &Path) -> Option<ProjectCompatibilityKey> {
+fn rust_project_compatibility_key(
+    root: &Path,
+    translator_template: Option<&TranslatorTemplate>,
+) -> Option<ProjectCompatibilityKey> {
     const INPUTS: &[&str] = &[
         "rust-toolchain",
         "rust-toolchain.toml",
@@ -503,7 +506,43 @@ fn rust_project_compatibility_key(root: &Path) -> Option<ProjectCompatibilityKey
         }
     }
 
+    if let Some(template) = translator_template {
+        let config = template.rust_server_config()?;
+        hasher.update(b"rust-server-config-v1");
+        hash_compatibility_field(&mut hasher, config.language_id.as_bytes());
+        hash_compatibility_field(&mut hasher, config.command.as_bytes());
+        for argument in &config.args {
+            hash_compatibility_field(&mut hasher, argument.as_bytes());
+        }
+        let mut environment = config.env.iter().collect::<Vec<_>>();
+        environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (name, value) in environment {
+            hash_compatibility_field(&mut hasher, name.as_bytes());
+            hash_compatibility_field(&mut hasher, value.as_bytes());
+        }
+        let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
+        hash_compatibility_field(&mut hasher, &initialization_options);
+        hash_compatibility_field(&mut hasher, &config.timeout_seconds.to_le_bytes());
+        if let Some(heuristics) = &config.heuristics {
+            for marker in &heuristics.project_markers {
+                hash_compatibility_field(&mut hasher, marker.as_bytes());
+            }
+        }
+        hash_compatibility_field(
+            &mut hasher,
+            &template
+                .heuristics_max_depth()
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+    }
+
     (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
+}
+
+fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_le_bytes());
+    hasher.update(field);
 }
 
 /// Observable lifecycle state for one project actor.
@@ -3710,7 +3749,10 @@ impl ProjectRegistry {
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
+        let compatibility_key = rust_project_compatibility_key(
+            identity.root.as_path(),
+            self.translator_template.as_deref(),
+        );
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
@@ -4513,6 +4555,36 @@ mod tests {
             GitRepositoryIdentity::discover(stale.path()),
             Err(GitRepositoryIdentityError::MissingGitDirectory { .. })
         ));
+    }
+
+    #[test]
+    fn rust_compatibility_key_changes_with_server_configuration() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut first = Translator::new();
+        first.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+        let mut changed_config = crate::config::LspServerConfig::rust_analyzer();
+        changed_config.args.push("--log-file=ra.log".to_string());
+        let mut second = Translator::new();
+        second.set_lsp_configs(vec![changed_config], Some(10));
+
+        assert_ne!(
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+        );
     }
 
     #[test]

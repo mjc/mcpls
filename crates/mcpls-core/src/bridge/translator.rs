@@ -60,6 +60,18 @@ pub struct TranslatorTemplate {
     heuristics_max_depth: Option<usize>,
 }
 
+impl TranslatorTemplate {
+    pub(crate) fn rust_server_config(&self) -> Option<&LspServerConfig> {
+        self.lsp_configs
+            .iter()
+            .find(|config| config.language_id.eq_ignore_ascii_case("rust"))
+    }
+
+    pub(crate) const fn heuristics_max_depth(&self) -> Option<usize> {
+        self.heuristics_max_depth
+    }
+}
+
 impl Translator {
     /// Create a new translator.
     #[must_use]
