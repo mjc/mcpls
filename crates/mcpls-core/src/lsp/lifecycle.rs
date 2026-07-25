@@ -646,17 +646,13 @@ where
         return None;
     }
 
+    let stdout = String::from_utf8(output.stdout).ok()?;
     Some(
-        output
-            .stdout
-            .split(|byte| *byte == b'\n')
+        stdout
+            .lines()
             .filter_map(|line| {
-                let separator = line.iter().position(|byte| *byte == b'=')?;
-                let (key, value) = line.split_at(separator);
-                Some((
-                    String::from_utf8(key.to_vec()).ok()?,
-                    Some(String::from_utf8(value[1..].to_vec()).ok()?),
-                ))
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_string(), Some(value.to_string())))
             })
             .collect(),
     )
