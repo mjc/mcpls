@@ -105,6 +105,11 @@ fn project_status_counts_json(counts: ProjectStatusCounts) -> serde_json::Value 
     })
 }
 
+#[derive(Serialize)]
+struct SubscriptionListResult {
+    subscriptions: Vec<String>,
+}
+
 fn project_events_json(
     project_id: &ProjectId,
     snapshot: &ProjectEventSnapshot,
@@ -410,7 +415,7 @@ impl McplsServer {
         Parameters(_params): Parameters<SubscriptionListParams>,
     ) -> Result<String, McpError> {
         let subscriptions = self.context.subscriptions.sorted_snapshot().await;
-        encode_json(&serde_json::json!({"subscriptions": subscriptions}))
+        encode_json(&SubscriptionListResult { subscriptions })
     }
 
     /// Return a cheap process and project liveness snapshot.
