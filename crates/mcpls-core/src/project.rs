@@ -2879,15 +2879,21 @@ fn mark_project_ready(
     runtime: &ProjectRuntime,
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
+    publish_project_readiness(channels, state, runtime);
+}
+
+fn publish_project_readiness(
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &ProjectRuntime,
+) {
     state.sync_runtime(runtime);
-    channels.publish_status(
-        state,
-        if runtime.translator.is_initializing() {
-            ProjectStatus::Starting
-        } else {
-            ProjectStatus::Ready
-        },
-    );
+    let status = if runtime.translator.is_initializing() {
+        ProjectStatus::Starting
+    } else {
+        ProjectStatus::Ready
+    };
+    channels.publish_status(state, status);
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -3265,8 +3271,7 @@ async fn handle_project_request(
             let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, notification);
             if was_initializing && !runtime.translator.is_initializing() {
-                state.sync_runtime(runtime);
-                channels.publish_status(state, ProjectStatus::Ready);
+                publish_project_readiness(channels, state, runtime);
             }
         }
         ProjectRequest::ServerExited { generation } => {
