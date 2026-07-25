@@ -80,6 +80,18 @@ impl HttpClient {
         }))
     }
 
+    fn request_method(&mut self, method: &str, params: &Value) -> Value {
+        let request_id = self.next_request_id();
+        let response = self.request(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params
+        }));
+        assert!(response.get("error").is_none(), "request error: {response}");
+        response["result"].clone()
+    }
+
     fn subscribe(&mut self, uri: &str) {
         let request_id = self.next_request_id();
         let response = self.request(&json!({
@@ -177,6 +189,9 @@ impl HttpEventStream {
 
     fn wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
+        self.stream
+            .set_read_timeout(Some(timeout.min(Duration::from_secs(10))))
+            .unwrap();
         let needle = needle.as_bytes();
         let mut bytes = Vec::new();
         while Instant::now() < deadline {
@@ -386,6 +401,10 @@ fn main() {
     let counter = env::var("MCPLS_SPAWN_COUNTER").unwrap();
     let value = fs::read_to_string(&counter).ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
     fs::write(counter, (value + 1).to_string()).unwrap();
+    if env::var("MCPLS_BLOCK_READY").ok().as_deref() == Some("1") {
+        while read_message().is_some() {}
+        return;
+    }
     while let Some(message) = read_message() {
         if message.contains("\"method\":\"initialize\"") {
             let id = request_id(&message).unwrap();
@@ -424,6 +443,7 @@ fn write_config(
 struct HttpFixture {
     directory: TempDir,
     config: PathBuf,
+    lsp_command: PathBuf,
     spawn_counter: PathBuf,
 }
 
@@ -436,6 +456,7 @@ impl HttpFixture {
         Self {
             directory,
             config,
+            lsp_command,
             spawn_counter,
         }
     }
@@ -686,6 +707,14 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
         resumed_events.wait_for("notifications/resources/updated", Duration::from_secs(10)),
         "reconnected session did not resume project events"
     );
+    let polled = first.request_method(
+        "resources/read",
+        &json!({"uri": "mcpls-project-events:///project-a?since=0"}),
+    );
+    let polled_text = polled["contents"][0]["text"].as_str().unwrap();
+    let polled_events: Value = serde_json::from_str(polled_text).unwrap();
+    assert_eq!(polled_events["resync_required"], false);
+    assert!(!polled_events["events"].as_array().unwrap().is_empty());
 
     let removed = second.call_tool("project_remove", json!({"project_id": "project-b"}));
     assert_eq!(removed["project_id"], "project-b");
@@ -703,6 +732,106 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     restored.initialize();
     assert_eq!(project_ids(&mut restored), ["project-a", "project-b"]);
     restarted_daemon.terminate();
+}
+
+#[test]
+fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
+    let fixture = HttpFixture::new();
+    let root_a = fixture.project_root("blocked-project");
+    let root_b = fixture.project_root("ready-project");
+    let mut daemon = HttpDaemon::spawn(&fixture.config);
+    let mut first = HttpClient::new(daemon.address);
+    let mut second = HttpClient::new(daemon.address);
+    first.initialize();
+    second.initialize();
+
+    first.call_tool(
+        "project_add",
+        json!({
+            "project_id": "blocked",
+            "root": root_a,
+            "config": {
+                "lsp_servers": [{
+                    "language_id": "rust",
+                    "command": fixture.lsp_command,
+                    "args": [],
+                    "env": {
+                        "MCPLS_BLOCK_READY": "1",
+                        "MCPLS_SPAWN_COUNTER": fixture.spawn_counter
+                    },
+                    "file_patterns": ["**/*.rs"],
+                    "timeout_seconds": 1
+                }]
+            }
+        }),
+    );
+    second.call_tool(
+        "project_add",
+        json!({"project_id": "ready", "root": root_b}),
+    );
+
+    let blocked = first.call_tool_response("project_activate", json!({"project_id": "blocked"}));
+    let blocked_status = blocked["result"]["content"][0]["text"]
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| value["status"].as_str().map(str::to_owned));
+    assert!(
+        blocked.get("error").is_some() || blocked_status.as_deref() == Some("Failed"),
+        "blocked project unexpectedly activated: {blocked}"
+    );
+
+    let ready = second.call_tool("project_activate", json!({"project_id": "ready"}));
+    assert_eq!(ready["status"], "Ready");
+    assert_eq!(
+        std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
+        "2"
+    );
+
+    for client in [&mut first, &mut second] {
+        assert_eq!(
+            client.call_tool("project_status", json!({"project_id": "ready"}))["status"],
+            "Ready"
+        );
+    }
+    let restart_one = second.call_tool("project_restart_lsp", json!({"project_id": "ready"}));
+    assert_eq!(
+        restart_one["status"], "Ready",
+        "restart response: {restart_one}"
+    );
+    let restart_two = first.call_tool("project_restart_lsp", json!({"project_id": "ready"}));
+    assert_eq!(
+        restart_two["status"], "Ready",
+        "restart response: {restart_two}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
+        "4"
+    );
+    daemon.terminate();
+}
+
+#[test]
+fn http_rejects_non_loopback_listener_without_binding() {
+    let fixture = HttpFixture::new();
+    let output = Command::cargo_bin("mcpls")
+        .unwrap()
+        .args([
+            "--config",
+            fixture.config.to_str().unwrap(),
+            "--listen",
+            "0.0.0.0:0",
+        ])
+        .env("MCPLS_LOG", "error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("loopback"),
+        "unexpected validation error: {stderr}"
+    );
 }
 
 #[test]
