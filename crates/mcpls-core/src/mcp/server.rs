@@ -80,10 +80,24 @@ fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpErro
     })
 }
 
+#[derive(Serialize)]
+struct ActorGroupState {
+    group_id: usize,
+    roots: Vec<PathBuf>,
+}
+
+fn actor_group_states(actor_group_roots: Vec<Vec<PathBuf>>) -> Vec<ActorGroupState> {
+    actor_group_roots
+        .into_iter()
+        .enumerate()
+        .map(|(group_id, roots)| ActorGroupState { group_id, roots })
+        .collect()
+}
+
 fn project_state_json(
     identity: &ProjectIdentity,
     state: &ProjectState,
-    actor_groups: Vec<serde_json::Value>,
+    actor_groups: &[ActorGroupState],
 ) -> serde_json::Value {
     serde_json::json!({
         "project_id": identity.id().as_str(),
@@ -207,17 +221,8 @@ impl McplsServer {
             .actor_group_roots(project_id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let actor_groups: Vec<_> = actor_group_roots
-            .into_iter()
-            .enumerate()
-            .map(|(group_id, roots)| {
-                serde_json::json!({
-                    "group_id": group_id,
-                    "roots": roots,
-                })
-            })
-            .collect();
-        encode_json(&project_state_json(identity, state, actor_groups))
+        let actor_groups = actor_group_states(actor_group_roots);
+        encode_json(&project_state_json(identity, state, &actor_groups))
     }
 
     async fn actor_for_project(&self, value: String) -> Result<ProjectHandle, McpError> {
