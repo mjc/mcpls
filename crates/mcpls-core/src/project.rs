@@ -4625,6 +4625,17 @@ impl ProjectRegistry {
         Ok(removal)
     }
 
+    async fn abort_project_removal(
+        &self,
+        id: &ProjectId,
+        removal: &ProjectRemovalSnapshot,
+        error: ProjectRegistryError,
+    ) -> Result<(), ProjectRegistryError> {
+        removal.accept_new_work();
+        self.lifecycle.end_removal(id).await;
+        Err(error)
+    }
+
     /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
@@ -4634,9 +4645,7 @@ impl ProjectRegistry {
         let removal = self.begin_project_removal(&id).await?;
         let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
         if let Err(error) = removal.shutdown(&id).await {
-            removal.accept_new_work();
-            self.lifecycle.end_removal(&id).await;
-            return Err(error);
+            return self.abort_project_removal(&id, &removal, error).await;
         }
         if self.projects.write().await.remove(&id).is_none() {
             self.lifecycle.end_removal(&id).await;
