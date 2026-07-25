@@ -1698,6 +1698,12 @@ mod tests {
         McplsServer::new(translator, subscriptions)
     }
 
+    #[test]
+    fn server_constructor_does_not_require_a_global_translator() {
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let _server = McplsServer::new(subscriptions);
+    }
+
     #[tokio::test]
     async fn http_session_clones_have_independent_subscriptions() {
         let server = create_test_server();
