@@ -186,6 +186,13 @@ fn project_status_summaries_json(summaries: &[ProjectStatusSummary]) -> serde_js
         .into()
 }
 
+fn project_queue_pressure_json(pressure: ProjectQueuePressure) -> serde_json::Value {
+    serde_json::json!({
+        "queued": pressure.queued,
+        "capacity": pressure.capacity,
+    })
+}
+
 #[derive(Serialize)]
 struct SubscriptionListResult {
     subscriptions: Vec<String>,
@@ -594,10 +601,7 @@ impl McplsServer {
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
             "session_count": snapshot.session_count,
-            "queue_pressure": {
-                "queued": snapshot.queue_pressure.queued,
-                "capacity": snapshot.queue_pressure.capacity,
-            },
+            "queue_pressure": project_queue_pressure_json(snapshot.queue_pressure),
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -618,10 +622,7 @@ impl McplsServer {
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
             "session_count": snapshot.session_count,
-            "queue_pressure": {
-                "queued": snapshot.queue_pressure.queued,
-                "capacity": snapshot.queue_pressure.capacity,
-            },
+            "queue_pressure": project_queue_pressure_json(snapshot.queue_pressure),
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
