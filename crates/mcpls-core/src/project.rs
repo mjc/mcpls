@@ -532,6 +532,9 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
     hasher.update(b"rust-server-config-v1");
     hash_compatibility_field(hasher, config.language_id.as_bytes());
     hash_compatibility_field(hasher, config.command.as_bytes());
+    for pattern in &config.file_patterns {
+        hash_compatibility_field(hasher, pattern.as_bytes());
+    }
     for argument in &config.args {
         hash_compatibility_field(hasher, argument.as_bytes());
     }
@@ -4964,6 +4967,38 @@ mod tests {
         changed_config.args.push("--log-file=ra.log".to_string());
         let mut second = Translator::new();
         second.set_lsp_configs(vec![changed_config], Some(10));
+
+        assert_ne!(
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+        );
+    }
+
+    #[test]
+    fn rust_compatibility_key_changes_with_file_patterns() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut first_config = crate::config::LspServerConfig::rust_analyzer();
+        first_config.file_patterns = vec!["**/*.rs".to_string()];
+        let mut second_config = first_config.clone();
+        second_config.file_patterns = vec!["**/*.rs", "**/*.toml"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut first = Translator::new();
+        first.set_lsp_configs(vec![first_config], Some(10));
+        let mut second = Translator::new();
+        second.set_lsp_configs(vec![second_config], Some(10));
 
         assert_ne!(
             rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
