@@ -53,6 +53,13 @@ impl HandlerContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
+        Self::with_subscriptions(subscriptions, project_registry)
+    }
+
+    fn with_subscriptions(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
         let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
             subscriptions,
@@ -65,12 +72,10 @@ impl HandlerContext {
     /// resource subscriptions with another MCP session.
     #[must_use]
     pub fn for_session(&self) -> Self {
-        let subscriptions = Arc::new(ResourceSubscriptions::new());
-        Self {
-            subscriptions: Arc::clone(&subscriptions),
-            project_registry: self.project_registry.clone(),
-            event_sink: Arc::new(SessionEventSink::new(subscriptions)),
-        }
+        Self::from_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            self.project_registry.clone(),
+        )
     }
 
     /// Return the actor owning a path or the registry's explicit routing error.
