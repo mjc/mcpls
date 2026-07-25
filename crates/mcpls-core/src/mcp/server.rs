@@ -180,9 +180,12 @@ impl McplsServer {
     ) -> Result<(), McpError> {
         self.context
             .subscriptions
-            .subscribe(uri)
+            .subscribe(uri.clone())
             .await
             .map_err(|error| McpError::invalid_params(error, None))?;
+        self.context
+            .event_sink
+            .track_subscription(project_id.clone(), uri);
         self.context.event_sink.attach(project_id, actor, peer);
         Ok(())
     }
@@ -1349,9 +1352,16 @@ impl ServerHandler for McplsServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         // Parse the URI for consistency with subscribe validation.
-        parse_session_resource_uri(&request.uri)
+        let resource = parse_session_resource_uri(&request.uri)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        self.context.subscriptions.unsubscribe(&request.uri).await;
+        let uri = match resource {
+            SessionResource::ProjectEvents { project_id, .. } => {
+                project_events_resource_uri(&project_id)
+            }
+            SessionResource::ProjectStatus(_) | SessionResource::Diagnostics(_) => request.uri,
+        };
+        self.context.subscriptions.unsubscribe(&uri).await;
+        self.context.event_sink.untrack_subscription(&uri);
         Ok(())
     }
 

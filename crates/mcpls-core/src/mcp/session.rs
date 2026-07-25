@@ -1,6 +1,6 @@
 //! Per-MCP-session delivery of project events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -129,6 +129,7 @@ impl SessionNotifier for PeerNotifier {
 pub struct SessionEventSink {
     subscriptions: Arc<ResourceSubscriptions>,
     tasks: Mutex<HashMap<ProjectId, JoinHandle<()>>>,
+    project_resources: Arc<Mutex<HashMap<ProjectId, HashSet<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +143,28 @@ impl SessionEventSink {
         Self {
             subscriptions,
             tasks: Mutex::new(HashMap::new()),
+            project_resources: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn track_subscription(&self, project_id: ProjectId, uri: String) {
+        self.project_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(project_id)
+            .or_default()
+            .insert(uri);
+    }
+
+    pub(crate) fn untrack_subscription(&self, uri: &str) {
+        let mut resources = self
+            .project_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for subscriptions in resources.values_mut() {
+            subscriptions.remove(uri);
+        }
+        resources.retain(|_, subscriptions| !subscriptions.is_empty());
     }
 
     /// Attach one project actor to this session's peer, deduplicating repeated
@@ -179,6 +201,7 @@ impl SessionEventSink {
         tasks.remove(&project_id);
 
         let subscriptions = Arc::clone(&self.subscriptions);
+        let project_resources = Arc::clone(&self.project_resources);
         let event_project_id = project_id.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -196,6 +219,7 @@ impl SessionEventSink {
                         if removed {
                             cleanup_removed_project_subscriptions(
                                 &subscriptions,
+                                &project_resources,
                                 &event_project_id,
                                 &event,
                             )
@@ -240,14 +264,23 @@ async fn forward_event(
 
 async fn cleanup_removed_project_subscriptions(
     subscriptions: &ResourceSubscriptions,
+    project_resources: &Mutex<HashMap<ProjectId, HashSet<String>>>,
     project_id: &ProjectId,
     event: &ProjectEvent,
 ) {
-    for uri in event_resource_uris(project_id, event) {
+    let uris = project_resources
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(project_id)
+        .unwrap_or_default();
+    let had_tracked_resources = !uris.is_empty();
+    for uri in uris {
         subscriptions.unsubscribe(&uri).await;
     }
-    if let ProjectEvent::ProjectRemoved { root, .. } = event {
-        subscriptions.unsubscribe_under_path(root).await;
+    if !had_tracked_resources {
+        for uri in event_resource_uris(project_id, event) {
+            subscriptions.unsubscribe(&uri).await;
+        }
     }
 }
 
@@ -455,6 +488,7 @@ mod tests {
         let event_uri = project_events_resource_uri(&project_id);
         let status_uri = project_status_resource_uri(&project_id);
         let diagnostics_uri = "lsp-diagnostics:///workspace/src/main.rs".to_string();
+        let other_diagnostics_uri = "lsp-diagnostics:///workspace/other/src/lib.rs".to_string();
         let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
         subscriptions.subscribe(event_uri.clone()).await.unwrap();
         subscriptions.subscribe(status_uri.clone()).await.unwrap();
@@ -462,7 +496,18 @@ mod tests {
             .subscribe(diagnostics_uri.clone())
             .await
             .unwrap();
+        subscriptions
+            .subscribe(other_diagnostics_uri.clone())
+            .await
+            .unwrap();
         let sink = SessionEventSink::new(Arc::clone(&subscriptions));
+        sink.track_subscription(project_id.clone(), event_uri.clone());
+        sink.track_subscription(project_id.clone(), status_uri.clone());
+        sink.track_subscription(project_id.clone(), diagnostics_uri.clone());
+        sink.track_subscription(
+            ProjectId::new("other").unwrap(),
+            other_diagnostics_uri.clone(),
+        );
         let (events_tx, events_rx) = broadcast::channel(8);
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
 
@@ -491,6 +536,7 @@ mod tests {
                 .await
         );
         assert!(!subscriptions.contains(&diagnostics_uri).await);
+        assert!(subscriptions.contains(&other_diagnostics_uri).await);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if sink
