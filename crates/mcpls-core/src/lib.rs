@@ -45,6 +45,7 @@ pub mod error;
 pub mod lsp;
 pub mod mcp;
 pub mod project;
+pub mod project_persistence;
 pub mod transport;
 pub mod workspace_edit;
 
