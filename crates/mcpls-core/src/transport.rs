@@ -10,6 +10,12 @@
 //! binding. The default entry point [`crate::serve`] always uses
 //! [`Transport::Stdio`].
 
+#[cfg(feature = "transport-http")]
+use std::sync::Arc;
+
+#[cfg(feature = "transport-http")]
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
 /// The transport over which the MCP server communicates with clients.
 ///
 /// # Examples
@@ -45,6 +51,85 @@ pub enum Transport {
     /// stdio. Only available when the `transport-http` feature is enabled.
     #[cfg(feature = "transport-http")]
     Http(HttpConfig),
+}
+
+#[cfg(feature = "transport-http")]
+pub(crate) type SessionManagerHandle = Option<Arc<LocalSessionManager>>;
+
+#[cfg(not(feature = "transport-http"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NoSessionManager;
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) type SessionManagerHandle = NoSessionManager;
+
+#[cfg(feature = "transport-http")]
+pub(crate) const fn no_session_manager() -> SessionManagerHandle {
+    None
+}
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) const fn no_session_manager() -> SessionManagerHandle {
+    NoSessionManager
+}
+
+#[cfg(feature = "transport-http")]
+pub(crate) fn session_manager_for(transport: &Transport) -> SessionManagerHandle {
+    match transport {
+        Transport::Stdio => None,
+        Transport::Http(_) => Some(Arc::new(LocalSessionManager::default())),
+    }
+}
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) const fn session_manager_for(_transport: &Transport) -> SessionManagerHandle {
+    NoSessionManager
+}
+
+#[cfg(feature = "transport-http")]
+pub(crate) async fn session_count(manager: &SessionManagerHandle) -> usize {
+    match manager {
+        Some(manager) => manager.sessions.read().await.len(),
+        None => 0,
+    }
+}
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) async fn session_count(_manager: &SessionManagerHandle) -> usize {
+    std::future::ready(0).await
+}
+
+/// Safe, non-secret transport details included in daemon status snapshots.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TransportSnapshot {
+    pub mode: &'static str,
+    pub bind: Option<String>,
+    pub path: Option<String>,
+}
+
+impl TransportSnapshot {
+    #[must_use]
+    pub(crate) const fn stdio() -> Self {
+        Self {
+            mode: "stdio",
+            bind: None,
+            path: None,
+        }
+    }
+}
+
+impl From<&Transport> for TransportSnapshot {
+    fn from(transport: &Transport) -> Self {
+        match transport {
+            Transport::Stdio => Self::stdio(),
+            #[cfg(feature = "transport-http")]
+            Transport::Http(config) => Self {
+                mode: "http",
+                bind: Some(config.bind.to_string()),
+                path: Some(config.path.clone()),
+            },
+        }
+    }
 }
 
 /// Configuration for the HTTP transport.
@@ -743,7 +828,7 @@ mod tests {
     mod http_tests {
         use std::net::SocketAddr;
 
-        use super::super::{HttpConfig, Transport};
+        use super::super::{HttpConfig, LocalSessionManager, Transport};
 
         #[test]
         fn test_http_config_fields() {

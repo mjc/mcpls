@@ -79,12 +79,35 @@ impl BridgeContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
-        Self::with_subscriptions(subscriptions, project_registry)
+        Self::with_subscriptions(
+            subscriptions,
+            project_registry,
+            Arc::new(TransportSnapshot::stdio()),
+            transport::no_session_manager(),
+        )
+    }
+
+    /// Create a handler context with explicit daemon transport metadata.
+    #[must_use]
+    pub(crate) fn from_registry_with_transport(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+        transport: TransportSnapshot,
+        session_manager: SessionManagerHandle,
+    ) -> Self {
+        Self::with_subscriptions(
+            subscriptions,
+            project_registry,
+            Arc::new(transport),
+            session_manager,
+        )
     }
 
     fn with_subscriptions(
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
+        transport: Arc<TransportSnapshot>,
+        session_manager: SessionManagerHandle,
     ) -> Self {
         let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
@@ -110,12 +133,19 @@ impl BridgeContext {
     /// resource subscriptions with another MCP session.
     #[must_use]
     pub fn for_session(&self) -> Self {
-        let mut context = Self::from_registry(
+        let mut context = Self::with_subscriptions(
             Arc::new(ResourceSubscriptions::new()),
             self.project_registry.clone(),
+            Arc::clone(&self.transport),
+            self.session_manager.clone(),
         );
         context.started_at = self.started_at;
         context
+    }
+
+    /// Return the number of active HTTP sessions without touching project actors.
+    pub(crate) async fn session_count(&self) -> usize {
+        transport::session_count(&self.session_manager).await
     }
 
     /// Return the actor owning a path or the registry's explicit routing error.

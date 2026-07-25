@@ -12,6 +12,7 @@ pub use client::LspClient;
 #[cfg(test)]
 pub(crate) use lifecycle::fake_lsp_server;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
+pub(crate) use lifecycle::{load_project_environment, resolve_command};
 pub use transport::LspTransport;
 pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,

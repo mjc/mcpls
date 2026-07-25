@@ -23,7 +23,7 @@ use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
-use crate::lsp::LspNotification;
+use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use lsp_types::WorkspaceEdit;
 
@@ -468,12 +468,18 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProjectCompatibilityKey([u8; 32]);
 
+fn has_dynamic_project_environment(root: &Path) -> bool {
+    [".envrc", "flake.nix"]
+        .into_iter()
+        .any(|marker| root.join(marker).is_file())
+}
+
 /// Return a conservative fingerprint for the inputs that shape Rust analysis.
 ///
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
 /// unknown rather than compatible. This keeps linked-project reuse fail-closed
 /// until the daemon can resolve the effective toolchain and environment.
-fn rust_project_compatibility_key(
+async fn rust_project_compatibility_key(
     root: &Path,
     translator_template: Option<&TranslatorTemplate>,
 ) -> Option<ProjectCompatibilityKey> {
@@ -485,6 +491,16 @@ fn rust_project_compatibility_key(
         ".cargo/config",
         ".cargo/config.toml",
     ];
+
+    let project_environment =
+        if translator_template.is_some() || has_dynamic_project_environment(root) {
+            load_project_environment(root).await
+        } else {
+            None
+        };
+    if has_dynamic_project_environment(root) && project_environment.is_none() {
+        return None;
+    }
 
     let mut hasher = Sha256::new();
     let mut has_toolchain = false;
@@ -511,33 +527,39 @@ fn rust_project_compatibility_key(
         let toolchain_signature = rust_toolchain_signature(root)?;
         hash_compatibility_field(&mut hasher, b"rustc-toolchain-v1");
         hash_compatibility_field(&mut hasher, &toolchain_signature);
-        hash_rust_server_config(&mut hasher, template)?;
+        hash_rust_server_config(&mut hasher, template, project_environment.as_ref())?;
     }
 
     (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
 }
 
-fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -> Option<()> {
+fn hash_rust_server_config(
+    hasher: &mut Sha256,
+    template: &TranslatorTemplate,
+    project_environment: Option<&std::collections::HashMap<String, Option<String>>>,
+) -> Option<()> {
     let config = template.rust_server_config()?;
     hasher.update(b"rust-server-config-v1");
     hash_compatibility_field(hasher, config.language_id.as_bytes());
     hash_compatibility_field(hasher, config.command.as_bytes());
-    for argument in &config.args {
-        hash_compatibility_field(hasher, argument.as_bytes());
-    }
+    let resolved_command = resolve_command(&config.command, project_environment);
+    let resolved_command = resolved_command.canonicalize().ok()?;
+    hash_compatibility_field(hasher, b"resolved-command-v1");
+    hash_compatibility_field(hasher, resolved_command.to_string_lossy().as_bytes());
+    hash_compatibility_strings(hasher, &config.file_patterns);
+    hash_compatibility_strings(hasher, &config.args);
     let mut environment = config.env.iter().collect::<Vec<_>>();
     environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
     for (name, value) in environment {
         hash_compatibility_field(hasher, name.as_bytes());
         hash_compatibility_field(hasher, value.as_bytes());
     }
+    hash_project_environment(hasher, project_environment);
     let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
     hash_compatibility_field(hasher, &initialization_options);
     hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
     if let Some(heuristics) = &config.heuristics {
-        for marker in &heuristics.project_markers {
-            hash_compatibility_field(hasher, marker.as_bytes());
-        }
+        hash_compatibility_strings(hasher, &heuristics.project_markers);
     }
     hash_compatibility_field(
         hasher,
@@ -549,26 +571,63 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
     Some(())
 }
 
+fn hash_project_environment(
+    hasher: &mut Sha256,
+    project_environment: Option<&std::collections::HashMap<String, Option<String>>>,
+) {
+    let Some(project_environment) = project_environment else {
+        return;
+    };
+    let mut entries = project_environment
+        .iter()
+        .filter(|(name, _)| !is_ephemeral_environment_key(name))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (name, value) in entries {
+        hash_compatibility_field(hasher, name.as_bytes());
+        match value {
+            Some(value) => {
+                hash_compatibility_field(hasher, b"set");
+                hash_compatibility_field(hasher, value.as_bytes());
+            }
+            None => hash_compatibility_field(hasher, b"unset"),
+        }
+    }
+}
+
+fn is_ephemeral_environment_key(name: &str) -> bool {
+    matches!(name, "PWD" | "OLDPWD" | "SHLVL" | "_") || name.starts_with("DIRENV_")
+}
+
+fn hash_compatibility_strings(hasher: &mut Sha256, values: &[String]) {
+    for value in values {
+        hash_compatibility_field(hasher, value.as_bytes());
+    }
+}
+
 fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
     let channel = rust_toolchain_channel(root)?;
     probe_rustc_version(&channel)
 }
 
 fn probe_rustc_version(channel: &str) -> Option<Vec<u8>> {
-    let output = Command::new("rustup")
-        .args(["run", channel, "rustc", "-Vv"])
+    let mut rustup = Command::new("rustup");
+    rustup.args(["run", channel, "rustc", "-Vv"]);
+    match rustup.output() {
+        Ok(output) if output.status.success() => Some(output.stdout),
+        Err(error) if error.kind() == ErrorKind::NotFound => probe_direct_rustc(channel),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn probe_direct_rustc(channel: &str) -> Option<Vec<u8>> {
+    Command::new("rustc")
+        .arg(format!("+{channel}"))
+        .arg("-Vv")
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .or_else(|| {
-            Command::new("rustc")
-                .arg(format!("+{channel}"))
-                .arg("-Vv")
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-        })?;
-    Some(output.stdout)
+        .map(|output| output.stdout)
 }
 
 fn rust_toolchain_channel(root: &Path) -> Option<String> {
@@ -576,20 +635,23 @@ fn rust_toolchain_channel(root: &Path) -> Option<String> {
         .into_iter()
         .find_map(|relative| {
             let contents = std::fs::read_to_string(root.join(relative)).ok()?;
-            if relative == "rust-toolchain.toml" {
-                contents.lines().find_map(|line| {
-                    let (key, value) = line.split_once('=')?;
-                    (key.trim() == "channel")
-                        .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
-                })
-            } else {
-                contents
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(str::to_owned)
-            }
+            parse_rust_toolchain_channel(relative, &contents)
         })
+}
+
+fn parse_rust_toolchain_channel(relative: &str, contents: &str) -> Option<String> {
+    if relative == "rust-toolchain.toml" {
+        contents.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "channel").then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+        })
+    } else {
+        contents
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
@@ -615,6 +677,22 @@ pub enum ProjectStatus {
     Stopped,
     /// The project failed and requires recovery or explicit restart.
     Failed,
+}
+
+impl ProjectStatus {
+    /// Return the stable wire spelling for this lifecycle state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Ready => "Ready",
+            Self::Degraded => "Degraded",
+            Self::Restarting => "Restarting",
+            Self::Stopping => "Stopping",
+            Self::Stopped => "Stopped",
+            Self::Failed => "Failed",
+        }
+    }
 }
 
 /// Typed events emitted by a project actor for session-facing delivery.
@@ -1266,6 +1344,15 @@ pub struct ProjectHandle {
 }
 
 impl ProjectHandle {
+    /// Return the actor request queue depth and fixed capacity without awaiting it.
+    #[must_use]
+    pub fn queue_pressure(&self) -> ProjectQueuePressure {
+        ProjectQueuePressure {
+            queued: self.sender.max_capacity() - self.sender.capacity(),
+            capacity: self.sender.max_capacity(),
+        }
+    }
+
     /// Subscribe to lifecycle changes for this project.
     #[must_use]
     pub fn status(&self) -> watch::Receiver<ProjectStatus> {
@@ -3617,12 +3704,56 @@ impl ProjectEntry {
         })
     }
 
+    fn compatible_actor(
+        &self,
+        compatibility_key: Option<ProjectCompatibilityKey>,
+    ) -> Option<(ProjectHandle, MutationGate)> {
+        let compatibility_key = compatibility_key?;
+        self.actors
+            .iter()
+            .find(|actor| actor.compatibility_key == Some(compatibility_key))
+            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+    }
+
+    fn has_compatible_actor(&self, compatibility_key: Option<ProjectCompatibilityKey>) -> bool {
+        let Some(compatibility_key) = compatibility_key else {
+            return false;
+        };
+        self.actors
+            .iter()
+            .any(|actor| actor.compatibility_key == Some(compatibility_key))
+    }
+
     fn status(&self) -> ProjectStatus {
         aggregate_statuses(
             self.actors
                 .iter()
                 .map(|actor| *actor.actor.status().borrow()),
         )
+    }
+
+    fn status_summary(&self) -> ProjectStatusSummary {
+        let mut roots = self
+            .actors
+            .iter()
+            .flat_map(|actor| actor.roots.iter().map(CanonicalRoot::as_path))
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        ProjectStatusSummary {
+            project_id: self.identity.id().clone(),
+            status: self.status(),
+            actor_group_count: self.actors.len(),
+            roots,
+        }
+    }
+
+    fn queue_pressure(&self) -> ProjectQueuePressure {
+        self.actors
+            .iter()
+            .map(|actor| actor.actor.queue_pressure())
+            .fold(ProjectQueuePressure::default(), ProjectQueuePressure::add)
     }
 }
 
@@ -3677,6 +3808,50 @@ pub struct ProjectStatusCounts {
     pub stopped: usize,
     /// Failed projects.
     pub failed: usize,
+}
+
+/// Cheap lifecycle summary for one registered logical project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStatusSummary {
+    /// Stable project identifier.
+    pub project_id: ProjectId,
+    /// Aggregate lifecycle status across the project's actor groups.
+    pub status: ProjectStatus,
+    /// Number of actor groups backing the logical project.
+    pub actor_group_count: usize,
+    /// Canonical roots owned by the project, sorted and deduplicated.
+    pub roots: Vec<PathBuf>,
+}
+
+/// Bounded actor request queue usage across the registry snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectQueuePressure {
+    /// Requests currently occupying actor queue slots.
+    pub queued: usize,
+    /// Total bounded request queue slots.
+    pub capacity: usize,
+}
+
+impl ProjectQueuePressure {
+    const fn add(self, other: Self) -> Self {
+        Self {
+            queued: self.queued + other.queued,
+            capacity: self.capacity + other.capacity,
+        }
+    }
+}
+
+/// Coherent, non-blocking snapshot of registered project lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRegistryStatusSnapshot {
+    /// Counts by lifecycle state.
+    pub counts: ProjectStatusCounts,
+    /// Total actor groups across all logical projects.
+    pub actor_groups: usize,
+    /// Per-project lifecycle summaries.
+    pub summaries: Vec<ProjectStatusSummary>,
+    /// Aggregate bounded actor queue usage.
+    pub queue_pressure: ProjectQueuePressure,
 }
 
 /// Negotiated capability data for one actor group in a logical project.
@@ -3911,22 +4086,18 @@ impl ProjectRegistry {
         let compatibility_key = rust_project_compatibility_key(
             identity.root.as_path(),
             self.translator_template.as_deref(),
-        );
+        )
+        .await;
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
             if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
                 return Ok(actor.actor.clone());
             }
-            let compatible = existing
-                .actors
-                .iter()
-                .find(|actor| {
-                    actor.compatibility_key == compatibility_key
-                        && compatibility_key.is_some()
-                        && existing.identity.repository_identity() == identity.repository_identity()
-                })
-                .map(|actor| (actor.actor.clone(), actor.mutation.clone()));
+            let compatible = (existing.identity.repository_identity()
+                == identity.repository_identity())
+            .then(|| existing.compatible_actor(compatibility_key))
+            .flatten();
             if let Some((actor, mutation)) = compatible {
                 drop(projects);
                 let mutation_guard = mutation.lock().await;
@@ -4029,6 +4200,40 @@ impl ProjectRegistry {
         }
         drop(projects);
         counts
+    }
+
+    /// Read project lifecycle summaries without awaiting any actor request.
+    pub async fn status_summaries(&self) -> Vec<ProjectStatusSummary> {
+        let projects = self.projects.read().await;
+        let mut summaries: Vec<ProjectStatusSummary> = projects
+            .values()
+            .map(ProjectEntry::status_summary)
+            .collect();
+        drop(projects);
+        summaries.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        summaries
+    }
+
+    /// Read one coherent lifecycle snapshot without awaiting any actor request.
+    pub async fn status_snapshot(&self) -> ProjectRegistryStatusSnapshot {
+        let projects = self.projects.read().await;
+        let mut snapshot = ProjectRegistryStatusSnapshot {
+            counts: ProjectStatusCounts::default(),
+            actor_groups: 0,
+            summaries: Vec::with_capacity(projects.len()),
+            queue_pressure: ProjectQueuePressure::default(),
+        };
+        for entry in projects.values() {
+            snapshot.counts.record(entry.status());
+            snapshot.actor_groups += entry.actors.len();
+            snapshot.summaries.push(entry.status_summary());
+            snapshot.queue_pressure = snapshot.queue_pressure.add(entry.queue_pressure());
+        }
+        drop(projects);
+        snapshot
+            .summaries
+            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        snapshot
     }
 
     /// Return whether durable project registration is configured.
@@ -4158,33 +4363,24 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let (actors, mutations, root) = self
-            .projects
-            .read()
-            .await
+        // Reserve the registry write lock before waiting on actor mutation gates.
+        // Otherwise a concurrent add can mutate this entry after the snapshot
+        // below but before removal, and have its registration deleted silently.
+        let mut projects = self.projects.write().await;
+        let entry = projects
             .get(&id)
-            .map(|entry| {
-                (
-                    entry
-                        .actors
-                        .iter()
-                        .map(|actor| actor.actor.clone())
-                        .collect::<Vec<_>>(),
-                    entry
-                        .actors
-                        .iter()
-                        .map(|actor| actor.mutation.clone())
-                        .collect::<Vec<_>>(),
-                    entry.identity.root().as_path().to_path_buf(),
-                )
-            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        let (actors, mutations): (Vec<_>, Vec<_>) = entry
+            .actors
+            .iter()
+            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+            .unzip();
+        let root = entry.identity.root().as_path().to_path_buf();
         let _mutation_guards = self.lock_mutation_gates(mutations).await;
-        self.projects
-            .write()
-            .await
+        projects
             .remove(&id)
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        drop(projects);
         self.persist().await?;
         for actor in actors {
             actor
@@ -4694,10 +4890,7 @@ fn compatible_project<'a>(
     let compatibility_key = compatibility_key?;
     projects.values().find(|project| {
         project.identity.repository_identity() == Some(repository)
-            && project
-                .actors
-                .iter()
-                .any(|actor| actor.compatibility_key == Some(compatibility_key))
+            && project.has_compatible_actor(Some(compatibility_key))
     })
 }
 
@@ -4813,8 +5006,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rust_compatibility_key_changes_with_server_configuration() {
+    #[tokio::test]
+    async fn rust_compatibility_key_changes_with_server_configuration() {
         let root = TempDir::new().unwrap();
         fs::write(
             root.path().join("rust-toolchain.toml"),
@@ -4838,13 +5031,117 @@ mod tests {
         second.set_lsp_configs(vec![changed_config], Some(10));
 
         assert_ne!(
-            rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
-            rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template()))
+                .await,
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template()))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_compatibility_key_changes_with_file_patterns() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut first_config = crate::config::LspServerConfig::rust_analyzer();
+        first_config.file_patterns = vec!["**/*.rs".to_string()];
+        let mut second_config = first_config.clone();
+        second_config.file_patterns = vec!["**/*.rs", "**/*.toml"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut first = Translator::new();
+        first.set_lsp_configs(vec![first_config], Some(10));
+        let mut second = Translator::new();
+        second.set_lsp_configs(vec![second_config], Some(10));
+
+        assert_ne!(
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template()))
+                .await,
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template()))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_compatibility_key_rejects_dynamic_project_environment() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".envrc"),
+            "export RUSTFLAGS=-Ctarget-cpu=native\n",
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+
+        assert_eq!(
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template()))
+                .await,
+            None
+        );
+
+        fs::remove_file(root.path().join(".envrc")).unwrap();
+        fs::write(root.path().join("flake.nix"), "{}\n").unwrap();
+        assert_eq!(
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template()))
+                .await,
+            None
         );
     }
 
     #[test]
-    fn rust_compatibility_key_rejects_unavailable_toolchains() {
+    fn rust_compatibility_environment_ignores_ephemeral_values() {
+        let mut first = HashMap::from([
+            ("DIRENV_DIFF".to_string(), Some("first".to_string())),
+            ("PWD".to_string(), Some("/first".to_string())),
+            (
+                "RUSTFLAGS".to_string(),
+                Some("-Ctarget-cpu=native".to_string()),
+            ),
+        ]);
+        let mut second = first.clone();
+        second.insert("DIRENV_DIFF".to_string(), Some("second".to_string()));
+        second.insert("PWD".to_string(), Some("/second".to_string()));
+
+        let fingerprint = |environment: &HashMap<String, Option<String>>| {
+            let mut hasher = Sha256::new();
+            hash_project_environment(&mut hasher, Some(environment));
+            hasher.finalize()
+        };
+
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        first.insert(
+            "RUSTFLAGS".to_string(),
+            Some("-Ctarget-cpu=generic".to_string()),
+        );
+        assert_ne!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[tokio::test]
+    async fn rust_compatibility_key_rejects_unavailable_toolchains() {
         let root = TempDir::new().unwrap();
         fs::write(
             root.path().join("rust-toolchain.toml"),
@@ -4864,7 +5161,8 @@ mod tests {
         );
 
         assert_eq!(
-            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template()))
+                .await,
             None
         );
     }
@@ -6107,6 +6405,37 @@ mod tests {
         assert!(restart.is_ok() || matches!(restart, Err(ProjectRegistryError::Actor(_))));
         assert!(remove.is_ok());
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_remove_blocks_re_registration_until_removal_finishes() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let id = ProjectId::new("race").unwrap();
+        let identity = ProjectIdentity::new(id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        registry.add(identity.clone()).await.unwrap();
+
+        let mutation = registry.projects.read().await.get(&id).unwrap().actors[0]
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+        let remove_registry = registry.clone();
+        let remove_id = id.clone();
+        let remove = tokio::spawn(async move { remove_registry.remove(remove_id).await });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), registry.add(identity.clone()),)
+                .await
+                .is_err()
+        );
+
+        drop(guard);
+        assert!(remove.await.unwrap().is_ok());
+        registry.add(identity).await.unwrap();
+        assert_eq!(registry.list().await.len(), 1);
     }
 
     #[tokio::test]

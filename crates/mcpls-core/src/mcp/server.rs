@@ -30,6 +30,7 @@ use crate::bridge::{
     DiagnosticInfo, NotificationCache, PositionEncoding, ResourceSubscriptions, Translator,
     validate_path_against_roots,
 };
+use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
 /// MCP server that exposes LSP capabilities as tools.
 pub struct McplsServer {
