@@ -317,6 +317,16 @@ fn project_root(directory: &TempDir, name: &str) -> PathBuf {
     root
 }
 
+fn project_ids(client: &mut HttpClient) -> Vec<String> {
+    client
+        .call_tool("project_list", json!({}))
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|project| project["project_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[cfg(unix)]
 #[test]
 fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
@@ -345,8 +355,7 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     assert_eq!(added_b["project_id"], "project-b");
 
     for client in [&mut first, &mut second] {
-        let projects = client.call_tool("project_list", json!({}));
-        assert_eq!(projects.as_array().unwrap().len(), 2);
+        assert_eq!(project_ids(client), ["project-a", "project-b"]);
         for id in ["project-a", "project-b"] {
             let status = client.call_tool("project_status", json!({"project_id": id}));
             assert_eq!(status["project_id"], id);
@@ -362,14 +371,7 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     let removed = second.call_tool("project_remove", json!({"project_id": "project-b"}));
     assert_eq!(removed["project_id"], "project-b");
     assert_eq!(removed["removed"], true);
-    assert_eq!(
-        first
-            .call_tool("project_list", json!({}))
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(project_ids(&mut first), ["project-a"]);
     let restored_b = first.call_tool(
         "project_add",
         json!({"project_id": "project-b", "root": root_b}),
@@ -380,13 +382,6 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     let mut restarted_daemon = HttpDaemon::spawn(&config);
     let mut restored = HttpClient::new(restarted_daemon.address);
     restored.initialize();
-    let projects = restored.call_tool("project_list", json!({}));
-    let ids: Vec<_> = projects
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|project| project["project_id"].as_str())
-        .collect();
-    assert_eq!(ids, ["project-a", "project-b"]);
+    assert_eq!(project_ids(&mut restored), ["project-a", "project-b"]);
     restarted_daemon.terminate();
 }
