@@ -170,6 +170,12 @@ mod tests {
         assert_eq!(Arc::strong_count(&context.subscriptions), 2);
     }
 
+    #[test]
+    fn handler_context_creation_does_not_require_a_global_translator() {
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let _context = HandlerContext::new(subscriptions);
+    }
+
     #[tokio::test]
     async fn edit_plan_ownership_is_local_to_one_session() {
         let translator = Arc::new(Mutex::new(Translator::new()));
