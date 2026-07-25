@@ -1206,8 +1206,7 @@ impl ServerHandler for McplsServer {
 
         self.context
             .event_sink
-            .attach(project_id, actor, context.peer)
-            .await;
+            .attach(project_id, &actor, context.peer);
 
         Ok(())
     }

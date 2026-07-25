@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::{Peer, RoleServer};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::bridge::resources::make_uri;
@@ -43,13 +43,16 @@ impl SessionEventSink {
 
     /// Attach one project actor to this session's peer, deduplicating repeated
     /// subscriptions for files owned by the same project.
-    pub(crate) async fn attach(
+    pub(crate) fn attach(
         &self,
         project_id: ProjectId,
-        actor: ProjectHandle,
+        actor: &ProjectHandle,
         peer: Peer<RoleServer>,
     ) {
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if tasks
             .get(&project_id)
             .is_some_and(|task| !task.is_finished())
@@ -93,10 +96,12 @@ impl SessionEventSink {
 
 impl Drop for SessionEventSink {
     fn drop(&mut self) {
-        if let Ok(mut tasks) = self.tasks.try_lock() {
-            for task in tasks.drain().map(|(_, task)| task) {
-                task.abort();
-            }
+        let tasks = self
+            .tasks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for task in tasks.drain().map(|(_, task)| task) {
+            task.abort();
         }
     }
 }
