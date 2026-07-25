@@ -249,7 +249,7 @@ impl McplsServer {
                 .total_actor_group_count()
                 .await,
             persistence: DaemonPersistenceSnapshot {
-                configured: self.context.project_registry.persistence_configured().await,
+                configured: self.context.project_registry.persistence_configured(),
             },
             shutting_down: self.context.project_registry.is_shutting_down(),
         }
