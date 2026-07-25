@@ -171,7 +171,6 @@ impl BridgeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::Translator;
     use crate::edit_plan::PlanId;
 
     #[test]
@@ -190,11 +189,16 @@ mod tests {
         assert_eq!(Arc::strong_count(&context.translator), 1);
     }
 
+    #[test]
+    fn handler_context_creation_does_not_require_a_global_translator() {
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let _context = HandlerContext::from_registry(subscriptions, ProjectRegistry::new(32));
+    }
+
     #[tokio::test]
     async fn edit_plan_ownership_is_local_to_one_session() {
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let context = HandlerContext::new(translator, subscriptions);
+        let context = HandlerContext::from_registry(subscriptions, ProjectRegistry::new(32));
         let session = context.for_session();
         let plan_id = PlanId::new();
 

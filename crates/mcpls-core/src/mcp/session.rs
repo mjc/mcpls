@@ -162,6 +162,10 @@ impl SessionEventSink {
     }
 
     pub(crate) fn untrack_subscription(&self, uri: &str) {
+        self.stop_project_tasks(self.remove_tracked_resource(uri));
+    }
+
+    fn remove_tracked_resource(&self, uri: &str) -> Vec<ProjectId> {
         let mut resources = self
             .project_resources
             .lock()
@@ -169,7 +173,35 @@ impl SessionEventSink {
         for subscriptions in resources.values_mut() {
             subscriptions.remove(uri);
         }
+        let empty_projects = resources
+            .iter()
+            .filter(|(_, subscriptions)| subscriptions.is_empty())
+            .map(|(project_id, _)| project_id.clone())
+            .collect::<Vec<_>>();
         resources.retain(|_, subscriptions| !subscriptions.is_empty());
+        empty_projects
+    }
+
+    fn stop_project_tasks(&self, project_ids: impl IntoIterator<Item = ProjectId>) {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for project_id in project_ids {
+            if let Some(task) = tasks.remove(&project_id) {
+                task.abort();
+            }
+        }
+    }
+
+    fn stop_all_tasks(&mut self) {
+        let tasks = self
+            .tasks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for task in tasks.drain().map(|(_, task)| task) {
+            task.abort();
+        }
     }
 
     /// Attach all actor groups for one logical project to this session's peer,
@@ -345,13 +377,7 @@ async fn cleanup_removed_project_subscriptions(
 
 impl Drop for SessionEventSink {
     fn drop(&mut self) {
-        let tasks = self
-            .tasks
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for task in tasks.drain().map(|(_, task)| task) {
-            task.abort();
-        }
+        self.stop_all_tasks();
     }
 }
 
@@ -604,6 +630,42 @@ mod tests {
         })
         .await
         .expect("session sink did not stop after peer disconnect");
+    }
+
+    #[tokio::test]
+    async fn unsubscribing_last_project_resource_stops_sink() {
+        let project_id = ProjectId::new("a").unwrap();
+        let resource = project_events_resource_uri(&project_id);
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(resource.clone()).await.unwrap();
+        let sink = SessionEventSink::new(subscriptions);
+        sink.track_subscription(project_id.clone(), resource);
+        let (_events_tx, events_rx) = broadcast::channel(8);
+        let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+
+        sink.attach_receivers(
+            project_id.clone(),
+            vec![events_rx],
+            Arc::new(TestNotifier(updates_tx)),
+        );
+        sink.untrack_subscription(&project_events_resource_uri(&project_id));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if sink
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(&project_id)
+                    .is_none_or(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session sink did not stop after its last subscription was removed");
     }
 
     #[tokio::test]

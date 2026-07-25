@@ -13,11 +13,12 @@ use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
-    CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
-    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
+    DefinitionResult, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
-    ReferencesResult, RenameResult, ServerCapability, ServerLogsResult, ServerMessagesResult,
-    SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ProjectActivation, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, Translator, TranslatorTemplate,
+    WorkspaceSymbolResult,
 };
 use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
@@ -2606,6 +2607,15 @@ impl ProjectRuntime {
         self.generation == generation
     }
 
+    fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
+        self.translator.has_active_workspace_roots(roots)
+    }
+
+    fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
+        matches!(status, ProjectStatus::Ready | ProjectStatus::Degraded)
+            && self.has_active_workspace_roots(roots)
+    }
+
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
         self.edit_plans
             .insert(plan)
@@ -3098,30 +3108,27 @@ impl ProjectRuntime {
     async fn activate_workspace_roots(
         &mut self,
         roots: Vec<PathBuf>,
-    ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+    ) -> Result<ProjectActivation, String> {
         self.translator
             .activate_project_with_roots(roots)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn add_workspace_root(
-        &mut self,
-        root: PathBuf,
-    ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+    async fn add_workspace_root(&mut self, root: PathBuf) -> Result<ProjectActivation, String> {
         self.translator
             .add_workspace_root(root)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn restart(&mut self) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+    async fn restart(&mut self) -> Result<ProjectActivation, String> {
         let roots = self.translator.workspace_roots().to_vec();
         if roots.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::ready());
         }
         if self.translator.configured_language_ids().is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::ready());
         }
         self.shutdown().await?;
         self.translator
@@ -3317,28 +3324,43 @@ async fn forward_lsp_notifications(
 }
 
 fn mark_project_started(
-    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    activation: ProjectActivation,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
 ) {
-    spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
-    publish_project_readiness(channels, state, runtime);
+    let health = activation.health();
+    spawn_notification_forwarders(
+        activation.into_notification_receivers(),
+        actor_sender,
+        runtime.generation(),
+    );
+    publish_project_readiness(channels, state, runtime, health);
+}
+
+const fn activation_status(health: ActivationHealth, initializing: bool) -> ProjectStatus {
+    if initializing {
+        ProjectStatus::Starting
+    } else {
+        match health {
+            ActivationHealth::Ready => ProjectStatus::Ready,
+            ActivationHealth::Degraded => ProjectStatus::Degraded,
+        }
+    }
 }
 
 fn publish_project_readiness(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
+    health: ActivationHealth,
 ) {
     state.sync_runtime(runtime);
-    let status = if runtime.translator.is_initializing() {
-        ProjectStatus::Starting
-    } else {
-        ProjectStatus::Ready
-    };
-    channels.publish_status(state, status);
+    channels.publish_status(
+        state,
+        activation_status(health, runtime.translator.is_initializing()),
+    );
 }
 
 async fn stop_project_runtime(
@@ -3376,6 +3398,11 @@ async fn handle_project_request(
             let _ = reply.send(state.clone());
         }
         ProjectRequest::Activate { root, reply } => {
+            if runtime.activation_is_reusable(state.status, std::slice::from_ref(&root)) {
+                state.sync_runtime(runtime);
+                let _ = reply.send(Ok(state.clone()));
+                return false;
+            }
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
@@ -3399,6 +3426,11 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
+            if runtime.activation_is_reusable(state.status, &roots) {
+                state.sync_runtime(runtime);
+                let _ = reply.send(Ok(state.clone()));
+                return false;
+            }
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
@@ -3740,7 +3772,12 @@ async fn handle_project_request(
             let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, notification);
             if was_initializing && !runtime.translator.is_initializing() {
-                publish_project_readiness(channels, state, runtime);
+                let health = if state.status == ProjectStatus::Degraded {
+                    ActivationHealth::Degraded
+                } else {
+                    ActivationHealth::Ready
+                };
+                publish_project_readiness(channels, state, runtime, health);
             }
         }
         ProjectRequest::ServerExited { generation } => {
@@ -4068,6 +4105,7 @@ pub struct ProjectRegistry {
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
+    persistence_error: std::sync::Arc<RwLock<Option<String>>>,
     lifecycle: std::sync::Arc<RegistryLifecycle>,
     shutdown_timeout: Duration,
 }
@@ -4264,6 +4302,7 @@ impl ProjectRegistry {
             actor_capacity: actor_capacity.max(1),
             translator_template: translator_template.map(std::sync::Arc::new),
             persistence: None,
+            persistence_error: std::sync::Arc::new(RwLock::new(None)),
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
             shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
         }
@@ -4312,7 +4351,14 @@ impl ProjectRegistry {
             })
             .collect::<Vec<_>>();
         projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
-        save_persisted_state(store, projects).await
+        let result = save_persisted_state(store, projects).await;
+        self.record_persistence_error(result.as_ref().err().map(ToString::to_string))
+            .await;
+        result
+    }
+
+    async fn record_persistence_error(&self, error: Option<String>) {
+        *self.persistence_error.write().await = error;
     }
 
     /// Restore valid registrations from the attached store.
@@ -4328,7 +4374,16 @@ impl ProjectRegistry {
         let Some(store) = self.persistence.clone() else {
             return Ok(0);
         };
-        let state = load_persisted_state(store).await?;
+        let state = match load_persisted_state(store).await {
+            Ok(state) => {
+                self.record_persistence_error(None).await;
+                state
+            }
+            Err(error) => {
+                self.record_persistence_error(Some(error.to_string())).await;
+                return Err(error);
+            }
+        };
         let mut restored = 0;
         for persisted in state.projects {
             let Ok(id) = persisted.project_id() else {
@@ -4607,6 +4662,11 @@ impl ProjectRegistry {
     #[must_use]
     pub const fn persistence_configured(&self) -> bool {
         self.persistence.is_some()
+    }
+
+    /// Return the most recent persistence error, if any.
+    pub async fn persistence_error(&self) -> Option<String> {
+        self.persistence_error.read().await.clone()
     }
 
     /// Return whether the registry is draining during daemon shutdown.
@@ -6371,6 +6431,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_activation_preserves_active_runtime_generation() {
+        let root = TempDir::new().unwrap();
+        let root = root.path().to_path_buf();
+        let mut translator = Translator::new();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.heuristics = None;
+        translator.set_workspace_roots(vec![root.clone()]);
+        translator.set_lsp_configs(vec![config.clone()], None);
+        translator.register_client(
+            config.language_id.clone(),
+            crate::lsp::LspClient::new(config),
+        );
+        translator.register_server_roots("rust".to_string(), vec![root.clone()]);
+
+        let actor = spawn_project_actor_with_translator(2, translator);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+        assert_eq!(actor.query().await.unwrap().runtime().generation(), 0);
+
+        actor.activate(root).await.unwrap();
+
+        assert_eq!(actor.query().await.unwrap().runtime().generation(), 0);
+    }
+
+    #[tokio::test]
     async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
         let actor = spawn_project_actor(2);
         actor.set_status(ProjectStatus::Ready).await.unwrap();
@@ -6874,6 +6958,7 @@ mod tests {
         let config = ProjectConfig {
             lsp_servers: Some(vec![server]),
             heuristics_max_depth: Some(3),
+            redaction_patterns: None,
         };
 
         registry
@@ -7024,6 +7109,14 @@ mod tests {
         )]);
 
         assert_eq!(state.status(), ProjectStatus::Ready);
+    }
+
+    #[test]
+    fn partial_activation_is_degraded() {
+        assert_eq!(
+            activation_status(ActivationHealth::Degraded, false),
+            ProjectStatus::Degraded
+        );
     }
 
     #[tokio::test]

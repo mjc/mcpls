@@ -23,12 +23,13 @@ pub use state::{
 };
 pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
-    CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult, DefinitionResult,
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, Location,
-    LocationsResult, OutgoingCallsResult, Position2D, Range, ReferencesResult, RenameResult,
-    ServerCapability, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Symbol,
-    TextEdit, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
+    DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges,
+    DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
+    InlayHintsResult, Location, LocationsResult, OutgoingCallsResult, Position2D,
+    ProjectActivation, Range, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, Symbol, TextEdit, Translator, TranslatorTemplate,
+    WorkspaceSymbolResult,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

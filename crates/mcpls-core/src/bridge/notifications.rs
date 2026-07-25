@@ -340,6 +340,185 @@ fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
     }
 }
 
+/// Redacts configured secret values from server output.
+#[derive(Debug, Clone, Default)]
+pub struct RedactionPolicy {
+    secrets: Vec<String>,
+}
+
+impl RedactionPolicy {
+    /// Build a policy from configured non-empty secret values.
+    #[must_use]
+    pub fn from_secrets<I>(secrets: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Self {
+            secrets: secrets
+                .into_iter()
+                .filter(|secret| !secret.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Replace every configured secret in one server message.
+    #[must_use]
+    pub fn redact(&self, message: &str) -> String {
+        let message = redact_bearer_tokens(message);
+        let message = redact_sensitive_assignments(&message);
+        self.secrets.iter().fold(message, |message, secret| {
+            message.replace(secret, "[REDACTED]")
+        })
+    }
+}
+
+const SENSITIVE_KEYS: &[&str] = &[
+    "access_key",
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+];
+
+fn is_boundary_before(bytes: &[u8], index: usize) -> bool {
+    index == 0 || !bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_'
+}
+
+fn is_boundary_after(bytes: &[u8], index: usize) -> bool {
+    index == bytes.len() || !bytes[index].is_ascii_alphanumeric() && bytes[index] != b'_'
+}
+
+fn value_end(bytes: &[u8], start: usize) -> usize {
+    if let Some(quote) = bytes
+        .get(start)
+        .copied()
+        .filter(|byte| *byte == b'"' || *byte == b'\'')
+    {
+        return bytes[start + 1..]
+            .iter()
+            .position(|byte| *byte == quote)
+            .map_or(bytes.len(), |offset| start + 1 + offset);
+    }
+
+    bytes[start..]
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace() || b",;}]\")".contains(byte))
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+fn redact_sensitive_assignments(message: &str) -> String {
+    let lowercase = message.to_ascii_lowercase();
+    let bytes = message.as_bytes();
+    let lowercase_bytes = lowercase.as_bytes();
+    let mut output = String::with_capacity(message.len());
+    let mut copied_until = 0;
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some((key_start, key_end)) = SENSITIVE_KEYS
+            .iter()
+            .filter_map(|key| {
+                lowercase_bytes[cursor..]
+                    .windows(key.len())
+                    .position(|window| window == key.as_bytes())
+                    .map(|offset| {
+                        let start = cursor + offset;
+                        (start, start + key.len())
+                    })
+            })
+            .min_by_key(|(start, _)| *start)
+        else {
+            break;
+        };
+        if !is_boundary_before(bytes, key_start)
+            || !is_boundary_after(bytes, key_end)
+            || !bytes[key_end..]
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| byte == b'=' || byte == b':')
+        {
+            cursor = key_end;
+            continue;
+        }
+
+        let Some(separator) = bytes[key_end..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|offset| key_end + offset)
+        else {
+            cursor = key_end;
+            continue;
+        };
+        let value_start = bytes[separator + 1..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map_or(bytes.len(), |offset| separator + 1 + offset);
+        let value_end = value_end(bytes, value_start);
+        if value_start >= value_end {
+            cursor = value_start;
+            continue;
+        }
+
+        output.push_str(&message[copied_until..value_start]);
+        output.push_str("[REDACTED]");
+        copied_until = value_end;
+        cursor = value_end;
+    }
+
+    output.push_str(&message[copied_until..]);
+    output
+}
+
+fn redact_bearer_tokens(message: &str) -> String {
+    let lowercase = message.to_ascii_lowercase();
+    let bytes = message.as_bytes();
+    let lowercase_bytes = lowercase.as_bytes();
+    let mut output = String::with_capacity(message.len());
+    let mut copied_until = 0;
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(offset) = lowercase_bytes[cursor..]
+            .windows("bearer".len())
+            .position(|window| window == b"bearer")
+        else {
+            break;
+        };
+        let key_start = cursor + offset;
+        let key_end = key_start + "bearer".len();
+        if !is_boundary_before(bytes, key_start) || !is_boundary_after(bytes, key_end) {
+            cursor = key_end;
+            continue;
+        }
+
+        let value_start = bytes[key_end..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map_or(key_end, |offset| key_end + offset);
+        let value_end = bytes[value_start..]
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || b",;}]\")".contains(byte))
+            .map_or(bytes.len(), |offset| value_start + offset);
+        if value_start >= value_end {
+            cursor = value_start;
+            continue;
+        }
+
+        output.push_str(&message[copied_until..value_start]);
+        output.push_str("[REDACTED]");
+        copied_until = value_end;
+        cursor = value_end;
+    }
+
+    output.push_str(&message[copied_until..]);
+    output
+}
+
 /// Information about diagnostics for a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticInfo {
