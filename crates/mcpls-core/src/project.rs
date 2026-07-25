@@ -3661,6 +3661,9 @@ pub enum ProjectRegistryError {
     /// No project with this stable ID is registered.
     #[error("project is not registered: {0}")]
     ProjectNotFound(ProjectId),
+    /// A project with this stable ID is already being removed.
+    #[error("project is being removed: {0}")]
+    ProjectRemoving(ProjectId),
     /// The daemon is draining projects and no new registrations are accepted.
     #[error("project registry is shutting down")]
     ShuttingDown,
@@ -3795,6 +3798,7 @@ type MutationGate = std::sync::Arc<Mutex<()>>;
 #[derive(Debug, Default)]
 struct RegistryLifecycle {
     shutting_down: AtomicBool,
+    removing: Mutex<HashSet<ProjectId>>,
 }
 
 const DEFAULT_PROJECT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3810,6 +3814,31 @@ impl RegistryLifecycle {
         } else {
             Ok(())
         }
+    }
+
+    async fn ensure_project_available(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<(), ProjectRegistryError> {
+        self.ensure_accepting()?;
+        if self.removing.lock().await.contains(project_id) {
+            Err(ProjectRegistryError::ProjectRemoving(project_id.clone()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn begin_removal(&self, project_id: &ProjectId) -> Result<(), ProjectRegistryError> {
+        let mut removing = self.removing.lock().await;
+        if removing.insert(project_id.clone()) {
+            Ok(())
+        } else {
+            Err(ProjectRegistryError::ProjectRemoving(project_id.clone()))
+        }
+    }
+
+    async fn end_removal(&self, project_id: &ProjectId) {
+        self.removing.lock().await.remove(project_id);
     }
 }
 
@@ -4188,7 +4217,9 @@ impl ProjectRegistry {
             rust_project_compatibility_key(identity.root.as_path(), translator_template.as_deref())
                 .await;
         let mut projects = self.projects.write().await;
-        self.lifecycle.ensure_accepting()?;
+        self.lifecycle
+            .ensure_project_available(identity.id())
+            .await?;
         if let Some(existing) = projects.get(identity.id()) {
             if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
                 if translator_templates_match(
@@ -4480,35 +4511,46 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        // Reserve the registry write lock before waiting on actor mutation gates.
-        // Otherwise a concurrent add can mutate this entry after the snapshot
-        // below but before removal, and have its registration deleted silently.
-        let mut projects = self.projects.write().await;
-        let entry = projects
-            .get(&id)
-            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        let (actors, mutations): (Vec<_>, Vec<_>) = entry
-            .actors
-            .iter()
-            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
-            .unzip();
-        let root = entry.identity.root().as_path().to_path_buf();
+        let (actors, mutations, root) = {
+            let projects = self.projects.read().await;
+            let entry = projects
+                .get(&id)
+                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+            self.lifecycle.begin_removal(&id).await?;
+            let (actors, mutations): (Vec<_>, Vec<_>) = entry
+                .actors
+                .iter()
+                .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+                .unzip();
+            let root = entry.identity.root().as_path().to_path_buf();
+            (actors, mutations, root)
+        };
         let _mutation_guards = self.lock_mutation_gates(mutations).await;
-        projects
+        let result = async {
+            for actor in actors {
+                actor
+                    .publish_event(ProjectEvent::ProjectRemoved {
+                        project_id: id.clone(),
+                        root: root.clone(),
+                    })
+                    .await
+                    .map_err(ProjectRegistryError::from)?;
+                actor.shutdown().await.map_err(ProjectRegistryError::from)?;
+            }
+            Ok::<(), ProjectRegistryError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.lifecycle.end_removal(&id).await;
+            return Err(error);
+        }
+        self.projects
+            .write()
+            .await
             .remove(&id)
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        drop(projects);
         self.persist().await?;
-        for actor in actors {
-            actor
-                .publish_event(ProjectEvent::ProjectRemoved {
-                    project_id: id.clone(),
-                    root: root.clone(),
-                })
-                .await
-                .map_err(ProjectRegistryError::from)?;
-            actor.shutdown().await.map_err(ProjectRegistryError::from)?;
-        }
+        self.lifecycle.end_removal(&id).await;
         Ok(())
     }
 
@@ -6365,6 +6407,59 @@ mod tests {
             .await
             .unwrap();
         assert!(store.load().unwrap().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_keeps_failed_removal_registered_and_persisted() {
+        let root = TempDir::new().unwrap();
+        let state_path = root.path().join("state/projects.json");
+        let store = ProjectRegistrationStore::new(&state_path);
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        let project_id = ProjectId::new("failed-removal").unwrap();
+        let identity =
+            ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (events, _) = broadcast::channel(1);
+        registry.projects.write().await.insert(
+            project_id.clone(),
+            ProjectEntry {
+                identity: identity.clone(),
+                actors: vec![ProjectActorEntry {
+                    actor: ProjectHandle {
+                        sender,
+                        status,
+                        events,
+                        event_history: std::sync::Arc::new(std::sync::Mutex::new(
+                            ProjectEventHistory::new(1),
+                        )),
+                    },
+                    mutation: std::sync::Arc::new(Mutex::new(())),
+                    compatibility_key: None,
+                    translator_template: None,
+                    roots: vec![identity.root().clone()],
+                }],
+                config: None,
+            },
+        );
+        store
+            .save(&[PersistedProject {
+                project_id: project_id.to_string(),
+                root: identity.root().as_path().to_path_buf(),
+                additional_roots: Vec::new(),
+                config: None,
+            }])
+            .unwrap();
+
+        let result = registry.remove(project_id.clone()).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Closed))
+        ));
+        assert_eq!(registry.list().await, vec![identity]);
+        assert_eq!(store.load().unwrap().projects.len(), 1);
     }
 
     #[tokio::test]
