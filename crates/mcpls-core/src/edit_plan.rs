@@ -9,6 +9,29 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Shared edit safety limits used by preview and project-local plan storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditLimits {
+    /// Maximum number of affected files retained in one project store.
+    pub max_files: usize,
+    /// Maximum number of text edits accepted by preview planning.
+    pub max_edits: usize,
+    /// Maximum combined plan bytes retained by one project store.
+    pub max_bytes: usize,
+    /// Lifetime of a stored plan.
+    pub plan_ttl: Duration,
+}
+
+impl EditLimits {
+    /// Default limits for one long-lived project actor.
+    pub const PROJECT: Self = Self {
+        max_files: 64,
+        max_edits: 4_096,
+        max_bytes: 16 * 1024 * 1024,
+        plan_ttl: Duration::from_secs(15 * 60),
+    };
+}
+
 /// Opaque identifier for one preview/apply transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PlanId(String);
@@ -340,7 +363,8 @@ impl EditPlanStore {
     /// Construct the daemon's bounded project-local plan store.
     #[must_use]
     pub fn for_project() -> Self {
-        Self::new(64, 16 * 1024 * 1024, Duration::from_secs(15 * 60))
+        let limits = EditLimits::PROJECT;
+        Self::new(limits.max_files, limits.max_bytes, limits.plan_ttl)
     }
 
     /// Create a bounded plan store.

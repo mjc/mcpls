@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use lsp_types::WorkspaceEdit;
 
@@ -11,7 +10,7 @@ use crate::bridge::{DocumentTracker, PositionEncoding, uri_to_path};
 use crate::edit_paths::{
     FileOperation, OperationValidationError, PathSafetyError, WorkspaceBoundary,
 };
-use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
+use crate::edit_plan::{EditLimits, EditPlan, FileSnapshot, SnapshotSource};
 use crate::edit_planner::apply_text_edits;
 use crate::workspace_edit::{EditOperation, NormalizedWorkspaceEdit, normalize};
 
@@ -29,9 +28,9 @@ pub struct PreviewLimits {
 impl Default for PreviewLimits {
     fn default() -> Self {
         Self {
-            max_files: 64,
-            max_edits: 4_096,
-            max_bytes: 16 * 1024 * 1024,
+            max_files: EditLimits::PROJECT.max_files,
+            max_edits: EditLimits::PROJECT.max_edits,
+            max_bytes: EditLimits::PROJECT.max_bytes,
         }
     }
 }
@@ -217,7 +216,7 @@ impl<'a> PreviewBuilder<'a> {
             snapshots,
             self.operations,
             safe_to_apply,
-            Duration::from_secs(15 * 60),
+            EditLimits::PROJECT.plan_ttl,
         );
         Ok(PreviewArtifact {
             plan,
