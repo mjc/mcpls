@@ -371,10 +371,7 @@ impl Translator {
             let same_root = self
                 .lsp_roots
                 .get(language_id)
-                .is_some_and(|existing_roots| {
-                    existing_roots.len() == roots.len()
-                        && roots.iter().all(|root| existing_roots.contains(root))
-                })
+                .is_some_and(|existing_roots| Self::same_workspace_roots(existing_roots, &roots))
                 && self.lsp_clients.contains_key(language_id);
 
             if same_root {
@@ -443,6 +440,13 @@ impl Translator {
         self.reopen_tracked_documents().await?;
         self.clear_expected_languages();
         Ok(ProjectActivation::new(notification_receivers, health))
+    }
+
+    fn same_workspace_roots(existing: &[PathBuf], requested: &[PathBuf]) -> bool {
+        existing.len() == requested.len()
+            && requested
+                .iter()
+                .all(|root| existing.iter().any(|existing| existing == root))
     }
 
     async fn reopen_tracked_documents(&self) -> Result<()> {
@@ -2978,7 +2982,11 @@ mod tests {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         fs::write(first.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
-        fs::write(second.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::write(
+            second.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[]\n",
+        )
+        .unwrap();
         let mut config = LspServerConfig::rust_analyzer();
         config.command = "/definitely/missing/rust-analyzer".to_string();
 
