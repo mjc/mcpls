@@ -9,8 +9,8 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     Implementation, ListResourcesResult, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    ReadResourceResult, ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
+    ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
@@ -1419,18 +1419,27 @@ impl ServerHandler for McplsServer {
             .validate_path(path.display().to_string())
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-
-        // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
-        // notify_resource_updated so clients subscribing after initial workspace indexing
-        // don't have to wait for the next LSP push. Requires peer access from HandlerContext.
-        // Track as follow-up issue.
+        let has_cached_diagnostics = actor
+            .has_cached_diagnostics(path.display().to_string())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         self.attach_subscription(
             project_id,
             std::slice::from_ref(&actor),
             request.uri.clone(),
-            context.peer,
+            context.peer.clone(),
         )
         .await?;
+
+        if has_cached_diagnostics {
+            context
+                .peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(request.uri))
+                .await
+                .map_err(|_| {
+                    McpError::internal_error("failed to replay cached diagnostics", None)
+                })?;
+        }
 
         Ok(())
     }

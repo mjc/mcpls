@@ -2022,6 +2022,14 @@ impl Translator {
         Ok(DiagnosticsResult { diagnostics })
     }
 
+    /// Return whether diagnostics have been cached for a document path.
+    pub fn has_cached_diagnostics(&self, file_path: &str) -> Result<bool> {
+        let path = PathBuf::from(file_path);
+        let validated_path = self.validate_path(&path)?;
+        let uri = path_to_uri(&validated_path).to_string();
+        Ok(self.notification_cache.contains_diagnostics(&uri))
+    }
+
     /// Handle server logs request.
     ///
     /// # Errors

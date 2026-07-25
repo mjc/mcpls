@@ -199,6 +199,12 @@ impl NotificationCache {
         self.diagnostics.get(uri_cache_key(uri).as_ref())
     }
 
+    /// Return whether diagnostics have been received for a document URI.
+    #[must_use]
+    pub fn contains_diagnostics(&self, uri: &str) -> bool {
+        self.diagnostics.contains_key(uri_cache_key(uri).as_ref())
+    }
+
     /// Get all stored log entries.
     #[inline]
     #[must_use]

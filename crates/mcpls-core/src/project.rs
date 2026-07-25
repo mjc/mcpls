@@ -1173,6 +1173,10 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
+    HasCachedDiagnostics {
+        file_path: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     OpenDocumentPaths {
         reply: oneshot::Sender<Vec<PathBuf>>,
     },
@@ -1966,6 +1970,27 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Return whether cached diagnostics exist for a document path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn has_cached_diagnostics(
+        &self,
+        file_path: String,
+    ) -> Result<bool, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::HasCachedDiagnostics { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return the paths of documents currently owned by this actor.
     ///
     /// # Errors
@@ -2702,6 +2727,12 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn has_cached_diagnostics(&self, file_path: &str) -> Result<bool, String> {
+        self.translator
+            .has_cached_diagnostics(file_path)
+            .map_err(|error| error.to_string())
+    }
+
     fn validate_path(&self, file_path: &str) -> Result<(), String> {
         self.translator
             .validate_path(Path::new(file_path))
@@ -3282,6 +3313,9 @@ async fn handle_project_request(
         }
         ProjectRequest::CachedDiagnostics { file_path, reply } => {
             let _ = reply.send(runtime.cached_diagnostics(&file_path));
+        }
+        ProjectRequest::HasCachedDiagnostics { file_path, reply } => {
+            let _ = reply.send(runtime.has_cached_diagnostics(&file_path));
         }
         ProjectRequest::OpenDocumentPaths { reply } => {
             let _ = reply.send(runtime.open_document_paths());
@@ -5315,6 +5349,36 @@ mod tests {
                 version: Some(7),
                 diagnostic_count: 0,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_reports_cached_diagnostics_presence_after_notification() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let actor = spawn_project_actor_for_root(2, &CanonicalRoot::new(root.path()).unwrap());
+        let uri = crate::bridge::path_to_uri(&file);
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "textDocument/publishDiagnostics",
+                    Some(serde_json::json!({
+                        "uri": uri,
+                        "diagnostics": []
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            actor
+                .has_cached_diagnostics(file.display().to_string())
+                .await
+                .unwrap()
         );
     }
 
