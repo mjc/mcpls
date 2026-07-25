@@ -3655,6 +3655,26 @@ impl ProjectEntry {
         })
     }
 
+    fn compatible_actor(
+        &self,
+        compatibility_key: Option<ProjectCompatibilityKey>,
+    ) -> Option<(ProjectHandle, MutationGate)> {
+        let compatibility_key = compatibility_key?;
+        self.actors
+            .iter()
+            .find(|actor| actor.compatibility_key == Some(compatibility_key))
+            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+    }
+
+    fn has_compatible_actor(&self, compatibility_key: Option<ProjectCompatibilityKey>) -> bool {
+        let Some(compatibility_key) = compatibility_key else {
+            return false;
+        };
+        self.actors
+            .iter()
+            .any(|actor| actor.compatibility_key == Some(compatibility_key))
+    }
+
     fn status(&self) -> ProjectStatus {
         aggregate_statuses(
             self.actors
@@ -4024,15 +4044,10 @@ impl ProjectRegistry {
             if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
                 return Ok(actor.actor.clone());
             }
-            let compatible = existing
-                .actors
-                .iter()
-                .find(|actor| {
-                    actor.compatibility_key == compatibility_key
-                        && compatibility_key.is_some()
-                        && existing.identity.repository_identity() == identity.repository_identity()
-                })
-                .map(|actor| (actor.actor.clone(), actor.mutation.clone()));
+            let compatible = (existing.identity.repository_identity()
+                == identity.repository_identity())
+            .then(|| existing.compatible_actor(compatibility_key))
+            .flatten();
             if let Some((actor, mutation)) = compatible {
                 drop(projects);
                 let mutation_guard = mutation.lock().await;
@@ -4825,10 +4840,7 @@ fn compatible_project<'a>(
     let compatibility_key = compatibility_key?;
     projects.values().find(|project| {
         project.identity.repository_identity() == Some(repository)
-            && project
-                .actors
-                .iter()
-                .any(|actor| actor.compatibility_key == Some(compatibility_key))
+            && project.has_compatible_actor(Some(compatibility_key))
     })
 }
 
