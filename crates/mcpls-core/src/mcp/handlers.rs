@@ -17,8 +17,6 @@ use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
 /// stored here because resource-update notifications are sent by the pump
 /// tasks in `lib.rs`, which own their own `Arc<OnceCell<Peer<RoleServer>>>`.
 pub struct HandlerContext {
-    /// Translator for converting MCP calls to LSP requests.
-    pub translator: Arc<Mutex<Translator>>,
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
     /// Shared registry for project lifecycle operations.
@@ -37,13 +35,12 @@ impl HandlerContext {
 
     /// Create a handler context with an existing shared project registry.
     #[must_use]
-    pub const fn with_registry(
-        translator: Arc<Mutex<Translator>>,
+    pub fn with_registry(
+        _translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
         Self {
-            translator,
             subscriptions,
             project_registry,
         }
@@ -71,6 +68,6 @@ mod tests {
         let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let context = HandlerContext::new(translator, subscriptions);
-        assert_eq!(Arc::strong_count(&context.translator), 1);
+        assert_eq!(Arc::strong_count(&context.subscriptions), 1);
     }
 }

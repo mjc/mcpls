@@ -756,6 +756,9 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
+    OpenDocumentPaths {
+        reply: oneshot::Sender<Vec<PathBuf>>,
+    },
     ValidatePath {
         file_path: String,
         reply: oneshot::Sender<Result<(), String>>,
@@ -1448,6 +1451,20 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Return the paths of documents currently owned by this actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped before replying.
+    pub async fn open_document_paths(&self) -> Result<Vec<PathBuf>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::OpenDocumentPaths { reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
     /// Validate that a path belongs to this project's workspace.
     ///
     /// # Errors
@@ -2103,6 +2120,14 @@ impl ProjectRuntime {
     fn summary(&self) -> ProjectRuntimeSummary {
         ProjectRuntimeSummary::from_translator(&self.translator)
     }
+
+    fn open_document_paths(&self) -> Vec<PathBuf> {
+        self.translator
+            .document_tracker()
+            .open_paths()
+            .map(PathBuf::from)
+            .collect()
+    }
 }
 
 /// Spawn a bounded project actor with `Starting` as its initial status.
@@ -2445,6 +2470,9 @@ async fn handle_project_request(
         ProjectRequest::CachedDiagnostics { file_path, reply } => {
             let _ = reply.send(runtime.cached_diagnostics(&file_path));
         }
+        ProjectRequest::OpenDocumentPaths { reply } => {
+            let _ = reply.send(runtime.open_document_paths());
+        }
         ProjectRequest::ValidatePath { file_path, reply } => {
             let _ = reply.send(runtime.validate_path(&file_path));
         }
@@ -2750,6 +2778,38 @@ impl ProjectRegistry {
             .collect();
         projects.sort_by(|left, right| left.id().cmp(right.id()));
         projects
+    }
+
+    /// Return open-document paths grouped by the registered project IDs that
+    /// own them. Actor state is queried after the registry lock is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an actor closes while its document state is queried.
+    pub async fn open_document_paths(
+        &self,
+    ) -> Result<Vec<(ProjectId, PathBuf)>, ProjectRegistryError> {
+        let entries: Vec<_> = self
+            .projects
+            .read()
+            .await
+            .values()
+            .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
+            .collect();
+        let mut paths = Vec::new();
+        for (id, actor) in entries {
+            paths.extend(
+                actor
+                    .open_document_paths()
+                    .await
+                    .map_err(ProjectRegistryError::from)?
+                    .into_iter()
+                    .map(|path| (id.clone(), path)),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     /// Remove a project and shut down its actor when no linked project remains.

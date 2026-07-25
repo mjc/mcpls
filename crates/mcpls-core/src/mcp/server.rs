@@ -1003,32 +1003,33 @@ impl ServerHandler for McplsServer {
     ) -> Result<ListResourcesResult, McpError> {
         // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
         // very large single-page responses that may exceed transport buffers).
-        let resources: Vec<_> = {
-            let translator = self.context.translator.lock().await;
-            translator
-                .document_tracker()
-                .open_paths()
-                .filter_map(|path| {
-                    let uri = make_uri(path)
-                        .inspect_err(|e| {
-                            tracing::warn!(
-                                "Skipping path in list_resources (make_uri failed): {}: {e}",
-                                path.display()
-                            );
-                        })
-                        .ok()?;
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let raw = RawResource::new(uri, name)
-                        .with_mime_type("application/json")
-                        .with_description("LSP diagnostics for this file");
-                    Some(rmcp::model::Annotated::new(raw, None))
-                })
-                .collect()
-        };
+        let open_documents = self
+            .context
+            .project_registry
+            .open_document_paths()
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let resources: Vec<_> = open_documents
+            .into_iter()
+            .filter_map(|(project_id, path)| {
+                let uri = make_uri(&path)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            "Skipping path in list_resources (make_uri failed): {}: {e}",
+                            path.display()
+                        );
+                    })
+                    .ok()?;
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                let raw = RawResource::new(uri, format!("{project_id}:{name}"))
+                    .with_mime_type("application/json")
+                    .with_description(format!("LSP diagnostics for {project_id}:{name}"));
+                Some(rmcp::model::Annotated::new(raw, None))
+            })
+            .collect();
 
         Ok(ListResourcesResult::with_all_items(resources))
     }
@@ -2520,14 +2521,17 @@ mod tests {
     // which requires a live Peer with private fields)
     // ------------------------------------------------------------------
 
-    /// `list_resources` returns an empty vec for a fresh translator with no open documents.
+    /// `list_resources` has no documents for a fresh project registry.
     #[tokio::test]
     async fn test_list_resources_returns_empty_when_no_open_documents() {
         let server = create_test_server();
-        let empty = {
-            let translator = server.context.translator.lock().await;
-            translator.document_tracker().open_paths().count() == 0
-        };
+        let empty = server
+            .context
+            .project_registry
+            .open_document_paths()
+            .await
+            .unwrap()
+            .is_empty();
         assert!(empty);
     }
 
