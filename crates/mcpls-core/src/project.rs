@@ -3704,6 +3704,12 @@ struct ProjectEntry {
     config: Option<ProjectConfig>,
 }
 
+struct ProjectRemovalSnapshot {
+    actors: Vec<ProjectHandle>,
+    mutations: Vec<MutationGate>,
+    root: PathBuf,
+}
+
 impl ProjectEntry {
     fn new(
         identity: ProjectIdentity,
@@ -3729,6 +3735,19 @@ impl ProjectEntry {
 
     fn primary(&self) -> &ProjectActorEntry {
         &self.actors[0]
+    }
+
+    fn removal_snapshot(&self) -> ProjectRemovalSnapshot {
+        let (actors, mutations): (Vec<_>, Vec<_>) = self
+            .actors
+            .iter()
+            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+            .unzip();
+        ProjectRemovalSnapshot {
+            actors,
+            mutations,
+            root: self.identity.root().as_path().to_path_buf(),
+        }
     }
 
     fn actor_for_root(&self, root: &Path) -> Option<&ProjectActorEntry> {
@@ -4529,22 +4548,18 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let (actors, mutations, root) = {
+        let removal = {
             let projects = self.projects.read().await;
             let entry = projects
                 .get(&id)
                 .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
             self.lifecycle.begin_removal(&id).await?;
-            let (actors, mutations): (Vec<_>, Vec<_>) = entry
-                .actors
-                .iter()
-                .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
-                .unzip();
-            let root = entry.identity.root().as_path().to_path_buf();
-            (actors, mutations, root)
+            let removal = entry.removal_snapshot();
+            drop(projects);
+            removal
         };
-        let _mutation_guards = self.lock_mutation_gates(mutations).await;
-        if let Err(error) = shutdown_project_actors(&id, &root, actors).await {
+        let _mutation_guards = self.lock_mutation_gates(removal.mutations).await;
+        if let Err(error) = shutdown_project_actors(&id, &removal.root, removal.actors).await {
             self.lifecycle.end_removal(&id).await;
             return Err(error);
         }
