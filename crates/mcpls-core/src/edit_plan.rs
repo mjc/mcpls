@@ -30,6 +30,10 @@ impl PlanId {
     ///
     /// The identifier remains opaque to callers; parsing only rejects an
     /// empty value so a missing plan cannot be confused with a valid token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanIdError::Empty`] when the supplied value is blank.
     pub fn parse(value: impl Into<String>) -> Result<Self, PlanIdError> {
         let value = value.into();
         if value.trim().is_empty() {
