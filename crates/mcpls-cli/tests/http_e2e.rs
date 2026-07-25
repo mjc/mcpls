@@ -311,10 +311,30 @@ fn write_config(
     path
 }
 
-fn project_root(directory: &TempDir, name: &str) -> PathBuf {
-    let root = directory.path().join(name);
-    std::fs::create_dir(&root).unwrap();
-    root
+struct HttpFixture {
+    _directory: TempDir,
+    config: PathBuf,
+    spawn_counter: PathBuf,
+}
+
+impl HttpFixture {
+    fn new() -> Self {
+        let directory = TempDir::new().unwrap();
+        let state_file = directory.path().join("projects.json");
+        let (lsp_command, spawn_counter) = write_mock_lsp(&directory);
+        let config = write_config(&directory, &state_file, &lsp_command, &spawn_counter);
+        Self {
+            _directory: directory,
+            config,
+            spawn_counter,
+        }
+    }
+
+    fn project_root(&self, name: &str) -> PathBuf {
+        let root = self._directory.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
 }
 
 fn project_ids(client: &mut HttpClient) -> Vec<String> {
@@ -330,14 +350,11 @@ fn project_ids(client: &mut HttpClient) -> Vec<String> {
 #[cfg(unix)]
 #[test]
 fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
-    let directory = TempDir::new().unwrap();
-    let state_file = directory.path().join("projects.json");
-    let (lsp_command, spawn_counter) = write_mock_lsp(&directory);
-    let config = write_config(&directory, &state_file, &lsp_command, &spawn_counter);
-    let root_a = project_root(&directory, "project-a");
-    let root_b = project_root(&directory, "project-b");
+    let fixture = HttpFixture::new();
+    let root_a = fixture.project_root("project-a");
+    let root_b = fixture.project_root("project-b");
 
-    let mut daemon = HttpDaemon::spawn(&config);
+    let mut daemon = HttpDaemon::spawn(&fixture.config);
     let mut first = HttpClient::new(daemon.address);
     let mut second = HttpClient::new(daemon.address);
     first.initialize();
@@ -366,7 +383,10 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     assert_eq!(activated["status"], "Ready");
     let restarted = second.call_tool("project_restart_lsp", json!({"project_id": "project-a"}));
     assert_eq!(restarted["status"], "Ready");
-    assert_eq!(std::fs::read_to_string(&spawn_counter).unwrap(), "2");
+    assert_eq!(
+        std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
+        "2"
+    );
 
     let removed = second.call_tool("project_remove", json!({"project_id": "project-b"}));
     assert_eq!(removed["project_id"], "project-b");
@@ -379,7 +399,7 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     assert_eq!(restored_b["project_id"], "project-b");
     daemon.terminate();
 
-    let mut restarted_daemon = HttpDaemon::spawn(&config);
+    let mut restarted_daemon = HttpDaemon::spawn(&fixture.config);
     let mut restored = HttpClient::new(restarted_daemon.address);
     restored.initialize();
     assert_eq!(project_ids(&mut restored), ["project-a", "project-b"]);
