@@ -550,8 +550,12 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
 
 fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
     let channel = rust_toolchain_channel(root)?;
+    probe_rustc_version(&channel)
+}
+
+fn probe_rustc_version(channel: &str) -> Option<Vec<u8>> {
     let output = Command::new("rustup")
-        .args(["run", &channel, "rustc", "-Vv"])
+        .args(["run", channel, "rustc", "-Vv"])
         .output()
         .ok()
         .filter(|output| output.status.success())
