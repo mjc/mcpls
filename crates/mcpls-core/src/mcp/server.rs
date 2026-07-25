@@ -261,6 +261,7 @@ impl McplsServer {
             .preview_edit(id, edit, encoding)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.context.remember_plan(artifact.plan.id().clone()).await;
         encode_json(&preview_artifact_json(&artifact, id.as_str()))
     }
 
@@ -269,6 +270,12 @@ impl McplsServer {
         id: &ProjectId,
         plan_id: PlanId,
     ) -> Result<String, McpError> {
+        if !self.context.claim_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit plan is not owned by this MCP session",
+                None,
+            ));
+        }
         let result = self
             .context
             .project_registry
@@ -969,6 +976,7 @@ impl McplsServer {
             .preview_code_action(&id, action_id, encoding)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.context.remember_plan(result.plan.id().clone()).await;
         encode_json(&preview_artifact_json(&result, id.as_str()))
     }
 
@@ -1688,6 +1696,10 @@ mod tests {
         let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        server
+            .context
+            .remember_plan(PlanId::parse(plan_id.clone()).unwrap())
+            .await;
         let result = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
@@ -1773,6 +1785,17 @@ mod tests {
         assert_eq!(result["affected_files"].as_array().unwrap().len(), 1);
         assert_eq!(result["safe_to_apply"], true);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+
+        let other_session = server.for_session();
+        let cross_session = other_session
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_string(),
+                plan_id: result["plan_id"].as_str().unwrap().to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(cross_session.contains("not owned by this MCP session"));
 
         server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {

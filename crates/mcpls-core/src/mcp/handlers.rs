@@ -4,12 +4,14 @@
 //! The actual tool implementations use the `#[tool]` macro from rmcp
 //! and are defined in the `server` module.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
 
 use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::edit_plan::PlanId;
 use crate::mcp::session::SessionEventSink;
 use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
 
@@ -27,6 +29,8 @@ pub struct HandlerContext {
     pub(crate) event_sink: Arc<SessionEventSink>,
     /// Monotonic daemon start point shared by session clones.
     pub(crate) started_at: Instant,
+    /// Edit plans previewed by this MCP session.
+    owned_plan_ids: Mutex<HashSet<PlanId>>,
 }
 
 impl HandlerContext {
@@ -69,7 +73,18 @@ impl HandlerContext {
             project_registry,
             event_sink,
             started_at: Instant::now(),
+            owned_plan_ids: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Remember a plan returned by a preview in this session.
+    pub(crate) async fn remember_plan(&self, plan_id: PlanId) {
+        self.owned_plan_ids.lock().await.insert(plan_id);
+    }
+
+    /// Claim a plan for application, consuming this session's ownership token.
+    pub(crate) async fn claim_plan(&self, plan_id: &PlanId) -> bool {
+        self.owned_plan_ids.lock().await.remove(plan_id)
     }
 
     /// Create a session-local context that shares project actors but not
@@ -108,6 +123,7 @@ impl HandlerContext {
 mod tests {
     use super::*;
     use crate::bridge::Translator;
+    use crate::edit_plan::PlanId;
 
     #[test]
     fn test_handler_context_creation() {
@@ -115,5 +131,20 @@ mod tests {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let context = HandlerContext::new(translator, subscriptions);
         assert_eq!(Arc::strong_count(&context.subscriptions), 2);
+    }
+
+    #[tokio::test]
+    async fn edit_plan_ownership_is_local_to_one_session() {
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let context = HandlerContext::new(translator, subscriptions);
+        let session = context.for_session();
+        let plan_id = PlanId::new();
+
+        context.remember_plan(plan_id.clone()).await;
+
+        assert!(context.claim_plan(&plan_id).await);
+        assert!(!context.claim_plan(&plan_id).await);
+        assert!(!session.claim_plan(&plan_id).await);
     }
 }
