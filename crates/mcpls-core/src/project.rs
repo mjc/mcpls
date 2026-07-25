@@ -3017,7 +3017,7 @@ pub fn spawn_project_actor_with_translator(
     translator: Translator,
 ) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
-    let actor_sender = sender.clone();
+    let actor_sender = sender.downgrade();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
     let event_sender = event_tx.clone();
@@ -3090,7 +3090,7 @@ impl ProjectActorChannels {
 
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
-    actor_sender: mpsc::Sender<ProjectRequest>,
+    actor_sender: mpsc::WeakSender<ProjectRequest>,
     channels: ProjectActorChannels,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
@@ -3101,17 +3101,29 @@ async fn run_project_actor(
             break;
         }
     }
+    if state.status != ProjectStatus::Stopped {
+        runtime.begin_transition();
+        channels.publish_status(&mut state, ProjectStatus::Stopping);
+        if let Err(error) = runtime.shutdown().await {
+            state.last_error = Some(error);
+        }
+        state.sync_runtime(&runtime);
+        channels.publish_status(&mut state, ProjectStatus::Stopped);
+    }
 }
 
 fn spawn_notification_forwarders(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
-    actor_sender: &mpsc::Sender<ProjectRequest>,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
     generation: u64,
 ) {
     for mut receiver in notification_receivers {
         let sender = actor_sender.clone();
         tokio::spawn(async move {
             while let Some(notification) = receiver.recv().await {
+                let Some(sender) = sender.upgrade() else {
+                    break;
+                };
                 if sender
                     .send(ProjectRequest::Notification {
                         generation,
@@ -3123,16 +3135,18 @@ fn spawn_notification_forwarders(
                     break;
                 }
             }
-            let _ = sender
-                .send(ProjectRequest::ServerExited { generation })
-                .await;
+            if let Some(sender) = sender.upgrade() {
+                let _ = sender
+                    .send(ProjectRequest::ServerExited { generation })
+                    .await;
+            }
         });
     }
 }
 
 fn mark_project_started(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
-    actor_sender: &mpsc::Sender<ProjectRequest>,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
@@ -3161,7 +3175,7 @@ fn publish_project_readiness(
 #[allow(clippy::large_stack_frames)]
 async fn handle_project_request(
     request: ProjectRequest,
-    actor_sender: &mpsc::Sender<ProjectRequest>,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
