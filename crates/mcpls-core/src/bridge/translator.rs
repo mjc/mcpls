@@ -1052,6 +1052,14 @@ impl Translator {
         crate::project::longest_matching_root(path, &self.workspace_roots).map(Path::to_path_buf)
     }
 
+    fn has_lsp_root(&self, language_id: &str, root: &Path) -> bool {
+        self.lsp_clients.contains_key(language_id)
+            && self
+                .lsp_roots
+                .get(language_id)
+                .is_some_and(|roots| roots.iter().any(|registered| registered == root))
+    }
+
     fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> PathBuf {
         // Registered project roots own the daemon's LSP lifecycle. Prefer the
         // most specific one before manifest heuristics so a nested Cargo.toml
@@ -1101,12 +1109,7 @@ impl Translator {
 
         let root = self.project_root_for_file(path, &config);
 
-        if self
-            .lsp_roots
-            .get(&language_id)
-            .is_some_and(|existing| existing.iter().any(|existing| existing == &root))
-            && self.lsp_clients.contains_key(&language_id)
-        {
+        if self.has_lsp_root(&language_id, &root) {
             return Ok(());
         }
 
