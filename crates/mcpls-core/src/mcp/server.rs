@@ -83,7 +83,7 @@ fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpErro
 fn project_state_json(
     identity: &ProjectIdentity,
     state: &ProjectState,
-    actor_group_count: usize,
+    actor_groups: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({
         "project_id": identity.id().as_str(),
@@ -95,7 +95,8 @@ fn project_state_json(
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
-        "actor_group_count": actor_group_count,
+        "actor_group_count": actor_groups.len(),
+        "actor_groups": actor_groups,
     })
 }
 
@@ -200,13 +201,23 @@ impl McplsServer {
         identity: &ProjectIdentity,
         state: &ProjectState,
     ) -> Result<String, McpError> {
-        let actor_group_count = self
+        let actor_group_roots = self
             .context
             .project_registry
-            .actor_group_count(project_id)
+            .actor_group_roots(project_id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(identity, state, actor_group_count))
+        let actor_groups: Vec<_> = actor_group_roots
+            .into_iter()
+            .enumerate()
+            .map(|(group_id, roots)| {
+                serde_json::json!({
+                    "group_id": group_id,
+                    "roots": roots,
+                })
+            })
+            .collect();
+        encode_json(&project_state_json(identity, state, actor_groups))
     }
 
     async fn actor_for_project(&self, value: String) -> Result<ProjectHandle, McpError> {
@@ -1634,6 +1645,14 @@ mod tests {
         assert_eq!(added_json["project_id"], "demo");
         assert_eq!(added_json["roots"].as_array().unwrap().len(), 1);
         assert_eq!(added_json["actor_group_count"], 1);
+        assert_eq!(added_json["actor_groups"][0]["group_id"], 0);
+        assert_eq!(
+            added_json["actor_groups"][0]["roots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         let duplicate = server
             .project_add(Parameters(ProjectAddParams {
                 project_id: "demo".to_string(),

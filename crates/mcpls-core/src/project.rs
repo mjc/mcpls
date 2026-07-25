@@ -4431,11 +4431,41 @@ impl ProjectRegistry {
     /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not
     /// registered.
     pub async fn actor_group_count(&self, id: &ProjectId) -> Result<usize, ProjectRegistryError> {
+        Ok(self.actor_group_roots(id).await?.len())
+    }
+
+    /// Return the canonical roots owned by each actor group in a logical project.
+    ///
+    /// Compatible linked worktrees appear in one inner vector; incompatible
+    /// roots appear in separate vectors. The outer order is stable for the
+    /// lifetime of the registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not
+    /// registered.
+    pub async fn actor_group_roots(
+        &self,
+        id: &ProjectId,
+    ) -> Result<Vec<Vec<PathBuf>>, ProjectRegistryError> {
         self.projects
             .read()
             .await
             .get(id)
-            .map(|project| project.actors.len())
+            .map(|project| {
+                project
+                    .actors
+                    .iter()
+                    .map(|actor| {
+                        actor
+                            .roots
+                            .iter()
+                            .map(CanonicalRoot::as_path)
+                            .map(Path::to_path_buf)
+                            .collect()
+                    })
+                    .collect()
+            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
