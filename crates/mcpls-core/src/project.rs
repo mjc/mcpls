@@ -809,26 +809,11 @@ impl ProjectState {
             self.status = state.status;
             self.last_error = state.last_error;
         }
-        self.runtime
-            .workspace_roots
-            .extend(state.runtime.workspace_roots);
-        self.runtime
-            .configured_language_ids
-            .extend(state.runtime.configured_language_ids);
-        self.runtime
-            .active_language_ids
-            .extend(state.runtime.active_language_ids);
-        self.runtime.open_document_count += state.runtime.open_document_count;
-        self.runtime.workspace_roots.sort();
-        self.runtime.workspace_roots.dedup();
-        self.runtime.configured_language_ids.sort();
-        self.runtime.configured_language_ids.dedup();
-        self.runtime.active_language_ids.sort();
-        self.runtime.active_language_ids.dedup();
+        self.runtime.merge(state.runtime);
     }
 }
 
-fn project_status_priority(status: ProjectStatus) -> u8 {
+const fn project_status_priority(status: ProjectStatus) -> u8 {
     match status {
         ProjectStatus::Failed => 6,
         ProjectStatus::Stopping => 5,
@@ -881,6 +866,20 @@ impl ProjectRuntimeSummary {
     #[must_use]
     pub const fn open_document_count(&self) -> usize {
         self.open_document_count
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.workspace_roots.extend(other.workspace_roots);
+        self.configured_language_ids
+            .extend(other.configured_language_ids);
+        self.active_language_ids.extend(other.active_language_ids);
+        self.open_document_count += other.open_document_count;
+        self.workspace_roots.sort();
+        self.workspace_roots.dedup();
+        self.configured_language_ids.sort();
+        self.configured_language_ids.dedup();
+        self.active_language_ids.sort();
+        self.active_language_ids.dedup();
     }
 }
 
