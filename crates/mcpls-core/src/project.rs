@@ -21,6 +21,7 @@ use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::LspNotification;
+use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
@@ -3246,6 +3247,9 @@ async fn handle_project_request(
 #[non_exhaustive]
 /// Errors returned by the shared project registry.
 pub enum ProjectRegistryError {
+    /// Dynamic registration state could not be loaded or persisted.
+    #[error(transparent)]
+    Persistence(#[from] crate::project_persistence::ProjectPersistenceError),
     /// A project identity operation failed while resolving a request path.
     #[error(transparent)]
     Identity(#[from] ProjectIdentityError),
@@ -3285,6 +3289,7 @@ pub struct ProjectRegistry {
     projects: std::sync::Arc<RwLock<HashMap<ProjectId, ProjectEntry>>>,
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
+    persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
 }
 
 impl ProjectRegistry {
@@ -3295,6 +3300,7 @@ impl ProjectRegistry {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
             actor_capacity: actor_capacity.max(1),
             translator_template: None,
+            persistence: None,
         }
     }
 
@@ -3305,7 +3311,75 @@ impl ProjectRegistry {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
             actor_capacity: actor_capacity.max(1),
             translator_template: Some(std::sync::Arc::new(template)),
+            persistence: None,
         }
+    }
+
+    /// Attach a durable registration store to this registry.
+    #[must_use]
+    pub fn with_persistence(mut self, store: ProjectRegistrationStore) -> Self {
+        self.persistence = Some(std::sync::Arc::new(store));
+        self
+    }
+
+    async fn persist(&self) -> Result<(), ProjectRegistryError> {
+        let Some(store) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let projects = self
+            .list()
+            .await
+            .iter()
+            .map(PersistedProject::from_identity)
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || store.save(&projects))
+            .await
+            .map_err(|error| {
+                crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(
+                    format!("persistence task failed: {error}"),
+                ))
+            })??;
+        Ok(())
+    }
+
+    /// Restore valid registrations from the attached store.
+    ///
+    /// Missing or moved roots are skipped and are removed from the next
+    /// successful save; no language server is activated during restoration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be loaded or a valid registration
+    /// cannot be added to the registry.
+    pub async fn restore_from_persistence(&self) -> Result<usize, ProjectRegistryError> {
+        let Some(store) = self.persistence.clone() else {
+            return Ok(0);
+        };
+        let state = tokio::task::spawn_blocking(move || store.load())
+            .await
+            .map_err(|error| {
+                crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(
+                    format!("persistence task failed: {error}"),
+                ))
+            })??;
+        let mut restored = 0;
+        for persisted in state.projects {
+            let Ok(id) = persisted.project_id() else {
+                continue;
+            };
+            let Ok(root) = CanonicalRoot::new(&persisted.root) else {
+                continue;
+            };
+            let mut identity = ProjectIdentity::new(id, root);
+            if let Ok(Some(repository)) = GitRepositoryIdentity::discover(identity.root().as_path())
+            {
+                identity = identity.with_repository_identity(repository);
+            }
+            self.add(identity).await?;
+            restored += 1;
+        }
+        self.persist().await?;
+        Ok(restored)
     }
 
     /// Add a project, sharing an actor with a compatible linked worktree.
@@ -3381,6 +3455,7 @@ impl ProjectRegistry {
             );
             drop(projects);
             drop(mutation_guard);
+            self.persist().await?;
             return Ok(actor);
         }
 
@@ -3404,6 +3479,7 @@ impl ProjectRegistry {
             },
         );
         drop(projects);
+        self.persist().await?;
         Ok(actor)
     }
 
@@ -3483,6 +3559,7 @@ impl ProjectRegistry {
             .await
             .values()
             .any(|entry| std::sync::Arc::ptr_eq(&entry.mutation, &mutation));
+        self.persist().await?;
         actor
             .publish_event(ProjectEvent::ProjectRemoved {
                 project_id: id.clone(),
@@ -4852,6 +4929,52 @@ mod tests {
                 })
         );
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_persists_add_and_remove_mutations() {
+        let root = TempDir::new().unwrap();
+        let state_path = root.path().join("state/projects.json");
+        let store = ProjectRegistrationStore::new(&state_path);
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        let identity = ProjectIdentity::new(
+            ProjectId::new("persisted").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+
+        registry.add(identity).await.unwrap();
+        assert_eq!(store.load().unwrap().projects.len(), 1);
+
+        registry
+            .remove(ProjectId::new("persisted").unwrap())
+            .await
+            .unwrap();
+        assert!(store.load().unwrap().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_restores_existing_roots_and_prunes_missing_roots() {
+        let root = TempDir::new().unwrap();
+        let state_path = root.path().join("state/projects.json");
+        let store = ProjectRegistrationStore::new(&state_path);
+        store
+            .save(&[
+                PersistedProject {
+                    project_id: "existing".to_string(),
+                    root: root.path().to_path_buf(),
+                },
+                PersistedProject {
+                    project_id: "missing".to_string(),
+                    root: root.path().join("gone"),
+                },
+            ])
+            .unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+
+        assert_eq!(registry.restore_from_persistence().await.unwrap(), 1);
+        assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(registry.list().await[0].id().as_str(), "existing");
+        assert_eq!(store.load().unwrap().projects.len(), 1);
     }
 
     #[tokio::test]
