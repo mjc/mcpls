@@ -204,8 +204,13 @@ fn apply_resource_operation(
         ValidatedFileOperation::Rename {
             from,
             to,
-            overwrite: _,
+            overwrite,
         } => {
+            if to.exists() && !overwrite {
+                return Err(ApplyError::Operation(
+                    OperationValidationError::DestinationExists(to.clone()),
+                ));
+            }
             fs::rename(from, to).map_err(|source| ApplyError::Resource {
                 operation: format!("rename {} -> {}", from.display(), to.display()),
                 committed_files: committed_files.to_vec(),
@@ -555,6 +560,31 @@ mod tests {
         assert_eq!(report.committed_files, vec![renamed.clone()]);
         assert!(!old.exists());
         assert_eq!(fs::read_to_string(renamed).unwrap(), "content\n");
+    }
+
+    #[test]
+    fn rename_without_overwrite_rechecks_destination_at_commit() {
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("old.rs");
+        let destination = root.path().join("destination.rs");
+        fs::write(&old, "old\n").unwrap();
+        fs::write(&destination, "destination\n").unwrap();
+        let operation = ValidatedFileOperation::Rename {
+            from: old.clone(),
+            to: destination.clone(),
+            overwrite: false,
+        };
+
+        let result = apply_resource_operation(&operation, &[]);
+
+        assert!(matches!(
+            result,
+            Err(ApplyError::Operation(
+                OperationValidationError::DestinationExists(path)
+            )) if path == destination
+        ));
+        assert_eq!(fs::read_to_string(old).unwrap(), "old\n");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "destination\n");
     }
 
     #[test]
