@@ -4600,23 +4600,28 @@ impl ProjectRegistry {
         Ok(paths)
     }
 
+    async fn begin_project_removal(
+        &self,
+        id: &ProjectId,
+    ) -> Result<ProjectRemovalSnapshot, ProjectRegistryError> {
+        let projects = self.projects.read().await;
+        let entry = projects
+            .get(id)
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        self.lifecycle.begin_removal(id).await?;
+        let removal = entry.removal_snapshot();
+        drop(projects);
+        removal.reject_new_work();
+        Ok(removal)
+    }
+
     /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let removal = {
-            let projects = self.projects.read().await;
-            let entry = projects
-                .get(&id)
-                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-            self.lifecycle.begin_removal(&id).await?;
-            let removal = entry.removal_snapshot();
-            drop(projects);
-            removal
-        };
-        removal.reject_new_work();
+        let removal = self.begin_project_removal(&id).await?;
         let _mutation_guards = self.lock_mutation_gates(removal.mutations).await;
         if let Err(error) = shutdown_project_actors(&id, &removal.root, removal.actors).await {
             self.lifecycle.end_removal(&id).await;
