@@ -193,6 +193,16 @@ fn project_queue_pressure_json(pressure: ProjectQueuePressure) -> serde_json::Va
     })
 }
 
+const fn health_status(counts: ProjectStatusCounts) -> &'static str {
+    if counts.failed > 0 {
+        "failed"
+    } else if counts.degraded > 0 || counts.restarting > 0 || counts.stopping > 0 {
+        "degraded"
+    } else {
+        "healthy"
+    }
+}
+
 #[derive(Serialize)]
 struct SubscriptionListResult {
     subscriptions: Vec<String>,
@@ -596,7 +606,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
-            "status": if snapshot.project_counts.failed == 0 { "healthy" } else { "degraded" },
+            "status": health_status(snapshot.project_counts),
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
@@ -1914,6 +1924,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shutdown_health["lifecycle"], "shutting_down");
+    }
+
+    #[tokio::test]
+    async fn health_distinguishes_failed_projects_from_degraded_state() {
+        let server = create_test_server();
+        let root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("failed").unwrap();
+        server
+            .context
+            .project_registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        server
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .unwrap()
+            .fail("test failure")
+            .await
+            .unwrap();
+
+        let health: serde_json::Value = serde_json::from_str(
+            &server
+                .health(Parameters(ProjectListParams {}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(health["status"], "failed");
+        assert_eq!(health["projects"]["failed"], 1);
     }
 
     #[tokio::test]
