@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -84,7 +84,7 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
     serde_json::json!({
         "project_id": identity.id().as_str(),
         "root": identity.root().as_path(),
-        "roots": identity.roots().iter().map(CanonicalRoot::as_path).collect::<Vec<_>>(),
+        "roots": project_root_paths(identity),
         "repository_root": identity.repository_identity().map(GitRepositoryIdentity::common_dir),
         "status": format!("{:?}", state.status()),
         "last_error": state.last_error(),
@@ -92,6 +92,15 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
     })
+}
+
+fn project_root_paths(identity: &ProjectIdentity) -> Vec<PathBuf> {
+    identity
+        .roots()
+        .iter()
+        .map(CanonicalRoot::as_path)
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 fn project_status_counts_json(counts: ProjectStatusCounts) -> serde_json::Value {
@@ -415,7 +424,7 @@ impl McplsServer {
                 serde_json::json!({
                     "project_id": project.id().as_str(),
                     "root": project.root().as_path(),
-                    "roots": project.roots().iter().map(CanonicalRoot::as_path).collect::<Vec<_>>(),
+                    "roots": project_root_paths(project),
                     "repository_root": project.repository_identity().map(GitRepositoryIdentity::common_dir),
                 })
             })
