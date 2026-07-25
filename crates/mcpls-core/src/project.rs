@@ -265,15 +265,17 @@ fn canonicalize_git_metadata(path: PathBuf) -> Result<PathBuf, GitRepositoryIden
 pub struct ProjectIdentity {
     id: ProjectId,
     root: CanonicalRoot,
+    roots: Vec<CanonicalRoot>,
     repository: Option<GitRepositoryIdentity>,
 }
 
 impl ProjectIdentity {
     /// Pair a stable project ID with its canonical root.
     #[must_use]
-    pub const fn new(id: ProjectId, root: CanonicalRoot) -> Self {
+    pub fn new(id: ProjectId, root: CanonicalRoot) -> Self {
         Self {
             id,
+            roots: vec![root.clone()],
             root,
             repository: None,
         }
@@ -289,6 +291,18 @@ impl ProjectIdentity {
     #[must_use]
     pub const fn root(&self) -> &CanonicalRoot {
         &self.root
+    }
+
+    /// Return every canonical worktree root owned by this logical project.
+    #[must_use]
+    pub fn roots(&self) -> &[CanonicalRoot] {
+        &self.roots
+    }
+
+    pub(crate) fn add_root(&mut self, root: CanonicalRoot) {
+        if !self.roots.iter().any(|existing| existing == &root) {
+            self.roots.push(root);
+        }
     }
 
     /// Attach the shared Git repository identity for this checkout.
@@ -328,8 +342,10 @@ impl ProjectResolver {
             if !ids.insert(project.id.clone()) {
                 return Err(ProjectIdentityError::DuplicateId(project.id));
             }
-            if !roots.insert(project.root.clone()) {
-                return Err(ProjectIdentityError::DuplicateRoot(project.root.0));
+            for root in project.roots() {
+                if !roots.insert(root.clone()) {
+                    return Err(ProjectIdentityError::DuplicateRoot(root.0.clone()));
+                }
             }
             projects.push(project);
         }
@@ -351,7 +367,10 @@ impl ProjectResolver {
             Ok(canonical) => canonical,
             Err(error) => {
                 if let Some(project) = self.projects.iter().find(|project| {
-                    !project.root.as_path().exists() && path.starts_with(project.root.as_path())
+                    project
+                        .roots()
+                        .iter()
+                        .any(|root| !root.as_path().exists() && path.starts_with(root.as_path()))
                 }) {
                     return Err(ProjectIdentityError::ProjectRootUnavailable(
                         project.id.clone(),
@@ -363,10 +382,16 @@ impl ProjectResolver {
 
         self.projects
             .iter()
-            .filter(|project| {
-                project.root.as_path().exists() && canonical.starts_with(project.root.as_path())
+            .filter_map(|project| {
+                project
+                    .roots()
+                    .iter()
+                    .filter(|root| root.as_path().exists() && canonical.starts_with(root.as_path()))
+                    .max_by_key(|root| root.as_path().components().count())
+                    .map(|root| (root.as_path().components().count(), project))
             })
-            .max_by_key(|project| project.root.as_path().components().count())
+            .max_by_key(|(components, _)| *components)
+            .map(|(_, project)| project)
             .ok_or(ProjectIdentityError::UnregisteredPath(canonical))
     }
 
@@ -388,7 +413,10 @@ impl ProjectResolver {
             (Some(project_id), Some(path)) => {
                 let project = self.resolve_id(project_id)?;
                 let canonical = canonicalize(path)?;
-                if project.root.as_path().exists() && canonical.starts_with(project.root.as_path())
+                if project
+                    .roots()
+                    .iter()
+                    .any(|root| root.as_path().exists() && canonical.starts_with(root.as_path()))
                 {
                     Ok(project)
                 } else {
@@ -3267,6 +3295,16 @@ pub enum ProjectRegistryError {
     /// A different project already owns this canonical root.
     #[error("project root is already registered: {0}")]
     DuplicateRoot(PathBuf),
+    /// A compatible linked worktree must use its logical project's stable ID.
+    #[error(
+        "linked worktree {requested_root} belongs to logical project {existing_id}; use that project ID"
+    )]
+    LinkedWorktreeProject {
+        /// Stable ID of the already-registered logical project.
+        existing_id: ProjectId,
+        /// Worktree root that was registered under another ID.
+        requested_root: PathBuf,
+    },
     /// No project with this stable ID is registered.
     #[error("project is not registered: {0}")]
     ProjectNotFound(ProjectId),
@@ -3483,6 +3521,12 @@ impl ProjectRegistry {
                 continue;
             };
             let mut identity = ProjectIdentity::new(id, root);
+            for additional_root in &persisted.additional_roots {
+                let Ok(additional_root) = CanonicalRoot::new(additional_root) else {
+                    continue;
+                };
+                identity.add_root(additional_root);
+            }
             if let Ok(Some(repository)) = GitRepositoryIdentity::discover(identity.root().as_path())
             {
                 identity = identity.with_repository_identity(repository);
@@ -3507,7 +3551,17 @@ impl ProjectRegistry {
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
-            if existing.identity.root() != identity.root() {
+            if existing.identity.root() == identity.root()
+                || existing.identity.roots().contains(identity.root())
+            {
+                return Ok(existing.actor.clone());
+            }
+            if existing.identity.repository_identity().is_none()
+                || identity.repository_identity().is_none()
+                || compatibility_key.is_none()
+                || existing.compatibility_key != compatibility_key
+                || existing.identity.repository_identity() != identity.repository_identity()
+            {
                 return Err(ProjectRegistryError::ConflictingProject {
                     id: identity.id().clone(),
                     existing_root: existing.identity.root().as_path().to_path_buf(),
@@ -3515,12 +3569,26 @@ impl ProjectRegistry {
                 });
             }
             let actor = existing.actor.clone();
+            let mutation = existing.mutation.clone();
             drop(projects);
+            let mutation_guard = mutation.lock().await;
+            self.lifecycle.ensure_accepting()?;
+            actor
+                .add_workspace_root(identity.root().as_path().to_path_buf())
+                .await?;
+            let mut projects = self.projects.write().await;
+            if let Some(existing) = projects.get_mut(identity.id()) {
+                existing.identity.add_root(identity.root.clone());
+            }
+            drop(projects);
+            drop(mutation_guard);
+            self.persist().await?;
             return Ok(actor);
         }
         if projects
             .values()
-            .any(|project| project.identity.root() == identity.root())
+            .flat_map(|project| project.identity.roots())
+            .any(|root| root == identity.root())
         {
             return Err(ProjectRegistryError::DuplicateRoot(
                 identity.root().as_path().to_path_buf(),
@@ -3529,6 +3597,12 @@ impl ProjectRegistry {
 
         let shared = compatible_project(&projects, &identity, compatibility_key);
         if let Some(existing) = shared {
+            if existing.identity.id() != identity.id() {
+                return Err(ProjectRegistryError::LinkedWorktreeProject {
+                    existing_id: existing.identity.id().clone(),
+                    requested_root: identity.root().as_path().to_path_buf(),
+                });
+            }
             let actor = existing.actor.clone();
             let mutation = existing.mutation.clone();
             drop(projects);
@@ -3996,9 +4070,23 @@ impl ProjectRegistry {
             .read()
             .await
             .values()
-            .filter(|project| canonical.starts_with(project.identity.root().as_path()))
-            .max_by_key(|project| project.identity.root().as_path().components().count())
-            .map(|project| (project.identity.id().clone(), project.actor.clone()))
+            .filter_map(|project| {
+                project
+                    .identity
+                    .roots()
+                    .iter()
+                    .filter(|root| canonical.starts_with(root.as_path()))
+                    .max_by_key(|root| root.as_path().components().count())
+                    .map(|root| {
+                        (
+                            root.as_path().components().count(),
+                            project.identity.id().clone(),
+                            project.actor.clone(),
+                        )
+                    })
+            })
+            .max_by_key(|(components, _, _)| *components)
+            .map(|(_, project_id, actor)| (project_id, actor))
             .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
     }
 
@@ -4945,7 +5033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_shares_actor_for_linked_git_worktrees() {
+    async fn registry_keeps_one_logical_project_for_linked_git_worktrees() {
         let repository = TempDir::new().unwrap();
         let git_dir = repository.path().join(".git");
         let worktree_git_dir = git_dir.join("worktrees").join("linked");
@@ -4977,19 +5065,24 @@ mod tests {
             .unwrap();
         let registry = ProjectRegistry::new(2);
         let main_id = ProjectId::new("main").unwrap();
-        let linked_id = ProjectId::new("linked").unwrap();
 
         let main_actor = registry
             .add(
-                ProjectIdentity::new(main_id, CanonicalRoot::new(repository.path()).unwrap())
-                    .with_repository_identity(main_repository),
+                ProjectIdentity::new(
+                    main_id.clone(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(main_repository),
             )
             .await
             .unwrap();
         let linked_actor = registry
             .add(
-                ProjectIdentity::new(linked_id, CanonicalRoot::new(worktree.path()).unwrap())
-                    .with_repository_identity(linked_repository),
+                ProjectIdentity::new(
+                    main_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_repository),
             )
             .await
             .unwrap();
@@ -4998,19 +5091,10 @@ mod tests {
         let linked_state = linked_actor.query().await.unwrap();
         assert_eq!(main_state.workspace_roots(), linked_state.workspace_roots());
         assert_eq!(main_state.workspace_roots().len(), 2);
+        assert_eq!(registry.list().await.len(), 1);
 
-        registry
-            .remove(ProjectId::new("main").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            linked_actor.query().await.unwrap().workspace_roots().len(),
-            2
-        );
-        registry
-            .remove(ProjectId::new("linked").unwrap())
-            .await
-            .unwrap();
+        registry.remove(main_id).await.unwrap();
+        assert_eq!(*linked_actor.status().borrow(), ProjectStatus::Stopped);
     }
 
     #[tokio::test]
@@ -5210,10 +5294,12 @@ mod tests {
                 PersistedProject {
                     project_id: "existing".to_string(),
                     root: root.path().to_path_buf(),
+                    additional_roots: Vec::new(),
                 },
                 PersistedProject {
                     project_id: "missing".to_string(),
                     root: root.path().join("gone"),
+                    additional_roots: Vec::new(),
                 },
             ])
             .unwrap();
@@ -5466,6 +5552,82 @@ mod tests {
             result,
             Err(ProjectRegistryError::ConflictingProject { id, .. }) if id.as_str() == "same"
         ));
+    }
+
+    #[tokio::test]
+    async fn project_registry_adds_compatible_worktree_to_one_logical_project() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        }
+        let repository_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+        let project_id = ProjectId::new("repository").unwrap();
+        let registry = ProjectRegistry::new(2);
+
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(repository_identity),
+            )
+            .await
+            .unwrap();
+        let wrong_id = ProjectId::new("worktree").unwrap();
+        let wrong_id_result = registry
+            .add(
+                ProjectIdentity::new(wrong_id, CanonicalRoot::new(worktree.path()).unwrap())
+                    .with_repository_identity(linked_identity.clone()),
+            )
+            .await;
+        assert!(matches!(
+            wrong_id_result,
+            Err(ProjectRegistryError::LinkedWorktreeProject { existing_id, .. })
+                if existing_id == project_id
+        ));
+        let actor = registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_identity),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(actor.query().await.unwrap().workspace_roots().len(), 2);
+        let file = worktree.path().join("src.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let (resolved_id, resolved_actor) = registry.project_for_path(&file).await.unwrap();
+        assert_eq!(resolved_id, project_id);
+        assert!(resolved_actor.sender.same_channel(&actor.sender));
     }
 
     #[cfg(unix)]

@@ -19,6 +19,9 @@ pub struct PersistedProject {
     pub project_id: String,
     /// Canonical root at the time the project was registered.
     pub root: PathBuf,
+    /// Additional linked worktree roots owned by the logical project.
+    #[serde(default)]
+    pub additional_roots: Vec<PathBuf>,
 }
 
 impl PersistedProject {
@@ -28,6 +31,12 @@ impl PersistedProject {
         Self {
             project_id: identity.id().as_str().to_string(),
             root: identity.root().as_path().to_path_buf(),
+            additional_roots: identity
+                .roots()
+                .iter()
+                .skip(1)
+                .map(|root| root.as_path().to_path_buf())
+                .collect(),
         }
     }
 
@@ -207,6 +216,7 @@ mod tests {
         let projects = vec![PersistedProject {
             project_id: "demo".to_string(),
             root: PathBuf::from("/workspace/demo"),
+            additional_roots: Vec::new(),
         }];
 
         store.save(&projects).unwrap();
