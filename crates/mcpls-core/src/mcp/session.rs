@@ -194,12 +194,12 @@ impl SessionEventSink {
                         let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
                             && event.belongs_to(&event_project_id);
                         if removed {
-                            for uri in event_resource_uris(&event_project_id, &event) {
-                                subscriptions.unsubscribe(&uri).await;
-                            }
-                            if let ProjectEvent::ProjectRemoved { root, .. } = &event {
-                                subscriptions.unsubscribe_under_path(root).await;
-                            }
+                            cleanup_removed_project_subscriptions(
+                                &subscriptions,
+                                &event_project_id,
+                                &event,
+                            )
+                            .await;
                             break;
                         }
                         if outcome == ForwardOutcome::Disconnect {
@@ -236,6 +236,19 @@ async fn forward_event(
         }
     }
     ForwardOutcome::Continue
+}
+
+async fn cleanup_removed_project_subscriptions(
+    subscriptions: &ResourceSubscriptions,
+    project_id: &ProjectId,
+    event: &ProjectEvent,
+) {
+    for uri in event_resource_uris(project_id, event) {
+        subscriptions.unsubscribe(&uri).await;
+    }
+    if let ProjectEvent::ProjectRemoved { root, .. } = event {
+        subscriptions.unsubscribe_under_path(root).await;
+    }
 }
 
 impl Drop for SessionEventSink {
