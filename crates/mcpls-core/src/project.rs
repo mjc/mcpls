@@ -1,6 +1,6 @@
 //! Project identity and canonical path routing primitives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -523,6 +523,108 @@ pub enum ProjectEvent {
     },
 }
 
+/// One ordered project event retained for cursor-based session polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEventRecord {
+    sequence: u64,
+    event: ProjectEvent,
+}
+
+impl ProjectEventRecord {
+    /// Return the monotonically increasing event sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Return the typed event payload.
+    #[must_use]
+    pub const fn event(&self) -> &ProjectEvent {
+        &self.event
+    }
+}
+
+/// Bounded event history snapshot returned to session polling clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEventSnapshot {
+    events: Vec<ProjectEventRecord>,
+    resync_required: bool,
+    next_sequence: u64,
+}
+
+impl ProjectEventSnapshot {
+    /// Return events newer than the requested cursor.
+    #[must_use]
+    pub fn events(&self) -> &[ProjectEventRecord] {
+        &self.events
+    }
+
+    /// Whether the requested cursor predates the retained bounded history.
+    #[must_use]
+    pub const fn resync_required(&self) -> bool {
+        self.resync_required
+    }
+
+    /// Return the next cursor clients should use for a subsequent poll.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+}
+
+/// Bounded actor-owned project event history.
+#[derive(Debug)]
+pub struct ProjectEventHistory {
+    records: VecDeque<ProjectEventRecord>,
+    capacity: usize,
+    next_sequence: u64,
+}
+
+impl ProjectEventHistory {
+    /// Create a bounded history with at least one retained event.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+            next_sequence: 1,
+        }
+    }
+
+    /// Record one event and return its assigned sequence.
+    pub fn record(&mut self, event: ProjectEvent) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.records.len() == self.capacity {
+            self.records.pop_front();
+        }
+        self.records
+            .push_back(ProjectEventRecord { sequence, event });
+        sequence
+    }
+
+    /// Return retained events newer than `cursor`, marking overflow when needed.
+    #[must_use]
+    pub fn snapshot_since(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+        let oldest = self
+            .records
+            .front()
+            .map_or(self.next_sequence, |record| record.sequence);
+        let resync_required = cursor.is_some_and(|cursor| cursor < oldest.saturating_sub(1));
+        let events = self
+            .records
+            .iter()
+            .filter(|record| cursor.is_none_or(|cursor| record.sequence > cursor))
+            .cloned()
+            .collect();
+        ProjectEventSnapshot {
+            events,
+            resync_required,
+            next_sequence: self.next_sequence,
+        }
+    }
+}
+
 /// Observable project state, including the most recent failure detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectState {
@@ -868,6 +970,7 @@ pub struct ProjectHandle {
     sender: mpsc::Sender<ProjectRequest>,
     status: watch::Receiver<ProjectStatus>,
     events: broadcast::Sender<ProjectEvent>,
+    event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
 }
 
 impl ProjectHandle {
@@ -881,6 +984,15 @@ impl ProjectHandle {
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<ProjectEvent> {
         self.events.subscribe()
+    }
+
+    /// Return retained project events newer than an optional polling cursor.
+    #[must_use]
+    pub fn event_snapshot(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+        self.event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_since(cursor)
     }
 
     /// Query the actor's current state.
@@ -2456,9 +2568,11 @@ pub fn spawn_project_actor_with_translator(
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
     let event_sender = event_tx.clone();
+    let event_history = std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(256)));
     let channels = ProjectActorChannels {
         status_tx,
         event_tx,
+        event_history: std::sync::Arc::clone(&event_history),
     };
     let runtime = ProjectRuntime::new(translator);
     tokio::spawn(run_project_actor(
@@ -2472,16 +2586,22 @@ pub fn spawn_project_actor_with_translator(
         sender,
         status: status_rx,
         events: event_sender,
+        event_history,
     }
 }
 
 struct ProjectActorChannels {
     status_tx: watch::Sender<ProjectStatus>,
     event_tx: broadcast::Sender<ProjectEvent>,
+    event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
 }
 
 impl ProjectActorChannels {
     fn publish(&self, event: ProjectEvent) {
+        self.event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(event.clone());
         let _ = self.event_tx.send(event);
     }
 
@@ -3739,6 +3859,26 @@ mod tests {
                 last_error: None,
             }
         );
+    }
+
+    #[test]
+    fn project_event_history_bounds_records_and_reports_cursor_resync() {
+        let mut history = ProjectEventHistory::new(2);
+        history.record(ProjectEvent::StatusChanged {
+            status: ProjectStatus::Starting,
+            last_error: None,
+        });
+        history.record(ProjectEvent::StatusChanged {
+            status: ProjectStatus::Ready,
+            last_error: None,
+        });
+        history.record(ProjectEvent::ServerExited { generation: 1 });
+
+        let snapshot = history.snapshot_since(Some(0));
+        assert!(snapshot.resync_required());
+        assert_eq!(snapshot.events().len(), 2);
+        assert_eq!(snapshot.events()[0].sequence(), 2);
+        assert_eq!(snapshot.events()[1].sequence(), 3);
     }
 
     #[tokio::test]
