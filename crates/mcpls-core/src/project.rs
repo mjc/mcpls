@@ -6412,6 +6412,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_activation_preserves_active_runtime_generation() {
+        let root = TempDir::new().unwrap();
+        let root = root.path().to_path_buf();
+        let mut translator = Translator::new();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.heuristics = None;
+        translator.set_workspace_roots(vec![root.clone()]);
+        translator.set_lsp_configs(vec![config.clone()], None);
+        translator.register_client(
+            config.language_id.clone(),
+            crate::lsp::LspClient::new(config),
+        );
+        translator.register_server_roots("rust".to_string(), vec![root.clone()]);
+
+        let actor = spawn_project_actor_with_translator(2, translator);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+        assert_eq!(actor.query().await.unwrap().runtime().generation(), 0);
+
+        actor.activate(root).await.unwrap();
+
+        assert_eq!(actor.query().await.unwrap().runtime().generation(), 0);
+    }
+
+    #[tokio::test]
     async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
         let actor = spawn_project_actor(2);
         actor.set_status(ProjectStatus::Ready).await.unwrap();
