@@ -814,6 +814,21 @@ pub struct AppliedEditPlan {
     pub committed_files: Vec<PathBuf>,
 }
 
+impl AppliedEditPlan {
+    fn project_events(&self) -> [ProjectEvent; 2] {
+        [
+            ProjectEvent::FilesChanged {
+                paths: self.committed_files.clone(),
+            },
+            ProjectEvent::EditApplied {
+                plan_id: self.plan_id.clone(),
+                committed_files: self.committed_files.clone(),
+                operation_count: self.operations.len(),
+            },
+        ]
+    }
+}
+
 enum ProjectRequest {
     Query {
         reply: oneshot::Sender<ProjectState>,
@@ -2685,14 +2700,9 @@ impl ProjectActorChannels {
     }
 
     fn publish_applied_edit(&self, applied: &AppliedEditPlan) {
-        self.publish(ProjectEvent::FilesChanged {
-            paths: applied.committed_files.clone(),
-        });
-        self.publish(ProjectEvent::EditApplied {
-            plan_id: applied.plan_id.clone(),
-            committed_files: applied.committed_files.clone(),
-            operation_count: applied.operations.len(),
-        });
+        for event in applied.project_events() {
+            self.publish(event);
+        }
     }
 
     fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
