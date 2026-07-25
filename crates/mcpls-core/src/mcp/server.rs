@@ -145,6 +145,21 @@ impl McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))
     }
 
+    async fn preview_project_edit(
+        &self,
+        id: &ProjectId,
+        edit: lsp_types::WorkspaceEdit,
+        encoding: PositionEncoding,
+    ) -> Result<String, McpError> {
+        let artifact = self
+            .context
+            .project_registry
+            .preview_edit(id, edit, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+    }
+
     /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
     pub fn new(
@@ -305,13 +320,7 @@ impl McplsServer {
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(workspace_edit)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
-        let artifact = self
-            .context
-            .project_registry
-            .preview_edit(&id, edit, encoding)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+        self.preview_project_edit(&id, edit, encoding).await
     }
 
     /// Request a rename from the project LSP and preview the resulting edit.
@@ -342,13 +351,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?
             .unwrap_or_default();
-        let artifact = self
-            .context
-            .project_registry
-            .preview_edit(&id, edit, encoding)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+        self.preview_project_edit(&id, edit, encoding).await
     }
 
     /// Request document formatting from the project LSP and preview the edit.
@@ -378,13 +381,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?
             .unwrap_or_default();
-        let artifact = self
-            .context
-            .project_registry
-            .preview_edit(&id, edit, encoding)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+        self.preview_project_edit(&id, edit, encoding).await
     }
 
     /// Apply a previously previewed, project-owned workspace edit plan.
