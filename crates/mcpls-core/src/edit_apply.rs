@@ -244,29 +244,37 @@ fn validate_snapshot<'a>(
         });
     }
     match snapshot.source() {
-        SnapshotSource::Disk => {
-            let current =
-                fs::read_to_string(snapshot.path()).map_err(|source| ApplyError::Stage {
-                    path: snapshot.path().clone(),
-                    source,
-                })?;
-            snapshot.validate(&current, None)?;
-        }
-        SnapshotSource::OpenDocument => {
-            let Some(documents) = documents else {
-                return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
-            };
-            let Some(document) = documents.get(snapshot.path()) else {
-                return Err(ApplyError::Stale(SnapshotValidationError::VersionChanged {
-                    path: snapshot.path().clone(),
-                    expected: snapshot.version().unwrap_or_default(),
-                    actual: None,
-                }));
-            };
-            snapshot.validate(&document.content, Some(document.version))?;
-        }
+        SnapshotSource::Disk => validate_disk_snapshot(snapshot)?,
+        SnapshotSource::OpenDocument => validate_open_document_snapshot(snapshot, documents)?,
     }
     Ok(snapshot)
+}
+
+fn validate_disk_snapshot(snapshot: &FileSnapshot) -> Result<(), ApplyError> {
+    let current = fs::read_to_string(snapshot.path()).map_err(|source| ApplyError::Stage {
+        path: snapshot.path().clone(),
+        source,
+    })?;
+    snapshot.validate(&current, None)?;
+    Ok(())
+}
+
+fn validate_open_document_snapshot(
+    snapshot: &FileSnapshot,
+    documents: Option<&DocumentTracker>,
+) -> Result<(), ApplyError> {
+    let Some(documents) = documents else {
+        return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
+    };
+    let Some(document) = documents.get(snapshot.path()) else {
+        return Err(ApplyError::Stale(SnapshotValidationError::VersionChanged {
+            path: snapshot.path().clone(),
+            expected: snapshot.version().unwrap_or_default(),
+            actual: None,
+        }));
+    };
+    snapshot.validate(&document.content, Some(document.version))?;
+    Ok(())
 }
 
 fn temporary_path(target: &Path, plan: &EditPlan, index: usize) -> PathBuf {
