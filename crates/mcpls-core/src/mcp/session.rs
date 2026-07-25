@@ -96,21 +96,12 @@ impl SessionEventSink {
         let task = tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(event) => {
-                        let Some(resource_uri) = event_resource_uri(&event) else {
-                            continue;
-                        };
-                        if !subscriptions.contains(&resource_uri).await {
-                            continue;
-                        }
-                        if notifier
-                            .notify_resource_updated(resource_uri)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                    Ok(event)
+                        if !forward_event(&subscriptions, notifier.as_ref(), &event).await =>
+                    {
+                        break;
                     }
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "session event sink lagged; polling can resync");
                     }
@@ -120,6 +111,20 @@ impl SessionEventSink {
         });
         tasks.insert(project_id, task);
     }
+}
+
+async fn forward_event(
+    subscriptions: &ResourceSubscriptions,
+    notifier: &dyn SessionNotifier,
+    event: &ProjectEvent,
+) -> bool {
+    let Some(resource_uri) = event_resource_uri(event) else {
+        return true;
+    };
+    if !subscriptions.contains(&resource_uri).await {
+        return true;
+    }
+    notifier.notify_resource_updated(resource_uri).await.is_ok()
 }
 
 impl Drop for SessionEventSink {
@@ -135,6 +140,7 @@ impl Drop for SessionEventSink {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 
