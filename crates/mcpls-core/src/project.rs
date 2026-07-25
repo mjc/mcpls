@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
@@ -496,6 +496,24 @@ pub enum ProjectStatus {
     Failed,
 }
 
+/// Typed events emitted by a project actor for session-facing delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProjectEvent {
+    /// The actor's lifecycle status changed.
+    StatusChanged {
+        /// New lifecycle status.
+        status: ProjectStatus,
+        /// Failure detail associated with the new status, if any.
+        last_error: Option<String>,
+    },
+    /// The current language-server notification stream ended unexpectedly.
+    ServerExited {
+        /// Runtime generation that exited.
+        generation: u64,
+    },
+}
+
 /// Observable project state, including the most recent failure detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectState {
@@ -840,6 +858,7 @@ enum ProjectRequest {
 pub struct ProjectHandle {
     sender: mpsc::Sender<ProjectRequest>,
     status: watch::Receiver<ProjectStatus>,
+    events: broadcast::Sender<ProjectEvent>,
 }
 
 impl ProjectHandle {
@@ -847,6 +866,12 @@ impl ProjectHandle {
     #[must_use]
     pub fn status(&self) -> watch::Receiver<ProjectStatus> {
         self.status.clone()
+    }
+
+    /// Subscribe to typed project lifecycle and failure events.
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ProjectEvent> {
+        self.events.subscribe()
     }
 
     /// Query the actor's current state.
@@ -2410,17 +2435,20 @@ pub fn spawn_project_actor_with_translator(
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.clone();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
+    let (event_tx, _) = broadcast::channel(256);
     let runtime = ProjectRuntime::new(translator);
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
         status_tx,
+        event_tx.clone(),
         ProjectState::new(ProjectStatus::Starting, runtime.summary()),
         runtime,
     ));
     ProjectHandle {
         sender,
         status: status_rx,
+        events: event_tx,
     }
 }
 
@@ -2428,12 +2456,20 @@ async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     actor_sender: mpsc::Sender<ProjectRequest>,
     status_tx: watch::Sender<ProjectStatus>,
+    event_tx: broadcast::Sender<ProjectEvent>,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
-        if handle_project_request(request, &actor_sender, &status_tx, &mut state, &mut runtime)
-            .await
+        if handle_project_request(
+            request,
+            &actor_sender,
+            &status_tx,
+            &event_tx,
+            &mut state,
+            &mut runtime,
+        )
+        .await
         {
             break;
         }
@@ -2471,13 +2507,27 @@ fn mark_project_ready(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
     actor_sender: &mpsc::Sender<ProjectRequest>,
     status_tx: &watch::Sender<ProjectStatus>,
+    event_tx: &broadcast::Sender<ProjectEvent>,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
     state.sync_runtime(runtime);
-    state.status = ProjectStatus::Ready;
-    let _ = status_tx.send(ProjectStatus::Ready);
+    publish_status(status_tx, event_tx, state, ProjectStatus::Ready);
+}
+
+fn publish_status(
+    status_tx: &watch::Sender<ProjectStatus>,
+    event_tx: &broadcast::Sender<ProjectEvent>,
+    state: &mut ProjectState,
+    status: ProjectStatus,
+) {
+    state.status = status;
+    let _ = status_tx.send(status);
+    let _ = event_tx.send(ProjectEvent::StatusChanged {
+        status,
+        last_error: state.last_error.clone(),
+    });
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -2488,6 +2538,7 @@ async fn handle_project_request(
     request: ProjectRequest,
     actor_sender: &mpsc::Sender<ProjectRequest>,
     status_tx: &watch::Sender<ProjectStatus>,
+    event_tx: &broadcast::Sender<ProjectEvent>,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) -> bool {
@@ -2498,15 +2549,15 @@ async fn handle_project_request(
         }
         ProjectRequest::Activate { root, reply } => {
             runtime.begin_transition();
-            state.status = ProjectStatus::Starting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Starting);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
                         status_tx,
+                        event_tx,
                         state,
                         runtime,
                     );
@@ -2514,24 +2565,23 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error.to_string());
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
             runtime.begin_transition();
-            state.status = ProjectStatus::Starting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Starting);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
                         status_tx,
+                        event_tx,
                         state,
                         runtime,
                     );
@@ -2539,9 +2589,8 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error.clone());
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2786,15 +2835,15 @@ async fn handle_project_request(
         }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             runtime.begin_transition();
-            state.status = ProjectStatus::Restarting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Restarting);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
                         status_tx,
+                        event_tx,
                         state,
                         runtime,
                     );
@@ -2802,9 +2851,8 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error.clone());
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2858,30 +2906,29 @@ async fn handle_project_request(
             if runtime.owns_generation(generation)
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
-                state.status = ProjectStatus::Failed;
                 state.last_error = Some("language server exited".to_string());
-                let _ = status_tx.send(ProjectStatus::Failed);
+                let _ = event_tx.send(ProjectEvent::ServerExited { generation });
+                publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
-            state.status = status;
             state.last_error = None;
-            let _ = status_tx.send(status);
+            publish_status(status_tx, event_tx, state, status);
             let _ = reply.send(());
         }
         ProjectRequest::Restart { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Restarting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Restarting);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
                         status_tx,
+                        event_tx,
                         state,
                         runtime,
                     );
@@ -2889,32 +2936,28 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error);
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
                     let _ = reply.send(state.clone());
                 }
             }
         }
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Failed;
             state.last_error = Some(message);
-            let _ = status_tx.send(ProjectStatus::Failed);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Stopping;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Stopping);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Stopping);
             if let Err(error) = runtime.shutdown().await {
                 state.last_error = Some(error);
             }
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Stopped;
-            let _ = status_tx.send(ProjectStatus::Stopped);
+            publish_status(status_tx, event_tx, state, ProjectStatus::Stopped);
             let _ = reply.send(());
             return true;
         }
@@ -3637,6 +3680,48 @@ mod tests {
         handle.set_status(ProjectStatus::Ready).await.unwrap();
 
         assert_eq!(handle.status().borrow().clone(), ProjectStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn project_actor_publishes_typed_status_events() {
+        let handle = spawn_project_actor(4);
+        let mut events = handle.subscribe_events();
+
+        handle.set_status(ProjectStatus::Ready).await.unwrap();
+
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::StatusChanged {
+                status: ProjectStatus::Ready,
+                last_error: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_publishes_server_exit_events_before_failure_status() {
+        let handle = spawn_project_actor(4);
+        let mut events = handle.subscribe_events();
+        handle.set_status(ProjectStatus::Ready).await.unwrap();
+        let _ = events.recv().await.unwrap();
+
+        handle
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::ServerExited { generation: 0 }
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::StatusChanged {
+                status: ProjectStatus::Failed,
+                last_error: Some("language server exited".to_string()),
+            }
+        );
     }
 
     #[tokio::test]
