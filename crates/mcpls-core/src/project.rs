@@ -6485,6 +6485,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_restarts_after_current_server_exit() {
+        let actor = spawn_project_actor(2);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let state = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() != ProjectStatus::Restarting {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(state.runtime().generation(), 1);
+    }
+
+    #[tokio::test]
     async fn project_actor_can_add_a_linked_workspace_root() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
