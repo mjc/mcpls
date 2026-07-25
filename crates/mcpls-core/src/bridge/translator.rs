@@ -442,7 +442,7 @@ impl Translator {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut result = LspServer::spawn_batch(&server_configs).await;
+        let result = LspServer::spawn_batch(&server_configs).await;
 
         if result.all_failed() {
             self.clear_expected_languages();
@@ -455,6 +455,7 @@ impl Translator {
             return Err(Error::LspInitFailed { message });
         }
 
+        let failures = result.failures;
         let servers = match self.wait_for_server_readiness(result.servers).await {
             Ok(servers) => servers,
             Err(error) => {
@@ -462,16 +463,14 @@ impl Translator {
                 return Err(error);
             }
         };
-        result.servers = servers;
-
-        let health = if result.partial_success() {
-            ActivationHealth::Degraded
-        } else {
+        let health = if failures.is_empty() {
             ActivationHealth::Ready
+        } else {
+            ActivationHealth::Degraded
         };
         self.set_workspace_roots(roots);
         let mut notification_receivers = Vec::new();
-        for (language_id, mut server) in result.servers {
+        for (language_id, mut server) in servers {
             let client = server.client().clone();
             let roots = server.workspace_roots().to_vec();
             notification_receivers.push(server.take_notification_rx());
