@@ -24,6 +24,19 @@ pub struct DocumentState {
     pub content: String,
 }
 
+impl DocumentState {
+    pub(crate) fn did_open_params(&self) -> DidOpenTextDocumentParams {
+        DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: self.uri.clone(),
+                language_id: self.language_id.clone(),
+                version: self.version,
+                text: self.content.clone(),
+            },
+        }
+    }
+}
+
 /// Resource limits for document tracking.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {

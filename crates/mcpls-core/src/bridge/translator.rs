@@ -7,14 +7,13 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, CompletionParams,
-    CompletionTriggerKind, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, FormattingOptions,
-    GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams, InlayHintLabel,
-    InlayHintParams, MarkedString, PartialResultParams, ReferenceContext, ReferenceParams,
-    RenameParams as LspRenameParams, SignatureHelpParams as LspSignatureHelpParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
+    CompletionTriggerKind, DidChangeTextDocumentParams, DocumentFormattingParams, DocumentSymbol,
+    DocumentSymbolParams, FormattingOptions, GotoDefinitionParams, Hover, HoverContents,
+    HoverParams as LspHoverParams, InlayHintLabel, InlayHintParams, MarkedString,
+    PartialResultParams, ReferenceContext, ReferenceParams, RenameParams as LspRenameParams,
+    SignatureHelpParams as LspSignatureHelpParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentPositionParams, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::Duration};
@@ -306,15 +305,9 @@ impl Translator {
             let Some(client) = self.lsp_clients.get(&document.language_id) else {
                 continue;
             };
-            let params = DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: document.uri,
-                    language_id: document.language_id,
-                    version: document.version,
-                    text: document.content,
-                },
-            };
-            client.notify("textDocument/didOpen", params).await?;
+            client
+                .notify("textDocument/didOpen", document.did_open_params())
+                .await?;
         }
         Ok(())
     }
