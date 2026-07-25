@@ -52,8 +52,21 @@ pub struct Translator {
     heuristics_max_depth: Option<usize>,
 }
 
-fn shutdown_error_is_recoverable(error: &Error) -> bool {
+const fn shutdown_error_is_recoverable(error: &Error) -> bool {
     matches!(error, Error::ServerTerminated)
+}
+
+async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
+    let mut first_error = None;
+    for server in servers.into_values() {
+        if let Err(error) = server.shutdown().await
+            && !shutdown_error_is_recoverable(&error)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Configuration snapshot used to construct an isolated project translator.
@@ -340,17 +353,7 @@ impl Translator {
         self.lsp_roots.clear();
         self.expected_languages.clear();
 
-        let mut first_error = None;
-        for server in servers.into_values() {
-            if let Err(error) = server.shutdown().await
-                && !shutdown_error_is_recoverable(&error)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-
-        first_error.map_or(Ok(()), Err)
+        shutdown_servers(servers).await
     }
 
     /// Add a linked workspace root, restarting active servers with all roots.
