@@ -7677,6 +7677,7 @@ while True:
             lsp_servers: Some(vec![server]),
             heuristics_max_depth: Some(3),
             redaction_patterns: None,
+            persist_environment: false,
         };
 
         registry
@@ -7802,6 +7803,7 @@ while True:
                     lsp_servers: Some(vec![broken_server]),
                     heuristics_max_depth: Some(3),
                     redaction_patterns: None,
+                    persist_environment: false,
                 }),
             )
             .await
