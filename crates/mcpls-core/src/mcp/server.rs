@@ -2015,6 +2015,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_persistence_errors() {
+        let parent = TempDir::new().unwrap();
+        let blocker = parent.path().join("not-a-directory");
+        std::fs::write(&blocker, "blocker").unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(
+            crate::project_persistence::ProjectRegistrationStore::new(blocker.join("state")),
+        );
+        let server = McplsServer::new_with_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            registry.clone(),
+        );
+
+        let root = TempDir::new().unwrap();
+        let result = registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("persistence-error").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await;
+        assert!(result.is_err());
+
+        let health: serde_json::Value = serde_json::from_str(
+            &server
+                .health(Parameters(ProjectListParams {}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health["status"], "degraded");
+        assert!(health["persistence"]["last_error"].is_string());
+    }
+
+    #[tokio::test]
     async fn workspace_edit_apply_consumes_project_owned_plan() {
         let root = TempDir::new().unwrap();
         let file = root.path().join("src.rs");
