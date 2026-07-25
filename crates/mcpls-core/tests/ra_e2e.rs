@@ -1451,3 +1451,172 @@ fn ra_e2e_suite() {
 
     println!("[ra_e2e] all {} sub-cases passed", results.len());
 }
+
+fn call_json(client: &mut McpClient, name: &str, arguments: Value) -> Result<Value, String> {
+    let response = client
+        .call_tool(name, &arguments)
+        .map_err(|error| format!("{name} failed: {error}"))?;
+    let text = assertions::assert_tool_ok(&response);
+    serde_json::from_str(&text).map_err(|error| format!("{name} returned invalid JSON: {error}"))
+}
+
+#[test]
+#[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
+fn ra_multi_project_safe_refactor_e2e() {
+    let ra_path = match resolve_rust_analyzer() {
+        Resolution::Found(path) => path,
+        Resolution::Skipped(reason) => {
+            println!("[ra_e2e] multi-project suite skipped: {reason}");
+            return;
+        }
+        Resolution::Missing => panic!("rust-analyzer is required for this suite"),
+    };
+
+    let first_tmp = stage_workspace();
+    let first = first_tmp.path().canonicalize().unwrap();
+    let second_tmp = stage_workspace();
+    let second = second_tmp.path().canonicalize().unwrap();
+
+    // Add a declaration in functions.rs and a call in lib.rs so rename must
+    // produce a multi-file edit rather than a single-document substitution.
+    let functions = second.join("src/functions.rs");
+    let mut functions_content = fs::read_to_string(&functions).unwrap();
+    functions_content.push_str("\npub fn cross_file_target() -> i32 { 7 }\n");
+    fs::write(&functions, functions_content).unwrap();
+    let second_lib = second.join("src/lib.rs");
+    let mut second_lib_content = fs::read_to_string(&second_lib).unwrap();
+    second_lib_content.push_str(
+        "\npub fn cross_file_caller() -> i32 { crate::functions::cross_file_target() }\n",
+    );
+    fs::write(&second_lib, second_lib_content).unwrap();
+
+    let config_path = first.join("mcpls-multi-project-e2e.toml");
+    write_config(&ra_path, &first, &config_path);
+    let config = config_path.to_string_lossy().into_owned();
+    let mut client = McpClient::spawn_with_args(&["--config", &config]).unwrap();
+    client.initialize().unwrap();
+    wait_until_ready(&mut client, &first.join("src/lib.rs"));
+
+    let added = call_json(
+        &mut client,
+        "project_add",
+        json!({"project_id": "second", "root": second}),
+    )
+    .unwrap();
+    assert_eq!(added["project_id"], "second");
+    call_json(
+        &mut client,
+        "project_activate",
+        json!({"project_id": "second"}),
+    )
+    .unwrap();
+    wait_until_ready(&mut client, &second_lib);
+
+    let projects = call_json(&mut client, "project_list", json!({})).unwrap();
+    assert_eq!(projects.as_array().unwrap().len(), 2);
+
+    let first_symbols = call_json(
+        &mut client,
+        "workspace_symbol_search",
+        json!({"project_id": "default", "query": "cross_file_target"}),
+    )
+    .unwrap();
+    assert!(first_symbols["symbols"].as_array().unwrap().is_empty());
+    let second_symbols = call_json(
+        &mut client,
+        "workspace_symbol_search",
+        json!({"project_id": "second", "query": "cross_file_target"}),
+    )
+    .unwrap();
+    assert!(!second_symbols["symbols"].as_array().unwrap().is_empty());
+
+    let target_line = find_line(&functions, "pub fn cross_file_target(");
+    let rename = call_json(
+        &mut client,
+        "rename_preview",
+        json!({
+            "project_id": "second",
+            "file_path": functions,
+            "line": target_line,
+            "character": 8,
+            "new_name": "renamed_target",
+            "position_encoding": "utf-8"
+        }),
+    )
+    .unwrap();
+    assert_eq!(rename["safe_to_apply"], true);
+    assert!(rename["affected_files"].as_array().unwrap().len() >= 2);
+    let rename_plan = rename["plan_id"].as_str().unwrap().to_owned();
+    let applied = call_json(
+        &mut client,
+        "workspace_edit_apply",
+        json!({"project_id": "second", "plan_id": rename_plan}),
+    )
+    .unwrap();
+    assert!(applied["committed_files"].as_array().unwrap().len() >= 2);
+    assert!(
+        fs::read_to_string(&functions)
+            .unwrap()
+            .contains("renamed_target")
+    );
+    assert!(
+        fs::read_to_string(&second_lib)
+            .unwrap()
+            .contains("renamed_target")
+    );
+
+    let stale = client.call_tool(
+        "workspace_edit_apply",
+        &json!({"project_id": "second", "plan_id": rename_plan}),
+    );
+    assert!(stale.is_err(), "a consumed edit plan must be rejected");
+
+    let bad_format = second.join("src/bad_format.rs");
+    let formatted = call_json(
+        &mut client,
+        "format_preview",
+        json!({
+            "project_id": "second",
+            "file_path": bad_format,
+            "tab_size": 4,
+            "insert_spaces": true,
+            "position_encoding": "utf-8"
+        }),
+    )
+    .unwrap();
+    let format_plan = formatted["plan_id"].as_str().unwrap().to_owned();
+    call_json(
+        &mut client,
+        "workspace_edit_apply",
+        json!({"project_id": "second", "plan_id": format_plan}),
+    )
+    .unwrap();
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/bad_format.fmt.rs");
+    assert_eq!(
+        fs::read_to_string(&bad_format).unwrap().trim(),
+        fs::read_to_string(golden).unwrap().trim()
+    );
+
+    // Exercise the existing real-RA structural code-action path on the second
+    // project, then restart it and prove the renamed symbol remains available.
+    sc_get_code_actions(&mut client, &second).unwrap();
+    let restarted = call_json(
+        &mut client,
+        "project_restart_lsp",
+        json!({"project_id": "second"}),
+    )
+    .unwrap();
+    assert_eq!(restarted["status"], "Ready");
+    let hover = call_json(
+        &mut client,
+        "get_hover",
+        json!({
+            "file_path": functions,
+            "line": find_line(&functions, "pub fn renamed_target("),
+            "character": 8
+        }),
+    )
+    .unwrap();
+    assert!(hover.to_string().contains("renamed_target"));
+}
