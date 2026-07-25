@@ -2542,16 +2542,25 @@ struct AutomaticRestartPolicy {
 }
 
 impl AutomaticRestartPolicy {
-    fn next(&mut self) -> Option<(usize, Duration)> {
+    fn next(&mut self) -> Option<AutomaticRestartAttempt> {
         let attempt = self.attempts + 1;
         let delay = AUTOMATIC_RESTART_BACKOFF.get(self.attempts).copied()?;
         self.attempts = attempt;
-        Some((attempt, delay))
+        Some(AutomaticRestartAttempt {
+            number: attempt,
+            delay,
+        })
     }
 
     const fn reset(&mut self) {
         self.attempts = 0;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutomaticRestartAttempt {
+    number: usize,
+    delay: Duration,
 }
 
 struct StoredCodeAction {
@@ -3184,7 +3193,7 @@ async fn recover_project_after_server_exit(
     runtime: &mut ProjectRuntime,
 ) {
     loop {
-        let Some((attempt, backoff)) = runtime.automatic_restart.next() else {
+        let Some(attempt) = runtime.automatic_restart.next() else {
             state.last_error = Some("language server exited".to_string());
             channels.publish_status(state, ProjectStatus::Failed);
             return;
@@ -3192,10 +3201,11 @@ async fn recover_project_after_server_exit(
 
         runtime.begin_transition();
         state.last_error = Some(format!(
-            "language server exited; restarting (attempt {attempt}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})"
+            "language server exited; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
+            attempt.number
         ));
         channels.publish_status(state, ProjectStatus::Restarting);
-        tokio::time::sleep(backoff).await;
+        tokio::time::sleep(attempt.delay).await;
         match runtime.restart().await {
             Ok(notification_receivers) => {
                 state.last_error = None;
@@ -3208,10 +3218,11 @@ async fn recover_project_after_server_exit(
                 );
                 return;
             }
-            Err(error) if attempt < MAX_AUTOMATIC_RESTART_ATTEMPTS => {
+            Err(error) if attempt.number < MAX_AUTOMATIC_RESTART_ATTEMPTS => {
                 state.sync_runtime(runtime);
                 state.last_error = Some(format!(
-                    "automatic restart attempt {attempt} failed: {error}"
+                    "automatic restart attempt {} failed: {error}",
+                    attempt.number
                 ));
             }
             Err(error) => {
@@ -6596,13 +6607,25 @@ mod tests {
     fn automatic_restart_policy_is_bounded_and_resettable() {
         let mut policy = AutomaticRestartPolicy::default();
 
-        assert_eq!(policy.next(), Some((1, Duration::from_millis(100))));
-        assert_eq!(policy.next(), Some((2, Duration::from_millis(500))));
-        assert_eq!(policy.next(), Some((3, Duration::from_secs(2))));
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((1, Duration::from_millis(100)))
+        );
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((2, Duration::from_millis(500)))
+        );
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((3, Duration::from_secs(2)))
+        );
         assert_eq!(policy.next(), None);
 
         policy.reset();
-        assert_eq!(policy.next(), Some((1, Duration::from_millis(100))));
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((1, Duration::from_millis(100)))
+        );
     }
 
     #[tokio::test]
@@ -6636,9 +6659,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.runtime().generation(), 3);
-        assert!(state
-            .last_error()
-            .is_some_and(|error| error.contains("No such file") || error.contains("not found")));
+        assert!(
+            state
+                .last_error()
+                .is_some_and(|error| error.contains("No such file") || error.contains("not found"))
+        );
     }
 
     #[tokio::test]
