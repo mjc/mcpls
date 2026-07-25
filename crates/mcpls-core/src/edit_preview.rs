@@ -120,7 +120,6 @@ pub fn preview_workspace_edit(
     )
 }
 
-#[allow(clippy::too_many_lines)]
 fn preview_normalized(
     boundary: &WorkspaceBoundary,
     project_id: &str,
@@ -129,75 +128,127 @@ fn preview_normalized(
     documents: &DocumentTracker,
     limits: PreviewLimits,
 ) -> Result<PreviewArtifact, PreviewError> {
-    let mut files = BTreeMap::<PathBuf, PlannedFile>::new();
-    let mut operations = Vec::new();
-    let mut conflicts = Vec::new();
-    let mut unsupported = Vec::new();
-    let mut edit_count = 0usize;
+    PreviewBuilder::new(boundary, project_id, encoding, documents, limits).finish(normalized)
+}
 
-    for operation in normalized.operations {
+struct PreviewBuilder<'a> {
+    boundary: &'a WorkspaceBoundary,
+    project_id: &'a str,
+    encoding: PositionEncoding,
+    documents: &'a DocumentTracker,
+    limits: PreviewLimits,
+    files: BTreeMap<PathBuf, PlannedFile>,
+    operations: Vec<String>,
+    conflicts: Vec<String>,
+    unsupported: Vec<String>,
+    edit_count: usize,
+}
+
+impl<'a> PreviewBuilder<'a> {
+    const fn new(
+        boundary: &'a WorkspaceBoundary,
+        project_id: &'a str,
+        encoding: PositionEncoding,
+        documents: &'a DocumentTracker,
+        limits: PreviewLimits,
+    ) -> Self {
+        Self {
+            boundary,
+            project_id,
+            encoding,
+            documents,
+            limits,
+            files: BTreeMap::new(),
+            operations: Vec::new(),
+            conflicts: Vec::new(),
+            unsupported: Vec::new(),
+            edit_count: 0,
+        }
+    }
+
+    fn finish(
+        mut self,
+        normalized: NormalizedWorkspaceEdit,
+    ) -> Result<PreviewArtifact, PreviewError> {
+        for operation in normalized.operations {
+            self.handle_operation(operation)?;
+        }
+        if self.files.len() > self.limits.max_files {
+            return Err(PreviewError::Limit {
+                kind: "file",
+                actual: self.files.len(),
+                limit: self.limits.max_files,
+            });
+        }
+        let total_bytes = self
+            .files
+            .values()
+            .map(|file| file.original.len().saturating_add(file.planned.len()))
+            .sum::<usize>();
+        if total_bytes > self.limits.max_bytes {
+            return Err(PreviewError::Limit {
+                kind: "byte",
+                actual: total_bytes,
+                limit: self.limits.max_bytes,
+            });
+        }
+        if self.operations.is_empty() {
+            self.conflicts
+                .push("workspace edit contains no operations".to_string());
+        }
+
+        let snapshots = self
+            .files
+            .into_iter()
+            .map(|(path, file)| {
+                FileSnapshot::from_contents(
+                    path,
+                    file.source,
+                    file.version,
+                    file.original,
+                    file.planned,
+                )
+            })
+            .collect::<Vec<_>>();
+        let safe_to_apply = self.conflicts.is_empty() && self.unsupported.is_empty();
+        let affected_files = snapshots.iter().map(|file| file.path().clone()).collect();
+        let plan = EditPlan::new(
+            self.project_id.to_string(),
+            snapshots,
+            self.operations,
+            safe_to_apply,
+            Duration::from_secs(15 * 60),
+        );
+        Ok(PreviewArtifact {
+            plan,
+            affected_files,
+            conflicts: self.conflicts,
+            unsupported: self.unsupported,
+        })
+    }
+
+    fn handle_operation(&mut self, operation: EditOperation) -> Result<(), PreviewError> {
         match operation {
             EditOperation::Text {
                 uri,
                 version,
                 edits,
-            } => {
-                edit_count = edit_count.saturating_add(edits.len());
-                if edit_count > limits.max_edits {
-                    return Err(PreviewError::Limit {
-                        kind: "edit",
-                        actual: edit_count,
-                        limit: limits.max_edits,
-                    });
-                }
-                let path = path_for_uri(&uri.to_string())?;
-                let path = boundary.validate_existing(path)?;
-                if !files.contains_key(&path) {
-                    files.insert(path.clone(), initial_file(&path, documents)?);
-                }
-                let entry = files.get_mut(&path).ok_or_else(|| PreviewError::Limit {
-                    kind: "file",
-                    actual: limits.max_files.saturating_add(1),
-                    limit: limits.max_files,
-                })?;
-
-                if let Some(expected) = version {
-                    if entry.source != SnapshotSource::OpenDocument {
-                        conflicts.push(format!(
-                            "versioned edit requires an open document: {}",
-                            path.display()
-                        ));
-                    } else if entry.version != Some(expected) {
-                        conflicts.push(format!(
-                            "document version changed for {}: expected {}, got {:?}",
-                            path.display(),
-                            expected,
-                            entry.version
-                        ));
-                    }
-                }
-                match apply_text_edits(&entry.planned, &edits, encoding) {
-                    Ok(planned) => entry.planned = planned,
-                    Err(error) => conflicts.push(format!("{}: {error}", path.display())),
-                }
-                operations.push(format!("text {}", path.display()));
-            }
+            } => self.handle_text(&uri.to_string(), version, &edits),
             EditOperation::Create { uri, options, .. } => {
-                let path = path_for_uri(&uri.to_string())?;
-                let path = boundary.validate_target(path)?;
+                let path = self
+                    .boundary
+                    .validate_target(path_for_uri(&uri.to_string())?)?;
                 let overwrite = options
                     .as_ref()
                     .and_then(|options| options.overwrite)
                     .unwrap_or(false);
-                boundary.validate_operations(&[FileOperation::Create {
+                self.boundary.validate_operations(&[FileOperation::Create {
                     path: path.clone(),
                     overwrite,
                 }])?;
                 let operation = format!("create {}", path.display());
-                operations.push(operation.clone());
-                unsupported.push(format!(
-                    "{operation}: resource operation application is not enabled"
-                ));
+                self.record_unsupported(&operation);
+                Ok(())
             }
             EditOperation::Rename {
                 old_uri,
@@ -205,91 +256,102 @@ fn preview_normalized(
                 options,
                 ..
             } => {
-                let from = boundary.validate_existing(path_for_uri(&old_uri.to_string())?)?;
-                let to = boundary.validate_target(path_for_uri(&new_uri.to_string())?)?;
+                let from = self
+                    .boundary
+                    .validate_existing(path_for_uri(&old_uri.to_string())?)?;
+                let to = self
+                    .boundary
+                    .validate_target(path_for_uri(&new_uri.to_string())?)?;
                 let overwrite = options
                     .as_ref()
                     .and_then(|options| options.overwrite)
                     .unwrap_or(false);
-                boundary.validate_operations(&[FileOperation::Rename {
+                self.boundary.validate_operations(&[FileOperation::Rename {
                     from: from.clone(),
                     to: to.clone(),
                     overwrite,
                 }])?;
                 let operation = format!("rename {} -> {}", from.display(), to.display());
-                operations.push(operation.clone());
-                unsupported.push(format!(
-                    "{operation}: resource operation application is not enabled"
-                ));
+                self.record_unsupported(&operation);
+                Ok(())
             }
             EditOperation::Delete { uri, options, .. } => {
-                let path = boundary.validate_existing(path_for_uri(&uri.to_string())?)?;
+                let path = self
+                    .boundary
+                    .validate_existing(path_for_uri(&uri.to_string())?)?;
                 let recursive = options
                     .as_ref()
                     .and_then(|options| options.recursive)
                     .unwrap_or(false);
-                boundary.validate_operations(&[FileOperation::Delete {
+                self.boundary.validate_operations(&[FileOperation::Delete {
                     path: path.clone(),
                     recursive,
                 }])?;
                 let operation = format!("delete {}", path.display());
-                operations.push(operation.clone());
-                unsupported.push(format!(
-                    "{operation}: resource operation application is not enabled"
-                ));
+                self.record_unsupported(&operation);
+                Ok(())
             }
         }
     }
 
-    if files.len() > limits.max_files {
-        return Err(PreviewError::Limit {
-            kind: "file",
-            actual: files.len(),
-            limit: limits.max_files,
-        });
-    }
-    let total_bytes = files
-        .values()
-        .map(|file| file.original.len().saturating_add(file.planned.len()))
-        .sum::<usize>();
-    if total_bytes > limits.max_bytes {
-        return Err(PreviewError::Limit {
-            kind: "byte",
-            actual: total_bytes,
-            limit: limits.max_bytes,
-        });
-    }
-    if operations.is_empty() {
-        conflicts.push("workspace edit contains no operations".to_string());
+    fn handle_text(
+        &mut self,
+        uri: &str,
+        version: Option<i32>,
+        edits: &[crate::workspace_edit::NormalizedTextEdit],
+    ) -> Result<(), PreviewError> {
+        self.edit_count = self.edit_count.saturating_add(edits.len());
+        if self.edit_count > self.limits.max_edits {
+            return Err(PreviewError::Limit {
+                kind: "edit",
+                actual: self.edit_count,
+                limit: self.limits.max_edits,
+            });
+        }
+        let path = self.boundary.validate_existing(path_for_uri(uri)?)?;
+        if !self.files.contains_key(&path) {
+            self.files
+                .insert(path.clone(), initial_file(&path, self.documents)?);
+        }
+        let entry = self
+            .files
+            .get_mut(&path)
+            .ok_or_else(|| PreviewError::Limit {
+                kind: "file",
+                actual: self.limits.max_files.saturating_add(1),
+                limit: self.limits.max_files,
+            })?;
+        let mut conflicts = Vec::new();
+        if let Some(expected) = version {
+            if entry.source != SnapshotSource::OpenDocument {
+                conflicts.push(format!(
+                    "versioned edit requires an open document: {}",
+                    path.display()
+                ));
+            } else if entry.version != Some(expected) {
+                conflicts.push(format!(
+                    "document version changed for {}: expected {}, got {:?}",
+                    path.display(),
+                    expected,
+                    entry.version
+                ));
+            }
+        }
+        match apply_text_edits(&entry.planned, edits, self.encoding) {
+            Ok(planned) => entry.planned = planned,
+            Err(error) => conflicts.push(format!("{}: {error}", path.display())),
+        }
+        self.conflicts.extend(conflicts);
+        self.operations.push(format!("text {}", path.display()));
+        Ok(())
     }
 
-    let snapshots = files
-        .into_iter()
-        .map(|(path, file)| {
-            FileSnapshot::from_contents(
-                path,
-                file.source,
-                file.version,
-                file.original,
-                file.planned,
-            )
-        })
-        .collect::<Vec<_>>();
-    let safe_to_apply = conflicts.is_empty() && unsupported.is_empty();
-    let affected_files = snapshots.iter().map(|file| file.path().clone()).collect();
-    let plan = EditPlan::new(
-        project_id.to_string(),
-        snapshots,
-        operations,
-        safe_to_apply,
-        Duration::from_secs(15 * 60),
-    );
-    Ok(PreviewArtifact {
-        plan,
-        affected_files,
-        conflicts,
-        unsupported,
-    })
+    fn record_unsupported(&mut self, operation: &str) {
+        self.operations.push(operation.to_string());
+        self.unsupported.push(format!(
+            "{operation}: resource operation application is not enabled"
+        ));
+    }
 }
 
 fn path_for_uri(uri: &str) -> Result<PathBuf, PreviewError> {
