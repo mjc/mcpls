@@ -214,13 +214,13 @@ impl DaemonHealth {
     }
 }
 
-const fn health_status(counts: ProjectStatusCounts, persistence_error: bool) -> DaemonHealth {
-    if counts.failed > 0 {
+const fn health_status(snapshot: &DaemonSnapshot) -> DaemonHealth {
+    if snapshot.project_counts.failed > 0 {
         DaemonHealth::Failed
-    } else if persistence_error
-        || counts.degraded > 0
-        || counts.restarting > 0
-        || counts.stopping > 0
+    } else if snapshot.persistence.last_error.is_some()
+        || snapshot.project_counts.degraded > 0
+        || snapshot.project_counts.restarting > 0
+        || snapshot.project_counts.stopping > 0
     {
         DaemonHealth::Degraded
     } else {
@@ -626,11 +626,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
-            "status": health_status(
-                snapshot.project_counts,
-                snapshot.persistence.last_error.is_some(),
-            )
-            .as_str(),
+            "status": health_status(&snapshot).as_str(),
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
