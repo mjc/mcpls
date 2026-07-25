@@ -5668,6 +5668,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_request_waiting_on_full_queue_is_rejected_when_work_closes() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sender = ProjectRequestSender::new(sender);
+        sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let (reply, _response) = oneshot::channel();
+        let mut pending = tokio::spawn({
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(ProjectRequest::SetStatus {
+                        status: ProjectStatus::Ready,
+                        reply,
+                    })
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        sender.reject_new_work();
+        let _ = receiver.recv().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn project_actor_publishes_typed_status_events() {
         let handle = spawn_project_actor(4);
         let mut events = handle.subscribe_events();
