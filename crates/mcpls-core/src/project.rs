@@ -2485,7 +2485,15 @@ impl ProjectActorChannels {
         let _ = self.event_tx.send(event);
     }
 
-    fn publish_notification(&self, runtime: &mut ProjectRuntime, notification: LspNotification) {
+    fn publish_notification(
+        &self,
+        runtime: &mut ProjectRuntime,
+        generation: u64,
+        notification: LspNotification,
+    ) {
+        if !runtime.owns_generation(generation) {
+            return;
+        }
         if let Some(event) = runtime.notification(notification) {
             self.publish(event);
         }
@@ -2919,9 +2927,7 @@ async fn handle_project_request(
             generation,
             notification,
         } => {
-            if runtime.owns_generation(generation) {
-                channels.publish_notification(runtime, notification);
-            }
+            channels.publish_notification(runtime, generation, notification);
         }
         ProjectRequest::ServerExited { generation } => {
             if runtime.owns_generation(generation)
@@ -4148,6 +4154,20 @@ mod tests {
             })),
         );
 
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 99,
+                notification: LspNotification::parse(
+                    "textDocument/publishDiagnostics",
+                    Some(serde_json::json!({
+                        "uri": "file:///project/src/stale.rs",
+                        "diagnostics": []
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
         actor
             .sender
             .send(ProjectRequest::Notification {
