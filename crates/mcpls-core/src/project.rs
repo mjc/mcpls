@@ -635,20 +635,23 @@ fn rust_toolchain_channel(root: &Path) -> Option<String> {
         .into_iter()
         .find_map(|relative| {
             let contents = std::fs::read_to_string(root.join(relative)).ok()?;
-            if relative == "rust-toolchain.toml" {
-                contents.lines().find_map(|line| {
-                    let (key, value) = line.split_once('=')?;
-                    (key.trim() == "channel")
-                        .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
-                })
-            } else {
-                contents
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(str::to_owned)
-            }
+            parse_rust_toolchain_channel(relative, &contents)
         })
+}
+
+fn parse_rust_toolchain_channel(relative: &str, contents: &str) -> Option<String> {
+    if relative == "rust-toolchain.toml" {
+        contents.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "channel").then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+        })
+    } else {
+        contents
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
