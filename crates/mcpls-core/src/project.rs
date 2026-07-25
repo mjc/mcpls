@@ -6596,6 +6596,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_retries_failed_restarts_until_the_policy_is_exhausted() {
+        let root = TempDir::new().unwrap();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/mcpls-language-server".to_string();
+        config.heuristics = None;
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], None);
+        let actor = spawn_project_actor_with_translator(2, translator);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let state = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() == ProjectStatus::Failed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(state.runtime().generation(), 3);
+        assert!(state
+            .last_error()
+            .is_some_and(|error| error.contains("No such file") || error.contains("not found")));
+    }
+
+    #[tokio::test]
     async fn project_actor_can_add_a_linked_workspace_root() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
