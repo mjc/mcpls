@@ -6555,6 +6555,90 @@ mod tests {
         assert_eq!(actor.query().await.unwrap().runtime().generation(), 0);
     }
 
+    #[cfg(unix)]
+    const DUPLICATE_ACTIVATION_LSP: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+counter = pathlib.Path(os.environ["MCPLS_SPAWN_COUNTER"])
+value = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(value + 1))
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    if message.get("method") == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-8"}
+        }})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"health": "ok", "quiescent": True}})
+    elif message.get("method") == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_activation_does_not_spawn_a_duplicate_lsp_process() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let counter = root.path().join("spawn-count");
+        let lsp = root.path().join("counting-lsp.py");
+        fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], Some(3));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        let first = actor.activate(root.path().to_path_buf()).await.unwrap();
+        assert_eq!(first.status(), ProjectStatus::Ready);
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+
+        let second = actor.activate(root.path().to_path_buf()).await.unwrap();
+        assert_eq!(second.status(), ProjectStatus::Ready);
+        assert_eq!(second.runtime().generation(), first.runtime().generation());
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+    }
+
     #[tokio::test]
     async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
         let actor = spawn_project_actor(2);
