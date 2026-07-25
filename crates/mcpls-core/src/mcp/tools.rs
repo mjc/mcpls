@@ -341,6 +341,17 @@ pub struct ServerMessagesParams {
     pub limit: usize,
 }
 
+/// Parameters for inspecting negotiated language-server capabilities.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for inspecting project-scoped LSP capabilities.")]
+pub struct ProjectLspCapabilitiesParams {
+    /// Registered project whose capabilities should be returned.
+    pub project_id: String,
+    /// Optional language-server identity to filter by.
+    #[serde(default)]
+    pub language_id: Option<String>,
+}
+
 const fn default_message_limit() -> usize {
     20
 }

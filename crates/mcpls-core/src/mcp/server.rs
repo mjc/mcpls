@@ -27,9 +27,9 @@ use super::tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
     FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
     HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams, ProjectListParams,
-    ReferencesParams, RenameParams, RenamePreviewParams, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, SubscriptionListParams, WorkspaceEditApplyParams,
-    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
+    ProjectLspCapabilitiesParams, ReferencesParams, RenameParams, RenamePreviewParams,
+    ServerLogsParams, ServerMessagesParams, SignatureHelpParams, SubscriptionListParams,
+    WorkspaceEditApplyParams, WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::make_uri;
 use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
@@ -1195,6 +1195,30 @@ impl McplsServer {
         encode_tool_result(actor.server_messages(limit).await)
     }
 
+    /// Inspect negotiated capabilities for a registered project's active servers.
+    #[tool(
+        description = "Negotiated capabilities for a project's active language servers. Optionally filter by language ID."
+    )]
+    async fn project_lsp_capabilities(
+        &self,
+        Parameters(ProjectLspCapabilitiesParams {
+            project_id,
+            language_id,
+        }): Parameters<ProjectLspCapabilitiesParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let servers = self
+            .context
+            .project_registry
+            .server_capabilities(&id, language_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        encode_json(&serde_json::json!({
+            "project_id": id.as_str(),
+            "servers": servers,
+        }))
+    }
+
     /// Get signature help at a position.
     #[tool(
         description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call."
@@ -1660,6 +1684,15 @@ mod tests {
                 .len(),
             1
         );
+        let capabilities = server
+            .project_lsp_capabilities(Parameters(ProjectLspCapabilitiesParams {
+                project_id: "demo".to_string(),
+                language_id: None,
+            }))
+            .await
+            .unwrap();
+        let capabilities_json: serde_json::Value = serde_json::from_str(&capabilities).unwrap();
+        assert!(capabilities_json["servers"].is_array());
         let duplicate = server
             .project_add(Parameters(ProjectAddParams {
                 project_id: "demo".to_string(),

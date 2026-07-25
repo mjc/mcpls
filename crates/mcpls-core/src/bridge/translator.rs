@@ -144,6 +144,34 @@ impl Translator {
         languages
     }
 
+    /// Return negotiated capabilities for active language servers.
+    ///
+    /// An optional language ID narrows the result without exposing command or
+    /// environment configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON serialization error if an LSP capability payload cannot
+    /// be represented safely.
+    pub fn server_capabilities(&self, language_id: Option<&str>) -> Result<Vec<ServerCapability>> {
+        let mut capabilities = self
+            .lsp_servers
+            .iter()
+            .filter(|(id, _)| {
+                language_id.is_none_or(|requested| id.eq_ignore_ascii_case(requested))
+            })
+            .map(|(language_id, server)| {
+                Ok(ServerCapability {
+                    language_id: language_id.clone(),
+                    position_encoding: format!("{:?}", server.position_encoding()),
+                    capabilities: serde_json::to_value(server.capabilities())?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        capabilities.sort_by(|left, right| left.language_id.cmp(&right.language_id));
+        Ok(capabilities)
+    }
+
     /// Return the number of open documents tracked by this translator.
     #[must_use]
     pub fn open_document_count(&self) -> usize {
@@ -887,6 +915,17 @@ pub struct ServerLogsResult {
 pub struct ServerMessagesResult {
     /// List of server messages.
     pub messages: Vec<crate::bridge::notifications::ServerMessage>,
+}
+
+/// Negotiated capabilities for one active language server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCapability {
+    /// Language ID configured for the server.
+    pub language_id: String,
+    /// Position encoding negotiated during initialization.
+    pub position_encoding: String,
+    /// Raw LSP server capabilities, with no environment or command details.
+    pub capabilities: serde_json::Value,
 }
 
 /// A single parameter in a signature.

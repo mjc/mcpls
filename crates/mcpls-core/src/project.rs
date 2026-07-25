@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
@@ -15,8 +16,8 @@ use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
-    ReferencesResult, RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ReferencesResult, RenameResult, ServerCapability, ServerLogsResult, ServerMessagesResult,
+    SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
@@ -1232,6 +1233,10 @@ enum ProjectRequest {
         limit: usize,
         reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
     },
+    ServerCapabilities {
+        language_id: Option<String>,
+        reply: oneshot::Sender<Result<Vec<ServerCapability>, String>>,
+    },
     Notification {
         generation: u64,
         notification: LspNotification,
@@ -2201,6 +2206,26 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Return negotiated capabilities for this project's active language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or cancels the response.
+    pub async fn server_capabilities(
+        &self,
+        language_id: Option<String>,
+    ) -> Result<Vec<ServerCapability>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ServerCapabilities { language_id, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Restart the project actor's managed services.
     ///
     /// # Errors
@@ -2762,6 +2787,15 @@ impl ProjectRuntime {
     fn server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult, String> {
         self.translator
             .handle_server_messages(limit)
+            .map_err(|error| error.to_string())
+    }
+
+    fn server_capabilities(
+        &self,
+        language_id: Option<&str>,
+    ) -> Result<Vec<ServerCapability>, String> {
+        self.translator
+            .server_capabilities(language_id)
             .map_err(|error| error.to_string())
     }
 
@@ -3404,6 +3438,9 @@ async fn handle_project_request(
         ProjectRequest::ServerMessages { limit, reply } => {
             let _ = reply.send(runtime.server_messages(limit));
         }
+        ProjectRequest::ServerCapabilities { language_id, reply } => {
+            let _ = reply.send(runtime.server_capabilities(language_id.as_deref()));
+        }
         ProjectRequest::Notification {
             generation,
             notification,
@@ -3640,6 +3677,19 @@ pub struct ProjectStatusCounts {
     pub stopped: usize,
     /// Failed projects.
     pub failed: usize,
+}
+
+/// Negotiated capability data for one actor group in a logical project.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectServerCapability {
+    /// Actor-group ordinal within the logical project snapshot.
+    pub group_id: usize,
+    /// Language ID configured for the server.
+    pub language_id: String,
+    /// Position encoding negotiated during initialization.
+    pub position_encoding: String,
+    /// Raw LSP server capabilities.
+    pub capabilities: serde_json::Value,
 }
 
 impl ProjectStatusCounts {
@@ -4127,6 +4177,37 @@ impl ProjectRegistry {
             states.push(actor.query().await?);
         }
         Ok(ProjectState::aggregate(states))
+    }
+
+    /// Return negotiated capabilities from every active actor group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or an actor cannot
+    /// service the capability request.
+    pub async fn server_capabilities(
+        &self,
+        id: &ProjectId,
+        language_id: Option<String>,
+    ) -> Result<Vec<ProjectServerCapability>, ProjectRegistryError> {
+        let (_, actors) = self.actor_entries(id).await?;
+        let mut capabilities = Vec::new();
+        for (group_id, (actor, _)) in actors.into_iter().enumerate() {
+            for capability in actor.server_capabilities(language_id.clone()).await? {
+                capabilities.push(ProjectServerCapability {
+                    group_id,
+                    language_id: capability.language_id,
+                    position_encoding: capability.position_encoding,
+                    capabilities: capability.capabilities,
+                });
+            }
+        }
+        capabilities.sort_by(|left, right| {
+            left.group_id
+                .cmp(&right.group_id)
+                .then_with(|| left.language_id.cmp(&right.language_id))
+        });
+        Ok(capabilities)
     }
 
     /// List code actions with project-owned opaque references.
