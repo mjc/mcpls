@@ -532,12 +532,8 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
     hasher.update(b"rust-server-config-v1");
     hash_compatibility_field(hasher, config.language_id.as_bytes());
     hash_compatibility_field(hasher, config.command.as_bytes());
-    for pattern in &config.file_patterns {
-        hash_compatibility_field(hasher, pattern.as_bytes());
-    }
-    for argument in &config.args {
-        hash_compatibility_field(hasher, argument.as_bytes());
-    }
+    hash_compatibility_strings(hasher, &config.file_patterns);
+    hash_compatibility_strings(hasher, &config.args);
     let mut environment = config.env.iter().collect::<Vec<_>>();
     environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
     for (name, value) in environment {
@@ -548,9 +544,7 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
     hash_compatibility_field(hasher, &initialization_options);
     hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
     if let Some(heuristics) = &config.heuristics {
-        for marker in &heuristics.project_markers {
-            hash_compatibility_field(hasher, marker.as_bytes());
-        }
+        hash_compatibility_strings(hasher, &heuristics.project_markers);
     }
     hash_compatibility_field(
         hasher,
@@ -560,6 +554,12 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
             .to_le_bytes(),
     );
     Some(())
+}
+
+fn hash_compatibility_strings(hasher: &mut Sha256, values: &[String]) {
+    for value in values {
+        hash_compatibility_field(hasher, value.as_bytes());
+    }
 }
 
 fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
