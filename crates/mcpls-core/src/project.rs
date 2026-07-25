@@ -3183,33 +3183,43 @@ async fn recover_project_after_server_exit(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) {
-    let Some((attempt, backoff)) = runtime.automatic_restart.next() else {
-        state.last_error = Some("language server exited".to_string());
-        channels.publish_status(state, ProjectStatus::Failed);
-        return;
-    };
-
-    runtime.begin_transition();
-    state.last_error = Some(format!(
-        "language server exited; restarting (attempt {attempt}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})"
-    ));
-    channels.publish_status(state, ProjectStatus::Restarting);
-    tokio::time::sleep(backoff).await;
-    match runtime.restart().await {
-        Ok(notification_receivers) => {
-            state.last_error = None;
-            mark_project_started(
-                notification_receivers,
-                actor_sender,
-                channels,
-                state,
-                runtime,
-            );
-        }
-        Err(error) => {
-            state.sync_runtime(runtime);
-            state.last_error = Some(error);
+    loop {
+        let Some((attempt, backoff)) = runtime.automatic_restart.next() else {
+            state.last_error = Some("language server exited".to_string());
             channels.publish_status(state, ProjectStatus::Failed);
+            return;
+        };
+
+        runtime.begin_transition();
+        state.last_error = Some(format!(
+            "language server exited; restarting (attempt {attempt}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})"
+        ));
+        channels.publish_status(state, ProjectStatus::Restarting);
+        tokio::time::sleep(backoff).await;
+        match runtime.restart().await {
+            Ok(notification_receivers) => {
+                state.last_error = None;
+                mark_project_started(
+                    notification_receivers,
+                    actor_sender,
+                    channels,
+                    state,
+                    runtime,
+                );
+                return;
+            }
+            Err(error) if attempt < MAX_AUTOMATIC_RESTART_ATTEMPTS => {
+                state.sync_runtime(runtime);
+                state.last_error = Some(format!(
+                    "automatic restart attempt {attempt} failed: {error}"
+                ));
+            }
+            Err(error) => {
+                state.sync_runtime(runtime);
+                state.last_error = Some(error);
+                channels.publish_status(state, ProjectStatus::Failed);
+                return;
+            }
         }
     }
 }
