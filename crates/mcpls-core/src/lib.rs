@@ -196,11 +196,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     info!("Starting MCPLS server...");
 
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
-    let translator_template = TranslatorTemplate::from_configuration(
-        config.build_effective_extension_map(),
-        config.lsp_servers.clone(),
-        Some(config.workspace.heuristics_max_depth),
-    );
+    let translator_template = TranslatorTemplate::from_server_config(&config);
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
@@ -354,11 +350,7 @@ mod tests {
     #[test]
     fn translator_template_is_built_without_a_live_translator() {
         let config = ServerConfig::default();
-        let template = bridge::TranslatorTemplate::from_configuration(
-            config.build_effective_extension_map(),
-            config.lsp_servers.clone(),
-            Some(config.workspace.heuristics_max_depth),
-        );
+        let template = bridge::TranslatorTemplate::from_server_config(&config);
 
         assert!(template.rust_server_config().is_some());
     }

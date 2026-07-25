@@ -122,10 +122,20 @@ pub struct TranslatorTemplate {
 }
 
 impl TranslatorTemplate {
+    /// Build the daemon template directly from its declarative configuration.
+    #[must_use]
+    pub(crate) fn from_server_config(config: &crate::config::ServerConfig) -> Self {
+        Self::from_configuration(
+            config.build_effective_extension_map(),
+            config.lsp_servers.clone(),
+            Some(config.workspace.heuristics_max_depth),
+        )
+    }
+
     /// Build an immutable project configuration without creating a live
     /// translator or language-server runtime.
     #[must_use]
-    pub(crate) fn from_configuration(
+    pub(crate) const fn from_configuration(
         extension_map: HashMap<String, String>,
         lsp_configs: Vec<LspServerConfig>,
         heuristics_max_depth: Option<usize>,
