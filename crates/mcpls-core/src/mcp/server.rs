@@ -3,7 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -819,26 +819,13 @@ impl ServerHandler for McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let path = match resource {
             SessionResource::ProjectStatus(project_id) => {
-                let actor = self
-                    .context
-                    .project_registry
-                    .actor_for_project(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                self.attach_subscription(project_id, &actor, request.uri, context.peer)
+                self.attach_project_subscription(project_id, request.uri, context.peer)
                     .await?;
                 return Ok(());
             }
             SessionResource::ProjectEvents { project_id, .. } => {
-                let actor = self
-                    .context
-                    .project_registry
-                    .actor_for_project(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                self.attach_subscription(
+                self.attach_project_subscription(
                     project_id.clone(),
-                    &actor,
                     project_events_resource_uri(&project_id),
                     context.peer,
                 )

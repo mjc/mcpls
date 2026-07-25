@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::{Peer, RoleServer};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::bridge::resources::{ResourceUriError, make_uri, parse_uri};
@@ -167,25 +167,25 @@ impl SessionEventSink {
         resources.retain(|_, subscriptions| !subscriptions.is_empty());
     }
 
-    /// Attach one project actor to this session's peer, deduplicating repeated
-    /// subscriptions for files owned by the same project.
+    /// Attach all actor groups for one logical project to this session's peer,
+    /// deduplicating repeated subscriptions for resources owned by the project.
     pub(crate) fn attach(
         &self,
         project_id: ProjectId,
-        actor: &ProjectHandle,
+        actors: &[ProjectHandle],
         peer: Peer<RoleServer>,
     ) {
-        self.attach_receiver(
+        self.attach_receivers(
             project_id,
-            actor.subscribe_events(),
+            actors.iter().map(ProjectHandle::subscribe_events).collect(),
             Arc::new(PeerNotifier(peer)),
         );
     }
 
-    fn attach_receiver(
+    fn attach_receivers(
         &self,
         project_id: ProjectId,
-        mut events: broadcast::Receiver<ProjectEvent>,
+        event_receivers: Vec<broadcast::Receiver<ProjectEvent>>,
         notifier: Arc<dyn SessionNotifier>,
     ) {
         let mut tasks = self
@@ -203,37 +203,48 @@ impl SessionEventSink {
         let subscriptions = Arc::clone(&self.subscriptions);
         let project_resources = Arc::clone(&self.project_resources);
         let event_project_id = project_id.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        for mut events in event_receivers {
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            if event_tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                skipped,
+                                "session actor event sink lagged; polling can resync"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        drop(event_tx);
         let task = tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        let outcome = forward_event(
-                            &subscriptions,
-                            notifier.as_ref(),
-                            &event_project_id,
-                            &event,
-                        )
+            while let Some(event) = event_rx.recv().await {
+                let outcome =
+                    forward_event(&subscriptions, notifier.as_ref(), &event_project_id, &event)
                         .await;
-                        let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
-                            && event.belongs_to(&event_project_id);
-                        if removed {
-                            cleanup_removed_project_subscriptions(
-                                &subscriptions,
-                                &project_resources,
-                                &event_project_id,
-                                &event,
-                            )
-                            .await;
-                            break;
-                        }
-                        if outcome == ForwardOutcome::Disconnect {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "session event sink lagged; polling can resync");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
+                    && event.belongs_to(&event_project_id);
+                if removed {
+                    cleanup_removed_project_subscriptions(
+                        &subscriptions,
+                        &project_resources,
+                        &event_project_id,
+                        &event,
+                    )
+                    .await;
+                    break;
+                }
+                if outcome == ForwardOutcome::Disconnect {
+                    break;
                 }
             }
         });
@@ -419,14 +430,14 @@ mod tests {
         let (updates_a_tx, mut updates_a_rx) = mpsc::unbounded_channel();
         let (updates_b_tx, mut updates_b_rx) = mpsc::unbounded_channel();
 
-        sink_a.attach_receiver(
+        sink_a.attach_receivers(
             ProjectId::new("a").unwrap(),
-            events_rx.resubscribe(),
+            vec![events_rx.resubscribe()],
             Arc::new(TestNotifier(updates_a_tx)),
         );
-        sink_b.attach_receiver(
+        sink_b.attach_receivers(
             ProjectId::new("b").unwrap(),
-            events_rx,
+            vec![events_rx],
             Arc::new(TestNotifier(updates_b_tx)),
         );
 
@@ -447,6 +458,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_sink_fans_in_events_from_multiple_actor_groups() {
+        let project_id = ProjectId::new("logical").unwrap();
+        let resource = project_events_resource_uri(&project_id);
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(resource.clone()).await.unwrap();
+        let sink = SessionEventSink::new(subscriptions);
+        let (first_tx, first_rx) = broadcast::channel(8);
+        let (second_tx, second_rx) = broadcast::channel(8);
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+
+        sink.attach_receivers(
+            project_id.clone(),
+            vec![first_rx, second_rx],
+            Arc::new(TestNotifier(updates_tx)),
+        );
+        second_tx
+            .send(ProjectEvent::StatusChanged {
+                status: ProjectStatus::Failed,
+                last_error: Some("secondary actor failed".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(updates_rx.recv().await.unwrap(), resource);
+        drop(first_tx);
+        drop(second_tx);
+    }
+
+    #[tokio::test]
     async fn session_sink_stops_after_notifier_disconnects() {
         let uri = "lsp-diagnostics:///workspace/a.rs".to_string();
         let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
@@ -455,7 +494,11 @@ mod tests {
         let (events_tx, events_rx) = broadcast::channel(8);
         let project_id = ProjectId::new("a").unwrap();
 
-        sink.attach_receiver(project_id.clone(), events_rx, Arc::new(FailingNotifier));
+        sink.attach_receivers(
+            project_id.clone(),
+            vec![events_rx],
+            Arc::new(FailingNotifier),
+        );
         events_tx
             .send(ProjectEvent::DiagnosticsUpdated {
                 uri: "file:///workspace/a.rs".to_string(),
@@ -511,9 +554,9 @@ mod tests {
         let (events_tx, events_rx) = broadcast::channel(8);
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
 
-        sink.attach_receiver(
+        sink.attach_receivers(
             project_id.clone(),
-            events_rx,
+            vec![events_rx],
             Arc::new(TestNotifier(updates_tx)),
         );
         events_tx

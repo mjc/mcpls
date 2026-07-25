@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -265,15 +266,17 @@ fn canonicalize_git_metadata(path: PathBuf) -> Result<PathBuf, GitRepositoryIden
 pub struct ProjectIdentity {
     id: ProjectId,
     root: CanonicalRoot,
+    roots: Vec<CanonicalRoot>,
     repository: Option<GitRepositoryIdentity>,
 }
 
 impl ProjectIdentity {
     /// Pair a stable project ID with its canonical root.
     #[must_use]
-    pub const fn new(id: ProjectId, root: CanonicalRoot) -> Self {
+    pub fn new(id: ProjectId, root: CanonicalRoot) -> Self {
         Self {
             id,
+            roots: vec![root.clone()],
             root,
             repository: None,
         }
@@ -289,6 +292,18 @@ impl ProjectIdentity {
     #[must_use]
     pub const fn root(&self) -> &CanonicalRoot {
         &self.root
+    }
+
+    /// Return every canonical worktree root owned by this logical project.
+    #[must_use]
+    pub fn roots(&self) -> &[CanonicalRoot] {
+        &self.roots
+    }
+
+    pub(crate) fn add_root(&mut self, root: CanonicalRoot) {
+        if !self.roots.iter().any(|existing| existing == &root) {
+            self.roots.push(root);
+        }
     }
 
     /// Attach the shared Git repository identity for this checkout.
@@ -328,8 +343,10 @@ impl ProjectResolver {
             if !ids.insert(project.id.clone()) {
                 return Err(ProjectIdentityError::DuplicateId(project.id));
             }
-            if !roots.insert(project.root.clone()) {
-                return Err(ProjectIdentityError::DuplicateRoot(project.root.0));
+            for root in project.roots() {
+                if !roots.insert(root.clone()) {
+                    return Err(ProjectIdentityError::DuplicateRoot(root.0.clone()));
+                }
             }
             projects.push(project);
         }
@@ -351,7 +368,10 @@ impl ProjectResolver {
             Ok(canonical) => canonical,
             Err(error) => {
                 if let Some(project) = self.projects.iter().find(|project| {
-                    !project.root.as_path().exists() && path.starts_with(project.root.as_path())
+                    project
+                        .roots()
+                        .iter()
+                        .any(|root| !root.as_path().exists() && path.starts_with(root.as_path()))
                 }) {
                     return Err(ProjectIdentityError::ProjectRootUnavailable(
                         project.id.clone(),
@@ -363,10 +383,16 @@ impl ProjectResolver {
 
         self.projects
             .iter()
-            .filter(|project| {
-                project.root.as_path().exists() && canonical.starts_with(project.root.as_path())
+            .filter_map(|project| {
+                project
+                    .roots()
+                    .iter()
+                    .filter(|root| root.as_path().exists() && canonical.starts_with(root.as_path()))
+                    .max_by_key(|root| root.as_path().components().count())
+                    .map(|root| (root.as_path().components().count(), project))
             })
-            .max_by_key(|project| project.root.as_path().components().count())
+            .max_by_key(|(components, _)| *components)
+            .map(|(_, project)| project)
             .ok_or(ProjectIdentityError::UnregisteredPath(canonical))
     }
 
@@ -388,7 +414,10 @@ impl ProjectResolver {
             (Some(project_id), Some(path)) => {
                 let project = self.resolve_id(project_id)?;
                 let canonical = canonicalize(path)?;
-                if project.root.as_path().exists() && canonical.starts_with(project.root.as_path())
+                if project
+                    .roots()
+                    .iter()
+                    .any(|root| root.as_path().exists() && canonical.starts_with(root.as_path()))
                 {
                     Ok(project)
                 } else {
@@ -443,7 +472,10 @@ struct ProjectCompatibilityKey([u8; 32]);
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
 /// unknown rather than compatible. This keeps linked-project reuse fail-closed
 /// until the daemon can resolve the effective toolchain and environment.
-fn rust_project_compatibility_key(root: &Path) -> Option<ProjectCompatibilityKey> {
+fn rust_project_compatibility_key(
+    root: &Path,
+    translator_template: Option<&TranslatorTemplate>,
+) -> Option<ProjectCompatibilityKey> {
     const INPUTS: &[&str] = &[
         "rust-toolchain",
         "rust-toolchain.toml",
@@ -463,19 +495,105 @@ fn rust_project_compatibility_key(root: &Path) -> Option<ProjectCompatibilityKey
                 has_toolchain |=
                     *relative == "rust-toolchain" || *relative == "rust-toolchain.toml";
                 has_manifest |= *relative == "Cargo.toml";
-                hasher.update(relative.as_bytes());
-                hasher.update((contents.len() as u64).to_le_bytes());
-                hasher.update(contents);
+                hash_compatibility_field(&mut hasher, relative.as_bytes());
+                hash_compatibility_field(&mut hasher, &contents);
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                hasher.update(relative.as_bytes());
-                hasher.update([0]);
+                hash_compatibility_field(&mut hasher, relative.as_bytes());
+                hash_compatibility_field(&mut hasher, &[]);
             }
             Err(_) => return None,
         }
     }
 
+    if let Some(template) = translator_template {
+        let toolchain_signature = rust_toolchain_signature(root)?;
+        hash_compatibility_field(&mut hasher, b"rustc-toolchain-v1");
+        hash_compatibility_field(&mut hasher, &toolchain_signature);
+        hash_rust_server_config(&mut hasher, template)?;
+    }
+
     (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
+}
+
+fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -> Option<()> {
+    let config = template.rust_server_config()?;
+    hasher.update(b"rust-server-config-v1");
+    hash_compatibility_field(hasher, config.language_id.as_bytes());
+    hash_compatibility_field(hasher, config.command.as_bytes());
+    for argument in &config.args {
+        hash_compatibility_field(hasher, argument.as_bytes());
+    }
+    let mut environment = config.env.iter().collect::<Vec<_>>();
+    environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (name, value) in environment {
+        hash_compatibility_field(hasher, name.as_bytes());
+        hash_compatibility_field(hasher, value.as_bytes());
+    }
+    let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
+    hash_compatibility_field(hasher, &initialization_options);
+    hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
+    if let Some(heuristics) = &config.heuristics {
+        for marker in &heuristics.project_markers {
+            hash_compatibility_field(hasher, marker.as_bytes());
+        }
+    }
+    hash_compatibility_field(
+        hasher,
+        &template
+            .heuristics_max_depth()
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    Some(())
+}
+
+fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
+    let channel = rust_toolchain_channel(root)?;
+    probe_rustc_version(&channel)
+}
+
+fn probe_rustc_version(channel: &str) -> Option<Vec<u8>> {
+    let output = Command::new("rustup")
+        .args(["run", channel, "rustc", "-Vv"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .or_else(|| {
+            Command::new("rustc")
+                .arg(format!("+{channel}"))
+                .arg("-Vv")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        })?;
+    Some(output.stdout)
+}
+
+fn rust_toolchain_channel(root: &Path) -> Option<String> {
+    ["rust-toolchain", "rust-toolchain.toml"]
+        .into_iter()
+        .find_map(|relative| {
+            let contents = std::fs::read_to_string(root.join(relative)).ok()?;
+            if relative == "rust-toolchain.toml" {
+                contents.lines().find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == "channel")
+                        .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+                })
+            } else {
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_owned)
+            }
+        })
+}
+
+fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_le_bytes());
+    hasher.update(field);
 }
 
 /// Observable lifecycle state for one project actor.
@@ -766,6 +884,38 @@ impl ProjectState {
     fn sync_runtime(&mut self, runtime: &ProjectRuntime) {
         self.runtime = runtime.summary();
     }
+
+    fn aggregate(states: impl IntoIterator<Item = Self>) -> Self {
+        let mut states = states.into_iter();
+        let Some(mut aggregate) = states.next() else {
+            return Self::new(ProjectStatus::Starting, ProjectRuntimeSummary::default());
+        };
+        for state in states {
+            aggregate.merge(state);
+        }
+        aggregate
+    }
+
+    fn merge(&mut self, state: Self) {
+        let state_priority = project_status_priority(state.status);
+        if state_priority >= project_status_priority(self.status) {
+            self.status = state.status;
+            self.last_error = state.last_error;
+        }
+        self.runtime.merge(state.runtime);
+    }
+}
+
+const fn project_status_priority(status: ProjectStatus) -> u8 {
+    match status {
+        ProjectStatus::Failed => 6,
+        ProjectStatus::Stopping => 5,
+        ProjectStatus::Restarting => 4,
+        ProjectStatus::Degraded => 3,
+        ProjectStatus::Starting => 2,
+        ProjectStatus::Ready => 1,
+        ProjectStatus::Stopped => 0,
+    }
 }
 
 /// Project-local state counts and roots owned by an actor.
@@ -809,6 +959,20 @@ impl ProjectRuntimeSummary {
     #[must_use]
     pub const fn open_document_count(&self) -> usize {
         self.open_document_count
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.workspace_roots.extend(other.workspace_roots);
+        self.configured_language_ids
+            .extend(other.configured_language_ids);
+        self.active_language_ids.extend(other.active_language_ids);
+        self.open_document_count += other.open_document_count;
+        self.workspace_roots.sort();
+        self.workspace_roots.dedup();
+        self.configured_language_ids.sort();
+        self.configured_language_ids.dedup();
+        self.active_language_ids.sort();
+        self.active_language_ids.dedup();
     }
 }
 
@@ -2588,9 +2752,13 @@ impl ProjectRuntime {
                     .store_message(params.typ.into(), params.message);
                 None
             }
-            LspNotification::Progress { .. }
-            | LspNotification::ServerStatus(_)
-            | LspNotification::Other { .. } => None,
+            LspNotification::ServerStatus(status) => {
+                if status.quiescent {
+                    self.translator.clear_expected_languages();
+                }
+                None
+            }
+            LspNotification::Progress { .. } | LspNotification::Other { .. } => None,
         }
     }
 
@@ -2796,7 +2964,7 @@ fn spawn_notification_forwarders(
     }
 }
 
-fn mark_project_ready(
+fn mark_project_started(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
     actor_sender: &mpsc::Sender<ProjectRequest>,
     channels: &ProjectActorChannels,
@@ -2804,8 +2972,21 @@ fn mark_project_ready(
     runtime: &ProjectRuntime,
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
+    publish_project_readiness(channels, state, runtime);
+}
+
+fn publish_project_readiness(
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &ProjectRuntime,
+) {
     state.sync_runtime(runtime);
-    channels.publish_status(state, ProjectStatus::Ready);
+    let status = if runtime.translator.is_initializing() {
+        ProjectStatus::Starting
+    } else {
+        ProjectStatus::Ready
+    };
+    channels.publish_status(state, status);
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -2830,7 +3011,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -2853,7 +3034,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -3114,7 +3295,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -3180,7 +3361,11 @@ async fn handle_project_request(
             generation,
             notification,
         } => {
+            let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, notification);
+            if was_initializing && !runtime.translator.is_initializing() {
+                publish_project_readiness(channels, state, runtime);
+            }
         }
         ProjectRequest::ServerExited { generation } => {
             if runtime.owns_generation(generation)
@@ -3204,7 +3389,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -3267,6 +3452,16 @@ pub enum ProjectRegistryError {
     /// A different project already owns this canonical root.
     #[error("project root is already registered: {0}")]
     DuplicateRoot(PathBuf),
+    /// A compatible linked worktree must use its logical project's stable ID.
+    #[error(
+        "linked worktree {requested_root} belongs to logical project {existing_id}; use that project ID"
+    )]
+    LinkedWorktreeProject {
+        /// Stable ID of the already-registered logical project.
+        existing_id: ProjectId,
+        /// Worktree root that was registered under another ID.
+        requested_root: PathBuf,
+    },
     /// No project with this stable ID is registered.
     #[error("project is not registered: {0}")]
     ProjectNotFound(ProjectId),
@@ -3278,11 +3473,73 @@ pub enum ProjectRegistryError {
     Actor(#[from] ProjectActorError),
 }
 
-struct ProjectEntry {
-    identity: ProjectIdentity,
+struct ProjectActorEntry {
     actor: ProjectHandle,
     mutation: MutationGate,
     compatibility_key: Option<ProjectCompatibilityKey>,
+    roots: Vec<CanonicalRoot>,
+}
+
+impl ProjectActorEntry {
+    fn new(
+        actor: ProjectHandle,
+        mutation: MutationGate,
+        compatibility_key: Option<ProjectCompatibilityKey>,
+        root: CanonicalRoot,
+    ) -> Self {
+        Self {
+            actor,
+            mutation,
+            compatibility_key,
+            roots: vec![root],
+        }
+    }
+}
+
+struct ProjectEntry {
+    identity: ProjectIdentity,
+    actors: Vec<ProjectActorEntry>,
+}
+
+impl ProjectEntry {
+    fn new(
+        identity: ProjectIdentity,
+        actor: ProjectHandle,
+        mutation: MutationGate,
+        compatibility_key: Option<ProjectCompatibilityKey>,
+    ) -> Self {
+        let root = identity.root.clone();
+        Self {
+            identity,
+            actors: vec![ProjectActorEntry::new(
+                actor,
+                mutation,
+                compatibility_key,
+                root,
+            )],
+        }
+    }
+
+    fn primary(&self) -> &ProjectActorEntry {
+        &self.actors[0]
+    }
+
+    fn actor_for_root(&self, root: &Path) -> Option<&ProjectActorEntry> {
+        self.actors.iter().find(|actor| {
+            actor
+                .roots
+                .iter()
+                .any(|candidate| candidate.as_path() == root)
+        })
+    }
+
+    fn status(&self) -> ProjectStatus {
+        aggregate_statuses(
+            self.actors
+                .iter()
+                .map(|actor| *actor.actor.status().borrow()),
+        )
+    }
 }
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
@@ -3336,6 +3593,20 @@ pub struct ProjectStatusCounts {
     pub stopped: usize,
     /// Failed projects.
     pub failed: usize,
+}
+
+impl ProjectStatusCounts {
+    const fn record(&mut self, status: ProjectStatus) {
+        match status {
+            ProjectStatus::Starting => self.starting += 1,
+            ProjectStatus::Ready => self.ready += 1,
+            ProjectStatus::Degraded => self.degraded += 1,
+            ProjectStatus::Restarting => self.restarting += 1,
+            ProjectStatus::Stopping => self.stopping += 1,
+            ProjectStatus::Stopped => self.stopped += 1,
+            ProjectStatus::Failed => self.failed += 1,
+        }
+    }
 }
 
 /// Result of a bounded daemon shutdown across all registered projects.
@@ -3407,6 +3678,15 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
 }
 
 impl ProjectRegistry {
+    fn spawn_actor(&self, root: &CanonicalRoot) -> ProjectHandle {
+        self.translator_template.as_deref().map_or_else(
+            || spawn_project_actor_for_root(self.actor_capacity, root),
+            |template| {
+                spawn_project_actor_for_root_with_template(self.actor_capacity, root, template)
+            },
+        )
+    }
+
     fn with_template(
         actor_capacity: usize,
         translator_template: Option<TranslatorTemplate>,
@@ -3482,116 +3762,137 @@ impl ProjectRegistry {
             let Ok(root) = CanonicalRoot::new(&persisted.root) else {
                 continue;
             };
-            let mut identity = ProjectIdentity::new(id, root);
-            if let Ok(Some(repository)) = GitRepositoryIdentity::discover(identity.root().as_path())
-            {
-                identity = identity.with_repository_identity(repository);
-            }
+            let identity = match GitRepositoryIdentity::discover(root.as_path()) {
+                Ok(Some(repository)) => {
+                    ProjectIdentity::new(id.clone(), root).with_repository_identity(repository)
+                }
+                _ => ProjectIdentity::new(id.clone(), root),
+            };
             self.add(identity).await?;
+            for additional_root in &persisted.additional_roots {
+                let Ok(additional_root) = CanonicalRoot::new(additional_root) else {
+                    continue;
+                };
+                let Ok(Some(repository)) =
+                    GitRepositoryIdentity::discover(additional_root.as_path())
+                else {
+                    continue;
+                };
+                self.add(
+                    ProjectIdentity::new(id.clone(), additional_root)
+                        .with_repository_identity(repository),
+                )
+                .await?;
+            }
             restored += 1;
         }
         self.persist().await?;
         Ok(restored)
     }
 
-    /// Add a project, sharing an actor with a compatible linked worktree.
+    /// Add a logical project, sharing actors only with compatible worktrees.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectRegistryError::DuplicateRoot`] when another project owns the root.
+    #[allow(clippy::too_many_lines)]
     pub async fn add(
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
+        let compatibility_key = rust_project_compatibility_key(
+            identity.root.as_path(),
+            self.translator_template.as_deref(),
+        );
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
-            if existing.identity.root() != identity.root() {
+            if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
+                return Ok(actor.actor.clone());
+            }
+            let compatible = existing
+                .actors
+                .iter()
+                .find(|actor| {
+                    actor.compatibility_key == compatibility_key
+                        && compatibility_key.is_some()
+                        && existing.identity.repository_identity() == identity.repository_identity()
+                })
+                .map(|actor| (actor.actor.clone(), actor.mutation.clone()));
+            if let Some((actor, mutation)) = compatible {
+                drop(projects);
+                let mutation_guard = mutation.lock().await;
+                self.lifecycle.ensure_accepting()?;
+                actor
+                    .add_workspace_root(identity.root().as_path().to_path_buf())
+                    .await?;
+                let mut projects = self.projects.write().await;
+                if let Some(existing) = projects.get_mut(identity.id()) {
+                    existing.identity.add_root(identity.root.clone());
+                    if let Some(actor) = existing
+                        .actors
+                        .iter_mut()
+                        .find(|entry| entry.actor.sender.same_channel(&actor.sender))
+                    {
+                        actor.roots.push(identity.root.clone());
+                    }
+                }
+                drop(projects);
+                drop(mutation_guard);
+                self.persist().await?;
+                return Ok(actor);
+            }
+            if existing.identity.repository_identity().is_none()
+                || identity.repository_identity().is_none()
+                || compatibility_key.is_none()
+                || existing.identity.repository_identity() != identity.repository_identity()
+            {
                 return Err(ProjectRegistryError::ConflictingProject {
                     id: identity.id().clone(),
                     existing_root: existing.identity.root().as_path().to_path_buf(),
                     requested_root: identity.root().as_path().to_path_buf(),
                 });
             }
-            let actor = existing.actor.clone();
+            let actor = self.spawn_actor(identity.root());
+            let mutation = std::sync::Arc::new(Mutex::new(()));
             drop(projects);
+            let mut projects = self.projects.write().await;
+            if let Some(existing) = projects.get_mut(identity.id()) {
+                existing.identity.add_root(identity.root.clone());
+                existing.actors.push(ProjectActorEntry::new(
+                    actor.clone(),
+                    mutation,
+                    compatibility_key,
+                    identity.root.clone(),
+                ));
+            }
+            drop(projects);
+            self.persist().await?;
             return Ok(actor);
         }
         if projects
             .values()
-            .any(|project| project.identity.root() == identity.root())
+            .flat_map(|project| project.identity.roots())
+            .any(|root| root == identity.root())
         {
             return Err(ProjectRegistryError::DuplicateRoot(
                 identity.root().as_path().to_path_buf(),
             ));
         }
 
-        let shared = compatible_project(&projects, &identity, compatibility_key);
-        if let Some(existing) = shared {
-            let actor = existing.actor.clone();
-            let mutation = existing.mutation.clone();
-            drop(projects);
-
-            self.lifecycle.ensure_accepting()?;
-
-            let mutation_guard = mutation.lock().await;
-            actor
-                .add_workspace_root(identity.root().as_path().to_path_buf())
-                .await?;
-
-            let mut projects = self.projects.write().await;
-            if let Some(existing) = projects.get(identity.id()) {
-                if existing.identity.root() != identity.root() {
-                    return Err(ProjectRegistryError::ConflictingProject {
-                        id: identity.id().clone(),
-                        existing_root: existing.identity.root().as_path().to_path_buf(),
-                        requested_root: identity.root().as_path().to_path_buf(),
-                    });
-                }
-                return Ok(existing.actor.clone());
-            }
-            if projects
-                .values()
-                .any(|project| project.identity.root() == identity.root())
-            {
-                return Err(ProjectRegistryError::DuplicateRoot(
-                    identity.root().as_path().to_path_buf(),
-                ));
-            }
-            projects.insert(
-                identity.id().clone(),
-                ProjectEntry {
-                    identity,
-                    actor: actor.clone(),
-                    mutation: mutation.clone(),
-                    compatibility_key,
-                },
-            );
-            drop(projects);
-            drop(mutation_guard);
-            self.persist().await?;
-            return Ok(actor);
+        if let Some(existing) = compatible_project(&projects, &identity, compatibility_key) {
+            return Err(ProjectRegistryError::LinkedWorktreeProject {
+                existing_id: existing.identity.id().clone(),
+                requested_root: identity.root().as_path().to_path_buf(),
+            });
         }
 
-        let actor = self.translator_template.as_deref().map_or_else(
-            || spawn_project_actor_for_root(self.actor_capacity, identity.root()),
-            |template| {
-                spawn_project_actor_for_root_with_template(
-                    self.actor_capacity,
-                    identity.root(),
-                    template,
-                )
-            },
-        );
+        let primary_root = identity.root.clone();
+        let actor = self.spawn_actor(&primary_root);
+        let mutation = std::sync::Arc::new(Mutex::new(()));
         projects.insert(
             identity.id().clone(),
-            ProjectEntry {
-                identity,
-                actor: actor.clone(),
-                mutation: std::sync::Arc::new(Mutex::new(())),
-                compatibility_key,
-            },
+            ProjectEntry::new(identity, actor.clone(), mutation, compatibility_key),
         );
         drop(projects);
         self.persist().await?;
@@ -3616,16 +3917,7 @@ impl ProjectRegistry {
         let projects = self.projects.read().await;
         let mut counts = ProjectStatusCounts::default();
         for entry in projects.values() {
-            let status = *entry.actor.status().borrow();
-            match status {
-                ProjectStatus::Starting => counts.starting += 1,
-                ProjectStatus::Ready => counts.ready += 1,
-                ProjectStatus::Degraded => counts.degraded += 1,
-                ProjectStatus::Restarting => counts.restarting += 1,
-                ProjectStatus::Stopping => counts.stopping += 1,
-                ProjectStatus::Stopped => counts.stopped += 1,
-                ProjectStatus::Failed => counts.failed += 1,
-            }
+            counts.record(entry.status());
         }
         drop(projects);
         counts
@@ -3633,11 +3925,9 @@ impl ProjectRegistry {
 
     /// Gracefully stop every registered project actor once.
     ///
-    /// Shared linked-worktree actors are deduplicated by their request channel,
-    /// so one shutdown request drains the shared language-server runtime for
-    /// all of its project identities. Requests already queued on an actor are
-    /// processed before its shutdown request, preserving edit commit
-    /// boundaries without holding the registry lock across the await.
+    /// Requests already queued on an actor are processed before its shutdown
+    /// request, preserving edit commit boundaries without holding the registry
+    /// lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
         self.lifecycle.begin_shutdown();
         let _mutation_guards = self.lock_project_mutations().await;
@@ -3646,7 +3936,12 @@ impl ProjectRegistry {
             .read()
             .await
             .values()
-            .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
+            .flat_map(|entry| {
+                entry
+                    .actors
+                    .iter()
+                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
+            })
             .collect();
 
         let (stopped, actors) = shutdown_actor_groups(entries);
@@ -3675,6 +3970,13 @@ impl ProjectRegistry {
             let projects = self.projects.read().await;
             unique_mutation_gates(&projects)
         };
+        self.lock_mutation_gates(mutations).await
+    }
+
+    async fn lock_mutation_gates(
+        &self,
+        mutations: Vec<MutationGate>,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
         let mut guards = Vec::with_capacity(mutations.len());
         for mutation in mutations {
             guards.push(mutation.lock_owned().await);
@@ -3696,7 +3998,12 @@ impl ProjectRegistry {
             .read()
             .await
             .values()
-            .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
+            .flat_map(|entry| {
+                entry
+                    .actors
+                    .iter()
+                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
+            })
             .collect();
         let mut paths = Vec::new();
         for (id, actor) in entries {
@@ -3720,44 +4027,45 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let (actor, mutation, root) = self
+        let (actors, mutations, root) = self
             .projects
             .read()
             .await
             .get(&id)
             .map(|entry| {
                 (
-                    entry.actor.clone(),
-                    entry.mutation.clone(),
+                    entry
+                        .actors
+                        .iter()
+                        .map(|actor| actor.actor.clone())
+                        .collect::<Vec<_>>(),
+                    entry
+                        .actors
+                        .iter()
+                        .map(|actor| actor.mutation.clone())
+                        .collect::<Vec<_>>(),
                     entry.identity.root().as_path().to_path_buf(),
                 )
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        let mutation_guard = mutation.lock().await;
+        let _mutation_guards = self.lock_mutation_gates(mutations).await;
         self.projects
             .write()
             .await
             .remove(&id)
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        let has_linked_projects = self
-            .projects
-            .read()
-            .await
-            .values()
-            .any(|entry| std::sync::Arc::ptr_eq(&entry.mutation, &mutation));
         self.persist().await?;
-        actor
-            .publish_event(ProjectEvent::ProjectRemoved {
-                project_id: id.clone(),
-                root,
-            })
-            .await
-            .map_err(ProjectRegistryError::from)?;
-        drop(mutation_guard);
-        if has_linked_projects {
-            return Ok(());
+        for actor in actors {
+            actor
+                .publish_event(ProjectEvent::ProjectRemoved {
+                    project_id: id.clone(),
+                    root: root.clone(),
+                })
+                .await
+                .map_err(ProjectRegistryError::from)?;
+            actor.shutdown().await.map_err(ProjectRegistryError::from)?;
         }
-        actor.shutdown().await.map_err(ProjectRegistryError::from)
+        Ok(())
     }
 
     /// Query a project's actor state without holding the registry lock during the await.
@@ -3766,11 +4074,12 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor is unavailable.
     pub async fn status(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        self.actor(id)
-            .await?
-            .query()
-            .await
-            .map_err(ProjectRegistryError::from)
+        let (_, actors) = self.actor_entries(id).await?;
+        let mut states = Vec::with_capacity(actors.len());
+        for (actor, _) in actors {
+            states.push(actor.query().await?);
+        }
+        Ok(ProjectState::aggregate(states))
     }
 
     /// List code actions with project-owned opaque references.
@@ -3843,20 +4152,28 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or activation fails.
     pub async fn activate(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
-        let _mutation = mutation.lock().await;
-        let roots = actor.query().await?.workspace_roots().to_vec();
-        if roots.len() > 1 {
-            actor
-                .activate_workspace_roots(roots)
-                .await
-                .map_err(ProjectRegistryError::from)
-        } else {
-            actor
-                .activate(identity.root().as_path().to_path_buf())
-                .await
-                .map_err(ProjectRegistryError::from)
+        let (_, actors) = self.actor_entries(id).await?;
+        let _mutations = self
+            .lock_mutation_gates(
+                actors
+                    .iter()
+                    .map(|(_, mutation)| mutation.clone())
+                    .collect(),
+            )
+            .await;
+        for (actor, _) in &actors {
+            let roots = actor.query().await?.workspace_roots().to_vec();
+            if roots.len() > 1 {
+                actor.activate_workspace_roots(roots).await?;
+            } else if let Some(root) = roots.into_iter().next() {
+                actor.activate(root).await?;
+            }
         }
+        actors[0]
+            .0
+            .query()
+            .await
+            .map_err(ProjectRegistryError::from)
     }
 
     /// Mark a registered project ready after its language servers are loaded.
@@ -3906,9 +4223,23 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor is unavailable.
     pub async fn restart(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        let (_, actor, mutation) = self.entry(id).await?;
-        let _mutation = mutation.lock().await;
-        actor.restart().await.map_err(ProjectRegistryError::from)
+        let (_, actors) = self.actor_entries(id).await?;
+        let _mutations = self
+            .lock_mutation_gates(
+                actors
+                    .iter()
+                    .map(|(_, mutation)| mutation.clone())
+                    .collect(),
+            )
+            .await;
+        for (actor, _) in &actors {
+            actor.restart().await?;
+        }
+        actors[0]
+            .0
+            .query()
+            .await
+            .map_err(ProjectRegistryError::from)
     }
 
     /// Consume and apply a project-owned edit plan under the registry's
@@ -3996,9 +4327,25 @@ impl ProjectRegistry {
             .read()
             .await
             .values()
-            .filter(|project| canonical.starts_with(project.identity.root().as_path()))
-            .max_by_key(|project| project.identity.root().as_path().components().count())
-            .map(|project| (project.identity.id().clone(), project.actor.clone()))
+            .filter_map(|project| {
+                project
+                    .identity
+                    .roots()
+                    .iter()
+                    .filter(|root| canonical.starts_with(root.as_path()))
+                    .max_by_key(|root| root.as_path().components().count())
+                    .and_then(|root| {
+                        project.actor_for_root(root.as_path()).map(|actor| {
+                            (
+                                root.as_path().components().count(),
+                                project.identity.id().clone(),
+                                actor.actor.clone(),
+                            )
+                        })
+                    })
+            })
+            .max_by_key(|(components, _, _)| *components)
+            .map(|(_, project_id, actor)| (project_id, actor))
             .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
     }
 
@@ -4014,12 +4361,59 @@ impl ProjectRegistry {
         self.actor(id).await
     }
 
+    /// Resolve every actor group belonging to one logical project.
+    ///
+    /// Compatible linked worktrees share one returned actor; incompatible
+    /// worktrees remain separate actors under the same stable project ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not registered.
+    pub async fn actors_for_project(
+        &self,
+        id: &ProjectId,
+    ) -> Result<Vec<ProjectHandle>, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| {
+                project
+                    .actors
+                    .iter()
+                    .map(|actor| actor.actor.clone())
+                    .collect()
+            })
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
     async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
         self.projects
             .read()
             .await
             .get(id)
-            .map(|project| project.actor.clone())
+            .map(|project| project.primary().actor.clone())
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
+    async fn actor_entries(
+        &self,
+        id: &ProjectId,
+    ) -> Result<(ProjectIdentity, Vec<(ProjectHandle, MutationGate)>), ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| {
+                (
+                    project.identity.clone(),
+                    project
+                        .actors
+                        .iter()
+                        .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+                        .collect(),
+                )
+            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
@@ -4034,22 +4428,31 @@ impl ProjectRegistry {
             .map(|project| {
                 (
                     project.identity.clone(),
-                    project.actor.clone(),
-                    project.mutation.clone(),
+                    project.primary().actor.clone(),
+                    project.primary().mutation.clone(),
                 )
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 }
 
+fn aggregate_statuses(statuses: impl IntoIterator<Item = ProjectStatus>) -> ProjectStatus {
+    statuses
+        .into_iter()
+        .max_by_key(|status| project_status_priority(*status))
+        .unwrap_or(ProjectStatus::Starting)
+}
+
 fn unique_mutation_gates(projects: &HashMap<ProjectId, ProjectEntry>) -> Vec<MutationGate> {
     let mut mutations = Vec::new();
     for entry in projects.values() {
-        if !mutations
-            .iter()
-            .any(|existing| std::sync::Arc::ptr_eq(existing, &entry.mutation))
-        {
-            mutations.push(entry.mutation.clone());
+        for actor in &entry.actors {
+            if !mutations
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, &actor.mutation))
+            {
+                mutations.push(actor.mutation.clone());
+            }
         }
     }
     mutations
@@ -4085,12 +4488,11 @@ fn compatible_project<'a>(
     let repository = identity.repository_identity()?;
     let compatibility_key = compatibility_key?;
     projects.values().find(|project| {
-        project
-            .identity
-            .repository_identity()
-            .is_some_and(|existing| {
-                existing == repository && project.compatibility_key == Some(compatibility_key)
-            })
+        project.identity.repository_identity() == Some(repository)
+            && project
+                .actors
+                .iter()
+                .any(|actor| actor.compatibility_key == Some(compatibility_key))
     })
 }
 
@@ -4204,6 +4606,62 @@ mod tests {
             GitRepositoryIdentity::discover(stale.path()),
             Err(GitRepositoryIdentityError::MissingGitDirectory { .. })
         ));
+    }
+
+    #[test]
+    fn rust_compatibility_key_changes_with_server_configuration() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut first = Translator::new();
+        first.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+        let mut changed_config = crate::config::LspServerConfig::rust_analyzer();
+        changed_config.args.push("--log-file=ra.log".to_string());
+        let mut second = Translator::new();
+        second.set_lsp_configs(vec![changed_config], Some(10));
+
+        assert_ne!(
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+        );
+    }
+
+    #[test]
+    fn rust_compatibility_key_rejects_unavailable_toolchains() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"mcpls-definitely-missing\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+
+        assert_eq!(
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            None
+        );
     }
 
     #[test]
@@ -4861,6 +5319,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_becomes_ready_when_server_status_reaches_quiescence() {
+        let mut translator = Translator::new();
+        translator.set_expected_languages(HashSet::from(["rust".to_string()]));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "experimental/serverStatus",
+                    Some(serde_json::json!({
+                        "health": "ok",
+                        "quiescent": true
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(actor.query().await.unwrap().status(), ProjectStatus::Ready);
+    }
+
+    #[tokio::test]
     async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
         let actor = spawn_project_actor(2);
         actor.set_status(ProjectStatus::Ready).await.unwrap();
@@ -4945,7 +5427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_shares_actor_for_linked_git_worktrees() {
+    async fn registry_keeps_one_logical_project_for_linked_git_worktrees() {
         let repository = TempDir::new().unwrap();
         let git_dir = repository.path().join(".git");
         let worktree_git_dir = git_dir.join("worktrees").join("linked");
@@ -4977,19 +5459,24 @@ mod tests {
             .unwrap();
         let registry = ProjectRegistry::new(2);
         let main_id = ProjectId::new("main").unwrap();
-        let linked_id = ProjectId::new("linked").unwrap();
 
         let main_actor = registry
             .add(
-                ProjectIdentity::new(main_id, CanonicalRoot::new(repository.path()).unwrap())
-                    .with_repository_identity(main_repository),
+                ProjectIdentity::new(
+                    main_id.clone(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(main_repository),
             )
             .await
             .unwrap();
         let linked_actor = registry
             .add(
-                ProjectIdentity::new(linked_id, CanonicalRoot::new(worktree.path()).unwrap())
-                    .with_repository_identity(linked_repository),
+                ProjectIdentity::new(
+                    main_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_repository),
             )
             .await
             .unwrap();
@@ -4998,19 +5485,10 @@ mod tests {
         let linked_state = linked_actor.query().await.unwrap();
         assert_eq!(main_state.workspace_roots(), linked_state.workspace_roots());
         assert_eq!(main_state.workspace_roots().len(), 2);
+        assert_eq!(registry.list().await.len(), 1);
 
-        registry
-            .remove(ProjectId::new("main").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            linked_actor.query().await.unwrap().workspace_roots().len(),
-            2
-        );
-        registry
-            .remove(ProjectId::new("linked").unwrap())
-            .await
-            .unwrap();
+        registry.remove(main_id).await.unwrap();
+        assert_eq!(*linked_actor.status().borrow(), ProjectStatus::Stopped);
     }
 
     #[tokio::test]
@@ -5040,6 +5518,9 @@ mod tests {
             "[toolchain]\nchannel = \"nightly\"\n",
         )
         .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        }
         let main_repository = GitRepositoryIdentity::discover(repository.path())
             .unwrap()
             .unwrap();
@@ -5061,25 +5542,23 @@ mod tests {
         let linked_actor = registry
             .add(
                 ProjectIdentity::new(
-                    ProjectId::new("linked").unwrap(),
+                    ProjectId::new("main").unwrap(),
                     CanonicalRoot::new(worktree.path()).unwrap(),
                 )
                 .with_repository_identity(linked_repository),
             )
-            .await
-            .unwrap();
+            .await;
+        let linked_actor = linked_actor.unwrap();
 
         assert_eq!(main_actor.query().await.unwrap().workspace_roots().len(), 1);
         assert_eq!(
             linked_actor.query().await.unwrap().workspace_roots().len(),
             1
         );
+        assert!(!main_actor.sender.same_channel(&linked_actor.sender));
+        assert_eq!(registry.list().await.len(), 1);
         registry
             .remove(ProjectId::new("main").unwrap())
-            .await
-            .unwrap();
-        registry
-            .remove(ProjectId::new("linked").unwrap())
             .await
             .unwrap();
     }
@@ -5210,10 +5689,12 @@ mod tests {
                 PersistedProject {
                     project_id: "existing".to_string(),
                     root: root.path().to_path_buf(),
+                    additional_roots: Vec::new(),
                 },
                 PersistedProject {
                     project_id: "missing".to_string(),
                     root: root.path().join("gone"),
+                    additional_roots: Vec::new(),
                 },
             ])
             .unwrap();
@@ -5290,6 +5771,58 @@ mod tests {
                 .status(),
             ProjectStatus::Starting
         );
+    }
+
+    #[tokio::test]
+    async fn project_status_reports_failure_in_any_actor_group() {
+        let primary_root = TempDir::new().unwrap();
+        let secondary_root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("logical").unwrap();
+        let primary = spawn_project_actor(2);
+        let secondary = spawn_project_actor(2);
+        primary.set_status(ProjectStatus::Ready).await.unwrap();
+        secondary.fail("secondary toolchain failed").await.unwrap();
+
+        let primary_root = CanonicalRoot::new(primary_root.path()).unwrap();
+        let secondary_root = CanonicalRoot::new(secondary_root.path()).unwrap();
+        let mut entry = ProjectEntry::new(
+            ProjectIdentity::new(project_id.clone(), primary_root.clone()),
+            primary,
+            std::sync::Arc::new(Mutex::new(())),
+            None,
+        );
+        entry.identity.add_root(secondary_root.clone());
+        entry.actors.push(ProjectActorEntry::new(
+            secondary,
+            std::sync::Arc::new(Mutex::new(())),
+            None,
+            secondary_root,
+        ));
+
+        let registry = ProjectRegistry::new(2);
+        registry
+            .projects
+            .write()
+            .await
+            .insert(project_id.clone(), entry);
+
+        let state = registry.status(&project_id).await.unwrap();
+
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(state.last_error(), Some("secondary toolchain failed"));
+        let counts = registry.status_counts().await;
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.ready, 0);
+    }
+
+    #[test]
+    fn project_status_aggregate_preserves_ready_for_one_actor() {
+        let state = ProjectState::aggregate([ProjectState::new(
+            ProjectStatus::Ready,
+            ProjectRuntimeSummary::default(),
+        )]);
+
+        assert_eq!(state.status(), ProjectStatus::Ready);
     }
 
     #[tokio::test]
@@ -5378,6 +5911,12 @@ mod tests {
         });
         let (_, status) = watch::channel(ProjectStatus::Starting);
         let (events, _) = broadcast::channel(1);
+        let actor = ProjectHandle {
+            sender,
+            status,
+            events,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
         registry.projects.write().await.insert(
             project_id.clone(),
             ProjectEntry {
@@ -5385,16 +5924,12 @@ mod tests {
                     project_id.clone(),
                     CanonicalRoot::new(root.path()).unwrap(),
                 ),
-                actor: ProjectHandle {
-                    sender,
-                    status,
-                    events,
-                    event_history: std::sync::Arc::new(std::sync::Mutex::new(
-                        ProjectEventHistory::new(1),
-                    )),
-                },
-                mutation: std::sync::Arc::new(Mutex::new(())),
-                compatibility_key: None,
+                actors: vec![ProjectActorEntry {
+                    actor,
+                    mutation: std::sync::Arc::new(Mutex::new(())),
+                    compatibility_key: None,
+                    roots: vec![CanonicalRoot::new(root.path()).unwrap()],
+                }],
             },
         );
 
@@ -5424,6 +5959,7 @@ mod tests {
             .await
             .get(&project_id)
             .unwrap()
+            .actors[0]
             .mutation
             .clone();
         let guard = mutation.lock().await;
@@ -5466,6 +6002,82 @@ mod tests {
             result,
             Err(ProjectRegistryError::ConflictingProject { id, .. }) if id.as_str() == "same"
         ));
+    }
+
+    #[tokio::test]
+    async fn project_registry_adds_compatible_worktree_to_one_logical_project() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        }
+        let repository_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+        let project_id = ProjectId::new("repository").unwrap();
+        let registry = ProjectRegistry::new(2);
+
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(repository_identity),
+            )
+            .await
+            .unwrap();
+        let wrong_id = ProjectId::new("worktree").unwrap();
+        let wrong_id_result = registry
+            .add(
+                ProjectIdentity::new(wrong_id, CanonicalRoot::new(worktree.path()).unwrap())
+                    .with_repository_identity(linked_identity.clone()),
+            )
+            .await;
+        assert!(matches!(
+            wrong_id_result,
+            Err(ProjectRegistryError::LinkedWorktreeProject { existing_id, .. })
+                if existing_id == project_id
+        ));
+        let actor = registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_identity),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(actor.query().await.unwrap().workspace_roots().len(), 2);
+        let file = worktree.path().join("src.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let (resolved_id, resolved_actor) = registry.project_for_path(&file).await.unwrap();
+        assert_eq!(resolved_id, project_id);
+        assert!(resolved_actor.sender.same_channel(&actor.sender));
     }
 
     #[cfg(unix)]

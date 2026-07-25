@@ -54,7 +54,6 @@ mod util;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(test)]
 use bridge::resources::make_uri;

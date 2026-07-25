@@ -1837,6 +1837,23 @@ mod tests {
     }
 
     #[test]
+    fn test_open_documents_snapshot_preserves_state() {
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/a.rs");
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
+        tracker.update(&path, "fn main() { println!(\"hi\"); }".to_string());
+
+        let documents = tracker.open_documents();
+
+        assert_eq!(
+            documents,
+            vec![tracker.get(Path::new("/a.rs")).unwrap().clone()]
+        );
+    }
+
+    #[test]
     fn test_open_paths_after_close() {
         let mut map = HashMap::new();
         map.insert("rs".to_string(), "rust".to_string());

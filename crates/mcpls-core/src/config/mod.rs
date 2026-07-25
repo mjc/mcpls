@@ -10,6 +10,7 @@ mod server;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
@@ -987,6 +988,13 @@ mod tests {
 
         let result = ServerConfig::load_from(&config_path);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn daemon_default_keeps_shutdown_timeout_when_section_is_omitted() {
+        let config: ServerConfig = toml::from_str("").unwrap();
+
+        assert_eq!(config.daemon.shutdown_timeout_seconds, 30);
     }
 
     #[test]
