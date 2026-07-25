@@ -3376,6 +3376,11 @@ async fn stop_project_runtime(
     channels.publish_status(state, ProjectStatus::Stopped);
 }
 
+fn can_reuse_activation(state: &ProjectState, runtime: &ProjectRuntime, roots: &[PathBuf]) -> bool {
+    matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
+        && runtime.has_active_workspace_roots(roots)
+}
+
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
@@ -3393,9 +3398,7 @@ async fn handle_project_request(
             let _ = reply.send(state.clone());
         }
         ProjectRequest::Activate { root, reply } => {
-            if matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
-                && runtime.has_active_workspace_roots(std::slice::from_ref(&root))
-            {
+            if can_reuse_activation(state, runtime, std::slice::from_ref(&root)) {
                 state.sync_runtime(runtime);
                 let _ = reply.send(Ok(state.clone()));
                 return false;
@@ -3423,9 +3426,7 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
-            if matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
-                && runtime.has_active_workspace_roots(&roots)
-            {
+            if can_reuse_activation(state, runtime, &roots) {
                 state.sync_runtime(runtime);
                 let _ = reply.send(Ok(state.clone()));
                 return false;
