@@ -2461,6 +2461,21 @@ struct ProjectActorChannels {
     event_tx: broadcast::Sender<ProjectEvent>,
 }
 
+impl ProjectActorChannels {
+    fn publish(&self, event: ProjectEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
+        state.status = status;
+        let _ = self.status_tx.send(status);
+        self.publish(ProjectEvent::StatusChanged {
+            status,
+            last_error: state.last_error.clone(),
+        });
+    }
+}
+
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     actor_sender: mpsc::Sender<ProjectRequest>,
@@ -2512,20 +2527,7 @@ fn mark_project_ready(
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
     state.sync_runtime(runtime);
-    publish_status(channels, state, ProjectStatus::Ready);
-}
-
-fn publish_status(
-    channels: &ProjectActorChannels,
-    state: &mut ProjectState,
-    status: ProjectStatus,
-) {
-    state.status = status;
-    let _ = channels.status_tx.send(status);
-    let _ = channels.event_tx.send(ProjectEvent::StatusChanged {
-        status,
-        last_error: state.last_error.clone(),
-    });
+    channels.publish_status(state, ProjectStatus::Ready);
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -2547,7 +2549,7 @@ async fn handle_project_request(
         ProjectRequest::Activate { root, reply } => {
             runtime.begin_transition();
             state.last_error = None;
-            publish_status(channels, state, ProjectStatus::Starting);
+            channels.publish_status(state, ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
@@ -2562,7 +2564,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error.to_string());
-                    publish_status(channels, state, ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
@@ -2570,7 +2572,7 @@ async fn handle_project_request(
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
             runtime.begin_transition();
             state.last_error = None;
-            publish_status(channels, state, ProjectStatus::Starting);
+            channels.publish_status(state, ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
@@ -2585,7 +2587,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error.clone());
-                    publish_status(channels, state, ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2831,7 +2833,7 @@ async fn handle_project_request(
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             runtime.begin_transition();
             state.last_error = None;
-            publish_status(channels, state, ProjectStatus::Restarting);
+            channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
@@ -2846,7 +2848,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error.clone());
-                    publish_status(channels, state, ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2901,23 +2903,21 @@ async fn handle_project_request(
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
                 state.last_error = Some("language server exited".to_string());
-                let _ = channels
-                    .event_tx
-                    .send(ProjectEvent::ServerExited { generation });
-                publish_status(channels, state, ProjectStatus::Failed);
+                channels.publish(ProjectEvent::ServerExited { generation });
+                channels.publish_status(state, ProjectStatus::Failed);
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
             state.last_error = None;
-            publish_status(channels, state, status);
+            channels.publish_status(state, status);
             let _ = reply.send(());
         }
         ProjectRequest::Restart { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
             state.last_error = None;
-            publish_status(channels, state, ProjectStatus::Restarting);
+            channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
@@ -2932,7 +2932,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error);
-                    publish_status(channels, state, ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(state.clone());
                 }
             }
@@ -2940,19 +2940,19 @@ async fn handle_project_request(
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
             state.last_error = Some(message);
-            publish_status(channels, state, ProjectStatus::Failed);
+            channels.publish_status(state, ProjectStatus::Failed);
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
             state.last_error = None;
-            publish_status(channels, state, ProjectStatus::Stopping);
+            channels.publish_status(state, ProjectStatus::Stopping);
             if let Err(error) = runtime.shutdown().await {
                 state.last_error = Some(error);
             }
             state.sync_runtime(runtime);
-            publish_status(channels, state, ProjectStatus::Stopped);
+            channels.publish_status(state, ProjectStatus::Stopped);
             let _ = reply.send(());
             return true;
         }
