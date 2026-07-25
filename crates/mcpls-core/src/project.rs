@@ -3473,6 +3473,20 @@ pub struct ProjectStatusCounts {
     pub failed: usize,
 }
 
+impl ProjectStatusCounts {
+    const fn record(&mut self, status: ProjectStatus) {
+        match status {
+            ProjectStatus::Starting => self.starting += 1,
+            ProjectStatus::Ready => self.ready += 1,
+            ProjectStatus::Degraded => self.degraded += 1,
+            ProjectStatus::Restarting => self.restarting += 1,
+            ProjectStatus::Stopping => self.stopping += 1,
+            ProjectStatus::Stopped => self.stopped += 1,
+            ProjectStatus::Failed => self.failed += 1,
+        }
+    }
+}
+
 /// Result of a bounded daemon shutdown across all registered projects.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectShutdownReport {
@@ -3784,15 +3798,7 @@ impl ProjectRegistry {
                     .iter()
                     .map(|actor| *actor.actor.status().borrow()),
             );
-            match status {
-                ProjectStatus::Starting => counts.starting += 1,
-                ProjectStatus::Ready => counts.ready += 1,
-                ProjectStatus::Degraded => counts.degraded += 1,
-                ProjectStatus::Restarting => counts.restarting += 1,
-                ProjectStatus::Stopping => counts.stopping += 1,
-                ProjectStatus::Stopped => counts.stopped += 1,
-                ProjectStatus::Failed => counts.failed += 1,
-            }
+            counts.record(status);
         }
         drop(projects);
         counts
