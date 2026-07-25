@@ -217,6 +217,22 @@ impl McplsServer {
         Ok(())
     }
 
+    async fn attach_project_subscription(
+        &self,
+        project_id: ProjectId,
+        uri: String,
+        peer: rmcp::Peer<RoleServer>,
+    ) -> Result<(), McpError> {
+        let actors = self
+            .context
+            .project_registry
+            .actors_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.attach_subscription(project_id, &actors, uri, peer)
+            .await
+    }
+
     async fn read_project_status_resource(
         &self,
         project_id: ProjectId,
@@ -1378,26 +1394,13 @@ impl ServerHandler for McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let path = match resource {
             SessionResource::ProjectStatus(project_id) => {
-                let actors = self
-                    .context
-                    .project_registry
-                    .actors_for_project(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                self.attach_subscription(project_id, &actors, request.uri, context.peer)
+                self.attach_project_subscription(project_id, request.uri, context.peer)
                     .await?;
                 return Ok(());
             }
             SessionResource::ProjectEvents { project_id, .. } => {
-                let actors = self
-                    .context
-                    .project_registry
-                    .actors_for_project(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                self.attach_subscription(
+                self.attach_project_subscription(
                     project_id.clone(),
-                    &actors,
                     project_events_resource_uri(&project_id),
                     context.peer,
                 )
