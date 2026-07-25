@@ -158,18 +158,7 @@ impl<'a> PreparedPlan<'a> {
         staged: &[StagedFile],
         operations: &[ValidatedFileOperation],
     ) -> Result<ApplyReport, ApplyError> {
-        let mut committed_files = Vec::with_capacity(staged.len().saturating_add(operations.len()));
-        for (index, file) in staged.iter().enumerate() {
-            if let Err(error) = fs::rename(&file.temp, &file.target) {
-                cleanup_staged(&staged[index..]);
-                return Err(ApplyError::Commit {
-                    path: file.target.clone(),
-                    committed_files,
-                    source: error,
-                });
-            }
-            committed_files.push(file.target.clone());
-        }
+        let mut committed_files = commit_staged_files(staged)?;
         for operation in operations {
             let path = apply_resource_operation(operation, &committed_files)?;
             committed_files.push(path);
@@ -177,6 +166,22 @@ impl<'a> PreparedPlan<'a> {
 
         Ok(ApplyReport { committed_files })
     }
+}
+
+fn commit_staged_files(staged: &[StagedFile]) -> Result<Vec<PathBuf>, ApplyError> {
+    let mut committed_files = Vec::with_capacity(staged.len());
+    for (index, file) in staged.iter().enumerate() {
+        if let Err(error) = fs::rename(&file.temp, &file.target) {
+            cleanup_staged(&staged[index..]);
+            return Err(ApplyError::Commit {
+                path: file.target.clone(),
+                committed_files,
+                source: error,
+            });
+        }
+        committed_files.push(file.target.clone());
+    }
+    Ok(committed_files)
 }
 
 fn apply_resource_operation(
