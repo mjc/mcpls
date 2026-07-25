@@ -409,8 +409,7 @@ impl McplsServer {
         &self,
         Parameters(_params): Parameters<SubscriptionListParams>,
     ) -> Result<String, McpError> {
-        let mut subscriptions = self.context.subscriptions.snapshot().await;
-        subscriptions.sort();
+        let subscriptions = self.context.subscriptions.sorted_snapshot().await;
         encode_json(&serde_json::json!({"subscriptions": subscriptions}))
     }
 
