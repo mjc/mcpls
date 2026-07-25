@@ -459,6 +459,16 @@ impl McplsServer {
         encode_json(&applied_edit_plan_json(&result, id.as_str()))
     }
 
+    async fn apply_project_plan_params(
+        &self,
+        params: WorkspaceEditApplyParams,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(params.project_id)?;
+        let plan_id = PlanId::parse(params.plan_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.apply_project_plan(&id, plan_id).await
+    }
+
     /// Create a new MCP server with an empty project registry.
     #[must_use]
     pub fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
@@ -785,15 +795,31 @@ impl McplsServer {
     )]
     async fn workspace_edit_apply(
         &self,
-        Parameters(WorkspaceEditApplyParams {
-            project_id,
-            plan_id,
-        }): Parameters<WorkspaceEditApplyParams>,
+        Parameters(params): Parameters<WorkspaceEditApplyParams>,
     ) -> Result<String, McpError> {
-        let id = parse_project_id(project_id.clone())?;
-        let plan_id = PlanId::parse(plan_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        self.apply_project_plan(&id, plan_id).await
+        self.apply_project_plan_params(params).await
+    }
+
+    /// Apply a rename preview through the generic workspace-edit transaction.
+    #[tool(
+        description = "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced."
+    )]
+    async fn rename_apply(
+        &self,
+        Parameters(params): Parameters<WorkspaceEditApplyParams>,
+    ) -> Result<String, McpError> {
+        self.apply_project_plan_params(params).await
+    }
+
+    /// Apply a formatting preview through the generic workspace-edit transaction.
+    #[tool(
+        description = "Apply a formatting plan returned by format_preview. Plans are single-use and revalidated before any file is replaced."
+    )]
+    async fn format_apply(
+        &self,
+        Parameters(params): Parameters<WorkspaceEditApplyParams>,
+    ) -> Result<String, McpError> {
+        self.apply_project_plan_params(params).await
     }
 
     /// Restart the language-server actor for one project.
@@ -2230,7 +2256,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            rename_apply.contains("project is not registered"),
+            rename_apply.contains("edit plan is not owned by this MCP session"),
             "{rename_apply}"
         );
 
@@ -2243,7 +2269,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            format_apply.contains("project is not registered"),
+            format_apply.contains("edit plan is not owned by this MCP session"),
             "{format_apply}"
         );
     }
