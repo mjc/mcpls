@@ -1435,6 +1435,49 @@ enum ProjectRequest {
 }
 
 impl ProjectRequest {
+    /// Fail LSP work that was queued while this actor exhausted recovery.
+    ///
+    /// Inspection and lifecycle requests still pass through so callers can
+    /// observe the failure and explicitly reactivate the project.
+    fn reject_if_failed(self, status: ProjectStatus) -> Result<Self, ()> {
+        if status != ProjectStatus::Failed {
+            return Ok(self);
+        }
+
+        macro_rules! reject {
+            ($reply:expr) => {{
+                let _ = $reply.send(Err("language server exited".to_string()));
+                return Err(());
+            }};
+        }
+
+        match self {
+            Self::Hover { reply, .. } => reject!(reply),
+            Self::Definition { reply, .. } => reject!(reply),
+            Self::References { reply, .. } => reject!(reply),
+            Self::Diagnostics { reply, .. } => reject!(reply),
+            Self::Rename { reply, .. } => reject!(reply),
+            Self::RenameWorkspaceEdit { reply, .. } => reject!(reply),
+            Self::Completions { reply, .. } => reject!(reply),
+            Self::DocumentSymbols { reply, .. } => reject!(reply),
+            Self::FormatDocument { reply, .. } => reject!(reply),
+            Self::FormatWorkspaceEdit { reply, .. } => reject!(reply),
+            Self::WorkspaceSymbol { reply, .. } => reject!(reply),
+            Self::CodeActions { reply, .. } => reject!(reply),
+            Self::CodeActionList { reply, .. } => reject!(reply),
+            Self::PrepareCallHierarchy { reply, .. } => reject!(reply),
+            Self::IncomingCalls { reply, .. } => reject!(reply),
+            Self::OutgoingCalls { reply, .. } => reject!(reply),
+            Self::SignatureHelp { reply, .. } => reject!(reply),
+            Self::InlayHints { reply, .. } => reject!(reply),
+            Self::GoToImplementation { reply, .. } => reject!(reply),
+            Self::GoToTypeDefinition { reply, .. } => reject!(reply),
+            request => Ok(request),
+        }
+    }
+}
+
+impl ProjectRequest {
     fn is_cancelled(&self) -> bool {
         match self {
             Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
@@ -3563,6 +3606,11 @@ async fn handle_project_request(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) -> bool {
+    let request = match request.reject_if_failed(state.status) {
+        Ok(request) => request,
+        Err(()) => return false,
+    };
+
     match request {
         ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
             state.sync_runtime(runtime);
