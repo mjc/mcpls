@@ -4333,8 +4333,13 @@ impl ProjectRegistry {
             .collect::<Vec<_>>();
         projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         let result = save_persisted_state(store, projects).await;
-        *self.persistence_error.write().await = result.as_ref().err().map(ToString::to_string);
+        self.record_persistence_error(result.as_ref().err().map(ToString::to_string))
+            .await;
         result
+    }
+
+    async fn record_persistence_error(&self, error: Option<String>) {
+        *self.persistence_error.write().await = error;
     }
 
     /// Restore valid registrations from the attached store.
@@ -4352,12 +4357,12 @@ impl ProjectRegistry {
         };
         let state = match load_persisted_state(store).await {
             Ok(state) => {
-                *self.persistence_error.write().await = None;
+                self.record_persistence_error(None).await;
                 state
             }
             Err(error) => {
-                *self.persistence_error.write().await = Some(error.to_string());
-                return Err(error.into());
+                self.record_persistence_error(Some(error.to_string())).await;
+                return Err(error);
             }
         };
         let mut restored = 0;
