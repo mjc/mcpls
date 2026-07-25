@@ -456,25 +456,8 @@ fn linked_project_initialization_options(
         }
     };
 
-    let mut linked_projects = match options.remove("linkedProjects") {
-        None => Vec::new(),
-        Some(serde_json::Value::Array(projects)) => projects,
-        Some(_) => {
-            return Err(Error::InvalidConfig(
-                "rust-analyzer linkedProjects must be a JSON array".to_string(),
-            ));
-        }
-    };
-
-    for root in roots {
-        let manifest = root.join("Cargo.toml");
-        if !manifest.is_file() {
-            return Err(Error::InvalidConfig(format!(
-                "shared rust project has no Cargo.toml: {}",
-                root.display()
-            )));
-        }
-        let manifest = serde_json::Value::String(manifest.to_string_lossy().into_owned());
+    let mut linked_projects = take_linked_projects(&mut options)?;
+    for manifest in cargo_manifest_values(roots)? {
         if !linked_projects.contains(&manifest) {
             linked_projects.push(manifest);
         }
@@ -484,6 +467,36 @@ fn linked_project_initialization_options(
         serde_json::Value::Array(linked_projects),
     );
     Ok(Some(serde_json::Value::Object(options)))
+}
+
+fn take_linked_projects(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>> {
+    match options.remove("linkedProjects") {
+        None => Ok(Vec::new()),
+        Some(serde_json::Value::Array(projects)) => Ok(projects),
+        Some(_) => Err(Error::InvalidConfig(
+            "rust-analyzer linkedProjects must be a JSON array".to_string(),
+        )),
+    }
+}
+
+fn cargo_manifest_values(roots: &[PathBuf]) -> Result<Vec<serde_json::Value>> {
+    roots
+        .iter()
+        .map(|root| {
+            let manifest = root.join("Cargo.toml");
+            if !manifest.is_file() {
+                return Err(Error::InvalidConfig(format!(
+                    "shared rust project has no Cargo.toml: {}",
+                    root.display()
+                )));
+            }
+            Ok(serde_json::Value::String(
+                manifest.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect()
 }
 
 impl TranslatorTemplate {
