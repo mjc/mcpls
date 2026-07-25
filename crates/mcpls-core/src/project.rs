@@ -4430,10 +4430,7 @@ impl ProjectRegistry {
     ///
     /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not
     /// registered.
-    pub async fn actor_group_count(
-        &self,
-        id: &ProjectId,
-    ) -> Result<usize, ProjectRegistryError> {
+    pub async fn actor_group_count(&self, id: &ProjectId) -> Result<usize, ProjectRegistryError> {
         self.projects
             .read()
             .await

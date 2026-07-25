@@ -80,7 +80,11 @@ fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpErro
     })
 }
 
-fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde_json::Value {
+fn project_state_json(
+    identity: &ProjectIdentity,
+    state: &ProjectState,
+    actor_group_count: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "project_id": identity.id().as_str(),
         "root": identity.root().as_path(),
@@ -91,6 +95,7 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
+        "actor_group_count": actor_group_count,
     })
 }
 
@@ -189,6 +194,21 @@ impl Clone for McplsServer {
 
 #[tool_router]
 impl McplsServer {
+    async fn project_state_json(
+        &self,
+        project_id: &ProjectId,
+        identity: &ProjectIdentity,
+        state: &ProjectState,
+    ) -> Result<String, McpError> {
+        let actor_group_count = self
+            .context
+            .project_registry
+            .actor_group_count(project_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        encode_json(&project_state_json(identity, state, actor_group_count))
+    }
+
     async fn actor_for_project(&self, value: String) -> Result<ProjectHandle, McpError> {
         let project_id = parse_project_id(value)?;
         self.context
@@ -250,7 +270,9 @@ impl McplsServer {
             .status(&project_id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let json = encode_json(&project_state_json(&identity, &state))?;
+        let json = self
+            .project_state_json(&project_id, &identity, &state)
+            .await?;
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             json, uri,
         )]))
@@ -400,7 +422,7 @@ impl McplsServer {
             .query()
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&identity, &state))
+        self.project_state_json(&id, &identity, &state).await
     }
 
     /// Activate a registered project and return while its language servers load.
@@ -424,7 +446,7 @@ impl McplsServer {
             .activate(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&identity, &state))
+        self.project_state_json(&id, &identity, &state).await
     }
 
     /// List all registered projects without waiting on project actors.
@@ -504,7 +526,7 @@ impl McplsServer {
             .status(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&identity, &state))
+        self.project_state_json(&id, &identity, &state).await
     }
 
     /// Remove a project and shut down its actor.
@@ -641,7 +663,7 @@ impl McplsServer {
             .restart(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&identity, &state))
+        self.project_state_json(&id, &identity, &state).await
     }
 
     /// Refresh one project actor's observable state.
@@ -663,7 +685,7 @@ impl McplsServer {
             .refresh(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&project_state_json(&identity, &state))
+        self.project_state_json(&id, &identity, &state).await
     }
 
     /// Get hover information at a position in a file.
@@ -1611,6 +1633,7 @@ mod tests {
         let added_json: serde_json::Value = serde_json::from_str(&added).unwrap();
         assert_eq!(added_json["project_id"], "demo");
         assert_eq!(added_json["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(added_json["actor_group_count"], 1);
         let duplicate = server
             .project_add(Parameters(ProjectAddParams {
                 project_id: "demo".to_string(),
