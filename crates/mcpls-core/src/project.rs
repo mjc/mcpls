@@ -1119,7 +1119,8 @@ impl ProjectRequestSender {
         self.sender.send(request).await
     }
 
-    async fn send_control(
+    // Lifecycle control must still reach the actor after normal work is rejected.
+    async fn send_unchecked(
         &self,
         request: ProjectRequest,
     ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
@@ -1426,7 +1427,7 @@ impl ProjectHandle {
     async fn publish_event(&self, event: ProjectEvent) -> Result<(), ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send_control(ProjectRequest::PublishEvent { event, reply })
+            .send_unchecked(ProjectRequest::PublishEvent { event, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -2401,7 +2402,7 @@ impl ProjectHandle {
     pub async fn shutdown(&self) -> Result<(), ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send_control(ProjectRequest::Shutdown { reply })
+            .send_unchecked(ProjectRequest::Shutdown { reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -3759,6 +3760,14 @@ struct ProjectRemovalSnapshot {
     root: PathBuf,
 }
 
+impl ProjectRemovalSnapshot {
+    fn reject_new_work(&self) {
+        for actor in &self.actors {
+            actor.reject_new_work();
+        }
+    }
+}
+
 impl ProjectEntry {
     fn new(
         identity: ProjectIdentity,
@@ -4607,9 +4616,7 @@ impl ProjectRegistry {
             drop(projects);
             removal
         };
-        for actor in &removal.actors {
-            actor.reject_new_work();
-        }
+        removal.reject_new_work();
         let _mutation_guards = self.lock_mutation_gates(removal.mutations).await;
         if let Err(error) = shutdown_project_actors(&id, &removal.root, removal.actors).await {
             self.lifecycle.end_removal(&id).await;
@@ -6825,8 +6832,11 @@ mod tests {
             Err(ProjectRegistryError::ProjectRemoving(project)) if project == id
         ));
         assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(10), actor.set_status(ProjectStatus::Ready))
-                .await,
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                actor.set_status(ProjectStatus::Ready)
+            )
+            .await,
             Ok(Err(ProjectActorError::Closed))
         ));
 
