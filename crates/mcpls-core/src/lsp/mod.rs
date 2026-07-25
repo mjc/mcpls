@@ -10,6 +10,7 @@ pub(crate) mod types;
 
 pub use client::LspClient;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};
+pub(crate) use lifecycle::{load_project_environment, resolve_command};
 pub use transport::LspTransport;
 pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,

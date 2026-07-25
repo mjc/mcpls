@@ -599,12 +599,14 @@ impl LspServer {
     }
 }
 
-/// Load a project's environment from direnv, falling back to its flake.
-async fn load_project_environment(
+/// Load the effective process environment for one project root.
+pub async fn load_project_environment(
     root: &std::path::Path,
 ) -> Option<HashMap<String, Option<String>>> {
     if root.join(".envrc").is_file()
-        && let Some(environment) = command_environment("direnv", ["export", "json"], root).await
+        && let Some(root_string) = root.to_str()
+        && let Some(environment) =
+            command_environment("direnv", ["exec", root_string, "env"], root).await
     {
         info!("Loaded LSP environment from direnv: {}", root.display());
         return Some(environment);
@@ -644,27 +646,24 @@ where
         return None;
     }
 
-    if command == "direnv" {
-        serde_json::from_slice(&output.stdout).ok()
-    } else {
-        Some(
-            output
-                .stdout
-                .split(|byte| *byte == b'\n')
-                .filter_map(|line| {
-                    let separator = line.iter().position(|byte| *byte == b'=')?;
-                    let (key, value) = line.split_at(separator);
-                    Some((
-                        String::from_utf8(key.to_vec()).ok()?,
-                        Some(String::from_utf8(value[1..].to_vec()).ok()?),
-                    ))
-                })
-                .collect(),
-        )
-    }
+    Some(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let separator = line.iter().position(|byte| *byte == b'=')?;
+                let (key, value) = line.split_at(separator);
+                Some((
+                    String::from_utf8(key.to_vec()).ok()?,
+                    Some(String::from_utf8(value[1..].to_vec()).ok()?),
+                ))
+            })
+            .collect(),
+    )
 }
 
-fn resolve_command(
+/// Resolve a configured command against the daemon and project environments.
+pub fn resolve_command(
     command: &str,
     project_env: Option<&HashMap<String, Option<String>>>,
 ) -> PathBuf {

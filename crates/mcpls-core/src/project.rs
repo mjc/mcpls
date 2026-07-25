@@ -23,7 +23,7 @@ use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
-use crate::lsp::LspNotification;
+use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use lsp_types::WorkspaceEdit;
 
@@ -479,7 +479,7 @@ fn has_dynamic_project_environment(root: &Path) -> bool {
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
 /// unknown rather than compatible. This keeps linked-project reuse fail-closed
 /// until the daemon can resolve the effective toolchain and environment.
-fn rust_project_compatibility_key(
+async fn rust_project_compatibility_key(
     root: &Path,
     translator_template: Option<&TranslatorTemplate>,
 ) -> Option<ProjectCompatibilityKey> {
@@ -492,7 +492,8 @@ fn rust_project_compatibility_key(
         ".cargo/config.toml",
     ];
 
-    if has_dynamic_project_environment(root) {
+    let project_environment = load_project_environment(root).await;
+    if has_dynamic_project_environment(root) && project_environment.is_none() {
         return None;
     }
 
@@ -521,17 +522,25 @@ fn rust_project_compatibility_key(
         let toolchain_signature = rust_toolchain_signature(root)?;
         hash_compatibility_field(&mut hasher, b"rustc-toolchain-v1");
         hash_compatibility_field(&mut hasher, &toolchain_signature);
-        hash_rust_server_config(&mut hasher, template)?;
+        hash_rust_server_config(&mut hasher, template, project_environment.as_ref())?;
     }
 
     (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
 }
 
-fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -> Option<()> {
+fn hash_rust_server_config(
+    hasher: &mut Sha256,
+    template: &TranslatorTemplate,
+    project_environment: Option<&std::collections::HashMap<String, Option<String>>>,
+) -> Option<()> {
     let config = template.rust_server_config()?;
     hasher.update(b"rust-server-config-v1");
     hash_compatibility_field(hasher, config.language_id.as_bytes());
     hash_compatibility_field(hasher, config.command.as_bytes());
+    let resolved_command = resolve_command(&config.command, project_environment);
+    let resolved_command = resolved_command.canonicalize().ok()?;
+    hash_compatibility_field(hasher, b"resolved-command-v1");
+    hash_compatibility_field(hasher, resolved_command.to_string_lossy().as_bytes());
     hash_compatibility_strings(hasher, &config.file_patterns);
     hash_compatibility_strings(hasher, &config.args);
     let mut environment = config.env.iter().collect::<Vec<_>>();
@@ -540,6 +549,7 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
         hash_compatibility_field(hasher, name.as_bytes());
         hash_compatibility_field(hasher, value.as_bytes());
     }
+    hash_project_environment(hasher, project_environment);
     let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
     hash_compatibility_field(hasher, &initialization_options);
     hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
@@ -554,6 +564,34 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
             .to_le_bytes(),
     );
     Some(())
+}
+
+fn hash_project_environment(
+    hasher: &mut Sha256,
+    project_environment: Option<&std::collections::HashMap<String, Option<String>>>,
+) {
+    let Some(project_environment) = project_environment else {
+        return;
+    };
+    let mut entries = project_environment
+        .iter()
+        .filter(|(name, _)| !is_ephemeral_environment_key(name))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (name, value) in entries {
+        hash_compatibility_field(hasher, name.as_bytes());
+        match value {
+            Some(value) => {
+                hash_compatibility_field(hasher, b"set");
+                hash_compatibility_field(hasher, value.as_bytes());
+            }
+            None => hash_compatibility_field(hasher, b"unset"),
+        }
+    }
+}
+
+fn is_ephemeral_environment_key(name: &str) -> bool {
+    matches!(name, "PWD" | "OLDPWD" | "SHLVL" | "_") || name.starts_with("DIRENV_")
 }
 
 fn hash_compatibility_strings(hasher: &mut Sha256, values: &[String]) {
@@ -4037,7 +4075,8 @@ impl ProjectRegistry {
         let compatibility_key = rust_project_compatibility_key(
             identity.root.as_path(),
             self.translator_template.as_deref(),
-        );
+        )
+        .await;
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
@@ -4956,8 +4995,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rust_compatibility_key_changes_with_server_configuration() {
+    #[tokio::test]
+    async fn rust_compatibility_key_changes_with_server_configuration() {
         let root = TempDir::new().unwrap();
         fs::write(
             root.path().join("rust-toolchain.toml"),
@@ -4981,13 +5020,15 @@ mod tests {
         second.set_lsp_configs(vec![changed_config], Some(10));
 
         assert_ne!(
-            rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
-            rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template()))
+                .await,
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template()))
+                .await,
         );
     }
 
-    #[test]
-    fn rust_compatibility_key_changes_with_file_patterns() {
+    #[tokio::test]
+    async fn rust_compatibility_key_changes_with_file_patterns() {
         let root = TempDir::new().unwrap();
         fs::write(
             root.path().join("rust-toolchain.toml"),
@@ -5013,13 +5054,15 @@ mod tests {
         second.set_lsp_configs(vec![second_config], Some(10));
 
         assert_ne!(
-            rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
-            rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&first.configuration_template()))
+                .await,
+            rust_project_compatibility_key(root.path(), Some(&second.configuration_template()))
+                .await,
         );
     }
 
-    #[test]
-    fn rust_compatibility_key_rejects_dynamic_project_environment() {
+    #[tokio::test]
+    async fn rust_compatibility_key_rejects_dynamic_project_environment() {
         let root = TempDir::new().unwrap();
         fs::write(
             root.path().join("rust-toolchain.toml"),
@@ -5044,20 +5087,50 @@ mod tests {
         );
 
         assert_eq!(
-            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template()))
+                .await,
             None
         );
 
         fs::remove_file(root.path().join(".envrc")).unwrap();
         fs::write(root.path().join("flake.nix"), "{}\n").unwrap();
         assert_eq!(
-            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template()))
+                .await,
             None
         );
     }
 
     #[test]
-    fn rust_compatibility_key_rejects_unavailable_toolchains() {
+    fn rust_compatibility_environment_ignores_ephemeral_values() {
+        let mut first = HashMap::from([
+            ("DIRENV_DIFF".to_string(), Some("first".to_string())),
+            ("PWD".to_string(), Some("/first".to_string())),
+            (
+                "RUSTFLAGS".to_string(),
+                Some("-Ctarget-cpu=native".to_string()),
+            ),
+        ]);
+        let mut second = first.clone();
+        second.insert("DIRENV_DIFF".to_string(), Some("second".to_string()));
+        second.insert("PWD".to_string(), Some("/second".to_string()));
+
+        let fingerprint = |environment: &HashMap<String, Option<String>>| {
+            let mut hasher = Sha256::new();
+            hash_project_environment(&mut hasher, Some(environment));
+            hasher.finalize()
+        };
+
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        first.insert(
+            "RUSTFLAGS".to_string(),
+            Some("-Ctarget-cpu=generic".to_string()),
+        );
+        assert_ne!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[tokio::test]
+    async fn rust_compatibility_key_rejects_unavailable_toolchains() {
         let root = TempDir::new().unwrap();
         fs::write(
             root.path().join("rust-toolchain.toml"),
@@ -5077,7 +5150,8 @@ mod tests {
         );
 
         assert_eq!(
-            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template()))
+                .await,
             None
         );
     }
