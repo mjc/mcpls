@@ -3595,57 +3595,11 @@ impl ProjectRegistry {
             ));
         }
 
-        let shared = compatible_project(&projects, &identity, compatibility_key);
-        if let Some(existing) = shared {
-            if existing.identity.id() != identity.id() {
-                return Err(ProjectRegistryError::LinkedWorktreeProject {
-                    existing_id: existing.identity.id().clone(),
-                    requested_root: identity.root().as_path().to_path_buf(),
-                });
-            }
-            let actor = existing.actor.clone();
-            let mutation = existing.mutation.clone();
-            drop(projects);
-
-            self.lifecycle.ensure_accepting()?;
-
-            let mutation_guard = mutation.lock().await;
-            actor
-                .add_workspace_root(identity.root().as_path().to_path_buf())
-                .await?;
-
-            let mut projects = self.projects.write().await;
-            if let Some(existing) = projects.get(identity.id()) {
-                if existing.identity.root() != identity.root() {
-                    return Err(ProjectRegistryError::ConflictingProject {
-                        id: identity.id().clone(),
-                        existing_root: existing.identity.root().as_path().to_path_buf(),
-                        requested_root: identity.root().as_path().to_path_buf(),
-                    });
-                }
-                return Ok(existing.actor.clone());
-            }
-            if projects
-                .values()
-                .any(|project| project.identity.root() == identity.root())
-            {
-                return Err(ProjectRegistryError::DuplicateRoot(
-                    identity.root().as_path().to_path_buf(),
-                ));
-            }
-            projects.insert(
-                identity.id().clone(),
-                ProjectEntry {
-                    identity,
-                    actor: actor.clone(),
-                    mutation: mutation.clone(),
-                    compatibility_key,
-                },
-            );
-            drop(projects);
-            drop(mutation_guard);
-            self.persist().await?;
-            return Ok(actor);
+        if let Some(existing) = compatible_project(&projects, &identity, compatibility_key) {
+            return Err(ProjectRegistryError::LinkedWorktreeProject {
+                existing_id: existing.identity.id().clone(),
+                requested_root: identity.root().as_path().to_path_buf(),
+            });
         }
 
         let actor = self.translator_template.as_deref().map_or_else(
