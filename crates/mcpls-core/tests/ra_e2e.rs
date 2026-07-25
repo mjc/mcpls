@@ -1452,9 +1452,9 @@ fn ra_e2e_suite() {
     println!("[ra_e2e] all {} sub-cases passed", results.len());
 }
 
-fn call_json(client: &mut McpClient, name: &str, arguments: Value) -> Result<Value, String> {
+fn call_json(client: &mut McpClient, name: &str, arguments: &Value) -> Result<Value, String> {
     let response = client
-        .call_tool(name, &arguments)
+        .call_tool(name, arguments)
         .map_err(|error| format!("{name} failed: {error}"))?;
     let text = assertions::assert_tool_ok(&response);
     serde_json::from_str(&text).map_err(|error| format!("{name} returned invalid JSON: {error}"))
@@ -1464,14 +1464,14 @@ fn add_and_activate_project(client: &mut McpClient, project_id: &str, root: &Pat
     let added = call_json(
         client,
         "project_add",
-        json!({"project_id": project_id, "root": root}),
+        &json!({"project_id": project_id, "root": root}),
     )
     .unwrap();
     assert_eq!(added["project_id"], project_id);
     call_json(
         client,
         "project_activate",
-        json!({"project_id": project_id}),
+        &json!({"project_id": project_id}),
     )
     .unwrap();
     wait_until_ready(client, lib_rs);
@@ -1481,7 +1481,7 @@ fn apply_workspace_plan(client: &mut McpClient, project_id: &str, plan_id: &str)
     call_json(
         client,
         "workspace_edit_apply",
-        json!({"project_id": project_id, "plan_id": plan_id}),
+        &json!({"project_id": project_id, "plan_id": plan_id}),
     )
     .unwrap()
 }
@@ -1549,31 +1549,39 @@ fn ra_multi_project_safe_refactor_e2e() {
     client.initialize().unwrap();
     wait_until_ready(&mut client, &fixture.first.join("src/lib.rs"));
 
-    add_and_activate_project(&mut client, "second", &fixture.second, &fixture.second_lib);
+    assert_project_isolation(&mut client, &fixture);
+    rename_and_apply(&mut client, &fixture);
+    format_and_restart(&mut client, &fixture);
+}
 
-    let projects = call_json(&mut client, "project_list", json!({})).unwrap();
+fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixture) {
+    add_and_activate_project(client, "second", &fixture.second, &fixture.second_lib);
+
+    let projects = call_json(client, "project_list", &json!({})).unwrap();
     assert_eq!(projects.as_array().unwrap().len(), 2);
 
     let first_symbols = call_json(
-        &mut client,
+        client,
         "workspace_symbol_search",
-        json!({"project_id": "default", "query": "cross_file_target"}),
+        &json!({"project_id": "default", "query": "cross_file_target"}),
     )
     .unwrap();
     assert!(first_symbols["symbols"].as_array().unwrap().is_empty());
     let second_symbols = call_json(
-        &mut client,
+        client,
         "workspace_symbol_search",
-        json!({"project_id": "second", "query": "cross_file_target"}),
+        &json!({"project_id": "second", "query": "cross_file_target"}),
     )
     .unwrap();
     assert!(!second_symbols["symbols"].as_array().unwrap().is_empty());
+}
 
+fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {
     let target_line = find_line(&fixture.functions, "pub fn cross_file_target(");
     let rename = call_json(
-        &mut client,
+        client,
         "rename_preview",
-        json!({
+        &json!({
             "project_id": "second",
             "file_path": fixture.functions,
             "line": target_line,
@@ -1586,7 +1594,7 @@ fn ra_multi_project_safe_refactor_e2e() {
     assert_eq!(rename["safe_to_apply"], true);
     assert!(rename["affected_files"].as_array().unwrap().len() >= 2);
     let rename_plan = rename["plan_id"].as_str().unwrap().to_owned();
-    let applied = apply_workspace_plan(&mut client, "second", &rename_plan);
+    let applied = apply_workspace_plan(client, "second", &rename_plan);
     assert!(applied["committed_files"].as_array().unwrap().len() >= 2);
     assert!(
         fs::read_to_string(&fixture.functions)
@@ -1604,11 +1612,13 @@ fn ra_multi_project_safe_refactor_e2e() {
         &json!({"project_id": "second", "plan_id": rename_plan}),
     );
     assert!(stale.is_err(), "a consumed edit plan must be rejected");
+}
 
+fn format_and_restart(client: &mut McpClient, fixture: &MultiProjectFixture) {
     let formatted = call_json(
-        &mut client,
+        client,
         "format_preview",
-        json!({
+        &json!({
             "project_id": "second",
             "file_path": fixture.bad_format,
             "tab_size": 4,
@@ -1618,7 +1628,7 @@ fn ra_multi_project_safe_refactor_e2e() {
     )
     .unwrap();
     let format_plan = formatted["plan_id"].as_str().unwrap().to_owned();
-    apply_workspace_plan(&mut client, "second", &format_plan);
+    apply_workspace_plan(client, "second", &format_plan);
     let golden =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/bad_format.fmt.rs");
     assert_eq!(
@@ -1628,18 +1638,18 @@ fn ra_multi_project_safe_refactor_e2e() {
 
     // Exercise the existing real-RA structural code-action path on the second
     // project, then restart it and prove the renamed symbol remains available.
-    sc_get_code_actions(&mut client, &fixture.second).unwrap();
+    sc_get_code_actions(client, &fixture.second).unwrap();
     let restarted = call_json(
-        &mut client,
+        client,
         "project_restart_lsp",
-        json!({"project_id": "second"}),
+        &json!({"project_id": "second"}),
     )
     .unwrap();
     assert_eq!(restarted["status"], "Ready");
     let hover = call_json(
-        &mut client,
+        client,
         "get_hover",
-        json!({
+        &json!({
             "file_path": fixture.functions,
             "line": find_line(&fixture.functions, "pub fn renamed_target("),
             "character": 8
