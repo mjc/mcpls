@@ -363,6 +363,18 @@ mod tests {
     }
 
     #[test]
+    fn translator_template_is_built_without_a_live_translator() {
+        let config = ServerConfig::default();
+        let template = bridge::TranslatorTemplate::from_configuration(
+            config.build_effective_extension_map(),
+            config.lsp_servers.clone(),
+            Some(config.workspace.heuristics_max_depth),
+        );
+
+        assert!(template.rust_server_config().is_some());
+    }
+
+    #[test]
     fn test_resolve_workspace_roots_with_dot_path() {
         let config_roots = vec![PathBuf::from(".")];
         let roots = resolve_workspace_roots(&config_roots);
