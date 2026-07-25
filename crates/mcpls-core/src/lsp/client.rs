@@ -133,8 +133,18 @@ enum ClientCommand {
         method: String,
         params: Option<Value>,
     },
+    /// Cancel an in-flight request whose caller timed out.
+    CancelRequest { id: RequestId },
     /// Shutdown the client.
     Shutdown,
+}
+
+fn cancel_request_notification(id: &RequestId) -> Value {
+    serde_json::json!({
+        "jsonrpc": JSONRPC_VERSION,
+        "method": "$/cancelRequest",
+        "params": { "id": id },
+    })
 }
 
 impl LspClient {
@@ -528,6 +538,7 @@ impl LspClient {
         } else {
             debug!("Message loop exiting normally");
         }
+        Self::fail_pending_requests(&pending_requests).await;
         result
     }
 
@@ -570,6 +581,10 @@ impl LspClient {
                                 "params": params,
                             });
                             transport.send(&notification).await?;
+                        }
+                        ClientCommand::CancelRequest { id } => {
+                            pending_requests.lock().await.remove(&id);
+                            transport.send(&cancel_request_notification(&id)).await?;
                         }
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
@@ -913,6 +928,34 @@ mod tests {
 
         let value = response.unwrap();
         assert_eq!(value, Value::Null, "Should receive Value::Null");
+    }
+
+    #[tokio::test]
+    async fn transport_exit_fails_pending_request_without_waiting_for_timeout() {
+        use std::process::Stdio;
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = LspClient::from_transport(
+            LspServerConfig::rust_analyzer(),
+            LspTransport::new(stdin, stdout),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.request::<_, Value>("test/request", Value::Null, Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(Error::ServerTerminated)));
+        let _ = child.wait().await;
     }
 
     #[tokio::test]

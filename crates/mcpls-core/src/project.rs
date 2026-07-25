@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
@@ -15,8 +16,8 @@ use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
-    ReferencesResult, RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ReferencesResult, RenameResult, ServerCapability, ServerLogsResult, ServerMessagesResult,
+    SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
@@ -925,15 +926,17 @@ pub struct ProjectRuntimeSummary {
     configured_language_ids: Vec<String>,
     active_language_ids: Vec<String>,
     open_document_count: usize,
+    generation: u64,
 }
 
 impl ProjectRuntimeSummary {
-    fn from_translator(translator: &Translator) -> Self {
+    fn from_translator(translator: &Translator, generation: u64) -> Self {
         Self {
             workspace_roots: translator.workspace_roots().to_vec(),
             configured_language_ids: translator.configured_language_ids(),
             active_language_ids: translator.active_language_ids(),
             open_document_count: translator.open_document_count(),
+            generation,
         }
     }
 
@@ -961,12 +964,19 @@ impl ProjectRuntimeSummary {
         self.open_document_count
     }
 
+    /// Return the actor's current LSP lifecycle generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn merge(&mut self, other: Self) {
         self.workspace_roots.extend(other.workspace_roots);
         self.configured_language_ids
             .extend(other.configured_language_ids);
         self.active_language_ids.extend(other.active_language_ids);
         self.open_document_count += other.open_document_count;
+        self.generation = self.generation.max(other.generation);
         self.workspace_roots.sort();
         self.workspace_roots.dedup();
         self.configured_language_ids.sort();
@@ -1173,6 +1183,10 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
+    HasCachedDiagnostics {
+        file_path: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     OpenDocumentPaths {
         reply: oneshot::Sender<Vec<PathBuf>>,
     },
@@ -1218,6 +1232,10 @@ enum ProjectRequest {
     ServerMessages {
         limit: usize,
         reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
+    },
+    ServerCapabilities {
+        language_id: Option<String>,
+        reply: oneshot::Sender<Result<Vec<ServerCapability>, String>>,
     },
     Notification {
         generation: u64,
@@ -1966,6 +1984,27 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Return whether cached diagnostics exist for a document path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
+    pub async fn has_cached_diagnostics(
+        &self,
+        file_path: String,
+    ) -> Result<bool, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::HasCachedDiagnostics { file_path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return the paths of documents currently owned by this actor.
     ///
     /// # Errors
@@ -2159,6 +2198,26 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::ServerMessages { limit, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Return negotiated capabilities for this project's active language servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or cancels the response.
+    pub async fn server_capabilities(
+        &self,
+        language_id: Option<String>,
+    ) -> Result<Vec<ServerCapability>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ServerCapabilities { language_id, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -2702,6 +2761,12 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn has_cached_diagnostics(&self, file_path: &str) -> Result<bool, String> {
+        self.translator
+            .has_cached_diagnostics(file_path)
+            .map_err(|error| error.to_string())
+    }
+
     fn validate_path(&self, file_path: &str) -> Result<(), String> {
         self.translator
             .validate_path(Path::new(file_path))
@@ -2725,7 +2790,20 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn notification(&mut self, notification: LspNotification) -> Option<ProjectEvent> {
+    fn server_capabilities(
+        &self,
+        language_id: Option<&str>,
+    ) -> Result<Vec<ServerCapability>, String> {
+        self.translator
+            .server_capabilities(language_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn notification(
+        &mut self,
+        generation: u64,
+        notification: LspNotification,
+    ) -> Option<ProjectEvent> {
         match notification {
             LspNotification::PublishDiagnostics(params) => {
                 let event = ProjectEvent::DiagnosticsUpdated {
@@ -2743,13 +2821,13 @@ impl ProjectRuntime {
             LspNotification::LogMessage(params) => {
                 self.translator
                     .notification_cache_mut()
-                    .store_log(params.typ.into(), params.message);
+                    .store_log_with_generation(generation, params.typ.into(), params.message);
                 None
             }
             LspNotification::ShowMessage(params) => {
                 self.translator
                     .notification_cache_mut()
-                    .store_message(params.typ.into(), params.message);
+                    .store_message_with_generation(generation, params.typ.into(), params.message);
                 None
             }
             LspNotification::ServerStatus(status) => {
@@ -2805,7 +2883,7 @@ impl ProjectRuntime {
     }
 
     fn summary(&self) -> ProjectRuntimeSummary {
-        ProjectRuntimeSummary::from_translator(&self.translator)
+        ProjectRuntimeSummary::from_translator(&self.translator, self.generation)
     }
 
     fn open_document_paths(&self) -> Vec<PathBuf> {
@@ -2901,7 +2979,7 @@ impl ProjectActorChannels {
         if !runtime.owns_generation(generation) {
             return;
         }
-        if let Some(event) = runtime.notification(notification) {
+        if let Some(event) = runtime.notification(generation, notification) {
             self.publish(event);
         }
     }
@@ -3283,6 +3361,9 @@ async fn handle_project_request(
         ProjectRequest::CachedDiagnostics { file_path, reply } => {
             let _ = reply.send(runtime.cached_diagnostics(&file_path));
         }
+        ProjectRequest::HasCachedDiagnostics { file_path, reply } => {
+            let _ = reply.send(runtime.has_cached_diagnostics(&file_path));
+        }
         ProjectRequest::OpenDocumentPaths { reply } => {
             let _ = reply.send(runtime.open_document_paths());
         }
@@ -3356,6 +3437,9 @@ async fn handle_project_request(
         }
         ProjectRequest::ServerMessages { limit, reply } => {
             let _ = reply.send(runtime.server_messages(limit));
+        }
+        ProjectRequest::ServerCapabilities { language_id, reply } => {
+            let _ = reply.send(runtime.server_capabilities(language_id.as_deref()));
         }
         ProjectRequest::Notification {
             generation,
@@ -3593,6 +3677,30 @@ pub struct ProjectStatusCounts {
     pub stopped: usize,
     /// Failed projects.
     pub failed: usize,
+}
+
+/// Negotiated capability data for one actor group in a logical project.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectServerCapability {
+    /// Actor-group ordinal within the logical project snapshot.
+    pub group_id: usize,
+    /// Language ID configured for the server.
+    pub language_id: String,
+    /// Position encoding negotiated during initialization.
+    pub position_encoding: String,
+    /// Raw LSP server capabilities.
+    pub capabilities: serde_json::Value,
+}
+
+impl ProjectServerCapability {
+    fn from_server(group_id: usize, capability: ServerCapability) -> Self {
+        Self {
+            group_id,
+            language_id: capability.language_id,
+            position_encoding: capability.position_encoding,
+            capabilities: capability.capabilities,
+        }
+    }
 }
 
 impl ProjectStatusCounts {
@@ -3923,6 +4031,29 @@ impl ProjectRegistry {
         counts
     }
 
+    /// Return whether durable project registration is configured.
+    #[must_use]
+    pub const fn persistence_configured(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Return whether the registry is draining during daemon shutdown.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.lifecycle.shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Count actor groups without awaiting any actor request.
+    #[must_use]
+    pub async fn total_actor_group_count(&self) -> usize {
+        self.projects
+            .read()
+            .await
+            .values()
+            .map(|project| project.actors.len())
+            .sum()
+    }
+
     /// Gracefully stop every registered project actor once.
     ///
     /// Requests already queued on an actor are processed before its shutdown
@@ -4080,6 +4211,32 @@ impl ProjectRegistry {
             states.push(actor.query().await?);
         }
         Ok(ProjectState::aggregate(states))
+    }
+
+    /// Return negotiated capabilities from every active actor group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or an actor cannot
+    /// service the capability request.
+    pub async fn server_capabilities(
+        &self,
+        id: &ProjectId,
+        language_id: Option<String>,
+    ) -> Result<Vec<ProjectServerCapability>, ProjectRegistryError> {
+        let (_, actors) = self.actor_entries(id).await?;
+        let mut capabilities = Vec::new();
+        for (group_id, (actor, _)) in actors.into_iter().enumerate() {
+            for capability in actor.server_capabilities(language_id.clone()).await? {
+                capabilities.push(ProjectServerCapability::from_server(group_id, capability));
+            }
+        }
+        capabilities.sort_by(|left, right| {
+            left.group_id
+                .cmp(&right.group_id)
+                .then_with(|| left.language_id.cmp(&right.language_id))
+        });
+        Ok(capabilities)
     }
 
     /// List code actions with project-owned opaque references.
@@ -4382,6 +4539,54 @@ impl ProjectRegistry {
                     .actors
                     .iter()
                     .map(|actor| actor.actor.clone())
+                    .collect()
+            })
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
+    /// Return the number of actor groups backing one logical project.
+    ///
+    /// Compatible linked roots share one group and therefore one language
+    /// server set; incompatible roots retain separate groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not
+    /// registered.
+    pub async fn actor_group_count(&self, id: &ProjectId) -> Result<usize, ProjectRegistryError> {
+        Ok(self.actor_group_roots(id).await?.len())
+    }
+
+    /// Return the canonical roots owned by each actor group in a logical project.
+    ///
+    /// Compatible linked worktrees appear in one inner vector; incompatible
+    /// roots appear in separate vectors. The outer order is stable for the
+    /// lifetime of the registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not
+    /// registered.
+    pub async fn actor_group_roots(
+        &self,
+        id: &ProjectId,
+    ) -> Result<Vec<Vec<PathBuf>>, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| {
+                project
+                    .actors
+                    .iter()
+                    .map(|actor| {
+                        actor
+                            .roots
+                            .iter()
+                            .map(CanonicalRoot::as_path)
+                            .map(Path::to_path_buf)
+                            .collect()
+                    })
                     .collect()
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
@@ -5266,6 +5471,7 @@ mod tests {
         let result = actor.server_logs(10, None).await.unwrap();
         assert_eq!(result.logs.len(), 1);
         assert_eq!(result.logs[0].message, "project log");
+        assert_eq!(result.logs[0].generation, 0);
     }
 
     #[tokio::test]
@@ -5315,6 +5521,36 @@ mod tests {
                 version: Some(7),
                 diagnostic_count: 0,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_reports_cached_diagnostics_presence_after_notification() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let actor = spawn_project_actor_for_root(2, &CanonicalRoot::new(root.path()).unwrap());
+        let uri = crate::bridge::path_to_uri(&file);
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "textDocument/publishDiagnostics",
+                    Some(serde_json::json!({
+                        "uri": uri,
+                        "diagnostics": []
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            actor
+                .has_cached_diagnostics(file.display().to_string())
+                .await
+                .unwrap()
         );
     }
 
@@ -5557,6 +5793,13 @@ mod tests {
         );
         assert!(!main_actor.sender.same_channel(&linked_actor.sender));
         assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(
+            registry
+                .actor_group_count(&ProjectId::new("main").unwrap())
+                .await
+                .unwrap(),
+            2
+        );
         registry
             .remove(ProjectId::new("main").unwrap())
             .await
@@ -5677,6 +5920,20 @@ mod tests {
             .await
             .unwrap();
         assert!(store.load().unwrap().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_reports_persistence_and_shutdown_state() {
+        let transient = ProjectRegistry::new(2);
+        assert!(!transient.persistence_configured());
+        assert!(!transient.is_shutting_down());
+
+        let state_path = tempfile::tempdir().unwrap().path().join("projects.json");
+        let persistent =
+            ProjectRegistry::new(2).with_persistence(ProjectRegistrationStore::new(state_path));
+        assert!(persistent.persistence_configured());
+        persistent.shutdown_all().await;
+        assert!(persistent.is_shutting_down());
     }
 
     #[tokio::test]
@@ -6072,6 +6329,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
         assert_eq!(actor.query().await.unwrap().workspace_roots().len(), 2);
         let file = worktree.path().join("src.rs");
         fs::write(&file, "fn main() {}\n").unwrap();

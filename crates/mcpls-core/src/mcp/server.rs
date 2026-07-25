@@ -626,6 +626,30 @@ impl McplsServer {
         })
     }
 
+    /// Inspect negotiated capabilities for a registered project's active servers.
+    #[tool(
+        description = "Negotiated capabilities for a project's active language servers. Optionally filter by language ID."
+    )]
+    async fn project_lsp_capabilities(
+        &self,
+        Parameters(ProjectLspCapabilitiesParams {
+            project_id,
+            language_id,
+        }): Parameters<ProjectLspCapabilitiesParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let servers = self
+            .context
+            .project_registry
+            .server_capabilities(&id, language_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        encode_json(&ProjectLspCapabilitiesResponse {
+            project_id: id.as_str().to_string(),
+            servers,
+        })
+    }
+
     /// Get signature help at a position.
     #[tool(
         description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call.",
@@ -879,6 +903,16 @@ impl ServerHandler for McplsServer {
                 .await
         {
             tracing::warn!("Failed to replay cached diagnostics for {canonical_uri}: {e}");
+        }
+
+        if has_cached_diagnostics {
+            context
+                .peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(request.uri))
+                .await
+                .map_err(|_| {
+                    McpError::internal_error("failed to replay cached diagnostics", None)
+                })?;
         }
 
         Ok(())
