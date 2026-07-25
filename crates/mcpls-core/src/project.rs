@@ -667,6 +667,13 @@ enum ProjectRequest {
         new_name: String,
         reply: oneshot::Sender<Result<RenameResult, String>>,
     },
+    RenameWorkspaceEdit {
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+        reply: oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
+    },
     Completions {
         file_path: String,
         line: u32,
@@ -683,6 +690,12 @@ enum ProjectRequest {
         tab_size: u32,
         insert_spaces: bool,
         reply: oneshot::Sender<Result<FormatDocumentResult, String>>,
+    },
+    FormatWorkspaceEdit {
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+        reply: oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
     },
     WorkspaceSymbol {
         query: String,
@@ -1029,6 +1042,36 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Request a raw LSP workspace edit for a rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actor is closed, the request is cancelled, or
+    /// the actor-owned translator rejects the request.
+    pub async fn rename_workspace_edit(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::RenameWorkspaceEdit {
+                file_path,
+                line,
+                character,
+                new_name,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Route a completion request through this project's actor-owned translator.
     ///
     /// # Errors
@@ -1095,6 +1138,34 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::FormatDocument {
+                file_path,
+                tab_size,
+                insert_spaces,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Request a raw LSP workspace edit for document formatting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actor is closed, the request is cancelled, or
+    /// the actor-owned translator rejects the request.
+    pub async fn format_workspace_edit(
+        &self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<WorkspaceEdit>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::FormatWorkspaceEdit {
                 file_path,
                 tab_size,
                 insert_spaces,
@@ -1753,6 +1824,19 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn rename_workspace_edit(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>, String> {
+        self.translator
+            .request_rename_workspace_edit(file_path, line, character, new_name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn completions(
         &mut self,
         file_path: String,
@@ -1784,6 +1868,18 @@ impl ProjectRuntime {
     ) -> Result<FormatDocumentResult, String> {
         self.translator
             .handle_format_document(file_path, tab_size, insert_spaces)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn format_workspace_edit(
+        &mut self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<WorkspaceEdit>, String> {
+        self.translator
+            .request_format_workspace_edit(file_path, tab_size, insert_spaces)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2193,6 +2289,19 @@ async fn handle_project_request(
         } => {
             let _ = reply.send(runtime.rename(file_path, line, character, new_name).await);
         }
+        ProjectRequest::RenameWorkspaceEdit {
+            file_path,
+            line,
+            character,
+            new_name,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .rename_workspace_edit(file_path, line, character, new_name)
+                    .await,
+            );
+        }
         ProjectRequest::Completions {
             file_path,
             line,
@@ -2218,6 +2327,18 @@ async fn handle_project_request(
             let _ = reply.send(
                 runtime
                     .format_document(file_path, tab_size, insert_spaces)
+                    .await,
+            );
+        }
+        ProjectRequest::FormatWorkspaceEdit {
+            file_path,
+            tab_size,
+            insert_spaces,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .format_workspace_edit(file_path, tab_size, insert_spaces)
                     .await,
             );
         }
@@ -3173,6 +3294,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_routes_raw_rename_edits_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .rename_workspace_edit(file.display().to_string(), 0, 0, "renamed".to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
     async fn project_actor_routes_completion_requests_through_owned_translator() {
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -3219,6 +3359,25 @@ mod tests {
 
         let result = handle
             .format_document(file.display().to_string(), 4, true)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_actor_routes_raw_format_edits_through_owned_translator() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .format_workspace_edit(file.display().to_string(), 4, true)
             .await;
 
         assert!(matches!(

@@ -79,6 +79,25 @@ pub struct RenameParams {
     pub new_name: String,
 }
 
+/// Parameters for previewing an LSP rename as a generic workspace edit plan.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for previewing a symbol rename as a workspace edit plan.")]
+pub struct RenamePreviewParams {
+    /// Registered project that owns the file.
+    pub project_id: String,
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Line number (1-based).
+    pub line: u32,
+    /// Character/column number (1-based).
+    pub character: u32,
+    /// New name for the symbol.
+    pub new_name: String,
+    /// Optional negotiated LSP position encoding.
+    #[serde(default)]
+    pub position_encoding: Option<String>,
+}
+
 /// Parameters for the `get_completions` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting code completion suggestions.")]
@@ -121,6 +140,25 @@ pub struct FormatDocumentParams {
     #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
     #[serde(default = "default_insert_spaces")]
     pub insert_spaces: bool,
+}
+
+/// Parameters for previewing document formatting as a generic workspace edit plan.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for previewing formatting as a workspace edit plan.")]
+pub struct FormatPreviewParams {
+    /// Registered project that owns the file.
+    pub project_id: String,
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Tab size for formatting (default: 4).
+    #[serde(default = "default_tab_size")]
+    pub tab_size: u32,
+    /// Whether to use spaces instead of tabs (default: true).
+    #[serde(default = "default_insert_spaces")]
+    pub insert_spaces: bool,
+    /// Optional negotiated LSP position encoding.
+    #[serde(default)]
+    pub position_encoding: Option<String>,
 }
 
 const fn default_tab_size() -> u32 {

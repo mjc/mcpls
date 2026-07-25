@@ -1048,7 +1048,7 @@ impl Translator {
 
         let params = LspHoverParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -1269,6 +1269,31 @@ impl Translator {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult> {
+        let edit = self
+            .request_rename_workspace_edit(file_path, line, character, new_name)
+            .await?;
+        let changes = edit.map_or_else(|| Ok(Vec::new()), workspace_edit_document_changes)?;
+
+        Ok(RenameResult { changes })
+    }
+
+    /// Request the raw LSP workspace edit for a rename.
+    ///
+    /// This is kept separate from the legacy rename DTO so callers can feed
+    /// the edit through the generic preview/apply engine without losing
+    /// cross-file or resource operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is outside the workspace, no applicable
+    /// language server is available, or the LSP request fails.
+    pub async fn request_rename_workspace_edit(
+        &mut self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    ) -> Result<Option<WorkspaceEdit>> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         self.ensure_client_for_file(&validated_path).await?;
@@ -1289,78 +1314,9 @@ impl Translator {
         };
 
         let timeout_duration = Duration::from_secs(30);
-        let response: Option<WorkspaceEdit> = client
+        client
             .request("textDocument/rename", params, timeout_duration)
-            .await?;
-
-        let changes = if let Some(edit) = response {
-            let mut result_changes = Vec::new();
-
-            // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
-            if let Some(changes_map) = edit.changes {
-                for (uri, edits) in changes_map {
-                    result_changes.push(DocumentChanges {
-                        uri: uri.to_string(),
-                        version: None,
-                        edits: edits
-                            .into_iter()
-                            .map(|e| TextEdit {
-                                range: normalize_range(e.range),
-                                new_text: e.new_text,
-                            })
-                            .collect(),
-                    });
-                }
-            }
-
-            // Also handle `documentChanges` (array format returned by rust-analyzer).
-            if result_changes.is_empty() {
-                let text_doc_edits = match edit.document_changes {
-                    Some(lsp_types::DocumentChanges::Edits(edits)) => edits,
-                    Some(lsp_types::DocumentChanges::Operations(ops)) => {
-                        let mut edits = Vec::with_capacity(ops.len());
-                        for operation in ops {
-                            match operation {
-                                lsp_types::DocumentChangeOperation::Edit(edit) => edits.push(edit),
-                                lsp_types::DocumentChangeOperation::Op(_) => {
-                                    return Err(Error::UnsupportedWorkspaceEdit(
-                                        "rename returned a resource operation".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                        edits
-                    }
-                    None => vec![],
-                };
-                for tde in text_doc_edits {
-                    result_changes.push(DocumentChanges {
-                        uri: tde.text_document.uri.to_string(),
-                        version: tde.text_document.version,
-                        edits: tde
-                            .edits
-                            .into_iter()
-                            .map(|one_of| match one_of {
-                                lsp_types::OneOf::Left(te) => TextEdit {
-                                    range: normalize_range(te.range),
-                                    new_text: te.new_text,
-                                },
-                                lsp_types::OneOf::Right(ate) => TextEdit {
-                                    range: normalize_range(ate.text_edit.range),
-                                    new_text: ate.text_edit.new_text,
-                                },
-                            })
-                            .collect(),
-                    });
-                }
-            }
-
-            result_changes
-        } else {
-            vec![]
-        };
-
-        Ok(RenameResult { changes })
+            .await
     }
 
     /// Handle completions request.
@@ -1448,7 +1404,7 @@ impl Translator {
             .await?;
 
         let params = DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
@@ -1489,6 +1445,37 @@ impl Translator {
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
+        let edit = self
+            .request_format_workspace_edit(file_path, tab_size, insert_spaces)
+            .await?;
+        let edits = edit.map_or_else(Vec::new, |edit| {
+            edit.changes.map_or_else(Vec::new, |changes| {
+                changes
+                    .into_values()
+                    .flatten()
+                    .map(|edit| TextEdit {
+                        range: normalize_range(edit.range),
+                        new_text: edit.new_text,
+                    })
+                    .collect()
+            })
+        });
+
+        Ok(FormatDocumentResult { edits })
+    }
+
+    /// Request the raw LSP workspace edit for document formatting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is outside the workspace, no applicable
+    /// language server is available, or the LSP request fails.
+    pub async fn request_format_workspace_edit(
+        &mut self,
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Option<WorkspaceEdit>> {
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         self.ensure_client_for_file(&validated_path).await?;
@@ -1499,7 +1486,7 @@ impl Translator {
             .await?;
 
         let params = DocumentFormattingParams {
-            text_document: TextDocumentIdentifier { uri },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             options: FormattingOptions {
                 tab_size,
                 insert_spaces,
@@ -1512,20 +1499,11 @@ impl Translator {
         let response: Option<Vec<lsp_types::TextEdit>> = client
             .request("textDocument/formatting", params, timeout_duration)
             .await?;
-
-        let edits = response.unwrap_or_default();
-
-        let result = FormatDocumentResult {
-            edits: edits
-                .into_iter()
-                .map(|edit| TextEdit {
-                    range: normalize_range(edit.range),
-                    new_text: edit.new_text,
-                })
-                .collect(),
-        };
-
-        Ok(result)
+        Ok(response.map(|edits| WorkspaceEdit {
+            changes: Some(std::iter::once((uri, edits)).collect()),
+            document_changes: None,
+            change_annotations: None,
+        }))
     }
 
     /// Handle workspace symbol search.
@@ -2404,6 +2382,59 @@ const fn denormalize_range(range: &Range) -> lsp_types::Range {
             character: range.end.character.saturating_sub(1),
         },
     }
+}
+
+fn workspace_edit_document_changes(edit: WorkspaceEdit) -> Result<Vec<DocumentChanges>> {
+    let mut result = Vec::new();
+    if let Some(changes) = edit.changes {
+        result.extend(changes.into_iter().map(|(uri, edits)| {
+            DocumentChanges {
+                uri: uri.to_string(),
+                version: None,
+                edits: edits
+                    .into_iter()
+                    .map(|edit| TextEdit {
+                        range: normalize_range(edit.range),
+                        new_text: edit.new_text,
+                    })
+                    .collect(),
+            }
+        }));
+    }
+    if result.is_empty()
+        && let Some(document_changes) = edit.document_changes
+    {
+        match document_changes {
+            lsp_types::DocumentChanges::Edits(edits) => {
+                result.extend(edits.into_iter().map(|edit| {
+                    DocumentChanges {
+                        uri: edit.text_document.uri.to_string(),
+                        version: edit.text_document.version,
+                        edits: edit
+                            .edits
+                            .into_iter()
+                            .map(|edit| match edit {
+                                lsp_types::OneOf::Left(edit) => TextEdit {
+                                    range: normalize_range(edit.range),
+                                    new_text: edit.new_text,
+                                },
+                                lsp_types::OneOf::Right(edit) => TextEdit {
+                                    range: normalize_range(edit.text_edit.range),
+                                    new_text: edit.text_edit.new_text,
+                                },
+                            })
+                            .collect(),
+                    }
+                }));
+            }
+            lsp_types::DocumentChanges::Operations(_) => {
+                return Err(Error::UnsupportedWorkspaceEdit(
+                    "rename returned a resource operation".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(result)
 }
 
 const fn normalize_range(range: lsp_types::Range) -> Range {

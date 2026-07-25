@@ -20,11 +20,11 @@ use super::handlers::HandlerContext;
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, GoToImplementationParams,
+    DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, GoToImplementationParams,
     GoToTypeDefinitionParams, HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams,
-    ProjectListParams, ReferencesParams, RenameParams, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
-    WorkspaceSymbolParams,
+    ProjectListParams, ReferencesParams, RenameParams, RenamePreviewParams, ServerLogsParams,
+    ServerMessagesParams, SignatureHelpParams, WorkspaceEditApplyParams,
+    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
@@ -302,6 +302,99 @@ impl McplsServer {
             })?,
             None => PositionEncoding::Utf8,
         };
+        let artifact = self
+            .context
+            .project_registry
+            .preview_edit(&id, edit, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+    }
+
+    /// Request a rename from the project LSP and preview the resulting edit.
+    #[tool(
+        description = "Preview an LSP rename as a project-owned workspace edit plan. Apply the returned plan with workspace_edit_apply."
+    )]
+    async fn rename_preview(
+        &self,
+        Parameters(RenamePreviewParams {
+            project_id,
+            file_path,
+            line,
+            character,
+            new_name,
+            position_encoding,
+        }): Parameters<RenamePreviewParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let encoding =
+            position_encoding
+                .as_deref()
+                .map_or(Ok(PositionEncoding::Utf8), |value| {
+                    PositionEncoding::from_lsp(value).ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("unsupported position encoding: {value}"),
+                            None,
+                        )
+                    })
+                })?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let edit = actor
+            .rename_workspace_edit(file_path, line, character, new_name)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .unwrap_or_default();
+        let artifact = self
+            .context
+            .project_registry
+            .preview_edit(&id, edit, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+    }
+
+    /// Request document formatting from the project LSP and preview the edit.
+    #[tool(
+        description = "Preview LSP document formatting as a project-owned workspace edit plan. Apply the returned plan with workspace_edit_apply."
+    )]
+    async fn format_preview(
+        &self,
+        Parameters(FormatPreviewParams {
+            project_id,
+            file_path,
+            tab_size,
+            insert_spaces,
+            position_encoding,
+        }): Parameters<FormatPreviewParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let encoding =
+            position_encoding
+                .as_deref()
+                .map_or(Ok(PositionEncoding::Utf8), |value| {
+                    PositionEncoding::from_lsp(value).ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("unsupported position encoding: {value}"),
+                            None,
+                        )
+                    })
+                })?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let edit = actor
+            .format_workspace_edit(file_path, tab_size, insert_spaces)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .unwrap_or_default();
         let artifact = self
             .context
             .project_registry
@@ -1357,6 +1450,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "after\n");
+    }
+
+    #[tokio::test]
+    async fn rename_and_format_preview_require_an_explicit_registered_project() {
+        let server = create_test_server();
+        let rename = server
+            .rename_preview(Parameters(RenamePreviewParams {
+                project_id: "missing".to_string(),
+                file_path: "/tmp/example.rs".to_string(),
+                line: 1,
+                character: 1,
+                new_name: "renamed".to_string(),
+                position_encoding: None,
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(rename.contains("project is not registered"), "{rename}");
+
+        let format = server
+            .format_preview(Parameters(FormatPreviewParams {
+                project_id: "missing".to_string(),
+                file_path: "/tmp/example.rs".to_string(),
+                tab_size: 4,
+                insert_spaces: true,
+                position_encoding: None,
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(format.contains("project is not registered"), "{format}");
     }
 
     #[tokio::test]

@@ -10,7 +10,8 @@ mod tools;
 pub use server::McplsServer;
 pub use tools::{
     CallHierarchyCallsParams, CallHierarchyPrepareParams, CompletionsParams, DefinitionParams,
-    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams, ProjectAddParams,
-    ProjectIdParams, ProjectListParams, ReferencesParams, RenameParams, WorkspaceEditApplyParams,
-    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
+    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams,
+    HoverParams, ProjectAddParams, ProjectIdParams, ProjectListParams, ReferencesParams,
+    RenameParams, RenamePreviewParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
+    WorkspaceSymbolParams,
 };
