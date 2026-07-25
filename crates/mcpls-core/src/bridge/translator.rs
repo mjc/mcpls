@@ -1641,14 +1641,6 @@ impl Translator {
         end_character: u32,
         kind_filter: Option<String>,
     ) -> Result<CodeActionsResult> {
-        validate_code_action_params(
-            start_line,
-            start_character,
-            end_line,
-            end_character,
-            kind_filter.as_deref(),
-        )?;
-
         let response_vec = self
             .request_code_actions(
                 file_path,
