@@ -4094,7 +4094,7 @@ struct RetainedProjectHistories {
     order: VecDeque<ProjectId>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct RetainedProjectHistory {
     logs: Vec<LogEntry>,
     messages: Vec<ServerMessage>,
@@ -5085,6 +5085,19 @@ impl ProjectRegistry {
         self.retained_history.write().await.insert(id, history);
     }
 
+    async fn retained_history_for(
+        &self,
+        id: &ProjectId,
+    ) -> Result<RetainedProjectHistory, ProjectRegistryError> {
+        self.retained_history
+            .read()
+            .await
+            .entries
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
     /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
@@ -5135,15 +5148,10 @@ impl ProjectRegistry {
         let actors = match self.actor_entries(id).await {
             Ok((_, actors)) => actors,
             Err(ProjectRegistryError::ProjectNotFound(_)) => {
-                let history = self
-                    .retained_history
-                    .read()
-                    .await
-                    .entries
-                    .get(id)
-                    .map(|history| history.capabilities.clone())
-                    .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-                return Ok(history
+                return Ok(self
+                    .retained_history_for(id)
+                    .await?
+                    .capabilities
                     .into_iter()
                     .filter(|capability| {
                         language_id
@@ -5186,12 +5194,8 @@ impl ProjectRegistry {
                 .await
                 .map_err(ProjectRegistryError::from),
             Err(ProjectRegistryError::ProjectNotFound(_)) => self
-                .retained_history
-                .read()
-                .await
-                .entries
-                .get(id)
-                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?
+                .retained_history_for(id)
+                .await?
                 .server_logs(limit, min_level.as_deref())
                 .map_err(ProjectRegistryError::from),
             Err(error) => Err(error),
@@ -5213,14 +5217,9 @@ impl ProjectRegistry {
                 .server_messages(limit)
                 .await
                 .map_err(ProjectRegistryError::from),
-            Err(ProjectRegistryError::ProjectNotFound(_)) => Ok(self
-                .retained_history
-                .read()
-                .await
-                .entries
-                .get(id)
-                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?
-                .server_messages(limit)),
+            Err(ProjectRegistryError::ProjectNotFound(_)) => {
+                Ok(self.retained_history_for(id).await?.server_messages(limit))
+            }
             Err(error) => Err(error),
         }
     }
