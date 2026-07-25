@@ -318,7 +318,7 @@ async fn notify_subscribed_resource(
     notifier
         .notify_resource_updated(resource_uri)
         .await
-        .map_or(ForwardOutcome::Disconnect, |_| ForwardOutcome::Continue)
+        .map_or(ForwardOutcome::Disconnect, |()| ForwardOutcome::Continue)
 }
 
 async fn cleanup_removed_project_subscriptions(
