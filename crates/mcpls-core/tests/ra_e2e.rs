@@ -1460,6 +1460,32 @@ fn call_json(client: &mut McpClient, name: &str, arguments: Value) -> Result<Val
     serde_json::from_str(&text).map_err(|error| format!("{name} returned invalid JSON: {error}"))
 }
 
+fn add_and_activate_project(client: &mut McpClient, project_id: &str, root: &Path, lib_rs: &Path) {
+    let added = call_json(
+        client,
+        "project_add",
+        json!({"project_id": project_id, "root": root}),
+    )
+    .unwrap();
+    assert_eq!(added["project_id"], project_id);
+    call_json(
+        client,
+        "project_activate",
+        json!({"project_id": project_id}),
+    )
+    .unwrap();
+    wait_until_ready(client, lib_rs);
+}
+
+fn apply_workspace_plan(client: &mut McpClient, project_id: &str, plan_id: &str) -> Value {
+    call_json(
+        client,
+        "workspace_edit_apply",
+        json!({"project_id": project_id, "plan_id": plan_id}),
+    )
+    .unwrap()
+}
+
 #[test]
 #[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
 fn ra_multi_project_safe_refactor_e2e() {
@@ -1497,20 +1523,7 @@ fn ra_multi_project_safe_refactor_e2e() {
     client.initialize().unwrap();
     wait_until_ready(&mut client, &first.join("src/lib.rs"));
 
-    let added = call_json(
-        &mut client,
-        "project_add",
-        json!({"project_id": "second", "root": second}),
-    )
-    .unwrap();
-    assert_eq!(added["project_id"], "second");
-    call_json(
-        &mut client,
-        "project_activate",
-        json!({"project_id": "second"}),
-    )
-    .unwrap();
-    wait_until_ready(&mut client, &second_lib);
+    add_and_activate_project(&mut client, "second", &second, &second_lib);
 
     let projects = call_json(&mut client, "project_list", json!({})).unwrap();
     assert_eq!(projects.as_array().unwrap().len(), 2);
@@ -1547,12 +1560,7 @@ fn ra_multi_project_safe_refactor_e2e() {
     assert_eq!(rename["safe_to_apply"], true);
     assert!(rename["affected_files"].as_array().unwrap().len() >= 2);
     let rename_plan = rename["plan_id"].as_str().unwrap().to_owned();
-    let applied = call_json(
-        &mut client,
-        "workspace_edit_apply",
-        json!({"project_id": "second", "plan_id": rename_plan}),
-    )
-    .unwrap();
+    let applied = apply_workspace_plan(&mut client, "second", &rename_plan);
     assert!(applied["committed_files"].as_array().unwrap().len() >= 2);
     assert!(
         fs::read_to_string(&functions)
@@ -1585,12 +1593,7 @@ fn ra_multi_project_safe_refactor_e2e() {
     )
     .unwrap();
     let format_plan = formatted["plan_id"].as_str().unwrap().to_owned();
-    call_json(
-        &mut client,
-        "workspace_edit_apply",
-        json!({"project_id": "second", "plan_id": format_plan}),
-    )
-    .unwrap();
+    apply_workspace_plan(&mut client, "second", &format_plan);
     let golden =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/bad_format.fmt.rs");
     assert_eq!(
