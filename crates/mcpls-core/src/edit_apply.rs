@@ -206,11 +206,7 @@ fn apply_resource_operation(
             to,
             overwrite,
         } => {
-            if to.exists() && !overwrite {
-                return Err(ApplyError::Operation(
-                    OperationValidationError::DestinationExists(to.clone()),
-                ));
-            }
+            ensure_destination_available(to, *overwrite)?;
             fs::rename(from, to).map_err(|source| ApplyError::Resource {
                 operation: format!("rename {} -> {}", from.display(), to.display()),
                 committed_files: committed_files.to_vec(),
@@ -232,6 +228,15 @@ fn apply_resource_operation(
             Ok(path.clone())
         }
     }
+}
+
+fn ensure_destination_available(path: &Path, overwrite: bool) -> Result<(), ApplyError> {
+    if path.exists() && !overwrite {
+        return Err(ApplyError::Operation(
+            OperationValidationError::DestinationExists(path.to_path_buf()),
+        ));
+    }
+    Ok(())
 }
 
 /// Errors returned while applying an edit plan.
