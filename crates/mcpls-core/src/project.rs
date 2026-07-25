@@ -2611,6 +2611,11 @@ impl ProjectRuntime {
         self.translator.has_active_workspace_roots(roots)
     }
 
+    fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
+        matches!(status, ProjectStatus::Ready | ProjectStatus::Degraded)
+            && self.has_active_workspace_roots(roots)
+    }
+
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
         self.edit_plans
             .insert(plan)
@@ -3376,11 +3381,6 @@ async fn stop_project_runtime(
     channels.publish_status(state, ProjectStatus::Stopped);
 }
 
-fn can_reuse_activation(state: &ProjectState, runtime: &ProjectRuntime, roots: &[PathBuf]) -> bool {
-    matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
-        && runtime.has_active_workspace_roots(roots)
-}
-
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
@@ -3398,7 +3398,7 @@ async fn handle_project_request(
             let _ = reply.send(state.clone());
         }
         ProjectRequest::Activate { root, reply } => {
-            if can_reuse_activation(state, runtime, std::slice::from_ref(&root)) {
+            if runtime.activation_is_reusable(state.status, std::slice::from_ref(&root)) {
                 state.sync_runtime(runtime);
                 let _ = reply.send(Ok(state.clone()));
                 return false;
@@ -3426,7 +3426,7 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
-            if can_reuse_activation(state, runtime, &roots) {
+            if runtime.activation_is_reusable(state.status, &roots) {
                 state.sync_runtime(runtime);
                 let _ = reply.send(Ok(state.clone()));
                 return false;
