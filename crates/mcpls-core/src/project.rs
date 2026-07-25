@@ -19,6 +19,7 @@ use crate::bridge::{
     ReferencesResult, RenameResult, ServerCapability, ServerLogsResult, ServerMessagesResult,
     SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
+use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
@@ -3648,6 +3649,7 @@ struct ProjectActorEntry {
     actor: ProjectHandle,
     mutation: MutationGate,
     compatibility_key: Option<ProjectCompatibilityKey>,
+    translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     roots: Vec<CanonicalRoot>,
 }
 
@@ -3656,12 +3658,14 @@ impl ProjectActorEntry {
         actor: ProjectHandle,
         mutation: MutationGate,
         compatibility_key: Option<ProjectCompatibilityKey>,
+        translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
         root: CanonicalRoot,
     ) -> Self {
         Self {
             actor,
             mutation,
             compatibility_key,
+            translator_template,
             roots: vec![root],
         }
     }
@@ -3670,6 +3674,7 @@ impl ProjectActorEntry {
 struct ProjectEntry {
     identity: ProjectIdentity,
     actors: Vec<ProjectActorEntry>,
+    config: Option<ProjectConfig>,
 }
 
 impl ProjectEntry {
@@ -3678,6 +3683,8 @@ impl ProjectEntry {
         actor: ProjectHandle,
         mutation: MutationGate,
         compatibility_key: Option<ProjectCompatibilityKey>,
+        translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
+        config: Option<ProjectConfig>,
     ) -> Self {
         let root = identity.root.clone();
         Self {
@@ -3686,8 +3693,10 @@ impl ProjectEntry {
                 actor,
                 mutation,
                 compatibility_key,
+                translator_template,
                 root,
             )],
+            config,
         }
     }
 
@@ -3961,8 +3970,12 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
 }
 
 impl ProjectRegistry {
-    fn spawn_actor(&self, root: &CanonicalRoot) -> ProjectHandle {
-        self.translator_template.as_deref().map_or_else(
+    fn spawn_actor(
+        &self,
+        root: &CanonicalRoot,
+        translator_template: Option<&TranslatorTemplate>,
+    ) -> ProjectHandle {
+        translator_template.map_or_else(
             || spawn_project_actor_for_root(self.actor_capacity, root),
             |template| {
                 spawn_project_actor_for_root_with_template(self.actor_capacity, root, template)
@@ -4014,12 +4027,19 @@ impl ProjectRegistry {
         let Some(store) = self.persistence.clone() else {
             return Ok(());
         };
-        let projects = self
-            .list()
+        let mut projects = self
+            .projects
+            .read()
             .await
-            .iter()
-            .map(PersistedProject::from_identity)
+            .values()
+            .map(|project| {
+                PersistedProject::from_identity_with_config(
+                    &project.identity,
+                    project.config.clone(),
+                )
+            })
             .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         save_persisted_state(store, projects).await
     }
 
@@ -4051,7 +4071,8 @@ impl ProjectRegistry {
                 }
                 _ => ProjectIdentity::new(id.clone(), root),
             };
-            self.add(identity).await?;
+            self.add_with_config(identity, persisted.config.clone())
+                .await?;
             for additional_root in &persisted.additional_roots {
                 let Ok(additional_root) = CanonicalRoot::new(additional_root) else {
                     continue;
@@ -4061,9 +4082,10 @@ impl ProjectRegistry {
                 else {
                     continue;
                 };
-                self.add(
+                self.add_with_config(
                     ProjectIdentity::new(id.clone(), additional_root)
                         .with_repository_identity(repository),
+                    persisted.config.clone(),
                 )
                 .await?;
             }
@@ -4083,16 +4105,79 @@ impl ProjectRegistry {
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        let compatibility_key = rust_project_compatibility_key(
-            identity.root.as_path(),
-            self.translator_template.as_deref(),
-        )
-        .await;
+        self.add_registration(identity, None, None).await
+    }
+
+    /// Add a project with an optional JSON-facing configuration override.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if project identity, compatibility, actor, or
+    /// persistence validation fails.
+    pub async fn add_with_config(
+        &self,
+        identity: ProjectIdentity,
+        config: Option<ProjectConfig>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let config = config.filter(|config| !config.is_empty());
+        let template = config.as_ref().map(|config| {
+            self.translator_template
+                .as_deref()
+                .cloned()
+                .unwrap_or_default()
+                .with_project_config(config)
+        });
+        self.add_registration(identity, config, template).await
+    }
+
+    /// Add a project with an optional runtime translator configuration.
+    ///
+    /// When no override is supplied, actors inherit the daemon template. A
+    /// project ID/root pair can only be reused with the same effective
+    /// translator configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if project identity, compatibility, actor, or
+    /// persistence validation fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn add_with_template(
+        &self,
+        identity: ProjectIdentity,
+        translator_template: Option<TranslatorTemplate>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.add_registration(identity, None, translator_template)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn add_registration(
+        &self,
+        identity: ProjectIdentity,
+        config: Option<ProjectConfig>,
+        translator_template: Option<TranslatorTemplate>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let translator_template = translator_template
+            .map(std::sync::Arc::new)
+            .or_else(|| self.translator_template.clone());
+        let compatibility_key =
+            rust_project_compatibility_key(identity.root.as_path(), translator_template.as_deref())
+                .await;
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
             if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
-                return Ok(actor.actor.clone());
+                if translator_templates_match(
+                    actor.translator_template.as_deref(),
+                    translator_template.as_deref(),
+                ) {
+                    return Ok(actor.actor.clone());
+                }
+                return Err(ProjectRegistryError::ConflictingProject {
+                    id: identity.id().clone(),
+                    existing_root: identity.root().as_path().to_path_buf(),
+                    requested_root: identity.root().as_path().to_path_buf(),
+                });
             }
             let compatible = (existing.identity.repository_identity()
                 == identity.repository_identity())
@@ -4132,7 +4217,7 @@ impl ProjectRegistry {
                     requested_root: identity.root().as_path().to_path_buf(),
                 });
             }
-            let actor = self.spawn_actor(identity.root());
+            let actor = self.spawn_actor(identity.root(), translator_template.as_deref());
             let mutation = std::sync::Arc::new(Mutex::new(()));
             drop(projects);
             let mut projects = self.projects.write().await;
@@ -4142,6 +4227,7 @@ impl ProjectRegistry {
                     actor.clone(),
                     mutation,
                     compatibility_key,
+                    translator_template.clone(),
                     identity.root.clone(),
                 ));
             }
@@ -4167,11 +4253,18 @@ impl ProjectRegistry {
         }
 
         let primary_root = identity.root.clone();
-        let actor = self.spawn_actor(&primary_root);
+        let actor = self.spawn_actor(&primary_root, translator_template.as_deref());
         let mutation = std::sync::Arc::new(Mutex::new(()));
         projects.insert(
             identity.id().clone(),
-            ProjectEntry::new(identity, actor.clone(), mutation, compatibility_key),
+            ProjectEntry::new(
+                identity,
+                actor.clone(),
+                mutation,
+                compatibility_key,
+                translator_template,
+                config,
+            ),
         );
         drop(projects);
         self.persist().await?;
@@ -4892,6 +4985,17 @@ fn compatible_project<'a>(
         project.identity.repository_identity() == Some(repository)
             && project.has_compatible_actor(Some(compatibility_key))
     })
+}
+
+fn translator_templates_match(
+    left: Option<&TranslatorTemplate>,
+    right: Option<&TranslatorTemplate>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.same_configuration(right),
+        _ => false,
+    }
 }
 
 async fn save_persisted_state(
@@ -6245,11 +6349,13 @@ mod tests {
                     project_id: "existing".to_string(),
                     root: root.path().to_path_buf(),
                     additional_roots: Vec::new(),
+                    config: None,
                 },
                 PersistedProject {
                     project_id: "missing".to_string(),
                     root: root.path().join("gone"),
                     additional_roots: Vec::new(),
+                    config: None,
                 },
             ])
             .unwrap();
@@ -6259,6 +6365,51 @@ mod tests {
         assert_eq!(registry.list().await.len(), 1);
         assert_eq!(registry.list().await[0].id().as_str(), "existing");
         assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registry_persists_project_configuration() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let store = ProjectRegistrationStore::new(root.path().join("state/projects.json"));
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        let mut server = crate::config::LspServerConfig::rust_analyzer();
+        server.command = "/definitely/missing/rust-analyzer".to_string();
+        let config = ProjectConfig {
+            lsp_servers: Some(vec![server]),
+            heuristics_max_depth: Some(3),
+        };
+
+        registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    ProjectId::new("configured").unwrap(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ),
+                Some(config.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.load().unwrap().projects[0].config, Some(config));
+
+        let restored = ProjectRegistry::new(2).with_persistence(store);
+        assert_eq!(restored.restore_from_persistence().await.unwrap(), 1);
+        let state = restored
+            .actor_for_project(&ProjectId::new("configured").unwrap())
+            .await
+            .unwrap()
+            .query()
+            .await
+            .unwrap();
+        assert_eq!(
+            state.runtime().configured_language_ids(),
+            vec!["rust".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -6345,11 +6496,14 @@ mod tests {
             primary,
             std::sync::Arc::new(Mutex::new(())),
             None,
+            None,
+            None,
         );
         entry.identity.add_root(secondary_root.clone());
         entry.actors.push(ProjectActorEntry::new(
             secondary,
             std::sync::Arc::new(Mutex::new(())),
+            None,
             None,
             secondary_root,
         ));
@@ -6514,8 +6668,10 @@ mod tests {
                     actor,
                     mutation: std::sync::Arc::new(Mutex::new(())),
                     compatibility_key: None,
+                    translator_template: None,
                     roots: vec![CanonicalRoot::new(root.path()).unwrap()],
                 }],
+                config: None,
             },
         );
 

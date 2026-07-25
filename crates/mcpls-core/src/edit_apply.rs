@@ -158,18 +158,7 @@ impl<'a> PreparedPlan<'a> {
         staged: &[StagedFile],
         operations: &[ValidatedFileOperation],
     ) -> Result<ApplyReport, ApplyError> {
-        let mut committed_files = Vec::with_capacity(staged.len().saturating_add(operations.len()));
-        for (index, file) in staged.iter().enumerate() {
-            if let Err(error) = fs::rename(&file.temp, &file.target) {
-                cleanup_staged(&staged[index..]);
-                return Err(ApplyError::Commit {
-                    path: file.target.clone(),
-                    committed_files,
-                    source: error,
-                });
-            }
-            committed_files.push(file.target.clone());
-        }
+        let mut committed_files = commit_staged_files(staged)?;
         for operation in operations {
             let path = apply_resource_operation(operation, &committed_files)?;
             committed_files.push(path);
@@ -177,6 +166,22 @@ impl<'a> PreparedPlan<'a> {
 
         Ok(ApplyReport { committed_files })
     }
+}
+
+fn commit_staged_files(staged: &[StagedFile]) -> Result<Vec<PathBuf>, ApplyError> {
+    let mut committed_files = Vec::with_capacity(staged.len());
+    for (index, file) in staged.iter().enumerate() {
+        if let Err(error) = fs::rename(&file.temp, &file.target) {
+            cleanup_staged(&staged[index..]);
+            return Err(ApplyError::Commit {
+                path: file.target.clone(),
+                committed_files,
+                source: error,
+            });
+        }
+        committed_files.push(file.target.clone());
+    }
+    Ok(committed_files)
 }
 
 fn apply_resource_operation(
@@ -204,8 +209,9 @@ fn apply_resource_operation(
         ValidatedFileOperation::Rename {
             from,
             to,
-            overwrite: _,
+            overwrite,
         } => {
+            ensure_destination_available(to, *overwrite)?;
             fs::rename(from, to).map_err(|source| ApplyError::Resource {
                 operation: format!("rename {} -> {}", from.display(), to.display()),
                 committed_files: committed_files.to_vec(),
@@ -227,6 +233,15 @@ fn apply_resource_operation(
             Ok(path.clone())
         }
     }
+}
+
+fn ensure_destination_available(path: &Path, overwrite: bool) -> Result<(), ApplyError> {
+    if path.exists() && !overwrite {
+        return Err(ApplyError::Operation(
+            OperationValidationError::DestinationExists(path.to_path_buf()),
+        ));
+    }
+    Ok(())
 }
 
 /// Errors returned while applying an edit plan.
@@ -555,6 +570,31 @@ mod tests {
         assert_eq!(report.committed_files, vec![renamed.clone()]);
         assert!(!old.exists());
         assert_eq!(fs::read_to_string(renamed).unwrap(), "content\n");
+    }
+
+    #[test]
+    fn rename_without_overwrite_rechecks_destination_at_commit() {
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("old.rs");
+        let destination = root.path().join("destination.rs");
+        fs::write(&old, "old\n").unwrap();
+        fs::write(&destination, "destination\n").unwrap();
+        let operation = ValidatedFileOperation::Rename {
+            from: old.clone(),
+            to: destination.clone(),
+            overwrite: false,
+        };
+
+        let result = apply_resource_operation(&operation, &[]);
+
+        assert!(matches!(
+            result,
+            Err(ApplyError::Operation(
+                OperationValidationError::DestinationExists(path)
+            )) if path == destination
+        ));
+        assert_eq!(fs::read_to_string(old).unwrap(), "old\n");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "destination\n");
     }
 
     #[test]
