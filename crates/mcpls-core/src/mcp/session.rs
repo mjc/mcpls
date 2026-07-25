@@ -162,14 +162,32 @@ impl SessionEventSink {
     }
 
     pub(crate) fn untrack_subscription(&self, uri: &str) {
-        let mut resources = self
-            .project_resources
+        let empty_projects = {
+            let mut resources = self
+                .project_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for subscriptions in resources.values_mut() {
+                subscriptions.remove(uri);
+            }
+            let empty_projects = resources
+                .iter()
+                .filter(|(_, subscriptions)| subscriptions.is_empty())
+                .map(|(project_id, _)| project_id.clone())
+                .collect::<Vec<_>>();
+            resources.retain(|_, subscriptions| !subscriptions.is_empty());
+            empty_projects
+        };
+
+        let mut tasks = self
+            .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for subscriptions in resources.values_mut() {
-            subscriptions.remove(uri);
+        for project_id in empty_projects {
+            if let Some(task) = tasks.remove(&project_id) {
+                task.abort();
+            }
         }
-        resources.retain(|_, subscriptions| !subscriptions.is_empty());
     }
 
     /// Attach all actor groups for one logical project to this session's peer,
