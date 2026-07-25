@@ -1,7 +1,7 @@
 #![cfg(feature = "transport-http")]
-
-//! Wire-level Streamable HTTP coverage for the long-lived daemon.
-
+#![allow(missing_docs)]
+#![allow(rustdoc::missing_crate_level_docs)]
+#![doc = "Wire-level Streamable HTTP coverage for the long-lived daemon."]
 #![allow(clippy::unwrap_used)]
 
 use std::io::{Read, Write};

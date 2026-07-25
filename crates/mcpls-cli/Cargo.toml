@@ -14,6 +14,11 @@ categories = ["command-line-utilities", "development-tools"]
 name = "mcpls"
 path = "src/main.rs"
 
+[[test]]
+name = "http_e2e"
+path = "tests/http_e2e.rs"
+required-features = ["transport-http"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
