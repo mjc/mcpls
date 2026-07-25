@@ -3556,23 +3556,8 @@ impl ProjectRegistry {
             .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
             .collect();
 
-        let mut stopped = Vec::new();
+        let (mut stopped, actors) = shutdown_actor_groups(entries);
         let mut failures = Vec::new();
-        let mut actors: Vec<(ProjectHandle, Vec<ProjectId>)> = Vec::new();
-        for (id, actor) in entries {
-            if matches!(*actor.status().borrow(), ProjectStatus::Stopped) {
-                stopped.push(id);
-                continue;
-            }
-            if let Some((_, project_ids)) = actors
-                .iter_mut()
-                .find(|(existing, _)| existing.sender.same_channel(&actor.sender))
-            {
-                project_ids.push(id);
-            } else {
-                actors.push((actor, vec![id]));
-            }
-        }
 
         for (actor, project_ids) in actors {
             match actor.shutdown().await {
@@ -3952,6 +3937,28 @@ impl ProjectRegistry {
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
+}
+
+fn shutdown_actor_groups(
+    entries: Vec<(ProjectId, ProjectHandle)>,
+) -> (Vec<ProjectId>, Vec<(ProjectHandle, Vec<ProjectId>)>) {
+    let mut stopped = Vec::new();
+    let mut actors: Vec<(ProjectHandle, Vec<ProjectId>)> = Vec::new();
+    for (id, actor) in entries {
+        if matches!(*actor.status().borrow(), ProjectStatus::Stopped) {
+            stopped.push(id);
+            continue;
+        }
+        if let Some((_, project_ids)) = actors
+            .iter_mut()
+            .find(|(existing, _)| existing.sender.same_channel(&actor.sender))
+        {
+            project_ids.push(id);
+        } else {
+            actors.push((actor, vec![id]));
+        }
+    }
+    (stopped, actors)
 }
 
 fn compatible_project<'a>(
