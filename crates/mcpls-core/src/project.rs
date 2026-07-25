@@ -4785,18 +4785,7 @@ impl ProjectRegistry {
     /// lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
         self.lifecycle.begin_shutdown();
-        let entries: Vec<_> = self
-            .projects
-            .read()
-            .await
-            .values()
-            .flat_map(|entry| {
-                entry
-                    .actors
-                    .iter()
-                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
-            })
-            .collect();
+        let entries = self.registered_actor_entries().await;
 
         reject_new_actor_work(entries.iter().map(|(_, actor)| actor));
 
@@ -4831,6 +4820,20 @@ impl ProjectRegistry {
         self.lock_mutation_gates(mutations).await
     }
 
+    async fn registered_actor_entries(&self) -> Vec<(ProjectId, ProjectHandle)> {
+        self.projects
+            .read()
+            .await
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .actors
+                    .iter()
+                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
+            })
+            .collect()
+    }
+
     async fn lock_mutation_gates(
         &self,
         mutations: Vec<MutationGate>,
@@ -4851,18 +4854,7 @@ impl ProjectRegistry {
     pub async fn open_document_paths(
         &self,
     ) -> Result<Vec<(ProjectId, PathBuf)>, ProjectRegistryError> {
-        let entries: Vec<_> = self
-            .projects
-            .read()
-            .await
-            .values()
-            .flat_map(|entry| {
-                entry
-                    .actors
-                    .iter()
-                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
-            })
-            .collect();
+        let entries = self.registered_actor_entries().await;
         let mut paths = Vec::new();
         for (id, actor) in entries {
             paths.extend(
