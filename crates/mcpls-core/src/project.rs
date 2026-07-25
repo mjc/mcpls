@@ -2871,7 +2871,7 @@ fn spawn_notification_forwarders(
     }
 }
 
-fn mark_project_ready(
+fn mark_project_started(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
     actor_sender: &mpsc::Sender<ProjectRequest>,
     channels: &ProjectActorChannels,
@@ -2918,7 +2918,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -2941,7 +2941,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -3202,7 +3202,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
@@ -3296,7 +3296,7 @@ async fn handle_project_request(
             channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
-                    mark_project_ready(
+                    mark_project_started(
                         notification_receivers,
                         actor_sender,
                         channels,
