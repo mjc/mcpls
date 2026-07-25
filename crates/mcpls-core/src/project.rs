@@ -1387,6 +1387,63 @@ enum ProjectRequest {
     },
 }
 
+impl ProjectRequest {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
+                reply.is_closed()
+            }
+            Self::SetStatus { reply, .. } | Self::Fail { reply, .. } => reply.is_closed(),
+            Self::Activate { reply, .. } | Self::ActivateWorkspaceRoots { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::Hover { reply, .. } => reply.is_closed(),
+            Self::Definition { reply, .. } => reply.is_closed(),
+            Self::References { reply, .. } => reply.is_closed(),
+            Self::Diagnostics { reply, .. } | Self::CachedDiagnostics { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::Rename { reply, .. } => reply.is_closed(),
+            Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::Completions { reply, .. } => reply.is_closed(),
+            Self::DocumentSymbols { reply, .. } => reply.is_closed(),
+            Self::FormatDocument { reply, .. } => reply.is_closed(),
+            Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
+            Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::CodeActionPreview { reply, .. } | Self::PreviewEdit { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::PrepareCallHierarchy { reply, .. } => reply.is_closed(),
+            Self::IncomingCalls { reply, .. } => reply.is_closed(),
+            Self::OutgoingCalls { reply, .. } => reply.is_closed(),
+            Self::SignatureHelp { reply, .. } => reply.is_closed(),
+            Self::InlayHints { reply, .. } => reply.is_closed(),
+            Self::GoToImplementation { reply, .. } | Self::GoToTypeDefinition { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::HasCachedDiagnostics { reply, .. } => reply.is_closed(),
+            Self::OpenDocumentPaths { reply } => reply.is_closed(),
+            Self::ValidatePath { reply, .. } | Self::StoreEditPlan { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
+            Self::TakeEditPlan { reply, .. } => reply.is_closed(),
+            Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
+            Self::ServerLogs { reply, .. } => reply.is_closed(),
+            Self::ServerMessages { reply, .. } => reply.is_closed(),
+            Self::ServerCapabilities { reply, .. } => reply.is_closed(),
+            Self::PublishEvent { .. }
+            | Self::Shutdown { .. }
+            | Self::Notification { .. }
+            | Self::ServerExited { .. } => false,
+        }
+    }
+}
+
 /// Cloneable handle for querying and controlling one project actor.
 #[derive(Clone)]
 pub struct ProjectHandle {
@@ -3154,6 +3211,9 @@ async fn run_project_actor(
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
+        if request.is_cancelled() {
+            continue;
+        }
         if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
         {
             break;
@@ -5545,6 +5605,26 @@ mod tests {
         handle.set_status(ProjectStatus::Ready).await.unwrap();
 
         assert_eq!(handle.status().borrow().clone(), ProjectStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn project_actor_skips_cancelled_queued_mutation() {
+        let actor = spawn_project_actor(2);
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        actor
+            .sender
+            .send(ProjectRequest::SetStatus {
+                status: ProjectStatus::Ready,
+                reply,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            actor.query().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
     }
 
     #[tokio::test]
