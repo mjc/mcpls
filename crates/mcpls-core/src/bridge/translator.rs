@@ -3758,6 +3758,27 @@ mod tests {
     }
 
     #[test]
+    fn server_notifications_redact_bearer_and_sensitive_assignments() {
+        use crate::bridge::notifications::{LogLevel, MessageType};
+
+        let mut translator = Translator::new();
+        translator.notification_cache_mut().store_log(
+            LogLevel::Error,
+            "Bearer bearer-secret token=inline-secret".to_string(),
+        );
+        translator
+            .notification_cache_mut()
+            .store_message(MessageType::Error, "password: inline-password".to_string());
+
+        let logs = translator.handle_server_logs(10, None).unwrap();
+        assert!(!logs.logs[0].message.contains("bearer-secret"));
+        assert!(!logs.logs[0].message.contains("inline-secret"));
+
+        let messages = translator.handle_server_messages(10).unwrap();
+        assert!(!messages.messages[0].message.contains("inline-password"));
+    }
+
+    #[test]
     fn test_handle_server_messages_limit() {
         use crate::bridge::notifications::MessageType;
 
