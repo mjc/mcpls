@@ -2287,11 +2287,6 @@ mod tests {
         let counter = root.path().join("request-count");
         fs::write(&source, "old_name\n").unwrap();
         fs::write(&sibling, "old_name();\n").unwrap();
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .unwrap();
 
         let lsp = root.path().join("fake-edit-lsp.py");
         fs::write(
@@ -2378,7 +2373,7 @@ while True:
             HashMap::from([("MCPLS_COUNTER".to_string(), counter.display().to_string())]);
         let mut template_source = Translator::new()
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        template_source.set_lsp_configs(vec![server_config.clone()], Some(3));
+        template_source.set_lsp_configs(vec![server_config], Some(3));
         let registry =
             ProjectRegistry::with_translator_template(4, template_source.configuration_template());
         let project_id = ProjectId::new("fixture").unwrap();
