@@ -1049,6 +1049,13 @@ impl Translator {
     }
 
     fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> PathBuf {
+        // Registered project roots own the daemon's LSP lifecycle. Prefer the
+        // most specific one before manifest heuristics so a nested Cargo.toml
+        // does not replace an already-active workspace server on every request.
+        if let Some(root) = crate::project::longest_matching_root(path, &self.workspace_roots) {
+            return root.to_path_buf();
+        }
+
         let start = path.parent().unwrap_or(path);
 
         if let Some(heuristics) = &config.heuristics
@@ -1059,10 +1066,6 @@ impl Translator {
                     return ancestor.to_path_buf();
                 }
             }
-        }
-
-        if let Some(root) = crate::project::longest_matching_root(path, &self.workspace_roots) {
-            return root.to_path_buf();
         }
 
         start.to_path_buf()
@@ -2893,6 +2896,24 @@ mod tests {
         // and a real LSP server process. The actual registration functionality is
         // tested in integration tests (see rust_analyzer_tests.rs).
         // This test verifies the data structure is properly initialized.
+    }
+
+    #[test]
+    fn project_root_for_file_prefers_registered_workspace_root() {
+        let workspace = TempDir::new().unwrap();
+        let nested = workspace.path().join("crates/mcpls-core");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::write(nested.join("Cargo.toml"), "[package]\nname=\"nested\"\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![workspace.path().to_path_buf()]);
+        let file = nested.join("src/lib.rs");
+
+        assert_eq!(
+            translator.project_root_for_file(&file, &LspServerConfig::rust_analyzer()),
+            workspace.path()
+        );
     }
 
     #[test]
