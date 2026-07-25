@@ -576,12 +576,11 @@ fn rust_toolchain_channel(root: &Path) -> Option<String> {
         .find_map(|relative| {
             let contents = std::fs::read_to_string(root.join(relative)).ok()?;
             if relative == "rust-toolchain.toml" {
-                let document = contents.parse::<toml::Value>().ok()?;
-                document
-                    .get("toolchain")
-                    .and_then(|toolchain| toolchain.get("channel"))
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_owned)
+                contents.lines().find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == "channel")
+                        .then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+                })
             } else {
                 contents
                     .lines()
