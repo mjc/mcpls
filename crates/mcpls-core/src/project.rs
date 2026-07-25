@@ -2467,6 +2467,19 @@ fn spawn_notification_forwarders(
     }
 }
 
+fn mark_project_ready(
+    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    actor_sender: &mpsc::Sender<ProjectRequest>,
+    status_tx: &watch::Sender<ProjectStatus>,
+    state: &mut ProjectState,
+    runtime: &ProjectRuntime,
+) {
+    spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
+    state.sync_runtime(runtime);
+    state.status = ProjectStatus::Ready;
+    let _ = status_tx.send(ProjectStatus::Ready);
+}
+
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
@@ -2490,14 +2503,13 @@ async fn handle_project_request(
             let _ = status_tx.send(ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(
+                    mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        runtime.generation(),
+                        status_tx,
+                        state,
+                        runtime,
                     );
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
                     let _ = reply.send(Ok(state.clone()));
                 }
                 Err(error) => {
@@ -2516,14 +2528,13 @@ async fn handle_project_request(
             let _ = status_tx.send(ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(
+                    mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        runtime.generation(),
+                        status_tx,
+                        state,
+                        runtime,
                     );
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
                     let _ = reply.send(Ok(state.clone()));
                 }
                 Err(error) => {
@@ -2780,14 +2791,13 @@ async fn handle_project_request(
             let _ = status_tx.send(ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(
+                    mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        runtime.generation(),
+                        status_tx,
+                        state,
+                        runtime,
                     );
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
                     let _ = reply.send(Ok(state.clone()));
                 }
                 Err(error) => {
@@ -2868,14 +2878,13 @@ async fn handle_project_request(
             let _ = status_tx.send(ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(
+                    mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        runtime.generation(),
+                        status_tx,
+                        state,
+                        runtime,
                     );
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
                     let _ = reply.send(state.clone());
                 }
                 Err(error) => {
