@@ -4189,6 +4189,34 @@ impl ProjectRemovalSnapshot {
         }
         Ok(())
     }
+
+    async fn capture_history(&self) -> RetainedProjectHistory {
+        let mut history = RetainedProjectHistory::default();
+        for (group_id, actor) in self.actors.iter().enumerate() {
+            if let Ok(logs) = actor.server_logs_unchecked(usize::MAX, None).await {
+                history.logs.extend(logs.logs);
+            }
+            if let Ok(messages) = actor.server_messages_unchecked(usize::MAX).await {
+                history.messages.extend(messages.messages);
+            }
+            if let Ok(capabilities) = actor.server_capabilities_unchecked(None).await {
+                history.capabilities.extend(
+                    capabilities.into_iter().map(|capability| {
+                        ProjectServerCapability::from_server(group_id, capability)
+                    }),
+                );
+            }
+        }
+        history
+            .logs
+            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+        history.logs.truncate(RETAINED_LOG_CAPACITY);
+        history
+            .messages
+            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+        history.messages.truncate(RETAINED_MESSAGE_CAPACITY);
+        history
+    }
 }
 
 impl ProjectEntry {
@@ -5053,37 +5081,6 @@ impl ProjectRegistry {
         Err(error)
     }
 
-    async fn capture_removal_history(
-        &self,
-        removal: &ProjectRemovalSnapshot,
-    ) -> RetainedProjectHistory {
-        let mut history = RetainedProjectHistory::default();
-        for (group_id, actor) in removal.actors.iter().enumerate() {
-            if let Ok(logs) = actor.server_logs_unchecked(usize::MAX, None).await {
-                history.logs.extend(logs.logs);
-            }
-            if let Ok(messages) = actor.server_messages_unchecked(usize::MAX).await {
-                history.messages.extend(messages.messages);
-            }
-            if let Ok(capabilities) = actor.server_capabilities_unchecked(None).await {
-                history.capabilities.extend(
-                    capabilities.into_iter().map(|capability| {
-                        ProjectServerCapability::from_server(group_id, capability)
-                    }),
-                );
-            }
-        }
-        history
-            .logs
-            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
-        history.logs.truncate(RETAINED_LOG_CAPACITY);
-        history
-            .messages
-            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
-        history.messages.truncate(RETAINED_MESSAGE_CAPACITY);
-        history
-    }
-
     async fn retain_history(&self, id: ProjectId, history: RetainedProjectHistory) {
         self.retained_history.write().await.insert(id, history);
     }
@@ -5096,7 +5093,7 @@ impl ProjectRegistry {
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
         let removal = self.begin_project_removal(&id).await?;
         let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
-        let history = self.capture_removal_history(&removal).await;
+        let history = removal.capture_history().await;
         if let Err(error) = removal.shutdown(&id).await {
             return self.abort_project_removal(&id, &removal, error).await;
         }
@@ -7381,6 +7378,35 @@ while True:
         assert_eq!(logs.logs[0].message, "retained log");
         let messages = registry.server_messages(&project_id, 10).await.unwrap();
         assert_eq!(messages.messages[0].message, "retained message");
+    }
+
+    #[tokio::test]
+    async fn project_registry_evicts_old_removed_history() {
+        let registry = ProjectRegistry::new(1);
+        let roots = (0..=RETAINED_PROJECT_HISTORY_CAPACITY)
+            .map(|_| TempDir::new().unwrap())
+            .collect::<Vec<_>>();
+
+        for (index, root) in roots.iter().enumerate() {
+            let id = ProjectId::new(format!("removed-{index}")).unwrap();
+            registry
+                .add(ProjectIdentity::new(
+                    id.clone(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            registry.remove(id).await.unwrap();
+        }
+
+        let oldest = ProjectId::new("removed-0").unwrap();
+        assert!(matches!(
+            registry.server_logs(&oldest, 10, None).await,
+            Err(ProjectRegistryError::ProjectNotFound(_))
+        ));
+        let newest =
+            ProjectId::new(format!("removed-{RETAINED_PROJECT_HISTORY_CAPACITY}")).unwrap();
+        assert!(registry.server_logs(&newest, 10, None).await.is_ok());
     }
 
     #[tokio::test]
