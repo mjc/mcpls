@@ -4038,6 +4038,7 @@ mod tests {
                 heuristics_max_depth: 10,
             },
             lsp_servers: vec![],
+            daemon: crate::config::DaemonConfig::default(),
         };
 
         let extension_map = config.build_effective_extension_map();

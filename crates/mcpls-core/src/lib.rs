@@ -55,7 +55,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use bridge::resources::make_uri;
 use bridge::{ResourceSubscriptions, Translator};
-pub use config::ServerConfig;
+pub use config::{DaemonConfig, ServerConfig};
 pub use error::Error;
 #[cfg(test)]
 use lsp::LspNotification;
@@ -328,6 +328,15 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let peer_cell = Arc::new(OnceCell::new());
     let project_registry =
         project::ProjectRegistry::with_translator_template(32, translator_template);
+    let project_registry = if let Some(path) = config.daemon.state_file.clone() {
+        project_registry.with_persistence(project_persistence::ProjectRegistrationStore::new(path))
+    } else {
+        project_registry
+    };
+    project_registry
+        .restore_from_persistence()
+        .await
+        .map_err(|error| Error::Config(format!("failed to restore project state: {error}")))?;
     let registered = register_default_workspace_projects(&project_registry, &workspace_roots).await;
     info!("Registered {registered} default workspace project(s)");
 
@@ -649,6 +658,7 @@ mod tests {
                     timeout_seconds: 10,
                     heuristics: None,
                 }],
+                daemon: crate::config::DaemonConfig::default(),
             };
 
             // serve() proceeds to run the MCP server and blocks on the stdio
@@ -687,6 +697,7 @@ mod tests {
                     heuristics_max_depth: 10,
                 },
                 lsp_servers: vec![],
+                daemon: crate::config::DaemonConfig::default(),
             };
 
             let result = serve(config).await;

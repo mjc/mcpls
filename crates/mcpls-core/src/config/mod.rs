@@ -36,6 +36,19 @@ pub struct ServerConfig {
     /// LSP server configurations.
     #[serde(default)]
     pub lsp_servers: Vec<LspServerConfig>,
+
+    /// Long-lived daemon settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+}
+
+/// Configuration for daemon-owned runtime state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Optional JSON state file for dynamic project registrations.
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
 }
 
 /// Workspace-level configuration.
@@ -419,6 +432,7 @@ impl Default for ServerConfig {
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
             ],
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -738,6 +752,7 @@ mod tests {
                 timeout_seconds: 30,
                 heuristics: None,
             }],
+            daemon: DaemonConfig::default(),
         };
 
         let map = config.build_effective_extension_map();
@@ -759,6 +774,7 @@ mod tests {
                 timeout_seconds: 30,
                 heuristics: None,
             }],
+            daemon: DaemonConfig::default(),
         };
 
         let map = config.build_effective_extension_map();
