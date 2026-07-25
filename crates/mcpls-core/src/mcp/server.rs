@@ -2220,6 +2220,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(format.contains("project is not registered"), "{format}");
+
+        let rename_apply = server
+            .rename_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "missing".to_string(),
+                plan_id: "plan-1".to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rename_apply.contains("project is not registered"),
+            "{rename_apply}"
+        );
+
+        let format_apply = server
+            .format_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "missing".to_string(),
+                plan_id: "plan-1".to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            format_apply.contains("project is not registered"),
+            "{format_apply}"
+        );
     }
 
     #[tokio::test]
