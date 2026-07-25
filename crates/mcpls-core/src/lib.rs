@@ -335,7 +335,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     info!("Registered {registered} default workspace project(s)");
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::from_registry(Arc::clone(&subscriptions), project_registry);
+    let mcp_server =
+        mcp::McplsServer::from_registry(Arc::clone(&subscriptions), project_registry.clone());
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
@@ -346,6 +347,14 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         #[cfg(feature = "transport-http")]
         Transport::Http(cfg) => run_http(mcp_server, cfg).await,
     };
+
+    let shutdown = project_registry.shutdown_all().await;
+    if !shutdown.failed.is_empty() {
+        warn!(
+            failed_projects = ?shutdown.failed,
+            "some project actors did not shut down cleanly"
+        );
+    }
 
     info!("MCPLS server shutting down");
     result

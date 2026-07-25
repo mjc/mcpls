@@ -3311,6 +3311,24 @@ pub struct ProjectStatusCounts {
     pub failed: usize,
 }
 
+/// Result of a bounded daemon shutdown across all registered projects.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectShutdownReport {
+    /// Project IDs whose actor reached `Stopped` (including already-stopped actors).
+    pub stopped: Vec<ProjectId>,
+    /// Projects whose actor could not be shut down cleanly.
+    pub failed: Vec<ProjectShutdownFailure>,
+}
+
+/// One project shutdown failure and its actor error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectShutdownFailure {
+    /// Project ID associated with the failed actor.
+    pub project_id: ProjectId,
+    /// Human-readable shutdown failure.
+    pub error: String,
+}
+
 impl ProjectRegistry {
     /// Create an empty registry with a bounded actor queue capacity.
     #[must_use]
@@ -3520,6 +3538,60 @@ impl ProjectRegistry {
         }
         drop(projects);
         counts
+    }
+
+    /// Gracefully stop every registered project actor once.
+    ///
+    /// Shared linked-worktree actors are deduplicated by their request channel,
+    /// so one shutdown request drains the shared language-server runtime for
+    /// all of its project identities. Requests already queued on an actor are
+    /// processed before its shutdown request, preserving edit commit
+    /// boundaries without holding the registry lock across the await.
+    pub async fn shutdown_all(&self) -> ProjectShutdownReport {
+        let entries: Vec<_> = self
+            .projects
+            .read()
+            .await
+            .values()
+            .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
+            .collect();
+
+        let mut stopped = Vec::new();
+        let mut failures = Vec::new();
+        let mut actors: Vec<(ProjectHandle, Vec<ProjectId>)> = Vec::new();
+        for (id, actor) in entries {
+            if matches!(*actor.status().borrow(), ProjectStatus::Stopped) {
+                stopped.push(id);
+                continue;
+            }
+            if let Some((_, project_ids)) = actors
+                .iter_mut()
+                .find(|(existing, _)| existing.sender.same_channel(&actor.sender))
+            {
+                project_ids.push(id);
+            } else {
+                actors.push((actor, vec![id]));
+            }
+        }
+
+        for (actor, project_ids) in actors {
+            match actor.shutdown().await {
+                Ok(()) => stopped.extend(project_ids),
+                Err(error) => failures.extend(project_ids.into_iter().map(|project_id| {
+                    ProjectShutdownFailure {
+                        project_id,
+                        error: error.to_string(),
+                    }
+                })),
+            }
+        }
+
+        stopped.sort();
+        failures.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        ProjectShutdownReport {
+            stopped,
+            failed: failures,
+        }
     }
 
     /// Return open-document paths grouped by the registered project IDs that
@@ -5122,6 +5194,36 @@ mod tests {
         assert!(restart.is_ok() || matches!(restart, Err(ProjectRegistryError::Actor(_))));
         assert!(remove.is_ok());
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_shuts_down_all_registered_actors() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        let first_actor = registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let second_actor = registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let report = registry.shutdown_all().await;
+
+        assert!(report.failed.is_empty());
+        assert_eq!(report.stopped, vec![first_id, second_id]);
+        assert_eq!(*first_actor.status().borrow(), ProjectStatus::Stopped);
+        assert_eq!(*second_actor.status().borrow(), ProjectStatus::Stopped);
     }
 
     #[tokio::test]
