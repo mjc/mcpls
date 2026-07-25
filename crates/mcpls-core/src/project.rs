@@ -4022,6 +4022,24 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
         .map_or(ShutdownAttempt::TimedOut, ShutdownAttempt::Completed)
 }
 
+async fn shutdown_project_actors(
+    project_id: &ProjectId,
+    root: &Path,
+    actors: Vec<ProjectHandle>,
+) -> Result<(), ProjectRegistryError> {
+    for actor in actors {
+        actor
+            .publish_event(ProjectEvent::ProjectRemoved {
+                project_id: project_id.clone(),
+                root: root.to_path_buf(),
+            })
+            .await
+            .map_err(ProjectRegistryError::from)?;
+        actor.shutdown().await.map_err(ProjectRegistryError::from)?;
+    }
+    Ok(())
+}
+
 impl ProjectRegistry {
     fn spawn_actor(
         &self,
@@ -4526,32 +4544,17 @@ impl ProjectRegistry {
             (actors, mutations, root)
         };
         let _mutation_guards = self.lock_mutation_gates(mutations).await;
-        let result = async {
-            for actor in actors {
-                actor
-                    .publish_event(ProjectEvent::ProjectRemoved {
-                        project_id: id.clone(),
-                        root: root.clone(),
-                    })
-                    .await
-                    .map_err(ProjectRegistryError::from)?;
-                actor.shutdown().await.map_err(ProjectRegistryError::from)?;
-            }
-            Ok::<(), ProjectRegistryError>(())
-        }
-        .await;
-        if let Err(error) = result {
+        if let Err(error) = shutdown_project_actors(&id, &root, actors).await {
             self.lifecycle.end_removal(&id).await;
             return Err(error);
         }
-        self.projects
-            .write()
-            .await
-            .remove(&id)
-            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        self.persist().await?;
+        if self.projects.write().await.remove(&id).is_none() {
+            self.lifecycle.end_removal(&id).await;
+            return Err(ProjectRegistryError::ProjectNotFound(id));
+        }
+        let persisted = self.persist().await;
         self.lifecycle.end_removal(&id).await;
-        Ok(())
+        persisted
     }
 
     /// Query a project's actor state without holding the registry lock during the await.
@@ -6718,11 +6721,12 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), registry.add(identity.clone()),)
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(10), registry.add(identity.clone()))
                 .await
-                .is_err()
-        );
+                .unwrap(),
+            Err(ProjectRegistryError::ProjectRemoving(project)) if project == id
+        ));
 
         drop(guard);
         assert!(remove.await.unwrap().is_ok());
