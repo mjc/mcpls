@@ -4015,9 +4015,7 @@ struct ProjectRemovalSnapshot {
 
 impl ProjectRemovalSnapshot {
     fn reject_new_work(&self) {
-        for actor in &self.actors {
-            actor.reject_new_work();
-        }
+        reject_new_actor_work(&self.actors);
     }
 
     fn accept_new_work(&self) {
@@ -4800,9 +4798,7 @@ impl ProjectRegistry {
             })
             .collect();
 
-        for (_, actor) in &entries {
-            actor.reject_new_work();
-        }
+        reject_new_actor_work(entries.iter().map(|(_, actor)| actor));
 
         let _mutation_guards = self.lock_project_mutations().await;
 
@@ -5391,6 +5387,12 @@ fn unique_mutation_gates(projects: &HashMap<ProjectId, ProjectEntry>) -> Vec<Mut
         }
     }
     mutations
+}
+
+fn reject_new_actor_work<'a>(actors: impl IntoIterator<Item = &'a ProjectHandle>) {
+    for actor in actors {
+        actor.reject_new_work();
+    }
 }
 
 fn shutdown_actor_groups(
@@ -7612,7 +7614,13 @@ while True:
             .await
             .unwrap();
         let actor = registry.actor_for_project(&project_id).await.unwrap();
-        let mutation = registry.projects.read().await.get(&project_id).unwrap().actors[0]
+        let mutation = registry
+            .projects
+            .read()
+            .await
+            .get(&project_id)
+            .unwrap()
+            .actors[0]
             .mutation
             .clone();
         let guard = mutation.lock().await;
