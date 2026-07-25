@@ -6669,6 +6669,21 @@ while True:
     }
 
     #[tokio::test]
+    async fn project_actor_fails_when_current_server_exits_during_starting() {
+        let actor = spawn_project_actor(2);
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let state = actor.query().await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(state.last_error(), Some("language server exited"));
+    }
+
+    #[tokio::test]
     async fn project_actor_restarts_after_current_server_exit() {
         let actor = spawn_project_actor(2);
         actor.set_status(ProjectStatus::Ready).await.unwrap();
