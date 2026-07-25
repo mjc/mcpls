@@ -1158,7 +1158,7 @@ impl ProjectRequestSender {
                 Ok(permit) => permit,
                 Err(_) => return Err(mpsc::error::SendError(request)),
             },
-            _ = self.gate.wait_for_rejection() => {
+            () = self.gate.wait_for_rejection() => {
                 return Err(mpsc::error::SendError(request));
             }
         };
