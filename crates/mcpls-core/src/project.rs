@@ -4421,6 +4421,27 @@ impl ProjectRegistry {
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
+    /// Return the number of actor groups backing one logical project.
+    ///
+    /// Compatible linked roots share one group and therefore one language
+    /// server set; incompatible roots retain separate groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not
+    /// registered.
+    pub async fn actor_group_count(
+        &self,
+        id: &ProjectId,
+    ) -> Result<usize, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| project.actors.len())
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
     async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
         self.projects
             .read()
@@ -5621,6 +5642,13 @@ mod tests {
         );
         assert!(!main_actor.sender.same_channel(&linked_actor.sender));
         assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(
+            registry
+                .actor_group_count(&ProjectId::new("main").unwrap())
+                .await
+                .unwrap(),
+            2
+        );
         registry
             .remove(ProjectId::new("main").unwrap())
             .await
@@ -6136,6 +6164,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
         assert_eq!(actor.query().await.unwrap().workspace_roots().len(), 2);
         let file = worktree.path().join("src.rs");
         fs::write(&file, "fn main() {}\n").unwrap();
