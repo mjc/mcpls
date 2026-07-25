@@ -51,6 +51,7 @@ pub mod workspace_edit;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 use bridge::resources::make_uri;
@@ -321,7 +322,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
     let project_registry =
-        project::ProjectRegistry::with_translator_template(32, translator_template);
+        project::ProjectRegistry::with_translator_template(32, translator_template)
+            .with_shutdown_timeout(Duration::from_secs(config.daemon.shutdown_timeout_seconds));
     let project_registry = if let Some(path) = config.daemon.state_file.clone() {
         project_registry.with_persistence(project_persistence::ProjectRegistrationStore::new(path))
     } else {

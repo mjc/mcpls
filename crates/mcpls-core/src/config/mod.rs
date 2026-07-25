@@ -49,6 +49,14 @@ pub struct DaemonConfig {
     /// Optional JSON state file for dynamic project registrations.
     #[serde(default)]
     pub state_file: Option<PathBuf>,
+
+    /// Maximum time to wait for each project actor during daemon shutdown.
+    #[serde(default = "default_shutdown_timeout_seconds")]
+    pub shutdown_timeout_seconds: u64,
+}
+
+const fn default_shutdown_timeout_seconds() -> u64 {
+    30
 }
 
 /// Workspace-level configuration.
@@ -499,6 +507,7 @@ mod tests {
             r#"
                 [daemon]
                 state_file = "/tmp/mcpls-projects.json"
+                shutdown_timeout_seconds = 7
             "#,
         )
         .unwrap();
@@ -506,6 +515,7 @@ mod tests {
             config.daemon.state_file,
             Some(PathBuf::from("/tmp/mcpls-projects.json"))
         );
+        assert_eq!(config.daemon.shutdown_timeout_seconds, 7);
         let encoded = toml::to_string(&config).unwrap();
         assert!(encoded.contains("state_file"));
     }
