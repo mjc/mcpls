@@ -7796,6 +7796,89 @@ while True:
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn compatible_linked_worktrees_share_one_lsp_process() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        }
+        let counter = repository.path().join("spawn-count");
+        let lsp = repository.path().join("counting-lsp.py");
+        fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        let mut template_source = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        template_source.set_lsp_configs(vec![config], Some(3));
+        let registry =
+            ProjectRegistry::with_translator_template(4, template_source.configuration_template());
+        let project_id = ProjectId::new("repository").unwrap();
+        let repository_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(repository_identity),
+            )
+            .await
+            .unwrap();
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_identity),
+            )
+            .await
+            .unwrap();
+
+        let state = registry.activate(&project_id).await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(state.workspace_roots().len(), 2);
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
+        assert_eq!(fs::read_to_string(counter).unwrap(), "1");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn resolve_path_canonicalizes_symlink_aliases() {
         use std::os::unix::fs::symlink;
