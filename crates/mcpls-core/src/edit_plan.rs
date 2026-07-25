@@ -288,6 +288,14 @@ impl EditPlan {
         &self.files
     }
 
+    /// Return snapshots whose source is actor-owned open-document state.
+    #[must_use = "iterate the open-document snapshots"]
+    pub fn open_document_snapshots(&self) -> impl Iterator<Item = &FileSnapshot> {
+        self.files
+            .iter()
+            .filter(|snapshot| snapshot.source() == SnapshotSource::OpenDocument)
+    }
+
     /// Return planned file operations and other preview descriptors.
     #[must_use]
     pub fn operations(&self) -> &[String] {

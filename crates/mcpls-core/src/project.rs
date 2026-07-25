@@ -1670,9 +1670,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
         let open_documents = plan
-            .files()
-            .iter()
-            .filter(|snapshot| snapshot.source() == crate::edit_plan::SnapshotSource::OpenDocument)
+            .open_document_snapshots()
             .map(|snapshot| {
                 (
                     snapshot.path().clone(),
