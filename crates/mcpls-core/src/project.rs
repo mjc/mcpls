@@ -4292,16 +4292,11 @@ impl ProjectRegistry {
         let entry = projects
             .get(&id)
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        let actors = entry
+        let (actors, mutations): (Vec<_>, Vec<_>) = entry
             .actors
             .iter()
-            .map(|actor| actor.actor.clone())
-            .collect::<Vec<_>>();
-        let mutations = entry
-            .actors
-            .iter()
-            .map(|actor| actor.mutation.clone())
-            .collect::<Vec<_>>();
+            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+            .unzip();
         let root = entry.identity.root().as_path().to_path_buf();
         let _mutation_guards = self.lock_mutation_gates(mutations).await;
         projects
