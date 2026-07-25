@@ -3778,17 +3778,20 @@ impl ProjectRegistry {
         let projects = self.projects.read().await;
         let mut counts = ProjectStatusCounts::default();
         for entry in projects.values() {
-            for actor in &entry.actors {
-                let status = *actor.actor.status().borrow();
-                match status {
-                    ProjectStatus::Starting => counts.starting += 1,
-                    ProjectStatus::Ready => counts.ready += 1,
-                    ProjectStatus::Degraded => counts.degraded += 1,
-                    ProjectStatus::Restarting => counts.restarting += 1,
-                    ProjectStatus::Stopping => counts.stopping += 1,
-                    ProjectStatus::Stopped => counts.stopped += 1,
-                    ProjectStatus::Failed => counts.failed += 1,
-                }
+            let status = aggregate_statuses(
+                entry
+                    .actors
+                    .iter()
+                    .map(|actor| *actor.actor.status().borrow()),
+            );
+            match status {
+                ProjectStatus::Starting => counts.starting += 1,
+                ProjectStatus::Ready => counts.ready += 1,
+                ProjectStatus::Degraded => counts.degraded += 1,
+                ProjectStatus::Restarting => counts.restarting += 1,
+                ProjectStatus::Stopping => counts.stopping += 1,
+                ProjectStatus::Stopped => counts.stopped += 1,
+                ProjectStatus::Failed => counts.failed += 1,
             }
         }
         drop(projects);
@@ -4280,6 +4283,13 @@ impl ProjectRegistry {
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
+}
+
+fn aggregate_statuses(statuses: impl IntoIterator<Item = ProjectStatus>) -> ProjectStatus {
+    statuses
+        .into_iter()
+        .max_by_key(|status| project_status_priority(*status))
+        .unwrap_or(ProjectStatus::Starting)
 }
 
 fn unique_mutation_gates(projects: &HashMap<ProjectId, ProjectEntry>) -> Vec<MutationGate> {
@@ -5569,6 +5579,9 @@ mod tests {
 
         assert_eq!(state.status(), ProjectStatus::Failed);
         assert_eq!(state.last_error(), Some("secondary toolchain failed"));
+        let counts = registry.status_counts().await;
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.ready, 0);
     }
 
     #[tokio::test]
