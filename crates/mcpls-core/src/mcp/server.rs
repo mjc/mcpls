@@ -438,6 +438,75 @@ impl McplsServer {
         )
     }
 
+    /// List project-scoped code actions with bounded reusable references.
+    #[tool(description = "List code actions and return project-scoped references for preview.")]
+    async fn code_action_list(
+        &self,
+        Parameters(CodeActionListParams {
+            project_id,
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+        }): Parameters<CodeActionListParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let result = self
+            .context
+            .project_registry
+            .code_action_list(
+                &id,
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await;
+        encode_tool_result(result)
+    }
+
+    /// Resolve and preview one project-scoped code action.
+    #[tool(description = "Preview a code action using its project-scoped reference.")]
+    async fn code_action_preview(
+        &self,
+        Parameters(CodeActionPreviewParams {
+            project_id,
+            action_id,
+            position_encoding,
+        }): Parameters<CodeActionPreviewParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let action_id = PlanId::parse(action_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let encoding = parse_position_encoding(position_encoding.as_deref())?;
+        let result = self
+            .context
+            .project_registry
+            .preview_code_action(&id, action_id, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&preview_artifact_json(&result, id.as_str()))
+    }
+
+    /// Apply a previously previewed code action plan.
+    #[tool(description = "Apply a code action preview plan for a project.")]
+    async fn code_action_apply(
+        &self,
+        Parameters(CodeActionApplyParams {
+            project_id,
+            plan_id,
+        }): Parameters<CodeActionApplyParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let plan_id = PlanId::parse(plan_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.apply_project_plan(&id, plan_id).await
+    }
+
     /// Prepare call hierarchy at a position.
     #[tool(
         description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
@@ -931,6 +1000,24 @@ mod tests {
         // This should return an error (no LSP server configured)
         let result = server.get_hover(params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn semantic_tools_reject_unregistered_paths_without_global_fallback() {
+        let server = create_test_server();
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("unregistered.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let error = server
+            .get_hover(Parameters(HoverParams {
+                file_path: file.display().to_string(),
+                line: 1,
+                character: 1,
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("path is not registered"), "{error}");
     }
 
     #[tokio::test]
@@ -1678,7 +1765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cached_diagnostics_tool_with_params() {
+    async fn test_cached_diagnostics_tool_rejects_unregistered_paths() {
         use std::fs;
 
         use tempfile::TempDir;
@@ -1694,11 +1781,8 @@ mod tests {
         });
 
         let result = server.get_cached_diagnostics(params).await;
-        assert!(result.is_ok());
-
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(parsed.get("diagnostics").is_some());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("path is not registered"), "{error}");
     }
 
     /// `get_cached_diagnostics` end-to-end: a cache entry stored under the
@@ -2279,7 +2363,7 @@ mod tests {
     // which requires a live Peer with private fields)
     // ------------------------------------------------------------------
 
-    /// `list_resources` returns an empty vec for a fresh translator with no open documents.
+    /// `list_resources` has no documents for a fresh project registry.
     #[tokio::test]
     async fn test_list_resources_returns_empty_when_no_open_documents() {
         let server = create_test_server();

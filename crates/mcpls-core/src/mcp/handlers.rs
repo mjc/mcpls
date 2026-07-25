@@ -63,8 +63,8 @@ impl BridgeContext {
 
     /// Create a handler context with an existing shared project registry.
     #[must_use]
-    pub const fn with_registry(
-        translator: Arc<Mutex<Translator>>,
+    pub fn with_registry(
+        _translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
@@ -77,12 +77,15 @@ impl BridgeContext {
         }
     }
 
-    /// Return the actor owning a canonicalizable path, if it is registered.
+    /// Return the actor owning a path or the registry's explicit routing error.
     ///
-    /// A missing actor is the compatibility signal used by legacy stdio
-    /// callers that still rely on the daemon translator fallback.
-    pub async fn actor_for_path(&self, path: impl AsRef<std::path::Path>) -> Option<ProjectHandle> {
-        self.project_registry.actor_for_path(path).await.ok()
+    /// Semantic tools use this path so an unregistered file cannot fall back to
+    /// a process-global translator.
+    pub async fn required_actor_for_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.project_registry.actor_for_path(path).await
     }
 }
 

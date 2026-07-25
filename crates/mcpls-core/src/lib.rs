@@ -837,6 +837,22 @@ mod tests {
     use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
 
     use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn registers_a_default_project_for_one_workspace_root() {
+        let root = TempDir::new().unwrap();
+        let registry = project::ProjectRegistry::new(2);
+
+        let registered =
+            register_default_workspace_projects(&registry, &[root.path().to_path_buf()]).await;
+
+        assert_eq!(registered, 1);
+        let projects = registry.list().await;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id().as_str(), "default");
+        assert!(registry.actor_for_path(root.path()).await.is_ok());
+    }
 
     #[test]
     fn test_diagnostic_path_in_workspace_empty_roots_allows_any_uri() {
