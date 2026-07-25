@@ -58,13 +58,19 @@ pub struct ProjectConfig {
     /// Override the recursive project-marker search depth.
     #[serde(default)]
     pub heuristics_max_depth: Option<usize>,
+
+    /// Literal values to redact from project-scoped LSP notifications.
+    #[serde(default)]
+    pub redaction_patterns: Option<Vec<String>>,
 }
 
 impl ProjectConfig {
     /// Return whether this payload leaves all daemon settings unchanged.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.lsp_servers.is_none() && self.heuristics_max_depth.is_none()
+        self.lsp_servers.is_none()
+            && self.heuristics_max_depth.is_none()
+            && self.redaction_patterns.is_none()
     }
 }
 

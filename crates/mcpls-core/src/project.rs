@@ -6915,6 +6915,7 @@ mod tests {
         let config = ProjectConfig {
             lsp_servers: Some(vec![server]),
             heuristics_max_depth: Some(3),
+            redaction_patterns: None,
         };
 
         registry

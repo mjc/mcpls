@@ -121,6 +121,7 @@ async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
 pub struct TranslatorTemplate {
     extension_map: HashMap<String, String>,
     lsp_configs: Vec<LspServerConfig>,
+    redaction_patterns: Vec<String>,
     heuristics_max_depth: Option<usize>,
 }
 
@@ -146,6 +147,7 @@ impl TranslatorTemplate {
         Self {
             extension_map,
             lsp_configs,
+            redaction_patterns: Vec::new(),
             heuristics_max_depth,
         }
     }
@@ -168,6 +170,9 @@ impl TranslatorTemplate {
         }
         if let Some(max_depth) = config.heuristics_max_depth {
             self.heuristics_max_depth = Some(max_depth);
+        }
+        if let Some(patterns) = &config.redaction_patterns {
+            self.redaction_patterns.clone_from(patterns);
         }
         self
     }
@@ -286,6 +291,17 @@ impl Translator {
             .map(|config| (config.language_id.clone(), config))
             .collect();
         self.heuristics_max_depth = max_depth;
+    }
+
+    /// Configure literal values that must not escape through notifications.
+    pub fn set_redaction_patterns(&mut self, patterns: Vec<String>) {
+        let secrets = self
+            .lsp_configs
+            .values()
+            .flat_map(|config| config.env.values())
+            .cloned()
+            .chain(patterns);
+        self.redaction_policy = RedactionPolicy::from_secrets(secrets);
     }
 
     /// Clear the expected-languages set (e.g. after background init failed).
@@ -661,6 +677,7 @@ impl TranslatorTemplate {
         let mut translator = Translator::new().with_extensions(self.extension_map.clone());
         translator.set_workspace_roots(vec![root]);
         translator.set_lsp_configs(self.lsp_configs.clone(), self.heuristics_max_depth);
+        translator.set_redaction_patterns(self.redaction_patterns.clone());
         translator
     }
 }
