@@ -2436,40 +2436,40 @@ pub fn spawn_project_actor_with_translator(
     let actor_sender = sender.clone();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
+    let event_sender = event_tx.clone();
+    let channels = ProjectActorChannels {
+        status_tx,
+        event_tx,
+    };
     let runtime = ProjectRuntime::new(translator);
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
-        status_tx,
-        event_tx.clone(),
+        channels,
         ProjectState::new(ProjectStatus::Starting, runtime.summary()),
         runtime,
     ));
     ProjectHandle {
         sender,
         status: status_rx,
-        events: event_tx,
+        events: event_sender,
     }
+}
+
+struct ProjectActorChannels {
+    status_tx: watch::Sender<ProjectStatus>,
+    event_tx: broadcast::Sender<ProjectEvent>,
 }
 
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     actor_sender: mpsc::Sender<ProjectRequest>,
-    status_tx: watch::Sender<ProjectStatus>,
-    event_tx: broadcast::Sender<ProjectEvent>,
+    channels: ProjectActorChannels,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
-        if handle_project_request(
-            request,
-            &actor_sender,
-            &status_tx,
-            &event_tx,
-            &mut state,
-            &mut runtime,
-        )
-        .await
+        if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
         {
             break;
         }
@@ -2506,25 +2506,23 @@ fn spawn_notification_forwarders(
 fn mark_project_ready(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
     actor_sender: &mpsc::Sender<ProjectRequest>,
-    status_tx: &watch::Sender<ProjectStatus>,
-    event_tx: &broadcast::Sender<ProjectEvent>,
+    channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
     state.sync_runtime(runtime);
-    publish_status(status_tx, event_tx, state, ProjectStatus::Ready);
+    publish_status(channels, state, ProjectStatus::Ready);
 }
 
 fn publish_status(
-    status_tx: &watch::Sender<ProjectStatus>,
-    event_tx: &broadcast::Sender<ProjectEvent>,
+    channels: &ProjectActorChannels,
     state: &mut ProjectState,
     status: ProjectStatus,
 ) {
     state.status = status;
-    let _ = status_tx.send(status);
-    let _ = event_tx.send(ProjectEvent::StatusChanged {
+    let _ = channels.status_tx.send(status);
+    let _ = channels.event_tx.send(ProjectEvent::StatusChanged {
         status,
         last_error: state.last_error.clone(),
     });
@@ -2537,8 +2535,7 @@ fn publish_status(
 async fn handle_project_request(
     request: ProjectRequest,
     actor_sender: &mpsc::Sender<ProjectRequest>,
-    status_tx: &watch::Sender<ProjectStatus>,
-    event_tx: &broadcast::Sender<ProjectEvent>,
+    channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) -> bool {
@@ -2550,14 +2547,13 @@ async fn handle_project_request(
         ProjectRequest::Activate { root, reply } => {
             runtime.begin_transition();
             state.last_error = None;
-            publish_status(status_tx, event_tx, state, ProjectStatus::Starting);
+            publish_status(channels, state, ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
-                        event_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2566,7 +2562,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error.to_string());
-                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
+                    publish_status(channels, state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
@@ -2574,14 +2570,13 @@ async fn handle_project_request(
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
             runtime.begin_transition();
             state.last_error = None;
-            publish_status(status_tx, event_tx, state, ProjectStatus::Starting);
+            publish_status(channels, state, ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
-                        event_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2590,7 +2585,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error.clone());
-                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
+                    publish_status(channels, state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2836,14 +2831,13 @@ async fn handle_project_request(
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             runtime.begin_transition();
             state.last_error = None;
-            publish_status(status_tx, event_tx, state, ProjectStatus::Restarting);
+            publish_status(channels, state, ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
-                        event_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2852,7 +2846,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error.clone());
-                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
+                    publish_status(channels, state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2907,28 +2901,29 @@ async fn handle_project_request(
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
                 state.last_error = Some("language server exited".to_string());
-                let _ = event_tx.send(ProjectEvent::ServerExited { generation });
-                publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
+                let _ = channels
+                    .event_tx
+                    .send(ProjectEvent::ServerExited { generation });
+                publish_status(channels, state, ProjectStatus::Failed);
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
             state.last_error = None;
-            publish_status(status_tx, event_tx, state, status);
+            publish_status(channels, state, status);
             let _ = reply.send(());
         }
         ProjectRequest::Restart { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
             state.last_error = None;
-            publish_status(status_tx, event_tx, state, ProjectStatus::Restarting);
+            publish_status(channels, state, ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
-                        event_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2937,7 +2932,7 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     state.last_error = Some(error);
-                    publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
+                    publish_status(channels, state, ProjectStatus::Failed);
                     let _ = reply.send(state.clone());
                 }
             }
@@ -2945,19 +2940,19 @@ async fn handle_project_request(
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
             state.last_error = Some(message);
-            publish_status(status_tx, event_tx, state, ProjectStatus::Failed);
+            publish_status(channels, state, ProjectStatus::Failed);
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
             state.last_error = None;
-            publish_status(status_tx, event_tx, state, ProjectStatus::Stopping);
+            publish_status(channels, state, ProjectStatus::Stopping);
             if let Err(error) = runtime.shutdown().await {
                 state.last_error = Some(error);
             }
             state.sync_runtime(runtime);
-            publish_status(status_tx, event_tx, state, ProjectStatus::Stopped);
+            publish_status(channels, state, ProjectStatus::Stopped);
             let _ = reply.send(());
             return true;
         }
