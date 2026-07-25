@@ -7026,6 +7026,14 @@ mod tests {
         assert_eq!(state.status(), ProjectStatus::Ready);
     }
 
+    #[test]
+    fn partial_activation_is_degraded() {
+        assert_eq!(
+            activation_status(ActivationHealth::Degraded, false),
+            ProjectStatus::Degraded
+        );
+    }
+
     #[tokio::test]
     async fn project_registry_serializes_restart_and_remove() {
         let root = TempDir::new().unwrap();
