@@ -7248,6 +7248,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_isolates_failed_lsp_recovery_between_projects() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        for root in [first_root.path(), second_root.path()] {
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+        }
+
+        let mut broken_server = crate::config::LspServerConfig::rust_analyzer();
+        broken_server.command = "/definitely/missing/mcpls-language-server".to_string();
+        broken_server.heuristics = None;
+        let registry = ProjectRegistry::new(4);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    first_id.clone(),
+                    CanonicalRoot::new(first_root.path()).unwrap(),
+                ),
+                Some(ProjectConfig {
+                    lsp_servers: Some(vec![broken_server]),
+                    heuristics_max_depth: Some(3),
+                    redaction_patterns: None,
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let first = registry.actor_for_project(&first_id).await.unwrap();
+        let second = registry.actor_for_project(&second_id).await.unwrap();
+        first.set_status(ProjectStatus::Ready).await.unwrap();
+        second.set_status(ProjectStatus::Ready).await.unwrap();
+        let mut second_events = second.subscribe_events();
+        first
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let first_state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = first.query().await.unwrap();
+                if state.status() == ProjectStatus::Failed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(first_state.status(), ProjectStatus::Failed);
+        assert_eq!(
+            registry.status(&second_id).await.unwrap().status(),
+            ProjectStatus::Ready
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(50), second_events.recv()).await,
+            Err(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn project_status_reports_failure_in_any_actor_group() {
         let primary_root = TempDir::new().unwrap();
         let secondary_root = TempDir::new().unwrap();

@@ -3066,6 +3066,76 @@ mod tests {
         assert!(translator.lsp_clients.is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_activation_enforces_rust_readiness_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let server = root.path().join("handshake-only-lsp.py");
+        fs::write(
+            &server,
+            r##"#!/usr/bin/env python3
+import json
+import sys
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def send_message(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    if message.get("method") == "initialize":
+        send_message({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}})
+    elif message.get("method") == "shutdown":
+        send_message({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&server, permissions).unwrap();
+
+        let mut config = LspServerConfig::rust_analyzer();
+        config.command = server.display().to_string();
+        config.timeout_seconds = 1;
+        config.heuristics = None;
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![config], Some(3));
+
+        let result = translator
+            .activate_project(root.path().to_path_buf())
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout(1))));
+        assert!(translator.lsp_servers.is_empty());
+        assert!(translator.lsp_clients.is_empty());
+    }
+
     #[test]
     fn test_register_server() {
         let translator = Translator::new();
