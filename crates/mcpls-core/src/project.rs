@@ -494,13 +494,12 @@ fn rust_project_compatibility_key(
                 has_toolchain |=
                     *relative == "rust-toolchain" || *relative == "rust-toolchain.toml";
                 has_manifest |= *relative == "Cargo.toml";
-                hasher.update(relative.as_bytes());
-                hasher.update((contents.len() as u64).to_le_bytes());
-                hasher.update(contents);
+                hash_compatibility_field(&mut hasher, relative.as_bytes());
+                hash_compatibility_field(&mut hasher, &contents);
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                hasher.update(relative.as_bytes());
-                hasher.update([0]);
+                hash_compatibility_field(&mut hasher, relative.as_bytes());
+                hash_compatibility_field(&mut hasher, &[]);
             }
             Err(_) => return None,
         }
