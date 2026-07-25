@@ -7595,6 +7595,41 @@ while True:
     }
 
     #[tokio::test]
+    async fn project_registry_shutdown_rejects_new_actor_requests_before_draining() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("shutdown-race").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let actor = registry.actor_for_project(&project_id).await.unwrap();
+        let mutation = registry.projects.read().await.get(&project_id).unwrap().actors[0]
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move { shutdown_registry.shutdown_all().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(matches!(
+            actor.set_status(ProjectStatus::Ready).await,
+            Err(ProjectActorError::Closed)
+        ));
+
+        drop(guard);
+        let report = shutdown.await.unwrap();
+        assert!(report.failed.is_empty());
+        assert!(report.stopped.contains(&project_id));
+    }
+
+    #[tokio::test]
     async fn project_registry_rejects_registration_after_shutdown_begins() {
         let registry = ProjectRegistry::new(2);
         registry.shutdown_all().await;
