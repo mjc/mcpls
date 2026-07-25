@@ -4973,6 +4973,33 @@ impl ProjectRegistry {
         Ok(capabilities)
     }
 
+    /// Return recent logs from a project's primary actor.
+    pub async fn server_logs(
+        &self,
+        id: &ProjectId,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectRegistryError> {
+        self.actor(id)
+            .await?
+            .server_logs(limit, min_level)
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Return recent messages from a project's primary actor.
+    pub async fn server_messages(
+        &self,
+        id: &ProjectId,
+        limit: usize,
+    ) -> Result<ServerMessagesResult, ProjectRegistryError> {
+        self.actor(id)
+            .await?
+            .server_messages(limit)
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
     /// List code actions with project-owned opaque references.
     ///
     /// # Errors
@@ -7080,6 +7107,50 @@ while True:
                 })
         );
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_retains_bounded_history_after_removal() {
+        let root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("removed-history").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "window/logMessage",
+                    Some(serde_json::json!({"type": 1, "message": "retained log"})),
+                ),
+            })
+            .await
+            .unwrap();
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "window/showMessage",
+                    Some(serde_json::json!({"type": 2, "message": "retained message"})),
+                ),
+            })
+            .await
+            .unwrap();
+
+        registry.remove(project_id.clone()).await.unwrap();
+
+        let logs = registry.server_logs(&project_id, 10, None).await.unwrap();
+        assert_eq!(logs.logs[0].message, "retained log");
+        let messages = registry.server_messages(&project_id, 10).await.unwrap();
+        assert_eq!(messages.messages[0].message, "retained message");
     }
 
     #[tokio::test]
