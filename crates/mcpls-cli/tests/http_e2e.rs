@@ -714,21 +714,70 @@ fn real_rust_analyzer_http_sessions_and_safe_refactor_e2e() {
         );
         return;
     };
-    let fixture = RealRaHttpFixture::new(&rust_analyzer);
-    let mut daemon = HttpDaemon::spawn(&fixture.config);
-    let mut first = HttpClient::new(daemon.address);
-    let mut second = HttpClient::new(daemon.address);
-    first.initialize();
-    second.initialize();
+    let mut harness = RealRaHttpHarness::new(&rust_analyzer);
+    harness.register_projects();
+    harness.assert_navigation();
+    harness.apply_rename_and_format();
+    harness.apply_code_action_and_restart();
+    harness.shutdown();
+}
 
-    register_real_ra_projects(&mut first, &mut second, &fixture);
-    let target_line = find_line(&fixture.functions_b, "pub fn only_b(");
-    assert_real_ra_navigation(&mut first, &mut second, &fixture, target_line);
-    apply_real_ra_rename_and_format(&mut first, &fixture, target_line);
-    apply_real_ra_code_action_and_restart(&mut first, &mut second, &fixture, target_line);
+struct RealRaHttpHarness {
+    fixture: RealRaHttpFixture,
+    daemon: HttpDaemon,
+    first: HttpClient,
+    second: HttpClient,
+}
 
-    daemon.terminate();
-    assert!(daemon.child.try_wait().unwrap().is_some());
+impl RealRaHttpHarness {
+    fn new(rust_analyzer: &Path) -> Self {
+        let fixture = RealRaHttpFixture::new(rust_analyzer);
+        let daemon = HttpDaemon::spawn(&fixture.config);
+        let mut first = HttpClient::new(daemon.address);
+        let mut second = HttpClient::new(daemon.address);
+        first.initialize();
+        second.initialize();
+        Self {
+            fixture,
+            daemon,
+            first,
+            second,
+        }
+    }
+
+    fn register_projects(&mut self) {
+        register_real_ra_projects(&mut self.first, &mut self.second, &self.fixture);
+    }
+
+    fn assert_navigation(&mut self) {
+        let target_line = find_line(&self.fixture.functions_b, "pub fn only_b(");
+        assert_real_ra_navigation(
+            &mut self.first,
+            &mut self.second,
+            &self.fixture,
+            target_line,
+        );
+    }
+
+    fn apply_rename_and_format(&mut self) {
+        let target_line = find_line(&self.fixture.functions_b, "pub fn only_b(");
+        apply_real_ra_rename_and_format(&mut self.first, &self.fixture, target_line);
+    }
+
+    fn apply_code_action_and_restart(&mut self) {
+        let target_line = find_line(&self.fixture.functions_b, "pub fn renamed_b(");
+        apply_real_ra_code_action_and_restart(
+            &mut self.first,
+            &mut self.second,
+            &self.fixture,
+            target_line,
+        );
+    }
+
+    fn shutdown(&mut self) {
+        self.daemon.terminate();
+        assert!(self.daemon.child.try_wait().unwrap().is_some());
+    }
 }
 
 fn register_real_ra_projects(
