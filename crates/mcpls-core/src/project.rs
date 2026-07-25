@@ -3780,6 +3780,20 @@ impl ProjectRemovalSnapshot {
             actor.accept_new_work();
         }
     }
+
+    async fn shutdown(&self, project_id: &ProjectId) -> Result<(), ProjectRegistryError> {
+        for actor in &self.actors {
+            actor
+                .publish_event(ProjectEvent::ProjectRemoved {
+                    project_id: project_id.clone(),
+                    root: self.root.clone(),
+                })
+                .await
+                .map_err(ProjectRegistryError::from)?;
+            actor.shutdown().await.map_err(ProjectRegistryError::from)?;
+        }
+        Ok(())
+    }
 }
 
 impl ProjectEntry {
@@ -4111,24 +4125,6 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
     tokio::time::timeout(timeout, actor.shutdown())
         .await
         .map_or(ShutdownAttempt::TimedOut, ShutdownAttempt::Completed)
-}
-
-async fn shutdown_project_actors(
-    project_id: &ProjectId,
-    root: &Path,
-    actors: &[ProjectHandle],
-) -> Result<(), ProjectRegistryError> {
-    for actor in actors {
-        actor
-            .publish_event(ProjectEvent::ProjectRemoved {
-                project_id: project_id.clone(),
-                root: root.to_path_buf(),
-            })
-            .await
-            .map_err(ProjectRegistryError::from)?;
-        actor.shutdown().await.map_err(ProjectRegistryError::from)?;
-    }
-    Ok(())
 }
 
 impl ProjectRegistry {
@@ -4637,7 +4633,7 @@ impl ProjectRegistry {
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
         let removal = self.begin_project_removal(&id).await?;
         let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
-        if let Err(error) = shutdown_project_actors(&id, &removal.root, &removal.actors).await {
+        if let Err(error) = removal.shutdown(&id).await {
             removal.accept_new_work();
             self.lifecycle.end_removal(&id).await;
             return Err(error);
