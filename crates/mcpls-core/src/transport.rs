@@ -10,6 +10,12 @@
 //! binding. The default entry point [`crate::serve`] always uses
 //! [`Transport::Stdio`].
 
+#[cfg(feature = "transport-http")]
+use std::sync::Arc;
+
+#[cfg(feature = "transport-http")]
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
 /// The transport over which the MCP server communicates with clients.
 ///
 /// # Examples
@@ -38,6 +44,44 @@ pub enum Transport {
     /// stdio. Only available when the `transport-http` feature is enabled.
     #[cfg(feature = "transport-http")]
     Http(HttpConfig),
+}
+
+#[cfg(feature = "transport-http")]
+pub(crate) type SessionManagerHandle = Option<Arc<LocalSessionManager>>;
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) type SessionManagerHandle = ();
+
+#[cfg(feature = "transport-http")]
+pub(crate) const fn no_session_manager() -> SessionManagerHandle {
+    None
+}
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) const fn no_session_manager() -> SessionManagerHandle {}
+
+#[cfg(feature = "transport-http")]
+pub(crate) fn session_manager_for(transport: &Transport) -> SessionManagerHandle {
+    match transport {
+        Transport::Stdio => None,
+        Transport::Http(_) => Some(Arc::new(LocalSessionManager::default())),
+    }
+}
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) const fn session_manager_for(_transport: &Transport) -> SessionManagerHandle {}
+
+#[cfg(feature = "transport-http")]
+pub(crate) async fn session_count(manager: &SessionManagerHandle) -> usize {
+    match manager {
+        Some(manager) => manager.sessions.read().await.len(),
+        None => 0,
+    }
+}
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) async fn session_count(_manager: &SessionManagerHandle) -> usize {
+    0
 }
 
 /// Safe, non-secret transport details included in daemon status snapshots.
@@ -163,10 +207,8 @@ pub(crate) async fn run_stdio(
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
+    session_manager: SessionManagerHandle,
 ) -> Result<(), crate::Error> {
-    use std::sync::Arc;
-
-    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
     };
@@ -174,7 +216,12 @@ pub(crate) async fn run_http(
 
     cfg.validate()?;
 
-    let session_manager = Arc::new(LocalSessionManager::default());
+    let Some(session_manager) = session_manager else {
+        return Err(crate::Error::McpServer(
+            "HTTP transport requires a session manager".to_string(),
+        ));
+    };
+
     let cancel = CancellationToken::new();
 
     let mcp_for_factory = mcp_server;
@@ -245,7 +292,7 @@ mod tests {
     mod http_tests {
         use std::net::SocketAddr;
 
-        use super::super::{HttpConfig, Transport};
+        use super::super::{HttpConfig, LocalSessionManager, Transport};
 
         #[test]
         fn test_http_config_fields() {
@@ -315,7 +362,8 @@ mod tests {
                 path: "/mcp".to_string(),
             };
 
-            let server_task = tokio::spawn(super::super::run_http(server, cfg));
+            let session_manager = Some(Arc::new(LocalSessionManager::default()));
+            let server_task = tokio::spawn(super::super::run_http(server, cfg, session_manager));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             // A successful TCP connect proves the listener is up.
@@ -351,7 +399,8 @@ mod tests {
                 path: "/mcp".to_string(),
             };
 
-            let result = super::super::run_http(server, cfg).await;
+            let session_manager = Some(Arc::new(LocalSessionManager::default()));
+            let result = super::super::run_http(server, cfg, session_manager).await;
             assert!(
                 result.is_err(),
                 "run_http should fail when port is occupied"

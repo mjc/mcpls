@@ -14,7 +14,7 @@ use crate::bridge::{ResourceSubscriptions, Translator};
 use crate::edit_plan::PlanId;
 use crate::mcp::session::SessionEventSink;
 use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
-use crate::transport::TransportSnapshot;
+use crate::transport::{self, SessionManagerHandle, TransportSnapshot};
 
 /// Shared context for all tool handlers.
 ///
@@ -30,6 +30,8 @@ pub struct HandlerContext {
     pub(crate) event_sink: Arc<SessionEventSink>,
     /// Safe transport details shared by all session snapshots.
     pub(crate) transport: Arc<TransportSnapshot>,
+    /// Shared HTTP session store used for non-blocking status counts.
+    pub(crate) session_manager: SessionManagerHandle,
     /// Monotonic daemon start point shared by session clones.
     pub(crate) started_at: Instant,
     /// Edit plans previewed by this MCP session.
@@ -63,7 +65,12 @@ impl HandlerContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
-        Self::with_subscriptions(subscriptions, project_registry, TransportSnapshot::stdio())
+        Self::with_subscriptions(
+            subscriptions,
+            project_registry,
+            TransportSnapshot::stdio(),
+            transport::no_session_manager(),
+        )
     }
 
     /// Create a handler context with explicit daemon transport metadata.
@@ -72,14 +79,16 @@ impl HandlerContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
         transport: TransportSnapshot,
+        session_manager: SessionManagerHandle,
     ) -> Self {
-        Self::with_subscriptions(subscriptions, project_registry, transport)
+        Self::with_subscriptions(subscriptions, project_registry, transport, session_manager)
     }
 
     fn with_subscriptions(
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
         transport: TransportSnapshot,
+        session_manager: SessionManagerHandle,
     ) -> Self {
         let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
@@ -87,6 +96,7 @@ impl HandlerContext {
             project_registry,
             event_sink,
             transport: Arc::new(transport),
+            session_manager,
             started_at: Instant::now(),
             owned_plan_ids: Mutex::new(HashSet::new()),
         }
@@ -111,8 +121,14 @@ impl HandlerContext {
             self.project_registry.clone(),
         );
         context.transport = Arc::clone(&self.transport);
+        context.session_manager.clone_from(&self.session_manager);
         context.started_at = self.started_at;
         context
+    }
+
+    /// Return the number of active HTTP sessions without touching project actors.
+    pub(crate) async fn session_count(&self) -> usize {
+        transport::session_count(&self.session_manager).await
     }
 
     /// Return the actor owning a path or the registry's explicit routing error.

@@ -337,10 +337,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 
     info!("Starting MCP server with rmcp...");
     let transport_snapshot = transport::TransportSnapshot::from(&transport);
+    let session_manager = transport::session_manager_for(&transport);
     let mcp_server = mcp::McplsServer::from_registry_with_transport(
         Arc::clone(&subscriptions),
         project_registry.clone(),
         transport_snapshot,
+        session_manager.clone(),
     );
     info!("MCPLS server initialized successfully");
 
@@ -350,7 +352,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             run_stdio(mcp_server, &peer_cell).await
         }
         #[cfg(feature = "transport-http")]
-        Transport::Http(cfg) => run_http(mcp_server, cfg).await,
+        Transport::Http(cfg) => run_http(mcp_server, cfg, session_manager).await,
     };
 
     let shutdown = project_registry.shutdown_all().await;

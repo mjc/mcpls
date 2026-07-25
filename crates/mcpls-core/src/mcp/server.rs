@@ -41,7 +41,7 @@ use crate::project::{
     ProjectId, ProjectIdentity, ProjectRegistry, ProjectServerCapability, ProjectState,
     ProjectStatusCounts, ProjectStatusSummary,
 };
-use crate::transport::TransportSnapshot;
+use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
@@ -106,6 +106,7 @@ struct DaemonSnapshot {
     project_summaries: Vec<ProjectStatusSummary>,
     persistence: DaemonPersistenceSnapshot,
     transport: TransportSnapshot,
+    session_count: usize,
     shutting_down: bool,
 }
 
@@ -268,6 +269,7 @@ impl McplsServer {
                 configured: self.context.project_registry.persistence_configured(),
             },
             transport: (*self.context.transport).clone(),
+            session_count: self.context.session_count().await,
             shutting_down: self.context.project_registry.is_shutting_down(),
         }
     }
@@ -458,12 +460,14 @@ impl McplsServer {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
         transport: TransportSnapshot,
+        session_manager: SessionManagerHandle,
     ) -> Self {
         Self {
             context: Arc::new(HandlerContext::from_registry_with_transport(
                 subscriptions,
                 project_registry,
                 transport,
+                session_manager,
             )),
         }
     }
@@ -587,6 +591,7 @@ impl McplsServer {
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
+            "session_count": snapshot.session_count,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -606,6 +611,7 @@ impl McplsServer {
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
+            "session_count": snapshot.session_count,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -1875,6 +1881,7 @@ mod tests {
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(status["persistence"]["configured"], false);
         assert_eq!(status["transport"]["mode"], "stdio");
+        assert_eq!(status["session_count"], 0);
         assert_eq!(status["projects"]["starting"], 1);
         assert_eq!(status["actor_groups"], 1);
         assert_eq!(status["project_summaries"][0]["project_id"], "health");
