@@ -442,7 +442,7 @@ impl Translator {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let result = LspServer::spawn_batch(&server_configs).await;
+        let mut result = LspServer::spawn_batch(&server_configs).await;
 
         if result.all_failed() {
             self.clear_expected_languages();
@@ -454,6 +454,15 @@ impl Translator {
                 .join(", ");
             return Err(Error::LspInitFailed { message });
         }
+
+        let servers = match self.wait_for_server_readiness(result.servers).await {
+            Ok(servers) => servers,
+            Err(error) => {
+                self.clear_expected_languages();
+                return Err(error);
+            }
+        };
+        result.servers = servers;
 
         let health = if result.partial_success() {
             ActivationHealth::Degraded
@@ -473,6 +482,34 @@ impl Translator {
         self.reopen_tracked_documents().await?;
         self.clear_expected_languages();
         Ok(ProjectActivation::new(notification_receivers, health))
+    }
+
+    async fn wait_for_server_readiness(
+        &self,
+        servers: HashMap<String, LspServer>,
+    ) -> Result<HashMap<String, LspServer>> {
+        let mut ready = HashMap::with_capacity(servers.len());
+        for (language_id, server) in servers {
+            let timeout = self
+                .lsp_configs
+                .get(&language_id)
+                .map_or(Duration::from_secs(30), |config| {
+                    Duration::from_secs(config.timeout_seconds)
+                });
+            if let Err(error) = server.wait_until_quiescent(timeout).await {
+                let mut remaining = ready;
+                remaining.insert(language_id, server);
+                if let Err(shutdown_error) = shutdown_servers(remaining).await {
+                    tracing::warn!(
+                        %shutdown_error,
+                        "failed to clean up LSP servers after readiness failure"
+                    );
+                }
+                return Err(error);
+            }
+            ready.insert(language_id, server);
+        }
+        Ok(ready)
     }
 
     fn same_workspace_roots(existing: &[PathBuf], requested: &[PathBuf]) -> bool {
@@ -3127,9 +3164,7 @@ while True:
         let mut translator = Translator::new();
         translator.set_lsp_configs(vec![config], Some(3));
 
-        let result = translator
-            .activate_project(root.path().to_path_buf())
-            .await;
+        let result = translator.activate_project(root.path().to_path_buf()).await;
 
         assert!(matches!(result, Err(Error::Timeout(1))));
         assert!(translator.lsp_servers.is_empty());
