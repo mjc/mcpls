@@ -507,37 +507,42 @@ fn rust_project_compatibility_key(
     }
 
     if let Some(template) = translator_template {
-        let config = template.rust_server_config()?;
-        hasher.update(b"rust-server-config-v1");
-        hash_compatibility_field(&mut hasher, config.language_id.as_bytes());
-        hash_compatibility_field(&mut hasher, config.command.as_bytes());
-        for argument in &config.args {
-            hash_compatibility_field(&mut hasher, argument.as_bytes());
-        }
-        let mut environment = config.env.iter().collect::<Vec<_>>();
-        environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        for (name, value) in environment {
-            hash_compatibility_field(&mut hasher, name.as_bytes());
-            hash_compatibility_field(&mut hasher, value.as_bytes());
-        }
-        let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
-        hash_compatibility_field(&mut hasher, &initialization_options);
-        hash_compatibility_field(&mut hasher, &config.timeout_seconds.to_le_bytes());
-        if let Some(heuristics) = &config.heuristics {
-            for marker in &heuristics.project_markers {
-                hash_compatibility_field(&mut hasher, marker.as_bytes());
-            }
-        }
-        hash_compatibility_field(
-            &mut hasher,
-            &template
-                .heuristics_max_depth()
-                .unwrap_or_default()
-                .to_le_bytes(),
-        );
+        hash_rust_server_config(&mut hasher, template)?;
     }
 
     (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
+}
+
+fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -> Option<()> {
+    let config = template.rust_server_config()?;
+    hasher.update(b"rust-server-config-v1");
+    hash_compatibility_field(hasher, config.language_id.as_bytes());
+    hash_compatibility_field(hasher, config.command.as_bytes());
+    for argument in &config.args {
+        hash_compatibility_field(hasher, argument.as_bytes());
+    }
+    let mut environment = config.env.iter().collect::<Vec<_>>();
+    environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (name, value) in environment {
+        hash_compatibility_field(hasher, name.as_bytes());
+        hash_compatibility_field(hasher, value.as_bytes());
+    }
+    let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
+    hash_compatibility_field(hasher, &initialization_options);
+    hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
+    if let Some(heuristics) = &config.heuristics {
+        for marker in &heuristics.project_markers {
+            hash_compatibility_field(hasher, marker.as_bytes());
+        }
+    }
+    hash_compatibility_field(
+        hasher,
+        &template
+            .heuristics_max_depth()
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    Some(())
 }
 
 fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
