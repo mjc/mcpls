@@ -3407,30 +3407,30 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
 }
 
 impl ProjectRegistry {
-    /// Create an empty registry with a bounded actor queue capacity.
-    #[must_use]
-    pub fn new(actor_capacity: usize) -> Self {
+    fn with_template(
+        actor_capacity: usize,
+        translator_template: Option<TranslatorTemplate>,
+    ) -> Self {
         Self {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
             actor_capacity: actor_capacity.max(1),
-            translator_template: None,
+            translator_template: translator_template.map(std::sync::Arc::new),
             persistence: None,
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
             shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
         }
     }
 
+    /// Create an empty registry with a bounded actor queue capacity.
+    #[must_use]
+    pub fn new(actor_capacity: usize) -> Self {
+        Self::with_template(actor_capacity, None)
+    }
+
     /// Create a registry whose actors inherit only the daemon translator's configuration.
     #[must_use]
     pub fn with_translator_template(actor_capacity: usize, template: TranslatorTemplate) -> Self {
-        Self {
-            projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
-            actor_capacity: actor_capacity.max(1),
-            translator_template: Some(std::sync::Arc::new(template)),
-            persistence: None,
-            lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
-            shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
-        }
+        Self::with_template(actor_capacity, Some(template))
     }
 
     /// Set the maximum time allowed for each actor shutdown request.
