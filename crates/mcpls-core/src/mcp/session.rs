@@ -14,14 +14,21 @@ use crate::project::{ProjectEvent, ProjectHandle, ProjectId};
 
 /// Convert an LSP file URI from a diagnostics event into the MCP resource URI
 /// used by `resources/subscribe`.
-pub(crate) fn diagnostics_resource_uri(uri: &str) -> Option<String> {
+pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
     let uri = uri.parse().ok()?;
     let path = uri_to_path(&uri)?;
     make_uri(&path).ok()
 }
 
+fn event_resource_uri(event: &ProjectEvent) -> Option<String> {
+    match event {
+        ProjectEvent::DiagnosticsUpdated { uri, .. } => diagnostics_resource_uri(uri),
+        ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => None,
+    }
+}
+
 /// Owns event-forwarding tasks for one MCP session.
-pub(crate) struct SessionEventSink {
+pub struct SessionEventSink {
     subscriptions: Arc<ResourceSubscriptions>,
     tasks: Mutex<HashMap<ProjectId, JoinHandle<()>>>,
 }
@@ -56,8 +63,8 @@ impl SessionEventSink {
         let task = tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(ProjectEvent::DiagnosticsUpdated { uri, .. }) => {
-                        let Some(resource_uri) = diagnostics_resource_uri(&uri) else {
+                    Ok(event) => {
+                        let Some(resource_uri) = event_resource_uri(&event) else {
                             continue;
                         };
                         if !subscriptions.contains(&resource_uri).await {
@@ -73,9 +80,8 @@ impl SessionEventSink {
                             break;
                         }
                     }
-                    Ok(ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. }) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "session event sink lagged; polling can resync")
+                        tracing::warn!(skipped, "session event sink lagged; polling can resync");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -97,13 +103,25 @@ impl Drop for SessionEventSink {
 
 #[cfg(test)]
 mod tests {
-    use super::diagnostics_resource_uri;
+    use super::{diagnostics_resource_uri, event_resource_uri};
+    use crate::project::{ProjectEvent, ProjectStatus};
 
     #[test]
     fn diagnostics_events_map_to_subscribable_resource_uris() {
         assert_eq!(
             diagnostics_resource_uri("file:///workspace/src/main.rs"),
             Some("lsp-diagnostics:///workspace/src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_do_not_map_to_file_resources() {
+        assert_eq!(
+            event_resource_uri(&ProjectEvent::StatusChanged {
+                status: ProjectStatus::Ready,
+                last_error: None,
+            }),
+            None
         );
     }
 }
