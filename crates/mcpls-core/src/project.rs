@@ -2607,6 +2607,10 @@ impl ProjectRuntime {
         self.generation == generation
     }
 
+    fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
+        self.translator.has_active_workspace_roots(roots)
+    }
+
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
         self.edit_plans
             .insert(plan)
@@ -3389,6 +3393,13 @@ async fn handle_project_request(
             let _ = reply.send(state.clone());
         }
         ProjectRequest::Activate { root, reply } => {
+            if matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
+                && runtime.has_active_workspace_roots(std::slice::from_ref(&root))
+            {
+                state.sync_runtime(runtime);
+                let _ = reply.send(Ok(state.clone()));
+                return false;
+            }
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
@@ -3412,6 +3423,13 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
+            if matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
+                && runtime.has_active_workspace_roots(&roots)
+            {
+                state.sync_runtime(runtime);
+                let _ = reply.send(Ok(state.clone()));
+                return false;
+            }
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);

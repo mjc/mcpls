@@ -238,6 +238,19 @@ impl Translator {
         languages
     }
 
+    /// Return whether the active servers already own exactly these roots.
+    #[must_use]
+    pub fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
+        !self.lsp_clients.is_empty()
+            && self.expected_languages.is_empty()
+            && Self::same_workspace_roots(&self.workspace_roots, roots)
+            && self.lsp_clients.keys().all(|language_id| {
+                self.lsp_roots
+                    .get(language_id)
+                    .is_some_and(|registered| Self::same_workspace_roots(registered, roots))
+            })
+    }
+
     /// Return negotiated capabilities for active language servers.
     ///
     /// An optional language ID narrows the result without exposing command or
