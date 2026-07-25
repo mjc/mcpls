@@ -1109,6 +1109,10 @@ impl ProjectRequestSender {
         self.accepting.store(false, Ordering::Release);
     }
 
+    fn accept_new_work(&self) {
+        self.accepting.store(true, Ordering::Release);
+    }
+
     async fn send(
         &self,
         request: ProjectRequest,
@@ -1422,6 +1426,10 @@ impl ProjectHandle {
 
     fn reject_new_work(&self) {
         self.sender.reject_new_work();
+    }
+
+    fn accept_new_work(&self) {
+        self.sender.accept_new_work();
     }
 
     async fn publish_event(&self, event: ProjectEvent) -> Result<(), ProjectActorError> {
@@ -3766,6 +3774,12 @@ impl ProjectRemovalSnapshot {
             actor.reject_new_work();
         }
     }
+
+    fn accept_new_work(&self) {
+        for actor in &self.actors {
+            actor.accept_new_work();
+        }
+    }
 }
 
 impl ProjectEntry {
@@ -4102,7 +4116,7 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
 async fn shutdown_project_actors(
     project_id: &ProjectId,
     root: &Path,
-    actors: Vec<ProjectHandle>,
+    actors: &[ProjectHandle],
 ) -> Result<(), ProjectRegistryError> {
     for actor in actors {
         actor
@@ -4622,8 +4636,9 @@ impl ProjectRegistry {
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
         let removal = self.begin_project_removal(&id).await?;
-        let _mutation_guards = self.lock_mutation_gates(removal.mutations).await;
-        if let Err(error) = shutdown_project_actors(&id, &removal.root, removal.actors).await {
+        let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
+        if let Err(error) = shutdown_project_actors(&id, &removal.root, &removal.actors).await {
+            removal.accept_new_work();
             self.lifecycle.end_removal(&id).await;
             return Err(error);
         }
@@ -6542,6 +6557,55 @@ mod tests {
         ));
         assert_eq!(registry.list().await, vec![identity]);
         assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registry_reopens_work_after_failed_actor_shutdown() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("retry-removal").unwrap();
+        let identity =
+            ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let (sender, mut receiver) = mpsc::channel(2);
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    ProjectRequest::PublishEvent { reply, .. }
+                    | ProjectRequest::SetStatus { reply, .. } => {
+                        let _ = reply.send(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (events, _) = broadcast::channel(1);
+        let actor = ProjectHandle {
+            sender: ProjectRequestSender::new(sender),
+            status,
+            events,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
+        registry.projects.write().await.insert(
+            project_id.clone(),
+            ProjectEntry {
+                identity,
+                actors: vec![ProjectActorEntry {
+                    actor: actor.clone(),
+                    mutation: std::sync::Arc::new(Mutex::new(())),
+                    compatibility_key: None,
+                    translator_template: None,
+                    roots: vec![CanonicalRoot::new(root.path()).unwrap()],
+                }],
+                config: None,
+            },
+        );
+
+        assert!(matches!(
+            registry.remove(project_id).await,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Cancelled))
+        ));
+        assert!(actor.set_status(ProjectStatus::Ready).await.is_ok());
     }
 
     #[tokio::test]
