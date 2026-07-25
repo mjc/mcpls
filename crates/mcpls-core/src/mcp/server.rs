@@ -130,9 +130,14 @@ fn preview_artifact_json(result: &PreviewArtifact, project_id: &str) -> serde_js
 }
 
 /// MCP server that exposes LSP capabilities as tools.
-#[derive(Clone)]
 pub struct McplsServer {
     context: Arc<HandlerContext>,
+}
+
+impl Clone for McplsServer {
+    fn clone(&self) -> Self {
+        self.for_session()
+    }
 }
 
 #[tool_router]
@@ -1256,7 +1261,7 @@ mod tests {
     #[tokio::test]
     async fn http_session_clones_have_independent_subscriptions() {
         let server = create_test_server();
-        let session = server.for_session();
+        let session = server.clone();
         let uri = "lsp-diagnostics:///tmp/session.rs".to_string();
 
         server
