@@ -17,7 +17,10 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
-use super::session::{SessionResource, parse_session_resource_uri, project_status_resource_uri};
+use super::session::{
+    SessionResource, parse_session_resource_uri, project_events_resource_uri,
+    project_status_resource_uri,
+};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
@@ -34,8 +37,8 @@ use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
-    CanonicalRoot, GitRepositoryIdentity, ProjectHandle, ProjectId, ProjectIdentity,
-    ProjectRegistry, ProjectState,
+    CanonicalRoot, GitRepositoryIdentity, ProjectEvent, ProjectEventRecord, ProjectEventSnapshot,
+    ProjectHandle, ProjectId, ProjectIdentity, ProjectRegistry, ProjectState,
 };
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
@@ -87,6 +90,46 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
+    })
+}
+
+fn project_event_json(record: &ProjectEventRecord) -> serde_json::Value {
+    let event = match record.event() {
+        ProjectEvent::StatusChanged { status, last_error } => serde_json::json!({
+            "kind": "status_changed",
+            "status": format!("{status:?}"),
+            "last_error": last_error,
+        }),
+        ProjectEvent::ServerExited { generation } => serde_json::json!({
+            "kind": "server_exited",
+            "generation": generation,
+        }),
+        ProjectEvent::DiagnosticsUpdated {
+            uri,
+            version,
+            diagnostic_count,
+        } => serde_json::json!({
+            "kind": "diagnostics_updated",
+            "uri": uri,
+            "version": version,
+            "diagnostic_count": diagnostic_count,
+        }),
+    };
+    serde_json::json!({
+        "sequence": record.sequence(),
+        "event": event,
+    })
+}
+
+fn project_events_json(
+    project_id: &ProjectId,
+    snapshot: &ProjectEventSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id.as_str(),
+        "next_cursor": snapshot.next_sequence(),
+        "resync_required": snapshot.resync_required(),
+        "events": snapshot.events().iter().map(project_event_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1157,21 +1200,23 @@ impl ServerHandler for McplsServer {
             })
             .collect();
 
-        resources.extend(
-            self.context
-                .project_registry
-                .list()
-                .await
-                .into_iter()
-                .map(|identity| {
-                    let project_id = identity.id().clone();
-                    let uri = project_status_resource_uri(&project_id);
-                    let raw = RawResource::new(uri, format!("{project_id}:status"))
-                        .with_mime_type("application/json")
-                        .with_description(format!("Lifecycle status for project {project_id}"));
-                    rmcp::model::Annotated::new(raw, None)
-                }),
-        );
+        let projects = self.context.project_registry.list().await;
+        resources.extend(projects.iter().map(|identity| {
+            let project_id = identity.id().clone();
+            let uri = project_status_resource_uri(&project_id);
+            let raw = RawResource::new(uri, format!("{project_id}:status"))
+                .with_mime_type("application/json")
+                .with_description(format!("Lifecycle status for project {project_id}"));
+            rmcp::model::Annotated::new(raw, None)
+        }));
+        resources.extend(projects.iter().map(|identity| {
+            let project_id = identity.id().clone();
+            let uri = project_events_resource_uri(&project_id);
+            let raw = RawResource::new(uri, format!("{project_id}:events"))
+                .with_mime_type("application/json")
+                .with_description(format!("Ordered project events for {project_id}"));
+            rmcp::model::Annotated::new(raw, None)
+        }));
 
         Ok(ListResourcesResult::with_all_items(resources))
     }
@@ -1183,27 +1228,41 @@ impl ServerHandler for McplsServer {
     ) -> Result<ReadResourceResult, McpError> {
         let resource = parse_session_resource_uri(&request.uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let SessionResource::Diagnostics(path) = resource else {
-            let SessionResource::ProjectStatus(project_id) = resource else {
-                unreachable!("session resource parser returned an unknown scope");
-            };
-            let identity = self
-                .context
-                .project_registry
-                .identity(&project_id)
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-            let state = self
-                .context
-                .project_registry
-                .status(&project_id)
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-            let json = encode_json(&project_state_json(&identity, &state))?;
-            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                json,
-                request.uri,
-            )]));
+        let path = match resource {
+            SessionResource::ProjectStatus(project_id) => {
+                let identity = self
+                    .context
+                    .project_registry
+                    .identity(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let state = self
+                    .context
+                    .project_registry
+                    .status(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let json = encode_json(&project_state_json(&identity, &state))?;
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    json,
+                    request.uri,
+                )]));
+            }
+            SessionResource::ProjectEvents { project_id, cursor } => {
+                let actor = self
+                    .context
+                    .project_registry
+                    .actor_for_project(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let snapshot = actor.event_snapshot(cursor);
+                let json = encode_json(&project_events_json(&project_id, &snapshot))?;
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    json,
+                    request.uri,
+                )]));
+            }
+            SessionResource::Diagnostics(path) => path,
         };
 
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
@@ -1238,20 +1297,35 @@ impl ServerHandler for McplsServer {
     ) -> Result<(), McpError> {
         let resource = parse_session_resource_uri(&request.uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        if let SessionResource::ProjectStatus(project_id) = resource {
-            let actor = self
-                .context
-                .project_registry
-                .actor_for_project(&project_id)
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-            self.attach_subscription(project_id, &actor, request.uri, context.peer)
+        let path = match resource {
+            SessionResource::ProjectStatus(project_id) => {
+                let actor = self
+                    .context
+                    .project_registry
+                    .actor_for_project(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                self.attach_subscription(project_id, &actor, request.uri, context.peer)
+                    .await?;
+                return Ok(());
+            }
+            SessionResource::ProjectEvents { project_id, .. } => {
+                let actor = self
+                    .context
+                    .project_registry
+                    .actor_for_project(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                self.attach_subscription(
+                    project_id.clone(),
+                    &actor,
+                    project_events_resource_uri(&project_id),
+                    context.peer,
+                )
                 .await?;
-            return Ok(());
-        }
-
-        let SessionResource::Diagnostics(path) = resource else {
-            unreachable!("project status resource handled above");
+                return Ok(());
+            }
+            SessionResource::Diagnostics(path) => path,
         };
 
         let (project_id, actor) = self

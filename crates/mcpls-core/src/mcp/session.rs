@@ -15,6 +15,7 @@ use crate::bridge::{ResourceSubscriptions, uri_to_path};
 use crate::project::{ProjectEvent, ProjectHandle, ProjectId};
 
 const PROJECT_STATUS_PREFIX: &str = "mcpls-project-status:///";
+const PROJECT_EVENTS_PREFIX: &str = "mcpls-project-events:///";
 
 /// Encode a project identity as a subscribable MCP status resource URI.
 pub fn project_status_resource_uri(project_id: &ProjectId) -> String {
@@ -28,6 +29,29 @@ pub fn parse_project_status_resource_uri(uri: &str) -> Option<ProjectId> {
         .and_then(|value| ProjectId::new(value.to_string()).ok())
 }
 
+/// Encode a project identity as a bounded event-history resource URI.
+pub fn project_events_resource_uri(project_id: &ProjectId) -> String {
+    format!("{PROJECT_EVENTS_PREFIX}{project_id}")
+}
+
+/// Decode a project event resource URI and optional polling cursor.
+pub fn parse_project_events_resource_uri(uri: &str) -> Option<(ProjectId, Option<u64>)> {
+    let value = uri.strip_prefix(PROJECT_EVENTS_PREFIX)?;
+    let (id, query) = value
+        .split_once('?')
+        .map_or((value, None), |(id, query)| (id, Some(query)));
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    let cursor = query
+        .and_then(|query| query.strip_prefix("since="))
+        .and_then(|value| value.parse().ok());
+    if query.is_some() && cursor.is_none() {
+        return None;
+    }
+    Some((ProjectId::new(id.to_string()).ok()?, cursor))
+}
+
 /// Resource scopes understood by a session subscription.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionResource {
@@ -35,12 +59,22 @@ pub enum SessionResource {
     Diagnostics(PathBuf),
     /// Lifecycle state for one registered project.
     ProjectStatus(ProjectId),
+    /// Bounded ordered event history for one project and optional cursor.
+    ProjectEvents {
+        /// Stable project identity.
+        project_id: ProjectId,
+        /// Return only events newer than this cursor.
+        cursor: Option<u64>,
+    },
 }
 
 /// Parse either a diagnostics or project-status resource URI.
 pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, ResourceUriError> {
     if let Some(project_id) = parse_project_status_resource_uri(uri) {
         return Ok(SessionResource::ProjectStatus(project_id));
+    }
+    if let Some((project_id, cursor)) = parse_project_events_resource_uri(uri) {
+        return Ok(SessionResource::ProjectEvents { project_id, cursor });
     }
     parse_uri(uri).map(SessionResource::Diagnostics)
 }
@@ -53,13 +87,19 @@ pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
     make_uri(&path).ok()
 }
 
-fn event_resource_uri(project_id: &ProjectId, event: &ProjectEvent) -> Option<String> {
+fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<String> {
+    let mut uris = vec![project_events_resource_uri(project_id)];
     match event {
-        ProjectEvent::DiagnosticsUpdated { uri, .. } => diagnostics_resource_uri(uri),
+        ProjectEvent::DiagnosticsUpdated { uri, .. } => {
+            if let Some(uri) = diagnostics_resource_uri(uri) {
+                uris.push(uri);
+            }
+        }
         ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => {
-            Some(project_status_resource_uri(project_id))
+            uris.push(project_status_resource_uri(project_id));
         }
     }
+    uris
 }
 
 #[async_trait::async_trait]
@@ -167,17 +207,19 @@ async fn forward_event(
     project_id: &ProjectId,
     event: &ProjectEvent,
 ) -> ForwardOutcome {
-    let Some(resource_uri) = event_resource_uri(project_id, event) else {
-        return ForwardOutcome::Continue;
-    };
-    if !subscriptions.contains(&resource_uri).await {
-        return ForwardOutcome::Continue;
+    for resource_uri in event_resource_uris(project_id, event) {
+        if !subscriptions.contains(&resource_uri).await {
+            continue;
+        }
+        if notifier
+            .notify_resource_updated(resource_uri)
+            .await
+            .is_err()
+        {
+            return ForwardOutcome::Disconnect;
+        }
     }
-    if notifier.notify_resource_updated(resource_uri).await.is_ok() {
-        ForwardOutcome::Continue
-    } else {
-        ForwardOutcome::Disconnect
-    }
+    ForwardOutcome::Continue
 }
 
 impl Drop for SessionEventSink {
@@ -203,8 +245,9 @@ mod tests {
 
     use super::{SessionEventSink, SessionNotifier};
     use super::{
-        SessionResource, diagnostics_resource_uri, event_resource_uri,
-        parse_project_status_resource_uri, parse_session_resource_uri, project_status_resource_uri,
+        SessionResource, diagnostics_resource_uri, event_resource_uris,
+        parse_project_events_resource_uri, parse_project_status_resource_uri,
+        parse_session_resource_uri, project_events_resource_uri, project_status_resource_uri,
     };
     use crate::project::{ProjectEvent, ProjectId, ProjectStatus};
 
@@ -238,14 +281,17 @@ mod tests {
     fn lifecycle_events_do_not_map_to_file_resources() {
         let project_id = ProjectId::new("a").unwrap();
         assert_eq!(
-            event_resource_uri(
+            event_resource_uris(
                 &project_id,
                 &ProjectEvent::StatusChanged {
                     status: ProjectStatus::Ready,
                     last_error: None,
                 },
             ),
-            Some("mcpls-project-status:///a".to_string())
+            vec![
+                "mcpls-project-events:///a".to_string(),
+                "mcpls-project-status:///a".to_string(),
+            ]
         );
         assert_eq!(
             parse_project_status_resource_uri(&project_status_resource_uri(&project_id)),
@@ -259,6 +305,17 @@ mod tests {
         assert_eq!(
             parse_session_resource_uri("lsp-diagnostics:///workspace/a.rs").unwrap(),
             SessionResource::Diagnostics(std::path::PathBuf::from("/workspace/a.rs"))
+        );
+    }
+
+    #[test]
+    fn project_event_resource_uri_carries_optional_poll_cursor() {
+        let project_id = ProjectId::new("a").unwrap();
+        let uri = project_events_resource_uri(&project_id);
+        assert_eq!(uri, "mcpls-project-events:///a");
+        assert_eq!(
+            parse_project_events_resource_uri("mcpls-project-events:///a?since=7"),
+            Some((project_id, Some(7)))
         );
     }
 
