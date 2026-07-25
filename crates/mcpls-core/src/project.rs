@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -3269,6 +3270,9 @@ pub enum ProjectRegistryError {
     /// No project with this stable ID is registered.
     #[error("project is not registered: {0}")]
     ProjectNotFound(ProjectId),
+    /// The daemon is draining projects and no new registrations are accepted.
+    #[error("project registry is shutting down")]
+    ShuttingDown,
     /// The project actor could not service the request.
     #[error(transparent)]
     Actor(#[from] ProjectActorError),
@@ -3290,6 +3294,7 @@ pub struct ProjectRegistry {
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
+    shutting_down: std::sync::Arc<AtomicBool>,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -3366,6 +3371,7 @@ impl ProjectRegistry {
             actor_capacity: actor_capacity.max(1),
             translator_template: None,
             persistence: None,
+            shutting_down: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3377,6 +3383,7 @@ impl ProjectRegistry {
             actor_capacity: actor_capacity.max(1),
             translator_template: Some(std::sync::Arc::new(template)),
             persistence: None,
+            shutting_down: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3445,6 +3452,9 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
         let mut projects = self.projects.write().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ProjectRegistryError::ShuttingDown);
+        }
         if let Some(existing) = projects.get(identity.id()) {
             if existing.identity.root() != identity.root() {
                 return Err(ProjectRegistryError::ConflictingProject {
@@ -3472,12 +3482,19 @@ impl ProjectRegistry {
             let mutation = existing.mutation.clone();
             drop(projects);
 
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(ProjectRegistryError::ShuttingDown);
+            }
+
             let mutation_guard = mutation.lock().await;
             actor
                 .add_workspace_root(identity.root().as_path().to_path_buf())
                 .await?;
 
             let mut projects = self.projects.write().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(ProjectRegistryError::ShuttingDown);
+            }
             if let Some(existing) = projects.get(identity.id()) {
                 if existing.identity.root() != identity.root() {
                     return Err(ProjectRegistryError::ConflictingProject {
@@ -3576,6 +3593,7 @@ impl ProjectRegistry {
     /// processed before its shutdown request, preserving edit commit
     /// boundaries without holding the registry lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
+        self.shutting_down.store(true, Ordering::Release);
         let entries: Vec<_> = self
             .projects
             .read()
@@ -5250,6 +5268,22 @@ mod tests {
         assert_eq!(report.stopped, vec![first_id, second_id]);
         assert_eq!(*first_actor.status().borrow(), ProjectStatus::Stopped);
         assert_eq!(*second_actor.status().borrow(), ProjectStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn project_registry_rejects_registration_after_shutdown_begins() {
+        let registry = ProjectRegistry::new(2);
+        registry.shutdown_all().await;
+
+        let root = TempDir::new().unwrap();
+        let result = registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("late").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await;
+
+        assert!(matches!(result, Err(ProjectRegistryError::ShuttingDown)));
     }
 
     #[tokio::test]
