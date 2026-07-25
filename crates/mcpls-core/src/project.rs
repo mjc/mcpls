@@ -3323,12 +3323,46 @@ struct ProjectActorEntry {
     roots: Vec<CanonicalRoot>,
 }
 
+impl ProjectActorEntry {
+    fn new(
+        actor: ProjectHandle,
+        mutation: MutationGate,
+        compatibility_key: Option<ProjectCompatibilityKey>,
+        root: CanonicalRoot,
+    ) -> Self {
+        Self {
+            actor,
+            mutation,
+            compatibility_key,
+            roots: vec![root],
+        }
+    }
+}
+
 struct ProjectEntry {
     identity: ProjectIdentity,
     actors: Vec<ProjectActorEntry>,
 }
 
 impl ProjectEntry {
+    fn new(
+        identity: ProjectIdentity,
+        actor: ProjectHandle,
+        mutation: MutationGate,
+        compatibility_key: Option<ProjectCompatibilityKey>,
+    ) -> Self {
+        let root = identity.root.clone();
+        Self {
+            identity,
+            actors: vec![ProjectActorEntry::new(
+                actor,
+                mutation,
+                compatibility_key,
+                root,
+            )],
+        }
+    }
+
     fn primary(&self) -> &ProjectActorEntry {
         &self.actors[0]
     }
@@ -3577,7 +3611,7 @@ impl ProjectRegistry {
         Ok(restored)
     }
 
-    /// Add a project, sharing an actor with a compatible linked worktree.
+    /// Add a logical project, sharing actors only with compatible worktrees.
     ///
     /// # Errors
     ///
@@ -3643,12 +3677,12 @@ impl ProjectRegistry {
             let mut projects = self.projects.write().await;
             if let Some(existing) = projects.get_mut(identity.id()) {
                 existing.identity.add_root(identity.root.clone());
-                existing.actors.push(ProjectActorEntry {
-                    actor: actor.clone(),
+                existing.actors.push(ProjectActorEntry::new(
+                    actor.clone(),
                     mutation,
                     compatibility_key,
-                    roots: vec![identity.root.clone()],
-                });
+                    identity.root.clone(),
+                ));
             }
             drop(projects);
             self.persist().await?;
@@ -3676,15 +3710,7 @@ impl ProjectRegistry {
         let mutation = std::sync::Arc::new(Mutex::new(()));
         projects.insert(
             identity.id().clone(),
-            ProjectEntry {
-                identity,
-                actors: vec![ProjectActorEntry {
-                    actor: actor.clone(),
-                    mutation,
-                    compatibility_key,
-                    roots: vec![primary_root],
-                }],
-            },
+            ProjectEntry::new(identity, actor.clone(), mutation, compatibility_key),
         );
         drop(projects);
         self.persist().await?;
