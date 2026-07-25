@@ -1486,6 +1486,48 @@ fn apply_workspace_plan(client: &mut McpClient, project_id: &str, plan_id: &str)
     .unwrap()
 }
 
+struct MultiProjectFixture {
+    _first_tmp: TempDir,
+    _second_tmp: TempDir,
+    first: std::path::PathBuf,
+    second: std::path::PathBuf,
+    functions: std::path::PathBuf,
+    second_lib: std::path::PathBuf,
+    bad_format: std::path::PathBuf,
+}
+
+impl MultiProjectFixture {
+    fn new() -> Self {
+        let first_tmp = stage_workspace();
+        let first = first_tmp.path().canonicalize().unwrap();
+        let second_tmp = stage_workspace();
+        let second = second_tmp.path().canonicalize().unwrap();
+
+        let functions = second.join("src/functions.rs");
+        let mut functions_content = fs::read_to_string(&functions).unwrap();
+        functions_content.push_str("\npub fn cross_file_target() -> i32 { 7 }\n");
+        fs::write(&functions, functions_content).unwrap();
+
+        let second_lib = second.join("src/lib.rs");
+        let mut second_lib_content = fs::read_to_string(&second_lib).unwrap();
+        second_lib_content.push_str(
+            "\npub fn cross_file_caller() -> i32 { crate::functions::cross_file_target() }\n",
+        );
+        fs::write(&second_lib, second_lib_content).unwrap();
+
+        let bad_format = second.join("src/bad_format.rs");
+        Self {
+            _first_tmp: first_tmp,
+            _second_tmp: second_tmp,
+            first,
+            second,
+            functions,
+            second_lib,
+            bad_format,
+        }
+    }
+}
+
 #[test]
 #[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
 fn ra_multi_project_safe_refactor_e2e() {
@@ -1498,32 +1540,16 @@ fn ra_multi_project_safe_refactor_e2e() {
         Resolution::Missing => panic!("rust-analyzer is required for this suite"),
     };
 
-    let first_tmp = stage_workspace();
-    let first = first_tmp.path().canonicalize().unwrap();
-    let second_tmp = stage_workspace();
-    let second = second_tmp.path().canonicalize().unwrap();
+    let fixture = MultiProjectFixture::new();
 
-    // Add a declaration in functions.rs and a call in lib.rs so rename must
-    // produce a multi-file edit rather than a single-document substitution.
-    let functions = second.join("src/functions.rs");
-    let mut functions_content = fs::read_to_string(&functions).unwrap();
-    functions_content.push_str("\npub fn cross_file_target() -> i32 { 7 }\n");
-    fs::write(&functions, functions_content).unwrap();
-    let second_lib = second.join("src/lib.rs");
-    let mut second_lib_content = fs::read_to_string(&second_lib).unwrap();
-    second_lib_content.push_str(
-        "\npub fn cross_file_caller() -> i32 { crate::functions::cross_file_target() }\n",
-    );
-    fs::write(&second_lib, second_lib_content).unwrap();
-
-    let config_path = first.join("mcpls-multi-project-e2e.toml");
-    write_config(&ra_path, &first, &config_path);
+    let config_path = fixture.first.join("mcpls-multi-project-e2e.toml");
+    write_config(&ra_path, &fixture.first, &config_path);
     let config = config_path.to_string_lossy().into_owned();
     let mut client = McpClient::spawn_with_args(&["--config", &config]).unwrap();
     client.initialize().unwrap();
-    wait_until_ready(&mut client, &first.join("src/lib.rs"));
+    wait_until_ready(&mut client, &fixture.first.join("src/lib.rs"));
 
-    add_and_activate_project(&mut client, "second", &second, &second_lib);
+    add_and_activate_project(&mut client, "second", &fixture.second, &fixture.second_lib);
 
     let projects = call_json(&mut client, "project_list", json!({})).unwrap();
     assert_eq!(projects.as_array().unwrap().len(), 2);
@@ -1543,13 +1569,13 @@ fn ra_multi_project_safe_refactor_e2e() {
     .unwrap();
     assert!(!second_symbols["symbols"].as_array().unwrap().is_empty());
 
-    let target_line = find_line(&functions, "pub fn cross_file_target(");
+    let target_line = find_line(&fixture.functions, "pub fn cross_file_target(");
     let rename = call_json(
         &mut client,
         "rename_preview",
         json!({
             "project_id": "second",
-            "file_path": functions,
+            "file_path": fixture.functions,
             "line": target_line,
             "character": 8,
             "new_name": "renamed_target",
@@ -1563,12 +1589,12 @@ fn ra_multi_project_safe_refactor_e2e() {
     let applied = apply_workspace_plan(&mut client, "second", &rename_plan);
     assert!(applied["committed_files"].as_array().unwrap().len() >= 2);
     assert!(
-        fs::read_to_string(&functions)
+        fs::read_to_string(&fixture.functions)
             .unwrap()
             .contains("renamed_target")
     );
     assert!(
-        fs::read_to_string(&second_lib)
+        fs::read_to_string(&fixture.second_lib)
             .unwrap()
             .contains("renamed_target")
     );
@@ -1579,13 +1605,12 @@ fn ra_multi_project_safe_refactor_e2e() {
     );
     assert!(stale.is_err(), "a consumed edit plan must be rejected");
 
-    let bad_format = second.join("src/bad_format.rs");
     let formatted = call_json(
         &mut client,
         "format_preview",
         json!({
             "project_id": "second",
-            "file_path": bad_format,
+            "file_path": fixture.bad_format,
             "tab_size": 4,
             "insert_spaces": true,
             "position_encoding": "utf-8"
@@ -1597,13 +1622,13 @@ fn ra_multi_project_safe_refactor_e2e() {
     let golden =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/bad_format.fmt.rs");
     assert_eq!(
-        fs::read_to_string(&bad_format).unwrap().trim(),
+        fs::read_to_string(&fixture.bad_format).unwrap().trim(),
         fs::read_to_string(golden).unwrap().trim()
     );
 
     // Exercise the existing real-RA structural code-action path on the second
     // project, then restart it and prove the renamed symbol remains available.
-    sc_get_code_actions(&mut client, &second).unwrap();
+    sc_get_code_actions(&mut client, &fixture.second).unwrap();
     let restarted = call_json(
         &mut client,
         "project_restart_lsp",
@@ -1615,8 +1640,8 @@ fn ra_multi_project_safe_refactor_e2e() {
         &mut client,
         "get_hover",
         json!({
-            "file_path": functions,
-            "line": find_line(&functions, "pub fn renamed_target("),
+            "file_path": fixture.functions,
+            "line": find_line(&fixture.functions, "pub fn renamed_target("),
             "character": 8
         }),
     )
