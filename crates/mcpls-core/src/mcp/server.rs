@@ -40,6 +40,14 @@ fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
 }
 
+fn parse_position_encoding(value: Option<&str>) -> Result<PositionEncoding, McpError> {
+    value.map_or(Ok(PositionEncoding::Utf8), |value| {
+        PositionEncoding::from_lsp(value).ok_or_else(|| {
+            McpError::invalid_params(format!("unsupported position encoding: {value}"), None)
+        })
+    })
+}
+
 fn encode_json<T: Serialize>(value: &T) -> Result<String, McpError> {
     serde_json::to_string(value).map_err(|error| McpError::internal_error(error.to_string(), None))
 }
@@ -296,12 +304,7 @@ impl McplsServer {
         let id = parse_project_id(project_id)?;
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(workspace_edit)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let encoding = match position_encoding {
-            Some(value) => PositionEncoding::from_lsp(&value).ok_or_else(|| {
-                McpError::invalid_params(format!("unsupported position encoding: {value}"), None)
-            })?,
-            None => PositionEncoding::Utf8,
-        };
+        let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let artifact = self
             .context
             .project_registry
@@ -327,17 +330,7 @@ impl McplsServer {
         }): Parameters<RenamePreviewParams>,
     ) -> Result<String, McpError> {
         let id = parse_project_id(project_id)?;
-        let encoding =
-            position_encoding
-                .as_deref()
-                .map_or(Ok(PositionEncoding::Utf8), |value| {
-                    PositionEncoding::from_lsp(value).ok_or_else(|| {
-                        McpError::invalid_params(
-                            format!("unsupported position encoding: {value}"),
-                            None,
-                        )
-                    })
-                })?;
+        let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let actor = self
             .context
             .project_registry
@@ -373,17 +366,7 @@ impl McplsServer {
         }): Parameters<FormatPreviewParams>,
     ) -> Result<String, McpError> {
         let id = parse_project_id(project_id)?;
-        let encoding =
-            position_encoding
-                .as_deref()
-                .map_or(Ok(PositionEncoding::Utf8), |value| {
-                    PositionEncoding::from_lsp(value).ok_or_else(|| {
-                        McpError::invalid_params(
-                            format!("unsupported position encoding: {value}"),
-                            None,
-                        )
-                    })
-                })?;
+        let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let actor = self
             .context
             .project_registry
