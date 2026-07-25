@@ -214,6 +214,8 @@ fn sync_parent(parent: Option<&Path>) -> io::Result<()> {
 mod tests {
     use tempfile::TempDir;
 
+    use crate::config::{LspServerConfig, ProjectConfig};
+
     use super::*;
 
     #[test]
@@ -272,5 +274,39 @@ mod tests {
             ProjectRegistrationStore::new(path).load(),
             Err(ProjectPersistenceError::Json(_))
         ));
+    }
+
+    #[test]
+    fn project_lsp_environment_is_not_persisted_without_explicit_opt_in() {
+        let directory = TempDir::new().unwrap();
+        let store = ProjectRegistrationStore::new(directory.path().join("projects.json"));
+        let mut server = LspServerConfig::rust_analyzer();
+        server
+            .env
+            .insert("MCPLS_TEST_SECRET".to_string(), "do-not-write".to_string());
+        let project = PersistedProject {
+            project_id: "demo".to_string(),
+            root: PathBuf::from("/workspace/demo"),
+            additional_roots: Vec::new(),
+            config: Some(ProjectConfig {
+                lsp_servers: Some(vec![server]),
+                ..ProjectConfig::default()
+            }),
+        };
+
+        store.save(&[project]).unwrap();
+
+        let contents = fs::read_to_string(store.path()).unwrap();
+        assert!(!contents.contains("do-not-write"));
+        let persisted = store.load().unwrap();
+        let env = &persisted.projects[0]
+            .config
+            .as_ref()
+            .unwrap()
+            .lsp_servers
+            .as_ref()
+            .unwrap()[0]
+            .env;
+        assert!(env.is_empty());
     }
 }
