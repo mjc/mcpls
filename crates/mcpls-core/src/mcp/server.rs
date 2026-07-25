@@ -1360,6 +1360,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_edit_preview_and_apply_support_file_rename() {
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("old.rs");
+        let renamed = root.path().join("renamed.rs");
+        std::fs::write(&old, "content\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(
+            Arc::new(Mutex::new(Translator::new())),
+            Arc::new(ResourceSubscriptions::new()),
+            registry,
+        );
+        let result = server
+            .workspace_edit_preview(Parameters(WorkspaceEditPreviewParams {
+                project_id: "project".to_string(),
+                workspace_edit: serde_json::json!({
+                    "documentChanges": [{
+                        "kind": "rename",
+                        "oldUri": url::Url::from_file_path(&old).unwrap().to_string(),
+                        "newUri": url::Url::from_file_path(&renamed).unwrap().to_string()
+                    }]
+                }),
+                position_encoding: None,
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["safe_to_apply"], true);
+        assert!(result["unsupported"].as_array().unwrap().is_empty());
+
+        server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_string(),
+                plan_id: result["plan_id"].as_str().unwrap().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!old.exists());
+        assert_eq!(std::fs::read_to_string(renamed).unwrap(), "content\n");
+    }
+
+    #[tokio::test]
     async fn test_project_activate_uses_actor_runtime() {
         let root = TempDir::new().unwrap();
         std::fs::write(

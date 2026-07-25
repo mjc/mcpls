@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use crate::bridge::DocumentTracker;
 use crate::edit_paths::PathSafetyError;
-use crate::edit_paths::WorkspaceBoundary;
+use crate::edit_paths::{OperationValidationError, ValidatedFileOperation, WorkspaceBoundary};
 use crate::edit_plan::{
     EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
     SnapshotValidationError,
@@ -60,7 +60,7 @@ fn apply_plan_internal(
     let prepared = PreparedPlan::new(boundary, plan, documents)?;
     let staged = prepared.stage()?;
     prepared.revalidate(boundary, &staged, documents)?;
-    PreparedPlan::commit(&staged)
+    PreparedPlan::commit(&staged, &prepared.operations)
 }
 
 /// Consume and apply a plan from its owning project store.
@@ -83,6 +83,7 @@ pub fn apply_stored_plan(
 struct PreparedPlan<'a> {
     plan: &'a EditPlan,
     snapshots: Vec<&'a FileSnapshot>,
+    operations: Vec<ValidatedFileOperation>,
 }
 
 impl<'a> PreparedPlan<'a> {
@@ -103,7 +104,14 @@ impl<'a> PreparedPlan<'a> {
             .iter()
             .map(|snapshot| validate_snapshot(boundary, snapshot, documents))
             .collect::<Result<_, _>>()?;
-        Ok(Self { plan, snapshots })
+        let operations = boundary
+            .validate_operations(plan.file_operations())
+            .map_err(ApplyError::Operation)?;
+        Ok(Self {
+            plan,
+            snapshots,
+            operations,
+        })
     }
 
     fn stage(&self) -> Result<Vec<StagedFile>, ApplyError> {
@@ -139,11 +147,18 @@ impl<'a> PreparedPlan<'a> {
                 return Err(error);
             }
         }
+        if let Err(error) = boundary.validate_operations(self.plan.file_operations()) {
+            cleanup_staged(staged);
+            return Err(ApplyError::Operation(error));
+        }
         Ok(())
     }
 
-    fn commit(staged: &[StagedFile]) -> Result<ApplyReport, ApplyError> {
-        let mut committed_files = Vec::with_capacity(staged.len());
+    fn commit(
+        staged: &[StagedFile],
+        operations: &[ValidatedFileOperation],
+    ) -> Result<ApplyReport, ApplyError> {
+        let mut committed_files = Vec::with_capacity(staged.len().saturating_add(operations.len()));
         for (index, file) in staged.iter().enumerate() {
             if let Err(error) = fs::rename(&file.temp, &file.target) {
                 cleanup_staged(&staged[index..]);
@@ -155,8 +170,62 @@ impl<'a> PreparedPlan<'a> {
             }
             committed_files.push(file.target.clone());
         }
+        for operation in operations {
+            let path = apply_resource_operation(operation, &committed_files)?;
+            committed_files.push(path);
+        }
 
         Ok(ApplyReport { committed_files })
+    }
+}
+
+fn apply_resource_operation(
+    operation: &ValidatedFileOperation,
+    committed_files: &[PathBuf],
+) -> Result<PathBuf, ApplyError> {
+    match operation {
+        ValidatedFileOperation::Create { path, overwrite } => {
+            let result = if *overwrite {
+                fs::write(path, [])
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map(|_| ())
+            };
+            result.map_err(|source| ApplyError::Resource {
+                operation: format!("create {}", path.display()),
+                committed_files: committed_files.to_vec(),
+                source,
+            })?;
+            Ok(path.clone())
+        }
+        ValidatedFileOperation::Rename {
+            from,
+            to,
+            overwrite: _,
+        } => {
+            fs::rename(from, to).map_err(|source| ApplyError::Resource {
+                operation: format!("rename {} -> {}", from.display(), to.display()),
+                committed_files: committed_files.to_vec(),
+                source,
+            })?;
+            Ok(to.clone())
+        }
+        ValidatedFileOperation::Delete { path, recursive } => {
+            let result = if *recursive && path.is_dir() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            };
+            result.map_err(|source| ApplyError::Resource {
+                operation: format!("delete {}", path.display()),
+                committed_files: committed_files.to_vec(),
+                source,
+            })?;
+            Ok(path.clone())
+        }
     }
 }
 
@@ -171,6 +240,9 @@ pub enum ApplyError {
     /// The plan cannot be applied safely.
     #[error("edit plan is not safe to apply")]
     UnsafePlan,
+    /// A resource operation failed precondition validation.
+    #[error("workspace edit resource operation is invalid: {0}")]
+    Operation(#[from] OperationValidationError),
     /// The preview is no longer valid because its expiry was reached.
     #[error("edit plan has expired")]
     Expired,
@@ -215,6 +287,17 @@ pub enum ApplyError {
         /// Targets replaced before the failure.
         committed_files: Vec<PathBuf>,
         /// Filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A resource operation failed after earlier edits committed.
+    #[error("failed to apply {operation} after replacing {committed_files:?}: {source}")]
+    Resource {
+        /// Human-readable operation description.
+        operation: String,
+        /// Files already changed before the failure.
+        committed_files: Vec<PathBuf>,
+        /// Underlying filesystem error.
         #[source]
         source: std::io::Error,
     },
@@ -307,6 +390,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::{DocumentTracker, ResourceLimits};
+    use crate::edit_paths::FileOperation;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
 
     #[test]
@@ -444,6 +528,33 @@ mod tests {
         apply_plan_with_documents(&boundary, &plan, &documents).unwrap();
 
         assert_eq!(fs::read_to_string(file).unwrap(), "updated\n");
+    }
+
+    #[test]
+    fn applies_validated_resource_operations() {
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("old.rs");
+        let renamed = root.path().join("renamed.rs");
+        fs::write(&old, "content\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            Vec::new(),
+            vec![format!("rename {} -> {}", old.display(), renamed.display())],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_file_operations(vec![FileOperation::Rename {
+            from: old.clone(),
+            to: renamed.clone(),
+            overwrite: false,
+        }]);
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        let report = apply_plan(&boundary, &plan).unwrap();
+
+        assert_eq!(report.committed_files, vec![renamed.clone()]);
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(renamed).unwrap(), "content\n");
     }
 
     #[test]

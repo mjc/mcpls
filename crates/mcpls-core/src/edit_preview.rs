@@ -92,9 +92,9 @@ struct PlannedFile {
 /// Build a write-free plan from one LSP workspace edit.
 ///
 /// Text edits are applied against the exact disk or open-document contents
-/// observed during preview. Resource operations are path-validated and
-/// reported as unsupported until the corresponding transactional applier is
-/// enabled, so they can never silently turn into arbitrary file writes.
+/// observed during preview. Resource operations are path-validated and kept
+/// as explicit operations for apply-time revalidation, so they can never
+/// silently turn into arbitrary file writes.
 ///
 /// # Errors
 ///
@@ -137,6 +137,7 @@ struct PreviewBuilder<'a> {
     documents: &'a DocumentTracker,
     limits: PreviewLimits,
     files: BTreeMap<PathBuf, PlannedFile>,
+    file_operations: Vec<FileOperation>,
     operations: Vec<String>,
     conflicts: Vec<String>,
     unsupported: Vec<String>,
@@ -158,6 +159,7 @@ impl<'a> PreviewBuilder<'a> {
             documents,
             limits,
             files: BTreeMap::new(),
+            file_operations: Vec::new(),
             operations: Vec::new(),
             conflicts: Vec::new(),
             unsupported: Vec::new(),
@@ -195,6 +197,12 @@ impl<'a> PreviewBuilder<'a> {
             self.conflicts
                 .push("workspace edit contains no operations".to_string());
         }
+        if !self.files.is_empty() && !self.file_operations.is_empty() {
+            self.conflicts.push(
+                "text and resource operations in one plan are not yet transactionally ordered"
+                    .to_string(),
+            );
+        }
 
         let snapshots = self
             .files
@@ -217,7 +225,8 @@ impl<'a> PreviewBuilder<'a> {
             self.operations,
             safe_to_apply,
             EditLimits::PROJECT.plan_ttl,
-        );
+        )
+        .with_file_operations(self.file_operations);
         Ok(PreviewArtifact {
             plan,
             affected_files,
@@ -246,7 +255,17 @@ impl<'a> PreviewBuilder<'a> {
                     overwrite,
                 }])?;
                 let operation = format!("create {}", path.display());
-                self.record_unsupported(&operation);
+                self.operations.push(operation);
+                self.file_operations
+                    .push(FileOperation::Create { path, overwrite });
+                if options
+                    .as_ref()
+                    .and_then(|options| options.ignore_if_exists)
+                    .unwrap_or(false)
+                {
+                    self.unsupported
+                        .push("create ignoreIfExists is not supported".to_string());
+                }
                 Ok(())
             }
             EditOperation::Rename {
@@ -271,7 +290,20 @@ impl<'a> PreviewBuilder<'a> {
                     overwrite,
                 }])?;
                 let operation = format!("rename {} -> {}", from.display(), to.display());
-                self.record_unsupported(&operation);
+                self.operations.push(operation);
+                self.file_operations.push(FileOperation::Rename {
+                    from,
+                    to,
+                    overwrite,
+                });
+                if options
+                    .as_ref()
+                    .and_then(|options| options.ignore_if_exists)
+                    .unwrap_or(false)
+                {
+                    self.unsupported
+                        .push("rename ignoreIfExists is not supported".to_string());
+                }
                 Ok(())
             }
             EditOperation::Delete { uri, options, .. } => {
@@ -287,7 +319,17 @@ impl<'a> PreviewBuilder<'a> {
                     recursive,
                 }])?;
                 let operation = format!("delete {}", path.display());
-                self.record_unsupported(&operation);
+                self.operations.push(operation);
+                self.file_operations
+                    .push(FileOperation::Delete { path, recursive });
+                if options
+                    .as_ref()
+                    .and_then(|options| options.ignore_if_not_exists)
+                    .unwrap_or(false)
+                {
+                    self.unsupported
+                        .push("delete ignoreIfNotExists is not supported".to_string());
+                }
                 Ok(())
             }
         }
@@ -343,13 +385,6 @@ impl<'a> PreviewBuilder<'a> {
         self.conflicts.extend(conflicts);
         self.operations.push(format!("text {}", path.display()));
         Ok(())
-    }
-
-    fn record_unsupported(&mut self, operation: &str) {
-        self.operations.push(operation.to_string());
-        self.unsupported.push(format!(
-            "{operation}: resource operation application is not enabled"
-        ));
     }
 }
 

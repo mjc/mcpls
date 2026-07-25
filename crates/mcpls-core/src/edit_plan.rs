@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::edit_paths::FileOperation;
+
 /// Shared edit safety limits used by preview and project-local plan storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditLimits {
@@ -223,6 +225,7 @@ pub struct EditPlan {
     project_id: String,
     files: Vec<FileSnapshot>,
     operations: Vec<String>,
+    file_operations: Vec<FileOperation>,
     unified_diff: String,
     safe_to_apply: bool,
     created_at: SystemTime,
@@ -262,6 +265,7 @@ impl EditPlan {
             project_id,
             files,
             operations,
+            file_operations: Vec::new(),
             unified_diff,
             safe_to_apply,
             created_at,
@@ -300,6 +304,25 @@ impl EditPlan {
     #[must_use]
     pub fn operations(&self) -> &[String] {
         &self.operations
+    }
+
+    /// Attach validated resource operations to this plan.
+    #[must_use]
+    pub fn with_file_operations(mut self, file_operations: Vec<FileOperation>) -> Self {
+        self.estimated_bytes = self.estimated_bytes.saturating_add(
+            file_operations
+                .iter()
+                .map(file_operation_bytes)
+                .sum::<usize>(),
+        );
+        self.file_operations = file_operations;
+        self
+    }
+
+    /// Return resource operations retained for apply-time revalidation.
+    #[must_use]
+    pub fn file_operations(&self) -> &[FileOperation] {
+        &self.file_operations
     }
 
     /// Return the unified diff for changed text files.
@@ -509,6 +532,18 @@ impl EditPlanStore {
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+fn file_operation_bytes(operation: &FileOperation) -> usize {
+    match operation {
+        FileOperation::Create { path, .. } | FileOperation::Delete { path, .. } => {
+            path.to_string_lossy().len()
+        }
+        FileOperation::Rename { from, to, .. } => from
+            .to_string_lossy()
+            .len()
+            .saturating_add(to.to_string_lossy().len()),
     }
 }
 
