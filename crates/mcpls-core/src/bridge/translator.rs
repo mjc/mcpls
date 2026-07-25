@@ -185,11 +185,11 @@ impl Translator {
     /// Capture configuration without carrying live clients, servers, or documents.
     #[must_use]
     pub fn configuration_template(&self) -> TranslatorTemplate {
-        TranslatorTemplate {
-            extension_map: self.extension_map.clone(),
-            lsp_configs: self.lsp_configs.values().cloned().collect(),
-            heuristics_max_depth: self.heuristics_max_depth,
-        }
+        TranslatorTemplate::from_configuration(
+            self.extension_map.clone(),
+            self.lsp_configs.values().cloned().collect(),
+            self.heuristics_max_depth,
+        )
     }
 
     /// Set the workspace roots for path validation.
