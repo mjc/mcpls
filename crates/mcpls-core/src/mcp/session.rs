@@ -607,6 +607,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsubscribing_last_project_resource_stops_sink() {
+        let project_id = ProjectId::new("a").unwrap();
+        let resource = project_events_resource_uri(&project_id);
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(resource.clone()).await.unwrap();
+        let sink = SessionEventSink::new(subscriptions);
+        sink.track_subscription(project_id.clone(), resource);
+        let (_events_tx, events_rx) = broadcast::channel(8);
+        let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+
+        sink.attach_receivers(
+            project_id.clone(),
+            vec![events_rx],
+            Arc::new(TestNotifier(updates_tx)),
+        );
+        sink.untrack_subscription(&project_events_resource_uri(&project_id));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if sink
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(&project_id)
+                    .is_none_or(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session sink did not stop after its last subscription was removed");
+    }
+
+    #[tokio::test]
     async fn removal_notification_cleans_project_subscriptions_and_sink() {
         let project_id = ProjectId::new("a").unwrap();
         let event_uri = project_events_resource_uri(&project_id);
