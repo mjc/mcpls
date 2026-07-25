@@ -2142,6 +2142,16 @@ impl ProjectRuntime {
                         .await
                         .map_err(|error| error.to_string())?;
                 }
+                if let Some(reason) = action
+                    .disabled
+                    .as_ref()
+                    .map(|disabled| disabled.reason.clone())
+                {
+                    return Err(format!("resolved code action is disabled: {reason}"));
+                }
+                if action.command.is_some() {
+                    return Err("resolved code actions with commands are unsupported".to_string());
+                }
                 action
             }
         };
