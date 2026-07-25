@@ -39,21 +39,6 @@ pub struct HandlerContext {
 }
 
 impl HandlerContext {
-    /// Create a new handler context.
-    #[must_use]
-    pub fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
-        Self::with_registry(subscriptions, ProjectRegistry::new(32))
-    }
-
-    /// Create a handler context with an existing shared project registry.
-    #[must_use]
-    pub fn with_registry(
-        subscriptions: Arc<ResourceSubscriptions>,
-        project_registry: ProjectRegistry,
-    ) -> Self {
-        Self::from_registry(subscriptions, project_registry)
-    }
-
     /// Create a handler context from the shared project registry and
     /// session-owned subscriptions.
     #[must_use]
@@ -160,20 +145,20 @@ mod tests {
     #[test]
     fn test_handler_context_creation() {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let context = HandlerContext::new(subscriptions);
+        let context = HandlerContext::from_registry(subscriptions, ProjectRegistry::new(32));
         assert_eq!(Arc::strong_count(&context.subscriptions), 2);
     }
 
     #[test]
     fn handler_context_creation_does_not_require_a_global_translator() {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let _context = HandlerContext::new(subscriptions);
+        let _context = HandlerContext::from_registry(subscriptions, ProjectRegistry::new(32));
     }
 
     #[tokio::test]
     async fn edit_plan_ownership_is_local_to_one_session() {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let context = HandlerContext::new(subscriptions);
+        let context = HandlerContext::from_registry(subscriptions, ProjectRegistry::new(32));
         let session = context.for_session();
         let plan_id = PlanId::new();
 

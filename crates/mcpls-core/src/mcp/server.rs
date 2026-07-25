@@ -453,11 +453,10 @@ impl McplsServer {
         encode_json(&applied_edit_plan_json(&result, id.as_str()))
     }
 
-    /// Create a new MCP server with the given translator and subscriptions.
+    /// Create a new MCP server with an empty project registry.
     #[must_use]
     pub fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
-        let context = Arc::new(HandlerContext::new(subscriptions));
-        Self { context }
+        Self::from_registry(subscriptions, ProjectRegistry::new(32))
     }
 
     /// Create a server with an explicitly shared project registry.
@@ -466,11 +465,7 @@ impl McplsServer {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
-        let context = Arc::new(HandlerContext::with_registry(
-            subscriptions,
-            project_registry,
-        ));
-        Self { context }
+        Self::from_registry(subscriptions, project_registry)
     }
 
     /// Create a server from the shared project registry without a global
