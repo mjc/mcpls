@@ -486,6 +486,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_sink_notifies_project_events_after_broadcast_lag() {
+        let project_id = ProjectId::new("a").unwrap();
+        let event_uri = project_events_resource_uri(&project_id);
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(event_uri.clone()).await.unwrap();
+        let sink = SessionEventSink::new(subscriptions);
+        let (events_tx, events_rx) = broadcast::channel(1);
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+
+        sink.attach_receivers(
+            project_id,
+            vec![events_rx],
+            Arc::new(TestNotifier(updates_tx)),
+        );
+        for generation in 1..=3 {
+            events_tx
+                .send(ProjectEvent::ServerExited { generation })
+                .unwrap();
+        }
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), updates_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), updates_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, event_uri);
+        assert_eq!(second, event_uri);
+    }
+
+    #[tokio::test]
     async fn session_sink_stops_after_notifier_disconnects() {
         let uri = "lsp-diagnostics:///workspace/a.rs".to_string();
         let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
