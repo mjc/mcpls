@@ -40,6 +40,39 @@ pub enum Transport {
     Http(HttpConfig),
 }
 
+/// Safe, non-secret transport details included in daemon status snapshots.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TransportSnapshot {
+    pub mode: &'static str,
+    pub bind: Option<String>,
+    pub path: Option<String>,
+}
+
+impl TransportSnapshot {
+    #[must_use]
+    pub(crate) const fn stdio() -> Self {
+        Self {
+            mode: "stdio",
+            bind: None,
+            path: None,
+        }
+    }
+}
+
+impl From<&Transport> for TransportSnapshot {
+    fn from(transport: &Transport) -> Self {
+        match transport {
+            Transport::Stdio => Self::stdio(),
+            #[cfg(feature = "transport-http")]
+            Transport::Http(config) => Self {
+                mode: "http",
+                bind: Some(config.bind.to_string()),
+                path: Some(config.path.clone()),
+            },
+        }
+    }
+}
+
 /// Configuration for the HTTP transport.
 ///
 /// Passed inside [`Transport::Http`] to control the TCP bind address and the

@@ -14,6 +14,7 @@ use crate::bridge::{ResourceSubscriptions, Translator};
 use crate::edit_plan::PlanId;
 use crate::mcp::session::SessionEventSink;
 use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
+use crate::transport::TransportSnapshot;
 
 /// Shared context for all tool handlers.
 ///
@@ -27,6 +28,8 @@ pub struct HandlerContext {
     pub project_registry: ProjectRegistry,
     /// Per-session event forwarding tasks.
     pub(crate) event_sink: Arc<SessionEventSink>,
+    /// Safe transport details shared by all session snapshots.
+    pub(crate) transport: Arc<TransportSnapshot>,
     /// Monotonic daemon start point shared by session clones.
     pub(crate) started_at: Instant,
     /// Edit plans previewed by this MCP session.
@@ -60,18 +63,30 @@ impl HandlerContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
-        Self::with_subscriptions(subscriptions, project_registry)
+        Self::with_subscriptions(subscriptions, project_registry, TransportSnapshot::stdio())
+    }
+
+    /// Create a handler context with explicit daemon transport metadata.
+    #[must_use]
+    pub(crate) fn from_registry_with_transport(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+        transport: TransportSnapshot,
+    ) -> Self {
+        Self::with_subscriptions(subscriptions, project_registry, transport)
     }
 
     fn with_subscriptions(
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
+        transport: TransportSnapshot,
     ) -> Self {
         let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
             subscriptions,
             project_registry,
             event_sink,
+            transport: Arc::new(transport),
             started_at: Instant::now(),
             owned_plan_ids: Mutex::new(HashSet::new()),
         }
@@ -95,6 +110,7 @@ impl HandlerContext {
             Arc::new(ResourceSubscriptions::new()),
             self.project_registry.clone(),
         );
+        context.transport = Arc::clone(&self.transport);
         context.started_at = self.started_at;
         context
     }

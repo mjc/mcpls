@@ -41,6 +41,7 @@ use crate::project::{
     ProjectId, ProjectIdentity, ProjectRegistry, ProjectServerCapability, ProjectState,
     ProjectStatusCounts, ProjectStatusSummary,
 };
+use crate::transport::TransportSnapshot;
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
@@ -104,6 +105,7 @@ struct DaemonSnapshot {
     actor_groups: usize,
     project_summaries: Vec<ProjectStatusSummary>,
     persistence: DaemonPersistenceSnapshot,
+    transport: Arc<TransportSnapshot>,
     shutting_down: bool,
 }
 
@@ -265,6 +267,7 @@ impl McplsServer {
             persistence: DaemonPersistenceSnapshot {
                 configured: self.context.project_registry.persistence_configured(),
             },
+            transport: Arc::clone(&self.context.transport),
             shutting_down: self.context.project_registry.is_shutting_down(),
         }
     }
@@ -449,6 +452,22 @@ impl McplsServer {
         }
     }
 
+    /// Create a server with explicit daemon transport metadata.
+    #[must_use]
+    pub(crate) fn from_registry_with_transport(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+        transport: TransportSnapshot,
+    ) -> Self {
+        Self {
+            context: Arc::new(HandlerContext::from_registry_with_transport(
+                subscriptions,
+                project_registry,
+                transport,
+            )),
+        }
+    }
+
     /// Clone the server for one MCP session while sharing project actors.
     ///
     /// Session-local subscriptions are intentionally not shared with the
@@ -567,6 +586,7 @@ impl McplsServer {
             "status": if snapshot.project_counts.failed == 0 { "healthy" } else { "degraded" },
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
+            "transport": snapshot.transport,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -585,6 +605,7 @@ impl McplsServer {
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
+            "transport": snapshot.transport,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -1827,6 +1848,9 @@ mod tests {
         assert_eq!(health["status"], "healthy");
         assert_eq!(health["lifecycle"], "running");
         assert_eq!(health["persistence"]["configured"], false);
+        assert_eq!(health["transport"]["mode"], "stdio");
+        assert!(health["transport"]["bind"].is_null());
+        assert!(health["transport"]["path"].is_null());
         assert_eq!(health["projects"]["starting"], 0);
         assert_eq!(health["actor_groups"], 0);
 
@@ -1850,6 +1874,7 @@ mod tests {
         assert!(status["uptime_seconds"].is_number());
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(status["persistence"]["configured"], false);
+        assert_eq!(status["transport"]["mode"], "stdio");
         assert_eq!(status["projects"]["starting"], 1);
         assert_eq!(status["actor_groups"], 1);
         assert_eq!(status["project_summaries"][0]["project_id"], "health");

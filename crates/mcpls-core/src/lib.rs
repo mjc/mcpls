@@ -336,8 +336,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     info!("Registered {registered} default workspace project(s)");
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server =
-        mcp::McplsServer::from_registry(Arc::clone(&subscriptions), project_registry.clone());
+    let transport_snapshot = transport::TransportSnapshot::from(&transport);
+    let mcp_server = mcp::McplsServer::from_registry_with_transport(
+        Arc::clone(&subscriptions),
+        project_registry.clone(),
+        transport_snapshot,
+    );
     info!("MCPLS server initialized successfully");
 
     let result = match transport {
