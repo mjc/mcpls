@@ -1566,6 +1566,23 @@ mod tests {
             "after\n"
         );
 
+        let events = server
+            .read_project_events_resource(
+                ProjectId::new("project").unwrap(),
+                None,
+                "mcpls-project-events:///project".to_string(),
+            )
+            .await
+            .unwrap();
+        let events: serde_json::Value = serde_json::to_value(events).unwrap();
+        let event_text = events["contents"][0]["text"].as_str().unwrap();
+        let event_payload: serde_json::Value = serde_json::from_str(event_text).unwrap();
+        assert_eq!(event_payload["project_id"], "project");
+        assert_eq!(event_payload["resync_required"], false);
+        assert_eq!(event_payload["events"].as_array().unwrap().len(), 2);
+        assert_eq!(event_payload["events"][0]["event"]["kind"], "files_changed");
+        assert_eq!(event_payload["events"][1]["event"]["kind"], "edit_applied");
+
         let second = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
