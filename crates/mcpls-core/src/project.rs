@@ -4787,7 +4787,6 @@ impl ProjectRegistry {
     /// lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
         self.lifecycle.begin_shutdown();
-        let _mutation_guards = self.lock_project_mutations().await;
         let entries: Vec<_> = self
             .projects
             .read()
@@ -4800,6 +4799,12 @@ impl ProjectRegistry {
                     .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
             })
             .collect();
+
+        for (_, actor) in &entries {
+            actor.reject_new_work();
+        }
+
+        let _mutation_guards = self.lock_project_mutations().await;
 
         let (stopped, actors) = shutdown_actor_groups(entries);
         let mut report = ProjectShutdownReport {
