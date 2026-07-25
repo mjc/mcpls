@@ -52,7 +52,7 @@ pub mod workspace_edit;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bridge::{ResourceSubscriptions, Translator};
+use bridge::{ResourceSubscriptions, TranslatorTemplate};
 pub use config::{DaemonConfig, ServerConfig};
 pub use error::Error;
 use tokio::sync::OnceCell;
@@ -196,22 +196,11 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     info!("Starting MCPLS server...");
 
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
-    let extension_map = config.build_effective_extension_map();
-    let max_depth = Some(config.workspace.heuristics_max_depth);
-
-    let mut translator = Translator::new().with_extensions(extension_map);
-    let validation_roots = if config.workspace.roots.is_empty() {
-        Vec::new()
-    } else {
-        workspace_roots.clone()
-    };
-    translator.set_workspace_roots(validation_roots);
-    translator.set_lsp_configs(config.lsp_servers.clone(), max_depth);
-
-    // The daemon translator is retained as a compatibility shell. Project actors
-    // own all configured LSP processes; starting a second global batch here would
-    // duplicate every server when a project is explicitly activated.
-    let translator_template = translator.configuration_template();
+    let translator_template = TranslatorTemplate::from_configuration(
+        config.build_effective_extension_map(),
+        config.lsp_servers.clone(),
+        Some(config.workspace.heuristics_max_depth),
+    );
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());

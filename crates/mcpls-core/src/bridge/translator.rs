@@ -122,6 +122,21 @@ pub struct TranslatorTemplate {
 }
 
 impl TranslatorTemplate {
+    /// Build an immutable project configuration without creating a live
+    /// translator or language-server runtime.
+    #[must_use]
+    pub(crate) fn from_configuration(
+        extension_map: HashMap<String, String>,
+        lsp_configs: Vec<LspServerConfig>,
+        heuristics_max_depth: Option<usize>,
+    ) -> Self {
+        Self {
+            extension_map,
+            lsp_configs,
+            heuristics_max_depth,
+        }
+    }
+
     pub(crate) fn rust_server_config(&self) -> Option<&LspServerConfig> {
         self.lsp_configs
             .iter()
