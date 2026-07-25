@@ -3876,11 +3876,19 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ServerExited { generation } => {
-            if runtime.owns_generation(generation)
-                && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
-            {
+            if runtime.owns_generation(generation) {
                 channels.publish(ProjectEvent::ServerExited { generation });
-                recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
+                match state.status {
+                    ProjectStatus::Ready | ProjectStatus::Degraded => {
+                        recover_project_after_server_exit(actor_sender, channels, state, runtime)
+                            .await;
+                    }
+                    ProjectStatus::Starting | ProjectStatus::Restarting => {
+                        state.last_error = Some("language server exited".to_string());
+                        channels.publish_status(state, ProjectStatus::Failed);
+                    }
+                    ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
+                }
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
