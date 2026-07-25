@@ -101,6 +101,16 @@ struct DaemonSnapshot {
     shutting_down: bool,
 }
 
+impl DaemonSnapshot {
+    const fn lifecycle(self) -> &'static str {
+        if self.shutting_down {
+            "shutting_down"
+        } else {
+            "running"
+        }
+    }
+}
+
 fn actor_group_states(actor_group_roots: Vec<Vec<PathBuf>>) -> Vec<ActorGroupState> {
     actor_group_roots
         .into_iter()
@@ -534,7 +544,7 @@ impl McplsServer {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
             "status": if snapshot.project_counts.failed == 0 { "healthy" } else { "degraded" },
-            "lifecycle": if snapshot.shutting_down { "shutting_down" } else { "running" },
+            "lifecycle": snapshot.lifecycle(),
             "persistence": { "configured": snapshot.persistence_configured },
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
@@ -551,7 +561,7 @@ impl McplsServer {
         encode_json(&serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
-            "lifecycle": if snapshot.shutting_down { "shutting_down" } else { "running" },
+            "lifecycle": snapshot.lifecycle(),
             "persistence": { "configured": snapshot.persistence_configured },
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
@@ -1819,6 +1829,16 @@ mod tests {
         assert_eq!(status["persistence"]["configured"], false);
         assert_eq!(status["projects"]["starting"], 1);
         assert_eq!(status["actor_groups"], 1);
+
+        server.context.project_registry.shutdown_all().await;
+        let shutdown_health: serde_json::Value = serde_json::from_str(
+            &server
+                .health(Parameters(ProjectListParams {}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shutdown_health["lifecycle"], "shutting_down");
     }
 
     #[tokio::test]
