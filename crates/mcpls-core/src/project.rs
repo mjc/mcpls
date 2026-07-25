@@ -3395,6 +3395,17 @@ impl ProjectShutdownReport {
     }
 }
 
+enum ShutdownAttempt {
+    Completed(Result<(), ProjectActorError>),
+    TimedOut,
+}
+
+async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) -> ShutdownAttempt {
+    tokio::time::timeout(timeout, actor.shutdown())
+        .await
+        .map_or(ShutdownAttempt::TimedOut, ShutdownAttempt::Completed)
+}
+
 impl ProjectRegistry {
     /// Create an empty registry with a bounded actor queue capacity.
     #[must_use]
@@ -3645,9 +3656,13 @@ impl ProjectRegistry {
         };
 
         for (actor, project_ids) in actors {
-            match tokio::time::timeout(self.shutdown_timeout, actor.shutdown()).await {
-                Ok(result) => report.record_actor_result(project_ids, result),
-                Err(_) => report.record_actor_timeout(project_ids, self.shutdown_timeout),
+            match shutdown_actor_with_timeout(actor, self.shutdown_timeout).await {
+                ShutdownAttempt::Completed(result) => {
+                    report.record_actor_result(project_ids, result);
+                }
+                ShutdownAttempt::TimedOut => {
+                    report.record_actor_timeout(project_ids, self.shutdown_timeout);
+                }
             }
         }
 
