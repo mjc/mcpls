@@ -29,6 +29,13 @@ fn uri_cache_key(uri: &str) -> std::borrow::Cow<'_, str> {
 /// Maximum number of server messages to store.
 const MAX_SERVER_MESSAGES: usize = 50;
 
+fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {
+    if queue.len() >= capacity {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
 /// Information about diagnostics for a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticInfo {
@@ -180,10 +187,7 @@ impl NotificationCache {
             timestamp: Utc::now(),
         };
 
-        if self.logs.len() >= MAX_LOG_ENTRIES {
-            self.logs.pop_front();
-        }
-        self.logs.push_back(entry);
+        push_bounded(&mut self.logs, entry, MAX_LOG_ENTRIES);
     }
 
     /// Store a server message.
@@ -207,10 +211,7 @@ impl NotificationCache {
             timestamp: Utc::now(),
         };
 
-        if self.messages.len() >= MAX_SERVER_MESSAGES {
-            self.messages.pop_front();
-        }
-        self.messages.push_back(msg);
+        push_bounded(&mut self.messages, msg, MAX_SERVER_MESSAGES);
     }
 
     /// Get diagnostics for a document URI.
