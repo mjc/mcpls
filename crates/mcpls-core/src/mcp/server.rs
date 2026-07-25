@@ -84,6 +84,7 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
     serde_json::json!({
         "project_id": identity.id().as_str(),
         "root": identity.root().as_path(),
+        "roots": identity.roots().iter().map(CanonicalRoot::as_path).collect::<Vec<_>>(),
         "repository_root": identity.repository_identity().map(GitRepositoryIdentity::common_dir),
         "status": format!("{:?}", state.status()),
         "last_error": state.last_error(),
@@ -364,6 +365,12 @@ impl McplsServer {
             .add(identity.clone())
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let identity = self
+            .context
+            .project_registry
+            .identity(&id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let state = actor
             .query()
             .await
@@ -408,6 +415,7 @@ impl McplsServer {
                 serde_json::json!({
                     "project_id": project.id().as_str(),
                     "root": project.root().as_path(),
+                    "roots": project.roots().iter().map(CanonicalRoot::as_path).collect::<Vec<_>>(),
                     "repository_root": project.repository_identity().map(GitRepositoryIdentity::common_dir),
                 })
             })
@@ -1578,7 +1586,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(added.contains("demo"));
+        let added_json: serde_json::Value = serde_json::from_str(&added).unwrap();
+        assert_eq!(added_json["project_id"], "demo");
+        assert_eq!(added_json["roots"].as_array().unwrap().len(), 1);
         let duplicate = server
             .project_add(Parameters(ProjectAddParams {
                 project_id: "demo".to_string(),
