@@ -159,6 +159,15 @@ impl DocumentTracker {
         self.documents.keys().map(PathBuf::as_path)
     }
 
+    /// Snapshot all tracked documents for reopening after an LSP restart.
+    #[must_use]
+    pub fn open_documents(&self) -> Vec<(PathBuf, DocumentState)> {
+        self.documents
+            .iter()
+            .map(|(path, state)| (path.clone(), state.clone()))
+            .collect()
+    }
+
     /// Ensure a document is open, opening it lazily if necessary.
     ///
     /// If the document is already open, returns its URI immediately.
@@ -889,6 +898,23 @@ mod tests {
         let mut paths: Vec<_> = tracker.open_paths().collect();
         paths.sort();
         assert_eq!(paths, [Path::new("/a.rs"), Path::new("/b.rs")]);
+    }
+
+    #[test]
+    fn test_open_documents_snapshot_preserves_state() {
+        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let path = PathBuf::from("/a.rs");
+        tracker
+            .open(path.clone(), "fn main() {}".to_string())
+            .unwrap();
+        tracker.update(&path, "fn main() { println!(\"hi\"); }".to_string());
+
+        let documents = tracker.open_documents();
+
+        assert_eq!(
+            documents,
+            vec![(path, tracker.get(Path::new("/a.rs")).unwrap().clone())]
+        );
     }
 
     #[test]

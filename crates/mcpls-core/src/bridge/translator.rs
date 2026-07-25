@@ -7,13 +7,14 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, CompletionParams,
-    CompletionTriggerKind, DidChangeTextDocumentParams, DocumentFormattingParams, DocumentSymbol,
-    DocumentSymbolParams, FormattingOptions, GotoDefinitionParams, Hover, HoverContents,
-    HoverParams as LspHoverParams, InlayHintLabel, InlayHintParams, MarkedString,
-    PartialResultParams, ReferenceContext, ReferenceParams, RenameParams as LspRenameParams,
-    SignatureHelpParams as LspSignatureHelpParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentPositionParams, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
+    CompletionTriggerKind, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, FormattingOptions,
+    GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams, InlayHintLabel,
+    InlayHintParams, MarkedString, PartialResultParams, ReferenceContext, ReferenceParams,
+    RenameParams as LspRenameParams, SignatureHelpParams as LspSignatureHelpParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::Duration};
@@ -295,8 +296,27 @@ impl Translator {
             self.register_client(language_id.clone(), client);
             self.register_server(language_id, server);
         }
+        self.reopen_tracked_documents().await?;
         self.clear_expected_languages();
         Ok(notification_receivers)
+    }
+
+    async fn reopen_tracked_documents(&self) -> Result<()> {
+        for (_path, document) in self.document_tracker.open_documents() {
+            let Some(client) = self.lsp_clients.get(&document.language_id) else {
+                continue;
+            };
+            let params = DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: document.uri,
+                    language_id: document.language_id,
+                    version: document.version,
+                    text: document.content,
+                },
+            };
+            client.notify("textDocument/didOpen", params).await?;
+        }
+        Ok(())
     }
 
     /// Shut down every language server owned by this translator.
