@@ -1457,21 +1457,24 @@ impl ProjectRequest {
             Self::References { reply, .. } => reject!(reply),
             Self::Diagnostics { reply, .. } => reject!(reply),
             Self::Rename { reply, .. } => reject!(reply),
-            Self::RenameWorkspaceEdit { reply, .. } => reject!(reply),
+            Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
+                reject!(reply)
+            }
             Self::Completions { reply, .. } => reject!(reply),
             Self::DocumentSymbols { reply, .. } => reject!(reply),
             Self::FormatDocument { reply, .. } => reject!(reply),
-            Self::FormatWorkspaceEdit { reply, .. } => reject!(reply),
             Self::WorkspaceSymbol { reply, .. } => reject!(reply),
-            Self::CodeActions { reply, .. } => reject!(reply),
-            Self::CodeActionList { reply, .. } => reject!(reply),
+            Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
+                reject!(reply)
+            }
             Self::PrepareCallHierarchy { reply, .. } => reject!(reply),
             Self::IncomingCalls { reply, .. } => reject!(reply),
             Self::OutgoingCalls { reply, .. } => reject!(reply),
             Self::SignatureHelp { reply, .. } => reject!(reply),
             Self::InlayHints { reply, .. } => reject!(reply),
-            Self::GoToImplementation { reply, .. } => reject!(reply),
-            Self::GoToTypeDefinition { reply, .. } => reject!(reply),
+            Self::GoToImplementation { reply, .. } | Self::GoToTypeDefinition { reply, .. } => {
+                reject!(reply)
+            }
             request => Ok(request),
         }
     }
@@ -3607,9 +3610,8 @@ async fn handle_project_request(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) -> bool {
-    let request = match request.reject_if_failed(state.status) {
-        Ok(request) => request,
-        Err(()) => return false,
+    let Ok(request) = request.reject_if_failed(state.status) else {
+        return false;
     };
 
     match request {
