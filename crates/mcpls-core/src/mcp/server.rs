@@ -453,10 +453,9 @@ impl McplsServer {
     /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
     pub fn new(
-        translator: Arc<Mutex<Translator>>,
+        _translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
-        let _ = translator;
         let context = Arc::new(HandlerContext::new(subscriptions));
         Self { context }
     }
@@ -464,12 +463,14 @@ impl McplsServer {
     /// Create a server with an explicitly shared project registry.
     #[must_use]
     pub fn new_with_registry(
-        translator: Arc<Mutex<Translator>>,
+        _translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
-        let _ = translator;
-        let context = Arc::new(HandlerContext::with_registry(subscriptions, project_registry));
+        let context = Arc::new(HandlerContext::with_registry(
+            subscriptions,
+            project_registry,
+        ));
         Self { context }
     }
 
