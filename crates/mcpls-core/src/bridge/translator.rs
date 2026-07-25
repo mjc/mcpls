@@ -368,13 +368,7 @@ impl Translator {
         let mut pending = Vec::new();
         for config in &configs {
             let language_id = &config.language_id;
-            let same_root = self
-                .lsp_roots
-                .get(language_id)
-                .is_some_and(|existing_roots| Self::same_workspace_roots(existing_roots, &roots))
-                && self.lsp_clients.contains_key(language_id);
-
-            if same_root {
+            if self.can_reuse_server(language_id, &roots) {
                 continue;
             }
 
@@ -447,6 +441,14 @@ impl Translator {
             && requested
                 .iter()
                 .all(|root| existing.iter().any(|existing| existing == root))
+    }
+
+    fn can_reuse_server(&self, language_id: &str, requested_roots: &[PathBuf]) -> bool {
+        self.lsp_clients.contains_key(language_id)
+            && self
+                .lsp_roots
+                .get(language_id)
+                .is_some_and(|existing| Self::same_workspace_roots(existing, requested_roots))
     }
 
     async fn reopen_tracked_documents(&self) -> Result<()> {
