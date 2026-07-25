@@ -93,6 +93,12 @@ struct ProjectLspCapabilitiesResponse {
     servers: Vec<ProjectServerCapability>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DaemonSnapshot {
+    project_counts: ProjectStatusCounts,
+    actor_groups: usize,
+}
+
 fn actor_group_states(actor_group_roots: Vec<Vec<PathBuf>>) -> Vec<ActorGroupState> {
     actor_group_roots
         .into_iter()
@@ -217,14 +223,15 @@ impl Clone for McplsServer {
 
 #[tool_router]
 impl McplsServer {
-    async fn daemon_snapshot(&self) -> (ProjectStatusCounts, usize) {
-        (
-            self.context.project_registry.status_counts().await,
-            self.context
+    async fn daemon_snapshot(&self) -> DaemonSnapshot {
+        DaemonSnapshot {
+            project_counts: self.context.project_registry.status_counts().await,
+            actor_groups: self
+                .context
                 .project_registry
                 .total_actor_group_count()
                 .await,
-        )
+        }
     }
 
     async fn project_state_json(
@@ -520,11 +527,11 @@ impl McplsServer {
         &self,
         Parameters(_params): Parameters<ProjectListParams>,
     ) -> Result<String, McpError> {
-        let (counts, actor_groups) = self.daemon_snapshot().await;
+        let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
-            "status": if counts.failed == 0 { "healthy" } else { "degraded" },
-            "projects": project_status_counts_json(counts),
-            "actor_groups": actor_groups,
+            "status": if snapshot.project_counts.failed == 0 { "healthy" } else { "degraded" },
+            "projects": project_status_counts_json(snapshot.project_counts),
+            "actor_groups": snapshot.actor_groups,
         }))
     }
 
@@ -534,12 +541,12 @@ impl McplsServer {
         &self,
         Parameters(_params): Parameters<ProjectListParams>,
     ) -> Result<String, McpError> {
-        let (counts, actor_groups) = self.daemon_snapshot().await;
+        let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
-            "projects": project_status_counts_json(counts),
-            "actor_groups": actor_groups,
+            "projects": project_status_counts_json(snapshot.project_counts),
+            "actor_groups": snapshot.actor_groups,
         }))
     }
 
