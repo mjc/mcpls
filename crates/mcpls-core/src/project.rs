@@ -3671,21 +3671,10 @@ impl ProjectRegistry {
     }
 
     async fn lock_project_mutations(&self) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-        let mutations = self
-            .projects
-            .read()
-            .await
-            .values()
-            .map(|entry| entry.mutation.clone())
-            .fold(Vec::new(), |mut unique, mutation| {
-                if !unique
-                    .iter()
-                    .any(|existing| std::sync::Arc::ptr_eq(existing, &mutation))
-                {
-                    unique.push(mutation);
-                }
-                unique
-            });
+        let mutations = {
+            let projects = self.projects.read().await;
+            unique_mutation_gates(&projects)
+        };
         let mut guards = Vec::with_capacity(mutations.len());
         for mutation in mutations {
             guards.push(mutation.lock_owned().await);
@@ -4051,6 +4040,19 @@ impl ProjectRegistry {
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
+}
+
+fn unique_mutation_gates(projects: &HashMap<ProjectId, ProjectEntry>) -> Vec<MutationGate> {
+    let mut mutations = Vec::new();
+    for entry in projects.values() {
+        if !mutations
+            .iter()
+            .any(|existing| std::sync::Arc::ptr_eq(existing, &entry.mutation))
+        {
+            mutations.push(entry.mutation.clone());
+        }
+    }
+    mutations
 }
 
 fn shutdown_actor_groups(
