@@ -2972,6 +2972,37 @@ mod tests {
         assert_eq!(document.content, "updated\n");
     }
 
+    #[tokio::test]
+    async fn activation_restarts_when_requested_roots_shrink() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        fs::write(first.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::write(second.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        let mut config = LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/rust-analyzer".to_string();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ]);
+        translator.set_lsp_configs(vec![config.clone()], None);
+        translator.lsp_roots.insert(
+            config.language_id.clone(),
+            vec![first.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        translator
+            .lsp_clients
+            .insert(config.language_id.clone(), LspClient::new(config));
+
+        let result = translator
+            .activate_project_with_roots(vec![first.path().to_path_buf()])
+            .await;
+
+        assert!(matches!(result, Err(Error::LspInitFailed { .. })));
+        assert!(translator.lsp_clients.is_empty());
+    }
+
     #[test]
     fn test_register_server() {
         let translator = Translator::new();
