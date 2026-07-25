@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
@@ -1084,6 +1084,7 @@ pub enum ProjectActorError {
 struct ProjectRequestSender {
     sender: mpsc::Sender<ProjectRequest>,
     accepting: std::sync::Arc<AtomicBool>,
+    rejected: std::sync::Arc<Notify>,
 }
 
 impl ProjectRequestSender {
@@ -1091,6 +1092,7 @@ impl ProjectRequestSender {
         Self {
             sender,
             accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            rejected: std::sync::Arc::new(Notify::new()),
         }
     }
 
@@ -1107,6 +1109,7 @@ impl ProjectRequestSender {
 
     fn reject_new_work(&self) {
         self.accepting.store(false, Ordering::Release);
+        self.rejected.notify_waiters();
     }
 
     fn accept_new_work(&self) {
@@ -1120,7 +1123,21 @@ impl ProjectRequestSender {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(mpsc::error::SendError(request));
         }
-        self.sender.send(request).await
+
+        let permit = tokio::select! {
+            result = self.sender.clone().reserve_owned() => match result {
+                Ok(permit) => permit,
+                Err(_) => return Err(mpsc::error::SendError(request)),
+            },
+            _ = self.rejected.notified() => {
+                return Err(mpsc::error::SendError(request));
+            }
+        };
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(mpsc::error::SendError(request));
+        }
+        permit.send(request);
+        Ok(())
     }
 
     // Lifecycle control must still reach the actor after normal work is rejected.
