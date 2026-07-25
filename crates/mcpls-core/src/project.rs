@@ -3244,6 +3244,30 @@ async fn recover_project_after_server_exit(
     }
 }
 
+async fn handle_server_exit(
+    generation: u64,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) {
+    if !runtime.owns_generation(generation) {
+        return;
+    }
+
+    channels.publish(ProjectEvent::ServerExited { generation });
+    match state.status {
+        ProjectStatus::Ready | ProjectStatus::Degraded => {
+            recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
+        }
+        ProjectStatus::Starting | ProjectStatus::Restarting => {
+            state.last_error = Some("language server exited".to_string());
+            channels.publish_status(state, ProjectStatus::Failed);
+        }
+        ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
+    }
+}
+
 /// Spawn a bounded project actor with `Starting` as its initial status.
 #[must_use]
 pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
@@ -3876,20 +3900,7 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ServerExited { generation } => {
-            if runtime.owns_generation(generation) {
-                channels.publish(ProjectEvent::ServerExited { generation });
-                match state.status {
-                    ProjectStatus::Ready | ProjectStatus::Degraded => {
-                        recover_project_after_server_exit(actor_sender, channels, state, runtime)
-                            .await;
-                    }
-                    ProjectStatus::Starting | ProjectStatus::Restarting => {
-                        state.last_error = Some("language server exited".to_string());
-                        channels.publish_status(state, ProjectStatus::Failed);
-                    }
-                    ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
-                }
-            }
+            handle_server_exit(generation, actor_sender, channels, state, runtime).await;
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
