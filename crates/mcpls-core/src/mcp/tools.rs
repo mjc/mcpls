@@ -462,3 +462,8 @@ pub struct WorkspaceEditApplyParams {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List all registered projects.")]
 pub struct ProjectListParams {}
+
+/// Empty parameters for listing this MCP session's resource subscriptions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "List resource subscriptions owned by this MCP session.")]
+pub struct SubscriptionListParams {}

@@ -28,8 +28,8 @@ use super::tools::{
     FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
     HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams, ProjectListParams,
     ReferencesParams, RenameParams, RenamePreviewParams, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
-    WorkspaceSymbolParams,
+    SignatureHelpParams, SubscriptionListParams, WorkspaceEditApplyParams,
+    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
 use crate::bridge::resources::make_uri;
 use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
@@ -401,6 +401,17 @@ impl McplsServer {
             })
             .collect();
         encode_json(&result)
+    }
+
+    /// List resource subscriptions owned by this MCP session.
+    #[tool(description = "List resource URIs subscribed by this MCP session.")]
+    async fn subscription_list(
+        &self,
+        Parameters(_params): Parameters<SubscriptionListParams>,
+    ) -> Result<String, McpError> {
+        let mut subscriptions = self.context.subscriptions.snapshot().await;
+        subscriptions.sort();
+        encode_json(&serde_json::json!({"subscriptions": subscriptions}))
     }
 
     /// Return a cheap process and project liveness snapshot.
@@ -1460,6 +1471,46 @@ mod tests {
 
         assert!(server.context.subscriptions.contains(&uri).await);
         assert!(!session.context.subscriptions.contains(&uri).await);
+    }
+
+    #[tokio::test]
+    async fn subscription_list_is_sorted_and_session_local() {
+        let server = create_test_server();
+        let session = server.for_session();
+        server
+            .context
+            .subscriptions
+            .subscribe("lsp-diagnostics:///z.rs".to_string())
+            .await
+            .unwrap();
+        server
+            .context
+            .subscriptions
+            .subscribe("lsp-diagnostics:///a.rs".to_string())
+            .await
+            .unwrap();
+
+        let result = server
+            .subscription_list(Parameters(SubscriptionListParams {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+            serde_json::json!({
+                "subscriptions": [
+                    "lsp-diagnostics:///a.rs",
+                    "lsp-diagnostics:///z.rs"
+                ]
+            })
+        );
+        let session_result = session
+            .subscription_list(Parameters(SubscriptionListParams {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&session_result).unwrap(),
+            serde_json::json!({"subscriptions": []})
+        );
     }
 
     #[tokio::test]
