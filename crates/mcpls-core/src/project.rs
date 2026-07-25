@@ -617,6 +617,22 @@ pub enum ProjectStatus {
     Failed,
 }
 
+impl ProjectStatus {
+    /// Return the stable wire spelling for this lifecycle state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Ready => "Ready",
+            Self::Degraded => "Degraded",
+            Self::Restarting => "Restarting",
+            Self::Stopping => "Stopping",
+            Self::Stopped => "Stopped",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
 /// Typed events emitted by a project actor for session-facing delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -4066,6 +4082,7 @@ impl ProjectRegistry {
                 }
             })
             .collect::<Vec<_>>();
+        drop(projects);
         summaries.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         summaries
     }

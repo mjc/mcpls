@@ -135,7 +135,7 @@ fn project_state_json(
         "root": identity.root().as_path(),
         "roots": project_root_paths(identity),
         "repository_root": identity.repository_identity().map(GitRepositoryIdentity::common_dir),
-        "status": format!("{:?}", state.status()),
+        "status": state.status().as_str(),
         "last_error": state.last_error(),
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
@@ -167,15 +167,13 @@ fn project_status_counts_json(counts: ProjectStatusCounts) -> serde_json::Value 
     })
 }
 
-fn project_status_summaries_json(
-    summaries: &[ProjectStatusSummary],
-) -> serde_json::Value {
+fn project_status_summaries_json(summaries: &[ProjectStatusSummary]) -> serde_json::Value {
     summaries
         .iter()
         .map(|summary| {
             serde_json::json!({
                 "project_id": summary.project_id.as_str(),
-                "status": format!("{:?}", summary.status),
+                "status": summary.status.as_str(),
                 "actor_group_count": summary.actor_group_count,
                 "roots": summary.roots,
             })
@@ -266,11 +264,7 @@ impl McplsServer {
                 .project_registry
                 .total_actor_group_count()
                 .await,
-            project_summaries: self
-                .context
-                .project_registry
-                .status_summaries()
-                .await,
+            project_summaries: self.context.project_registry.status_summaries().await,
             persistence: DaemonPersistenceSnapshot {
                 configured: self.context.project_registry.persistence_configured(),
             },
