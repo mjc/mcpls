@@ -95,8 +95,18 @@ enum ClientCommand {
         method: String,
         params: Option<Value>,
     },
+    /// Cancel an in-flight request whose caller timed out.
+    CancelRequest { id: RequestId },
     /// Shutdown the client.
     Shutdown,
+}
+
+fn cancel_request_notification(id: &RequestId) -> Value {
+    serde_json::json!({
+        "jsonrpc": JSONRPC_VERSION,
+        "method": "$/cancelRequest",
+        "params": { "id": id },
+    })
 }
 
 impl LspClient {
@@ -302,10 +312,19 @@ impl LspClient {
                 .await
                 .map_err(|_| Error::ServerTerminated)?;
 
-            let outcome = timeout(timeout_duration, response_rx)
-                .await
-                .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
-                .map_err(|_| Error::ServerTerminated)?;
+            let outcome = if let Ok(result) = timeout(timeout_duration, response_rx).await {
+                result.map_err(|_| Error::ServerTerminated)?
+            } else {
+                // A dropped receiver leaves the request in the message
+                // loop's pending map and lets the LSP server continue
+                // doing expensive work. Remove it and send the standard
+                // cancellation notification before returning the timeout.
+                let _ = self
+                    .command_tx
+                    .send(ClientCommand::CancelRequest { id })
+                    .await;
+                return Err(Error::Timeout(timeout_duration.as_secs()));
+            };
 
             match outcome {
                 Ok(result_value) => {
@@ -438,6 +457,7 @@ impl LspClient {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
@@ -466,6 +486,10 @@ impl LspClient {
                                 "params": params,
                             });
                             transport.send(&notification).await?;
+                        }
+                        ClientCommand::CancelRequest { id } => {
+                            pending_requests.lock().await.remove(&id);
+                            transport.send(&cancel_request_notification(&id)).await?;
                         }
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
@@ -911,5 +935,19 @@ mod tests {
     #[test]
     fn test_jsonrpc_version_constant() {
         assert_eq!(JSONRPC_VERSION, "2.0");
+    }
+
+    #[test]
+    fn cancel_request_notification_uses_json_rpc_request_id() {
+        let value = cancel_request_notification(&RequestId::Number(7));
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "$/cancelRequest",
+                "params": { "id": 7 },
+            })
+        );
     }
 }
