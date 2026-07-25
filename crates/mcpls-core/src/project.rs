@@ -3329,6 +3329,34 @@ pub struct ProjectShutdownFailure {
     pub error: String,
 }
 
+impl ProjectShutdownReport {
+    fn record_actor_result(
+        &mut self,
+        project_ids: Vec<ProjectId>,
+        result: Result<(), ProjectActorError>,
+    ) {
+        match result {
+            Ok(()) => self.stopped.extend(project_ids),
+            Err(error) => self
+                .failed
+                .extend(
+                    project_ids
+                        .into_iter()
+                        .map(|project_id| ProjectShutdownFailure {
+                            project_id,
+                            error: error.to_string(),
+                        }),
+                ),
+        }
+    }
+
+    fn sort(&mut self) {
+        self.stopped.sort();
+        self.failed
+            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    }
+}
+
 impl ProjectRegistry {
     /// Create an empty registry with a bounded actor queue capacity.
     #[must_use]
@@ -3556,27 +3584,18 @@ impl ProjectRegistry {
             .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
             .collect();
 
-        let (mut stopped, actors) = shutdown_actor_groups(entries);
-        let mut failures = Vec::new();
+        let (stopped, actors) = shutdown_actor_groups(entries);
+        let mut report = ProjectShutdownReport {
+            stopped,
+            failed: Vec::new(),
+        };
 
         for (actor, project_ids) in actors {
-            match actor.shutdown().await {
-                Ok(()) => stopped.extend(project_ids),
-                Err(error) => failures.extend(project_ids.into_iter().map(|project_id| {
-                    ProjectShutdownFailure {
-                        project_id,
-                        error: error.to_string(),
-                    }
-                })),
-            }
+            report.record_actor_result(project_ids, actor.shutdown().await);
         }
 
-        stopped.sort();
-        failures.sort_by(|left, right| left.project_id.cmp(&right.project_id));
-        ProjectShutdownReport {
-            stopped,
-            failed: failures,
-        }
+        report.sort();
+        report
     }
 
     /// Return open-document paths grouped by the registered project IDs that
