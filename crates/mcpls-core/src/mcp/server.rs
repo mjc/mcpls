@@ -105,7 +105,7 @@ struct DaemonSnapshot {
     actor_groups: usize,
     project_summaries: Vec<ProjectStatusSummary>,
     persistence: DaemonPersistenceSnapshot,
-    transport: Arc<TransportSnapshot>,
+    transport: TransportSnapshot,
     shutting_down: bool,
 }
 
@@ -267,7 +267,7 @@ impl McplsServer {
             persistence: DaemonPersistenceSnapshot {
                 configured: self.context.project_registry.persistence_configured(),
             },
-            transport: Arc::clone(&self.context.transport),
+            transport: (*self.context.transport).clone(),
             shutting_down: self.context.project_registry.is_shutting_down(),
         }
     }
