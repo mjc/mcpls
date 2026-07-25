@@ -161,6 +161,20 @@ impl McplsServer {
         encode_json(&preview_artifact_json(&artifact, id.as_str()))
     }
 
+    async fn apply_project_plan(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<String, McpError> {
+        let result = self
+            .context
+            .project_registry
+            .apply_edit_plan(id, plan_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&applied_edit_plan_json(&result, id.as_str()))
+    }
+
     /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
     pub fn new(
@@ -399,13 +413,7 @@ impl McplsServer {
         let id = parse_project_id(project_id.clone())?;
         let plan_id = PlanId::parse(plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = self
-            .context
-            .project_registry
-            .apply_edit_plan(&id, plan_id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&applied_edit_plan_json(&result, id.as_str()))
+        self.apply_project_plan(&id, plan_id).await
     }
 
     /// Restart the language-server actor for one project.
@@ -810,13 +818,7 @@ impl McplsServer {
         let id = parse_project_id(project_id)?;
         let plan_id = PlanId::parse(plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = self
-            .context
-            .project_registry
-            .apply_edit_plan(&id, plan_id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&applied_edit_plan_json(&result, id.as_str()))
+        self.apply_project_plan(&id, plan_id).await
     }
 
     /// Prepare call hierarchy at a position.
