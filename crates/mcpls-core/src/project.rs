@@ -611,21 +611,23 @@ fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
 }
 
 fn probe_rustc_version(channel: &str) -> Option<Vec<u8>> {
-    match Command::new("rustup")
-        .args(["run", channel, "rustc", "-Vv"])
-        .output()
-    {
+    let mut rustup = Command::new("rustup");
+    rustup.args(["run", channel, "rustc", "-Vv"]);
+    match rustup.output() {
         Ok(output) if output.status.success() => Some(output.stdout),
-        Ok(_) => None,
-        Err(error) if error.kind() == ErrorKind::NotFound => Command::new("rustc")
-            .arg(format!("+{channel}"))
-            .arg("-Vv")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| output.stdout),
-        Err(_) => None,
+        Err(error) if error.kind() == ErrorKind::NotFound => probe_direct_rustc(channel),
+        Ok(_) | Err(_) => None,
     }
+}
+
+fn probe_direct_rustc(channel: &str) -> Option<Vec<u8>> {
+    Command::new("rustc")
+        .arg(format!("+{channel}"))
+        .arg("-Vv")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
 }
 
 fn rust_toolchain_channel(root: &Path) -> Option<String> {
