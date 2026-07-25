@@ -5636,6 +5636,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_delivers_active_mutation_after_response_cancellation() {
+        let (status_tx, _) = watch::channel(ProjectStatus::Starting);
+        let (event_tx, _) = broadcast::channel(1);
+        let channels = ProjectActorChannels {
+            status_tx,
+            event_tx,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        let actor_sender = sender.downgrade();
+        let mut runtime = ProjectRuntime::new(Translator::new());
+        let mut state = ProjectState::new(ProjectStatus::Starting, runtime.summary());
+        let (reply, response) = oneshot::channel();
+        drop(response);
+
+        assert!(
+            !handle_project_request(
+                ProjectRequest::SetStatus {
+                    status: ProjectStatus::Ready,
+                    reply,
+                },
+                &actor_sender,
+                &channels,
+                &mut state,
+                &mut runtime,
+            )
+            .await
+        );
+        assert_eq!(state.status(), ProjectStatus::Ready);
+    }
+
+    #[tokio::test]
     async fn project_actor_publishes_typed_status_events() {
         let handle = spawn_project_actor(4);
         let mut events = handle.subscribe_events();
