@@ -15,10 +15,10 @@ use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
-    ProjectActivation, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, Translator, TranslatorTemplate,
-    WorkspaceSymbolResult,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, LogEntry, LogLevel,
+    OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult, RenameResult,
+    ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult, SignatureHelpResult,
+    Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
@@ -1435,6 +1435,52 @@ enum ProjectRequest {
 }
 
 impl ProjectRequest {
+    /// Fail LSP work that was queued while this actor exhausted recovery.
+    ///
+    /// Inspection and lifecycle requests still pass through so callers can
+    /// observe the failure and explicitly reactivate the project.
+    fn reject_if_failed(self, status: ProjectStatus) -> Result<Self, ()> {
+        if status != ProjectStatus::Failed {
+            return Ok(self);
+        }
+
+        macro_rules! reject {
+            ($reply:expr) => {{
+                let _ = $reply.send(Err(LANGUAGE_SERVER_EXITED.to_string()));
+                return Err(());
+            }};
+        }
+
+        match self {
+            Self::Hover { reply, .. } => reject!(reply),
+            Self::Definition { reply, .. } => reject!(reply),
+            Self::References { reply, .. } => reject!(reply),
+            Self::Diagnostics { reply, .. } => reject!(reply),
+            Self::Rename { reply, .. } => reject!(reply),
+            Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
+                reject!(reply)
+            }
+            Self::Completions { reply, .. } => reject!(reply),
+            Self::DocumentSymbols { reply, .. } => reject!(reply),
+            Self::FormatDocument { reply, .. } => reject!(reply),
+            Self::WorkspaceSymbol { reply, .. } => reject!(reply),
+            Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
+                reject!(reply)
+            }
+            Self::PrepareCallHierarchy { reply, .. } => reject!(reply),
+            Self::IncomingCalls { reply, .. } => reject!(reply),
+            Self::OutgoingCalls { reply, .. } => reject!(reply),
+            Self::SignatureHelp { reply, .. } => reject!(reply),
+            Self::InlayHints { reply, .. } => reject!(reply),
+            Self::GoToImplementation { reply, .. } | Self::GoToTypeDefinition { reply, .. } => {
+                reject!(reply)
+            }
+            request => Ok(request),
+        }
+    }
+}
+
+impl ProjectRequest {
     fn is_cancelled(&self) -> bool {
         match self {
             Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
@@ -2455,6 +2501,56 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    async fn server_logs_unchecked(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send_unchecked(ProjectRequest::ServerLogs {
+                limit,
+                min_level,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    async fn server_messages_unchecked(
+        &self,
+        limit: usize,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send_unchecked(ProjectRequest::ServerMessages { limit, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    async fn server_capabilities_unchecked(
+        &self,
+        language_id: Option<String>,
+    ) -> Result<Vec<ServerCapability>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send_unchecked(ProjectRequest::ServerCapabilities { language_id, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return negotiated capabilities for this project's active language servers.
     ///
     /// # Errors
@@ -2526,6 +2622,42 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     code_actions: CodeActionStore,
     generation: u64,
+    automatic_restart: AutomaticRestartPolicy,
+}
+
+const LANGUAGE_SERVER_EXITED: &str = "language server exited";
+const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
+const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
+
+#[derive(Debug, Default)]
+struct AutomaticRestartPolicy {
+    attempts: usize,
+}
+
+impl AutomaticRestartPolicy {
+    fn next(&mut self) -> Option<AutomaticRestartAttempt> {
+        let attempt = self.attempts + 1;
+        let delay = AUTOMATIC_RESTART_BACKOFF.get(self.attempts).copied()?;
+        self.attempts = attempt;
+        Some(AutomaticRestartAttempt {
+            number: attempt,
+            delay,
+        })
+    }
+
+    const fn reset(&mut self) {
+        self.attempts = 0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutomaticRestartAttempt {
+    number: usize,
+    delay: Duration,
 }
 
 struct StoredCodeAction {
@@ -2592,6 +2724,7 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             code_actions: CodeActionStore::new(),
             generation: 0,
+            automatic_restart: AutomaticRestartPolicy::default(),
         }
     }
 
@@ -2614,6 +2747,16 @@ impl ProjectRuntime {
     fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
         matches!(status, ProjectStatus::Ready | ProjectStatus::Degraded)
             && self.has_active_workspace_roots(roots)
+    }
+
+    fn begin_automatic_restart(&mut self) -> Option<AutomaticRestartAttempt> {
+        let attempt = self.automatic_restart.next()?;
+        self.begin_transition();
+        Some(attempt)
+    }
+
+    const fn reset_automatic_restart(&mut self) {
+        self.automatic_restart.reset();
     }
 
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
@@ -3150,6 +3293,75 @@ impl ProjectRuntime {
     }
 }
 
+async fn recover_project_after_server_exit(
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) {
+    loop {
+        let Some(attempt) = runtime.begin_automatic_restart() else {
+            channels.publish_failure(state, LANGUAGE_SERVER_EXITED);
+            return;
+        };
+
+        state.last_error = Some(format!(
+            "{LANGUAGE_SERVER_EXITED}; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
+            attempt.number
+        ));
+        channels.publish_status(state, ProjectStatus::Restarting);
+        tokio::time::sleep(attempt.delay).await;
+        match runtime.restart().await {
+            Ok(notification_receivers) => {
+                state.last_error = None;
+                mark_project_started(
+                    notification_receivers,
+                    actor_sender,
+                    channels,
+                    state,
+                    runtime,
+                );
+                return;
+            }
+            Err(error) if attempt.number < MAX_AUTOMATIC_RESTART_ATTEMPTS => {
+                state.sync_runtime(runtime);
+                state.last_error = Some(format!(
+                    "automatic restart attempt {} failed: {error}",
+                    attempt.number
+                ));
+            }
+            Err(error) => {
+                state.sync_runtime(runtime);
+                channels.publish_failure(state, error);
+                return;
+            }
+        }
+    }
+}
+
+async fn handle_server_exit(
+    generation: u64,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) {
+    if !runtime.owns_generation(generation) {
+        return;
+    }
+
+    channels.publish(ProjectEvent::ServerExited { generation });
+    match state.status {
+        ProjectStatus::Ready | ProjectStatus::Degraded => {
+            recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
+        }
+        ProjectStatus::Starting | ProjectStatus::Restarting => {
+            channels.publish_failure(state, LANGUAGE_SERVER_EXITED);
+        }
+        ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
+    }
+}
+
 /// Spawn a bounded project actor with `Starting` as its initial status.
 #[must_use]
 pub fn spawn_project_actor(capacity: usize) -> ProjectHandle {
@@ -3254,6 +3466,11 @@ impl ProjectActorChannels {
             last_error: state.last_error.clone(),
         });
     }
+
+    fn publish_failure(&self, state: &mut ProjectState, error: impl Into<String>) {
+        state.last_error = Some(error.into());
+        self.publish_status(state, ProjectStatus::Failed);
+    }
 }
 
 async fn run_project_actor(
@@ -3328,8 +3545,9 @@ fn mark_project_started(
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
-    runtime: &ProjectRuntime,
+    runtime: &mut ProjectRuntime,
 ) {
+    runtime.reset_automatic_restart();
     let health = activation.health();
     spawn_notification_forwarders(
         activation.into_notification_receivers(),
@@ -3392,6 +3610,10 @@ async fn handle_project_request(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) -> bool {
+    let Ok(request) = request.reject_if_failed(state.status) else {
+        return false;
+    };
+
     match request {
         ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
             state.sync_runtime(runtime);
@@ -3419,8 +3641,7 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error.to_string());
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error.to_string());
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
@@ -3447,8 +3668,7 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error.clone());
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error.clone());
                     let _ = reply.send(Err(error));
                 }
             }
@@ -3711,8 +3931,7 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error.clone());
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error.clone());
                     let _ = reply.send(Err(error));
                 }
             }
@@ -3781,13 +4000,7 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ServerExited { generation } => {
-            if runtime.owns_generation(generation)
-                && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
-            {
-                state.last_error = Some("language server exited".to_string());
-                channels.publish(ProjectEvent::ServerExited { generation });
-                channels.publish_status(state, ProjectStatus::Failed);
-            }
+            handle_server_exit(generation, actor_sender, channels, state, runtime).await;
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -3813,16 +4026,14 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error);
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error);
                     let _ = reply.send(state.clone());
                 }
             }
         }
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
-            state.last_error = Some(message);
-            channels.publish_status(state, ProjectStatus::Failed);
+            channels.publish_failure(state, message);
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
@@ -3919,11 +4130,95 @@ struct ProjectRemovalSnapshot {
     root: PathBuf,
 }
 
+const RETAINED_PROJECT_HISTORY_CAPACITY: usize = 16;
+const RETAINED_LOG_CAPACITY: usize = 100;
+const RETAINED_MESSAGE_CAPACITY: usize = 50;
+
+/// Bounded, in-memory history retained after a project is removed.
+///
+/// Retention is deliberately process-local and limited to the most recent 16
+/// removed projects. It is not persisted and is cleared when a project ID is
+/// registered again.
+#[derive(Debug, Default)]
+struct RetainedProjectHistories {
+    entries: HashMap<ProjectId, RetainedProjectHistory>,
+    order: VecDeque<ProjectId>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RetainedProjectHistory {
+    logs: Vec<LogEntry>,
+    messages: Vec<ServerMessage>,
+    capabilities: Vec<ProjectServerCapability>,
+}
+
+impl RetainedProjectHistory {
+    fn server_logs(
+        &self,
+        limit: usize,
+        min_level: Option<&str>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
+        let min_level = min_level
+            .map(str::to_ascii_lowercase)
+            .map(|level| match level.as_str() {
+                "error" => Ok(LogLevel::Error),
+                "warning" => Ok(LogLevel::Warning),
+                "info" => Ok(LogLevel::Info),
+                "debug" => Ok(LogLevel::Debug),
+                _ => Err(ProjectActorError::Operation(format!(
+                    "Invalid min_level: '{level}'. Valid values: error, warning, info, debug"
+                ))),
+            })
+            .transpose()?;
+        Ok(ServerLogsResult {
+            logs: self
+                .logs
+                .iter()
+                .filter(|log| {
+                    min_level.is_none_or(|min| match min {
+                        LogLevel::Error => matches!(log.level, LogLevel::Error),
+                        LogLevel::Warning => {
+                            matches!(log.level, LogLevel::Error | LogLevel::Warning)
+                        }
+                        LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                        LogLevel::Debug => true,
+                    })
+                })
+                .take(limit)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn server_messages(&self, limit: usize) -> ServerMessagesResult {
+        ServerMessagesResult {
+            messages: self.messages.iter().take(limit).cloned().collect(),
+        }
+    }
+}
+
+impl RetainedProjectHistories {
+    fn insert(&mut self, id: ProjectId, history: RetainedProjectHistory) {
+        self.entries.remove(&id);
+        self.order.retain(|existing| existing != &id);
+        self.entries.insert(id.clone(), history);
+        self.order.push_back(id);
+        while self.order.len() > RETAINED_PROJECT_HISTORY_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, id: &ProjectId) {
+        self.entries.remove(id);
+        self.order.retain(|existing| existing != id);
+    }
+}
+
 impl ProjectRemovalSnapshot {
     fn reject_new_work(&self) {
-        for actor in &self.actors {
-            actor.reject_new_work();
-        }
+        reject_new_actor_work(&self.actors);
     }
 
     fn accept_new_work(&self) {
@@ -3944,6 +4239,34 @@ impl ProjectRemovalSnapshot {
             actor.shutdown().await.map_err(ProjectRegistryError::from)?;
         }
         Ok(())
+    }
+
+    async fn capture_history(&self) -> RetainedProjectHistory {
+        let mut history = RetainedProjectHistory::default();
+        for (group_id, actor) in self.actors.iter().enumerate() {
+            if let Ok(logs) = actor.server_logs_unchecked(usize::MAX, None).await {
+                history.logs.extend(logs.logs);
+            }
+            if let Ok(messages) = actor.server_messages_unchecked(usize::MAX).await {
+                history.messages.extend(messages.messages);
+            }
+            if let Ok(capabilities) = actor.server_capabilities_unchecked(None).await {
+                history.capabilities.extend(
+                    capabilities.into_iter().map(|capability| {
+                        ProjectServerCapability::from_server(group_id, capability)
+                    }),
+                );
+            }
+        }
+        history
+            .logs
+            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+        history.logs.truncate(RETAINED_LOG_CAPACITY);
+        history
+            .messages
+            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+        history.messages.truncate(RETAINED_MESSAGE_CAPACITY);
+        history
     }
 }
 
@@ -4102,6 +4425,7 @@ impl RegistryLifecycle {
 #[derive(Clone)]
 pub struct ProjectRegistry {
     projects: std::sync::Arc<RwLock<HashMap<ProjectId, ProjectEntry>>>,
+    retained_history: std::sync::Arc<RwLock<RetainedProjectHistories>>,
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
@@ -4299,6 +4623,7 @@ impl ProjectRegistry {
     ) -> Self {
         Self {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            retained_history: std::sync::Arc::new(RwLock::new(RetainedProjectHistories::default())),
             actor_capacity: actor_capacity.max(1),
             translator_template: translator_template.map(std::sync::Arc::new),
             persistence: None,
@@ -4582,6 +4907,7 @@ impl ProjectRegistry {
         }
 
         let primary_root = identity.root.clone();
+        let project_id = identity.id().clone();
         let actor = self.spawn_actor(&primary_root, translator_template.as_deref());
         let mutation = std::sync::Arc::new(Mutex::new(()));
         projects.insert(
@@ -4596,6 +4922,7 @@ impl ProjectRegistry {
             ),
         );
         drop(projects);
+        self.retained_history.write().await.remove(&project_id);
         self.persist().await?;
         Ok(actor)
     }
@@ -4693,19 +5020,11 @@ impl ProjectRegistry {
     /// lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
         self.lifecycle.begin_shutdown();
+        let entries = self.registered_actor_entries().await;
+
+        reject_new_actor_work(entries.iter().map(|(_, actor)| actor));
+
         let _mutation_guards = self.lock_project_mutations().await;
-        let entries: Vec<_> = self
-            .projects
-            .read()
-            .await
-            .values()
-            .flat_map(|entry| {
-                entry
-                    .actors
-                    .iter()
-                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
-            })
-            .collect();
 
         let (stopped, actors) = shutdown_actor_groups(entries);
         let mut report = ProjectShutdownReport {
@@ -4736,6 +5055,20 @@ impl ProjectRegistry {
         self.lock_mutation_gates(mutations).await
     }
 
+    async fn registered_actor_entries(&self) -> Vec<(ProjectId, ProjectHandle)> {
+        self.projects
+            .read()
+            .await
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .actors
+                    .iter()
+                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
+            })
+            .collect()
+    }
+
     async fn lock_mutation_gates(
         &self,
         mutations: Vec<MutationGate>,
@@ -4756,18 +5089,7 @@ impl ProjectRegistry {
     pub async fn open_document_paths(
         &self,
     ) -> Result<Vec<(ProjectId, PathBuf)>, ProjectRegistryError> {
-        let entries: Vec<_> = self
-            .projects
-            .read()
-            .await
-            .values()
-            .flat_map(|entry| {
-                entry
-                    .actors
-                    .iter()
-                    .map(move |actor| (entry.identity.id().clone(), actor.actor.clone()))
-            })
-            .collect();
+        let entries = self.registered_actor_entries().await;
         let mut paths = Vec::new();
         for (id, actor) in entries {
             paths.extend(
@@ -4810,6 +5132,23 @@ impl ProjectRegistry {
         Err(error)
     }
 
+    async fn retain_history(&self, id: ProjectId, history: RetainedProjectHistory) {
+        self.retained_history.write().await.insert(id, history);
+    }
+
+    async fn retained_history_for(
+        &self,
+        id: &ProjectId,
+    ) -> Result<RetainedProjectHistory, ProjectRegistryError> {
+        self.retained_history
+            .read()
+            .await
+            .entries
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
     /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
@@ -4818,6 +5157,7 @@ impl ProjectRegistry {
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
         let removal = self.begin_project_removal(&id).await?;
         let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
+        let history = removal.capture_history().await;
         if let Err(error) = removal.shutdown(&id).await {
             return self.abort_project_removal(&id, &removal, error).await;
         }
@@ -4825,6 +5165,7 @@ impl ProjectRegistry {
             self.lifecycle.end_removal(&id).await;
             return Err(ProjectRegistryError::ProjectNotFound(id));
         }
+        self.retain_history(id.clone(), history).await;
         let persisted = self.persist().await;
         self.lifecycle.end_removal(&id).await;
         persisted
@@ -4855,7 +5196,23 @@ impl ProjectRegistry {
         id: &ProjectId,
         language_id: Option<String>,
     ) -> Result<Vec<ProjectServerCapability>, ProjectRegistryError> {
-        let (_, actors) = self.actor_entries(id).await?;
+        let actors = match self.actor_entries(id).await {
+            Ok((_, actors)) => actors,
+            Err(ProjectRegistryError::ProjectNotFound(_)) => {
+                return Ok(self
+                    .retained_history_for(id)
+                    .await?
+                    .capabilities
+                    .into_iter()
+                    .filter(|capability| {
+                        language_id
+                            .as_deref()
+                            .is_none_or(|language| capability.language_id == language)
+                    })
+                    .collect());
+            }
+            Err(error) => return Err(error),
+        };
         let mut capabilities = Vec::new();
         for (group_id, (actor, _)) in actors.into_iter().enumerate() {
             for capability in actor.server_capabilities(language_id.clone()).await? {
@@ -4868,6 +5225,54 @@ impl ProjectRegistry {
                 .then_with(|| left.language_id.cmp(&right.language_id))
         });
         Ok(capabilities)
+    }
+
+    /// Return recent logs from a project's primary actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, its actor closes,
+    /// or the requested log-level filter is invalid.
+    pub async fn server_logs(
+        &self,
+        id: &ProjectId,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectRegistryError> {
+        match self.actor(id).await {
+            Ok(actor) => actor
+                .server_logs(limit, min_level)
+                .await
+                .map_err(ProjectRegistryError::from),
+            Err(ProjectRegistryError::ProjectNotFound(_)) => self
+                .retained_history_for(id)
+                .await?
+                .server_logs(limit, min_level.as_deref())
+                .map_err(ProjectRegistryError::from),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return recent messages from a project's primary actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor closes.
+    pub async fn server_messages(
+        &self,
+        id: &ProjectId,
+        limit: usize,
+    ) -> Result<ServerMessagesResult, ProjectRegistryError> {
+        match self.actor(id).await {
+            Ok(actor) => actor
+                .server_messages(limit)
+                .await
+                .map_err(ProjectRegistryError::from),
+            Err(ProjectRegistryError::ProjectNotFound(_)) => {
+                Ok(self.retained_history_for(id).await?.server_messages(limit))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// List code actions with project-owned opaque references.
@@ -5292,6 +5697,12 @@ fn unique_mutation_gates(projects: &HashMap<ProjectId, ProjectEntry>) -> Vec<Mut
         }
     }
     mutations
+}
+
+fn reject_new_actor_work<'a>(actors: impl IntoIterator<Item = &'a ProjectHandle>) {
+    for actor in actors {
+        actor.reject_new_work();
+    }
 }
 
 fn shutdown_actor_groups(
@@ -5891,7 +6302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_actor_publishes_server_exit_events_before_failure_status() {
+    async fn project_actor_publishes_server_exit_events_before_recovery_status() {
         let handle = spawn_project_actor(4);
         let mut events = handle.subscribe_events();
         handle.set_status(ProjectStatus::Ready).await.unwrap();
@@ -5910,8 +6321,15 @@ mod tests {
         assert_eq!(
             events.recv().await.unwrap(),
             ProjectEvent::StatusChanged {
-                status: ProjectStatus::Failed,
-                last_error: Some("language server exited".to_string()),
+                status: ProjectStatus::Restarting,
+                last_error: Some("language server exited; restarting (attempt 1/3)".to_string(),),
+            }
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::StatusChanged {
+                status: ProjectStatus::Ready,
+                last_error: None,
             }
         );
     }
@@ -6454,6 +6872,90 @@ mod tests {
         assert_eq!(actor.query().await.unwrap().runtime().generation(), 0);
     }
 
+    #[cfg(unix)]
+    const DUPLICATE_ACTIVATION_LSP: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+counter = pathlib.Path(os.environ["MCPLS_SPAWN_COUNTER"])
+value = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(value + 1))
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    if message.get("method") == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-8"}
+        }})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"health": "ok", "quiescent": True}})
+    elif message.get("method") == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_activation_does_not_spawn_a_duplicate_lsp_process() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let counter = root.path().join("spawn-count");
+        let lsp = root.path().join("counting-lsp.py");
+        fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], Some(3));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        let first = actor.activate(root.path().to_path_buf()).await.unwrap();
+        assert_eq!(first.status(), ProjectStatus::Ready);
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+
+        let second = actor.activate(root.path().to_path_buf()).await.unwrap();
+        assert_eq!(second.status(), ProjectStatus::Ready);
+        assert_eq!(second.runtime().generation(), first.runtime().generation());
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+    }
+
     #[tokio::test]
     async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
         let actor = spawn_project_actor(2);
@@ -6480,8 +6982,149 @@ mod tests {
             .await
             .unwrap();
         let state = actor.query().await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(state.runtime().generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn project_actor_fails_when_current_server_exits_during_starting() {
+        let actor = spawn_project_actor(2);
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let state = actor.query().await.unwrap();
         assert_eq!(state.status(), ProjectStatus::Failed);
         assert_eq!(state.last_error(), Some("language server exited"));
+    }
+
+    #[tokio::test]
+    async fn project_actor_restarts_after_current_server_exit() {
+        let actor = spawn_project_actor(2);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let state = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() != ProjectStatus::Restarting {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(state.runtime().generation(), 1);
+    }
+
+    #[test]
+    fn automatic_restart_policy_is_bounded_and_resettable() {
+        let mut policy = AutomaticRestartPolicy::default();
+
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((1, Duration::from_millis(100)))
+        );
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((2, Duration::from_millis(500)))
+        );
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((3, Duration::from_secs(2)))
+        );
+        assert_eq!(policy.next(), None);
+
+        policy.reset();
+        assert_eq!(
+            policy.next().map(|attempt| (attempt.number, attempt.delay)),
+            Some((1, Duration::from_millis(100)))
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_retries_failed_restarts_until_the_policy_is_exhausted() {
+        let root = TempDir::new().unwrap();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/mcpls-language-server".to_string();
+        config.heuristics = None;
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], None);
+        let actor = spawn_project_actor_with_translator(2, translator);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let state = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() == ProjectStatus::Failed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(state.runtime().generation(), 3);
+        assert!(
+            state
+                .last_error()
+                .is_some_and(|error| error.contains("No such file") || error.contains("not found"))
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_rejects_queued_semantic_work_after_restart_exhaustion() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/mcpls-language-server".to_string();
+        config.heuristics = None;
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+        let mut translator = Translator::new().with_extensions(extensions);
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], None);
+        let actor = spawn_project_actor_with_translator(2, translator);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+        let result = actor
+            .document_symbols(root.path().join("src/main.rs").display().to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message == "language server exited"
+        ));
     }
 
     #[tokio::test]
@@ -6778,6 +7421,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_retains_bounded_history_after_removal() {
+        let root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("removed-history").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "window/logMessage",
+                    Some(serde_json::json!({"type": 1, "message": "retained log"})),
+                ),
+            })
+            .await
+            .unwrap();
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "window/showMessage",
+                    Some(serde_json::json!({"type": 2, "message": "retained message"})),
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(actor.server_logs(10, None).await.unwrap().logs.len(), 1);
+
+        registry.remove(project_id.clone()).await.unwrap();
+
+        let logs = registry.server_logs(&project_id, 10, None).await.unwrap();
+        assert_eq!(logs.logs[0].message, "retained log");
+        let messages = registry.server_messages(&project_id, 10).await.unwrap();
+        assert_eq!(messages.messages[0].message, "retained message");
+    }
+
+    #[tokio::test]
+    async fn project_registry_evicts_old_removed_history() {
+        let registry = ProjectRegistry::new(1);
+        let roots = (0..=RETAINED_PROJECT_HISTORY_CAPACITY)
+            .map(|_| TempDir::new().unwrap())
+            .collect::<Vec<_>>();
+
+        for (index, root) in roots.iter().enumerate() {
+            let id = ProjectId::new(format!("removed-{index}")).unwrap();
+            registry
+                .add(ProjectIdentity::new(
+                    id.clone(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            registry.remove(id).await.unwrap();
+        }
+
+        let oldest = ProjectId::new("removed-0").unwrap();
+        assert!(matches!(
+            registry.server_logs(&oldest, 10, None).await,
+            Err(ProjectRegistryError::ProjectNotFound(_))
+        ));
+        let newest =
+            ProjectId::new(format!("removed-{RETAINED_PROJECT_HISTORY_CAPACITY}")).unwrap();
+        assert!(registry.server_logs(&newest, 10, None).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn project_registry_persists_add_and_remove_mutations() {
         let root = TempDir::new().unwrap();
         let state_path = root.path().join("state/projects.json");
@@ -7057,6 +7775,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_isolates_failed_lsp_recovery_between_projects() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        for root in [first_root.path(), second_root.path()] {
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+        }
+
+        let mut broken_server = crate::config::LspServerConfig::rust_analyzer();
+        broken_server.command = "/definitely/missing/mcpls-language-server".to_string();
+        broken_server.heuristics = None;
+        let registry = ProjectRegistry::new(4);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    first_id.clone(),
+                    CanonicalRoot::new(first_root.path()).unwrap(),
+                ),
+                Some(ProjectConfig {
+                    lsp_servers: Some(vec![broken_server]),
+                    heuristics_max_depth: Some(3),
+                    redaction_patterns: None,
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let first = registry.actor_for_project(&first_id).await.unwrap();
+        let second = registry.actor_for_project(&second_id).await.unwrap();
+        first.set_status(ProjectStatus::Ready).await.unwrap();
+        second.set_status(ProjectStatus::Ready).await.unwrap();
+        let mut second_events = second.subscribe_events();
+        first
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let first_state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = first.query().await.unwrap();
+                if state.status() == ProjectStatus::Failed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(first_state.status(), ProjectStatus::Failed);
+        assert_eq!(
+            registry.status(&second_id).await.unwrap().status(),
+            ProjectStatus::Ready
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn project_status_reports_failure_in_any_actor_group() {
         let primary_root = TempDir::new().unwrap();
         let secondary_root = TempDir::new().unwrap();
@@ -7242,6 +8035,47 @@ mod tests {
         assert_eq!(report.stopped, vec![first_id, second_id]);
         assert_eq!(*first_actor.status().borrow(), ProjectStatus::Stopped);
         assert_eq!(*second_actor.status().borrow(), ProjectStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn project_registry_shutdown_rejects_new_actor_requests_before_draining() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("shutdown-race").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let actor = registry.actor_for_project(&project_id).await.unwrap();
+        let mutation = registry
+            .projects
+            .read()
+            .await
+            .get(&project_id)
+            .unwrap()
+            .actors[0]
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move { shutdown_registry.shutdown_all().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(matches!(
+            actor.set_status(ProjectStatus::Ready).await,
+            Err(ProjectActorError::Closed)
+        ));
+
+        drop(guard);
+        let report = shutdown.await.unwrap();
+        assert!(report.failed.is_empty());
+        assert!(report.stopped.contains(&project_id));
     }
 
     #[tokio::test]
@@ -7443,6 +8277,89 @@ mod tests {
         let (resolved_id, resolved_actor) = registry.project_for_path(&file).await.unwrap();
         assert_eq!(resolved_id, project_id);
         assert!(resolved_actor.sender.same_channel(&actor.sender));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compatible_linked_worktrees_share_one_lsp_process() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        }
+        let counter = repository.path().join("spawn-count");
+        let lsp = repository.path().join("counting-lsp.py");
+        fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        let mut template_source = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        template_source.set_lsp_configs(vec![config], Some(3));
+        let registry =
+            ProjectRegistry::with_translator_template(4, template_source.configuration_template());
+        let project_id = ProjectId::new("repository").unwrap();
+        let repository_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(repository_identity),
+            )
+            .await
+            .unwrap();
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_identity),
+            )
+            .await
+            .unwrap();
+
+        let state = registry.activate(&project_id).await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(state.workspace_roots().len(), 2);
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
+        assert_eq!(fs::read_to_string(counter).unwrap(), "1");
     }
 
     #[cfg(unix)]
