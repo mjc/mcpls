@@ -59,13 +59,7 @@ impl HttpClient {
 
     #[allow(clippy::needless_pass_by_value)]
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        let request_id = self.next_request_id();
-        let response = self.request(&json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments}
-        }));
+        let response = self.call_tool_response(name, arguments);
         assert!(response.get("error").is_none(), "tool error: {response}");
         let text = response["result"]["content"][0]["text"]
             .as_str()
@@ -73,6 +67,17 @@ impl HttpClient {
         serde_json::from_str(text).unwrap_or_else(|error| {
             panic!("tool response is not JSON: {error}; response={response}")
         })
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn call_tool_response(&mut self, name: &str, arguments: Value) -> Value {
+        let request_id = self.next_request_id();
+        self.request(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
     }
 
     fn subscribe(&mut self, uri: &str) {
@@ -442,6 +447,180 @@ impl HttpFixture {
     }
 }
 
+struct RealRaHttpFixture {
+    _directory: TempDir,
+    config: PathBuf,
+    spawn_counter: PathBuf,
+    root_a: PathBuf,
+    root_b: PathBuf,
+    functions_b: PathBuf,
+    lib_b: PathBuf,
+    broken_b: PathBuf,
+    bad_format_b: PathBuf,
+}
+
+impl RealRaHttpFixture {
+    fn new(rust_analyzer: &Path) -> Self {
+        let directory = TempDir::new().unwrap();
+        let spawn_counter = directory.path().join("rust-analyzer-spawns");
+        std::fs::write(&spawn_counter, "0").unwrap();
+        let wrapper = write_counting_rust_analyzer(&directory, rust_analyzer);
+        let state_file = directory.path().join("projects.json");
+        let config = write_real_ra_config(&directory, &state_file, &wrapper, &spawn_counter);
+        let root_a = directory.path().join("project-a");
+        let root_b = directory.path().join("project-b");
+        write_rust_project(&root_a, "only_a", false);
+        write_rust_project(&root_b, "only_b", true);
+
+        Self {
+            _directory: directory,
+            config,
+            spawn_counter,
+            functions_b: root_b.join("src/functions.rs"),
+            lib_b: root_b.join("src/lib.rs"),
+            broken_b: root_b.join("src/broken.rs"),
+            bad_format_b: root_b.join("src/bad_format.rs"),
+            root_a,
+            root_b,
+        }
+    }
+}
+
+fn write_counting_rust_analyzer(directory: &TempDir, rust_analyzer: &Path) -> PathBuf {
+    let source = directory.path().join("counting-rust-analyzer.rs");
+    let command = directory.path().join("counting-rust-analyzer");
+    let analyzer = serde_json::to_string(&rust_analyzer.to_string_lossy()).unwrap();
+    let source_text = format!(
+        r#"
+use std::env;
+use std::fs;
+use std::process::Command;
+
+const RUST_ANALYZER: &str = {analyzer};
+
+fn main() {{
+    let counter = env::var("MCPLS_SPAWN_COUNTER").unwrap();
+    let value = fs::read_to_string(&counter)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    fs::write(&counter, (value + 1).to_string()).unwrap();
+    let status = Command::new(RUST_ANALYZER)
+        .args(env::args().skip(1))
+        .status()
+        .unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#
+    );
+    std::fs::write(&source, source_text).unwrap();
+    let status = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            source.to_str().unwrap(),
+            "-o",
+            command.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to compile counting rust-analyzer");
+    command
+}
+
+fn write_real_ra_config(
+    directory: &TempDir,
+    state_file: &Path,
+    lsp_command: &Path,
+    spawn_counter: &Path,
+) -> PathBuf {
+    let path = directory.path().join("mcpls-real-ra.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[workspace]\nroots = [\"/definitely/missing/mcpls-real-ra\"]\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"{}\"\nargs = []\nfile_patterns = [\"**/*.rs\"]\ntimeout_seconds = 15\nenv = {{ MCPLS_SPAWN_COUNTER = \"{}\" }}\n\n[daemon]\nstate_file = \"{}\"\n",
+            lsp_command.display(),
+            spawn_counter.display(),
+            state_file.display(),
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn write_rust_project(root: &Path, marker: &str, with_actions: bool) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('-', "_")
+        ),
+    )
+    .unwrap();
+
+    let functions = format!("pub fn {marker}() -> i32 {{ 7 }}\n");
+    std::fs::write(root.join("src/functions.rs"), functions).unwrap();
+    let mut lib = format!(
+        "pub mod functions;\npub fn caller() -> i32 {{ let _emoji = \"🙂\"; crate::functions::{marker}() }}\n"
+    );
+    if with_actions {
+        lib.push_str(
+            "pub trait Greet { fn greet(&self) -> &'static str; }\npub struct CodeActionTarget;\nimpl Greet for CodeActionTarget {}\n",
+        );
+    }
+    std::fs::write(root.join("src/lib.rs"), lib).unwrap();
+    std::fs::write(
+        root.join("src/broken.rs"),
+        "pub fn broken() -> i32 { \"not an integer\" }\n",
+    )
+    .unwrap();
+    let mut lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    lib.push_str("pub mod broken;\n");
+    std::fs::write(root.join("src/lib.rs"), lib).unwrap();
+    std::fs::write(
+        root.join("src/bad_format.rs"),
+        "pub fn badly_formatted()->i32{crate::functions::".to_owned() + marker + "()}\n",
+    )
+    .unwrap();
+}
+
+fn resolve_rust_analyzer_for_http() -> Option<PathBuf> {
+    if std::env::var("MCPLS_SKIP_RA").ok().as_deref() == Some("1") {
+        return None;
+    }
+    let candidate = std::env::var_os("MCPLS_RUST_ANALYZER")
+        .map_or_else(|| PathBuf::from("rust-analyzer"), PathBuf::from);
+    Command::new(&candidate)
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|_| candidate)
+}
+
+fn find_line(path: &Path, needle: &str) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|line| u32::try_from(line).unwrap() + 1)
+        .unwrap()
+}
+
+fn wait_project_ready(client: &mut HttpClient, project_id: &str) {
+    for _ in 0..120 {
+        let status = client.call_tool("project_status", json!({"project_id": project_id}));
+        match status["status"].as_str() {
+            Some("Ready") => return,
+            Some("Failed") => panic!("project {project_id} failed: {status}"),
+            _ => thread::sleep(Duration::from_millis(250)),
+        }
+    }
+    panic!("project {project_id} did not become ready")
+}
+
 fn project_ids(client: &mut HttpClient) -> Vec<String> {
     client
         .call_tool("project_list", json!({}))
@@ -524,4 +703,223 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     restored.initialize();
     assert_eq!(project_ids(&mut restored), ["project-a", "project-b"]);
     restarted_daemon.terminate();
+}
+
+#[test]
+#[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
+fn real_rust_analyzer_http_sessions_and_safe_refactor_e2e() {
+    let Some(rust_analyzer) = resolve_rust_analyzer_for_http() else {
+        println!(
+            "real rust-analyzer HTTP suite skipped: set MCPLS_RUST_ANALYZER or install rust-analyzer"
+        );
+        return;
+    };
+    let fixture = RealRaHttpFixture::new(&rust_analyzer);
+    let mut daemon = HttpDaemon::spawn(&fixture.config);
+    let mut first = HttpClient::new(daemon.address);
+    let mut second = HttpClient::new(daemon.address);
+    first.initialize();
+    second.initialize();
+
+    register_real_ra_projects(&mut first, &mut second, &fixture);
+    let target_line = find_line(&fixture.functions_b, "pub fn only_b(");
+    assert_real_ra_navigation(&mut first, &mut second, &fixture, target_line);
+    apply_real_ra_rename_and_format(&mut first, &fixture, target_line);
+    apply_real_ra_code_action_and_restart(&mut first, &mut second, &fixture, target_line);
+
+    daemon.terminate();
+    assert!(daemon.child.try_wait().unwrap().is_some());
+}
+
+fn register_real_ra_projects(
+    first: &mut HttpClient,
+    second: &mut HttpClient,
+    fixture: &RealRaHttpFixture,
+) {
+    first.call_tool(
+        "project_add",
+        json!({"project_id": "project-a", "root": fixture.root_a}),
+    );
+    second.call_tool(
+        "project_add",
+        json!({"project_id": "project-b", "root": fixture.root_b}),
+    );
+    first.call_tool("project_activate", json!({"project_id": "project-a"}));
+    second.call_tool("project_activate", json!({"project_id": "project-b"}));
+    wait_project_ready(first, "project-a");
+    wait_project_ready(second, "project-b");
+    assert_eq!(
+        std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
+        "2"
+    );
+    for client in [first, second] {
+        assert_eq!(project_ids(client), ["project-a", "project-b"]);
+    }
+}
+
+fn assert_real_ra_navigation(
+    first: &mut HttpClient,
+    second: &mut HttpClient,
+    fixture: &RealRaHttpFixture,
+    target_line: u32,
+) {
+    let symbols_a = first.call_tool(
+        "workspace_symbol_search",
+        json!({"project_id": "project-a", "query": "only_b"}),
+    );
+    assert!(symbols_a["symbols"].as_array().unwrap().is_empty());
+    let symbols_b = second.call_tool(
+        "workspace_symbol_search",
+        json!({"project_id": "project-b", "query": "only_b"}),
+    );
+    assert!(!symbols_b["symbols"].as_array().unwrap().is_empty());
+
+    let hover = second.call_tool(
+        "get_hover",
+        json!({"file_path": fixture.functions_b, "line": target_line, "character": 8}),
+    );
+    assert!(hover.to_string().contains("only_b"));
+    let caller_line = find_line(&fixture.lib_b, "crate::functions::only_b");
+    let definition = second.call_tool(
+        "get_definition",
+        json!({"file_path": fixture.lib_b, "line": caller_line, "character": 60}),
+    );
+    assert!(definition.to_string().contains("functions.rs"));
+    let references = second.call_tool(
+        "get_references",
+        json!({
+            "file_path": fixture.functions_b,
+            "line": target_line,
+            "character": 8,
+            "include_declaration": true
+        }),
+    );
+    assert!(references["locations"].as_array().unwrap().len() >= 2);
+
+    let diagnostics = second.call_tool("get_diagnostics", json!({"file_path": fixture.broken_b}));
+    assert!(!diagnostics["diagnostics"].as_array().unwrap().is_empty());
+}
+
+fn apply_real_ra_rename_and_format(
+    client: &mut HttpClient,
+    fixture: &RealRaHttpFixture,
+    target_line: u32,
+) {
+    let rename = client.call_tool(
+        "rename_preview",
+        json!({
+            "project_id": "project-b",
+            "file_path": fixture.functions_b,
+            "line": target_line,
+            "character": 8,
+            "new_name": "renamed_b",
+            "position_encoding": "utf-16"
+        }),
+    );
+    assert_eq!(rename["safe_to_apply"], true);
+    assert!(
+        rename["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("renamed_b")
+    );
+    assert!(rename["preconditions"].as_array().is_some());
+    let rename_plan = rename["plan_id"].as_str().unwrap().to_owned();
+    let applied = client.call_tool(
+        "workspace_edit_apply",
+        json!({"project_id": "project-b", "plan_id": rename_plan}),
+    );
+    assert!(applied["committed_files"].as_array().unwrap().len() >= 2);
+    assert!(
+        std::fs::read_to_string(&fixture.functions_b)
+            .unwrap()
+            .contains("renamed_b")
+    );
+    assert!(
+        std::fs::read_to_string(&fixture.lib_b)
+            .unwrap()
+            .contains("renamed_b")
+    );
+    let stale = client.call_tool_response(
+        "workspace_edit_apply",
+        json!({"project_id": "project-b", "plan_id": rename_plan}),
+    );
+    assert!(stale.get("error").is_some());
+
+    let formatted = client.call_tool(
+        "format_preview",
+        json!({
+            "project_id": "project-b",
+            "file_path": fixture.bad_format_b,
+            "tab_size": 4,
+            "insert_spaces": true,
+            "position_encoding": "utf-16"
+        }),
+    );
+    let format_plan = formatted["plan_id"].as_str().unwrap().to_owned();
+    client.call_tool(
+        "workspace_edit_apply",
+        json!({"project_id": "project-b", "plan_id": format_plan}),
+    );
+    assert!(
+        std::fs::read_to_string(&fixture.bad_format_b)
+            .unwrap()
+            .contains("pub fn badly_formatted()")
+    );
+}
+
+fn apply_real_ra_code_action_and_restart(
+    first: &mut HttpClient,
+    second: &mut HttpClient,
+    fixture: &RealRaHttpFixture,
+    target_line: u32,
+) {
+    let code_actions = second.call_tool(
+        "code_action_list",
+        json!({
+            "project_id": "project-b",
+            "file_path": fixture.lib_b,
+            "start_line": find_line(&fixture.lib_b, "impl Greet for CodeActionTarget"),
+            "start_character": 6,
+            "end_line": find_line(&fixture.lib_b, "impl Greet for CodeActionTarget"),
+            "end_character": 6
+        }),
+    );
+    let action = code_actions["actions"]
+        .as_array()
+        .and_then(|actions| actions.first())
+        .unwrap_or_else(|| panic!("expected a real rust-analyzer code action: {code_actions}"));
+    let action_id = action["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("code action has no action_id: {action}"));
+    let action_plan = second.call_tool(
+        "code_action_preview",
+        json!({"project_id": "project-b", "action_id": action_id, "position_encoding": "utf-16"}),
+    );
+    let action_plan_id = action_plan["plan_id"].as_str().unwrap();
+    second.call_tool(
+        "code_action_apply",
+        json!({"project_id": "project-b", "plan_id": action_plan_id}),
+    );
+    assert!(
+        std::fs::read_to_string(&fixture.lib_b)
+            .unwrap()
+            .contains("fn greet(&self)")
+    );
+
+    second.call_tool("project_restart_lsp", json!({"project_id": "project-b"}));
+    wait_project_ready(first, "project-b");
+    let post_restart = first.call_tool(
+        "get_hover",
+        json!({
+            "file_path": fixture.functions_b,
+            "line": target_line,
+            "character": 8
+        }),
+    );
+    assert!(post_restart.to_string().contains("renamed_b"));
+    assert_eq!(
+        std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
+        "3"
+    );
 }
