@@ -152,6 +152,22 @@ impl McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))
     }
 
+    async fn attach_subscription(
+        &self,
+        project_id: ProjectId,
+        actor: &ProjectHandle,
+        uri: String,
+        peer: rmcp::Peer<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.context
+            .subscriptions
+            .subscribe(uri)
+            .await
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        self.context.event_sink.attach(project_id, actor, peer);
+        Ok(())
+    }
+
     async fn preview_project_edit(
         &self,
         id: &ProjectId,
@@ -1225,14 +1241,8 @@ impl ServerHandler for McplsServer {
                 .actor_for_project(&project_id)
                 .await
                 .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-            self.context
-                .subscriptions
-                .subscribe(request.uri)
-                .await
-                .map_err(|error| McpError::invalid_params(error, None))?;
-            self.context
-                .event_sink
-                .attach(project_id, &actor, context.peer);
+            self.attach_subscription(project_id, &actor, request.uri, context.peer)
+                .await?;
             return Ok(());
         }
 
@@ -1253,15 +1263,8 @@ impl ServerHandler for McplsServer {
         // notify_resource_updated so clients subscribing after initial workspace indexing
         // don't have to wait for the next LSP push. Requires peer access from HandlerContext.
         // Track as follow-up issue.
-        self.context
-            .subscriptions
-            .subscribe(request.uri.clone())
-            .await
-            .map_err(|e| McpError::invalid_params(e, None))?;
-
-        self.context
-            .event_sink
-            .attach(project_id, &actor, context.peer);
+        self.attach_subscription(project_id, &actor, request.uri.clone(), context.peer)
+            .await?;
 
         Ok(())
     }
