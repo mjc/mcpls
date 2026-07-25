@@ -204,7 +204,14 @@ impl HttpEventStream {
                         return true;
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return false;
+                }
                 Err(error) => panic!("reading SSE stream failed: {error}"),
             }
         }
@@ -413,6 +420,7 @@ fn main() {
         } else if message.contains("\"method\":\"shutdown\"") {
             let id = request_id(&message).unwrap();
             send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}", id));
+        } else if message.contains("\"method\":\"exit\"") {
             break;
         }
     }
@@ -686,7 +694,10 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     let activated = first.call_tool("project_activate", json!({"project_id": "project-a"}));
     assert_eq!(activated["status"], "Ready");
     let restarted = second.call_tool("project_restart_lsp", json!({"project_id": "project-a"}));
-    assert_eq!(restarted["status"], "Ready");
+    assert_eq!(
+        restarted["status"], "Ready",
+        "restart response: {restarted}"
+    );
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "2"
@@ -695,6 +706,15 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     let events_uri = "mcpls-project-events:///project-a";
     first.subscribe(events_uri);
     let mut events = first.open_events(None);
+    second.call_tool("project_remove", json!({"project_id": "project-b"}));
+    assert!(
+        !events.wait_for("project-b", Duration::from_millis(100)),
+        "project-A subscription received an event for project B"
+    );
+    first.call_tool(
+        "project_add",
+        json!({"project_id": "project-b", "root": root_b}),
+    );
     second.call_tool("project_restart_lsp", json!({"project_id": "project-a"}));
     assert!(
         events.wait_for("notifications/resources/updated", Duration::from_secs(10)),
@@ -837,11 +857,14 @@ fn http_rejects_non_loopback_listener_without_binding() {
 #[test]
 #[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
 fn real_rust_analyzer_http_sessions_and_safe_refactor_e2e() {
-    let Some(rust_analyzer) = resolve_rust_analyzer_for_http() else {
-        println!(
-            "real rust-analyzer HTTP suite skipped: set MCPLS_RUST_ANALYZER or install rust-analyzer"
-        );
+    if std::env::var("MCPLS_SKIP_RA").ok().as_deref() == Some("1") {
+        println!("real rust-analyzer HTTP suite skipped by MCPLS_SKIP_RA=1");
         return;
+    }
+    let Some(rust_analyzer) = resolve_rust_analyzer_for_http() else {
+        panic!(
+            "rust-analyzer is required for this suite; set MCPLS_RUST_ANALYZER or MCPLS_SKIP_RA=1"
+        );
     };
     let mut harness = RealRaHttpHarness::new(&rust_analyzer);
     harness.register_projects();
@@ -930,9 +953,17 @@ fn register_real_ra_projects(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "2"
     );
-    for client in [first, second] {
-        assert_eq!(project_ids(client), ["project-a", "project-b"]);
-    }
+    assert_eq!(project_ids(first), ["project-a", "project-b"]);
+    assert_eq!(project_ids(second), ["project-a", "project-b"]);
+    let capabilities = second.call_tool(
+        "project_lsp_capabilities",
+        json!({"project_id": "project-b", "language_id": "rust"}),
+    );
+    assert!(
+        capabilities.to_string().contains("position_encoding")
+            || capabilities.to_string().contains("positionEncoding"),
+        "negotiated position encoding missing: {capabilities}"
+    );
 }
 
 fn assert_real_ra_navigation(
@@ -983,6 +1014,8 @@ fn apply_real_ra_rename_and_format(
     fixture: &RealRaHttpFixture,
     target_line: u32,
 ) {
+    client.subscribe("mcpls-project-events:///project-b");
+    let mut events = client.open_events(None);
     let rename = client.call_tool(
         "rename_preview",
         json!({
@@ -1001,7 +1034,16 @@ fn apply_real_ra_rename_and_format(
             .unwrap()
             .contains("renamed_b")
     );
-    assert!(rename["preconditions"].as_array().is_some());
+    let preconditions = rename["preconditions"].as_array().unwrap();
+    assert!(preconditions.len() >= 2);
+    for precondition in preconditions {
+        assert!(
+            precondition["sha256"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+        assert!(precondition.get("version").is_some());
+    }
     let rename_plan = rename["plan_id"].as_str().unwrap().to_owned();
     let applied = client.call_tool(
         "workspace_edit_apply",
@@ -1018,6 +1060,11 @@ fn apply_real_ra_rename_and_format(
             .unwrap()
             .contains("renamed_b")
     );
+    assert!(
+        events.wait_for("notifications/resources/updated", Duration::from_secs(10)),
+        "rename did not produce a project resource notification"
+    );
+    drop(events);
     let stale = client.call_tool_response(
         "workspace_edit_apply",
         json!({"project_id": "project-b", "plan_id": rename_plan}),
