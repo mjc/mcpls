@@ -2652,6 +2652,16 @@ impl ProjectRuntime {
             && self.has_active_workspace_roots(roots)
     }
 
+    fn begin_automatic_restart(&mut self) -> Option<AutomaticRestartAttempt> {
+        let attempt = self.automatic_restart.next()?;
+        self.begin_transition();
+        Some(attempt)
+    }
+
+    const fn reset_automatic_restart(&mut self) {
+        self.automatic_restart.reset();
+    }
+
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
         self.edit_plans
             .insert(plan)
@@ -3193,13 +3203,12 @@ async fn recover_project_after_server_exit(
     runtime: &mut ProjectRuntime,
 ) {
     loop {
-        let Some(attempt) = runtime.automatic_restart.next() else {
+        let Some(attempt) = runtime.begin_automatic_restart() else {
             state.last_error = Some("language server exited".to_string());
             channels.publish_status(state, ProjectStatus::Failed);
             return;
         };
 
-        runtime.begin_transition();
         state.last_error = Some(format!(
             "language server exited; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
             attempt.number
@@ -3415,7 +3424,7 @@ fn mark_project_started(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) {
-    runtime.automatic_restart.reset();
+    runtime.reset_automatic_restart();
     let health = activation.health();
     spawn_notification_forwarders(
         activation.into_notification_receivers(),
