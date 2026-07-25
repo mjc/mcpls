@@ -1081,18 +1081,48 @@ pub enum ProjectActorError {
 }
 
 #[derive(Clone)]
-struct ProjectRequestSender {
-    sender: mpsc::Sender<ProjectRequest>,
+struct ProjectRequestGate {
     accepting: std::sync::Arc<AtomicBool>,
     rejected: std::sync::Arc<Notify>,
+}
+
+impl ProjectRequestGate {
+    fn new() -> Self {
+        Self {
+            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            rejected: std::sync::Arc::new(Notify::new()),
+        }
+    }
+
+    fn reject_new_work(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.rejected.notify_waiters();
+    }
+
+    fn accept_new_work(&self) {
+        self.accepting.store(true, Ordering::Release);
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_rejection(&self) {
+        self.rejected.notified().await;
+    }
+}
+
+#[derive(Clone)]
+struct ProjectRequestSender {
+    sender: mpsc::Sender<ProjectRequest>,
+    gate: ProjectRequestGate,
 }
 
 impl ProjectRequestSender {
     fn new(sender: mpsc::Sender<ProjectRequest>) -> Self {
         Self {
             sender,
-            accepting: std::sync::Arc::new(AtomicBool::new(true)),
-            rejected: std::sync::Arc::new(Notify::new()),
+            gate: ProjectRequestGate::new(),
         }
     }
 
@@ -1108,19 +1138,18 @@ impl ProjectRequestSender {
     }
 
     fn reject_new_work(&self) {
-        self.accepting.store(false, Ordering::Release);
-        self.rejected.notify_waiters();
+        self.gate.reject_new_work();
     }
 
     fn accept_new_work(&self) {
-        self.accepting.store(true, Ordering::Release);
+        self.gate.accept_new_work();
     }
 
     async fn send(
         &self,
         request: ProjectRequest,
     ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
-        if !self.accepting.load(Ordering::Acquire) {
+        if !self.gate.is_accepting() {
             return Err(mpsc::error::SendError(request));
         }
 
@@ -1129,11 +1158,11 @@ impl ProjectRequestSender {
                 Ok(permit) => permit,
                 Err(_) => return Err(mpsc::error::SendError(request)),
             },
-            _ = self.rejected.notified() => {
+            _ = self.gate.wait_for_rejection() => {
                 return Err(mpsc::error::SendError(request));
             }
         };
-        if !self.accepting.load(Ordering::Acquire) {
+        if !self.gate.is_accepting() {
             return Err(mpsc::error::SendError(request));
         }
         permit.send(request);
