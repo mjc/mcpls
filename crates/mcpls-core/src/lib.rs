@@ -211,6 +211,49 @@ fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
+async fn register_default_workspace_projects(
+    registry: &project::ProjectRegistry,
+    roots: &[PathBuf],
+) -> usize {
+    let mut registered = 0;
+    for (index, root) in roots.iter().enumerate() {
+        let Ok(canonical_root) = project::CanonicalRoot::new(root) else {
+            warn!(
+                "Skipping unavailable configured workspace root: {}",
+                root.display()
+            );
+            continue;
+        };
+        let project_id = if roots.len() == 1 {
+            "default".to_string()
+        } else {
+            format!("workspace-{index}")
+        };
+        let Ok(project_id) = project::ProjectId::new(project_id) else {
+            continue;
+        };
+        let repository = project::GitRepositoryIdentity::discover(canonical_root.as_path())
+            .ok()
+            .flatten();
+        let identity = repository.map_or_else(
+            || project::ProjectIdentity::new(project_id.clone(), canonical_root.clone()),
+            |repository| {
+                project::ProjectIdentity::new(project_id.clone(), canonical_root.clone())
+                    .with_repository_identity(repository)
+            },
+        );
+        if let Err(error) = registry.add(identity).await {
+            warn!(
+                "Skipping default workspace project for {}: {error}",
+                root.display()
+            );
+        } else {
+            registered += 1;
+        }
+    }
+    registered
+}
+
 /// Start the MCPLS server with the given configuration over stdio.
 ///
 /// This is the backward-compatible entry point. It is equivalent to calling
@@ -283,6 +326,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let peer_cell = Arc::new(OnceCell::new());
     let project_registry =
         project::ProjectRegistry::with_translator_template(32, translator_template);
+    let registered = register_default_workspace_projects(&project_registry, &workspace_roots).await;
+    info!("Registered {registered} default workspace project(s)");
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new_with_registry(
@@ -309,6 +354,22 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn registers_a_default_project_for_one_workspace_root() {
+        let root = TempDir::new().unwrap();
+        let registry = project::ProjectRegistry::new(2);
+
+        let registered =
+            register_default_workspace_projects(&registry, &[root.path().to_path_buf()]).await;
+
+        assert_eq!(registered, 1);
+        let projects = registry.list().await;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id().as_str(), "default");
+        assert!(registry.actor_for_path(root.path()).await.is_ok());
+    }
 
     #[test]
     fn test_resolve_workspace_roots_empty_config() {
