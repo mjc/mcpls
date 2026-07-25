@@ -486,6 +486,10 @@ fn rust_project_compatibility_key(
         ".cargo/config.toml",
     ];
 
+    if root.join(".envrc").is_file() || root.join("flake.nix").is_file() {
+        return None;
+    }
+
     let mut hasher = Sha256::new();
     let mut has_toolchain = false;
     let mut has_manifest = false;
@@ -4958,6 +4962,44 @@ mod tests {
         assert_ne!(
             rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
             rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+        );
+    }
+
+    #[test]
+    fn rust_compatibility_key_rejects_dynamic_project_environment() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".envrc"),
+            "export RUSTFLAGS=-Ctarget-cpu=native\n",
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+
+        assert_eq!(
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            None
+        );
+
+        fs::remove_file(root.path().join(".envrc")).unwrap();
+        fs::write(root.path().join("flake.nix"), "{}\n").unwrap();
+        assert_eq!(
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            None
         );
     }
 
