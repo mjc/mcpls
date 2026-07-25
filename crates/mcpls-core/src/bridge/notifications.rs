@@ -36,6 +36,38 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {
     queue.push_back(value);
 }
 
+/// Redacts configured secret values from server output.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RedactionPolicy {
+    secrets: Vec<String>,
+}
+
+impl RedactionPolicy {
+    /// Build a policy from configured non-empty secret values.
+    #[must_use]
+    pub(crate) fn from_secrets<I>(secrets: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Self {
+            secrets: secrets
+                .into_iter()
+                .filter(|secret| !secret.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Replace every configured secret in one server message.
+    #[must_use]
+    pub(crate) fn redact(&self, message: &str) -> String {
+        self.secrets
+            .iter()
+            .fold(message.to_owned(), |message, secret| {
+                message.replace(secret, "[REDACTED]")
+            })
+    }
+}
+
 /// Information about diagnostics for a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticInfo {

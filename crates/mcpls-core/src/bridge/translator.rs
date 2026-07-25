@@ -18,6 +18,7 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::Duration};
 
+use super::notifications::RedactionPolicy;
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
@@ -93,22 +94,13 @@ pub struct Translator {
     /// Workspace roots used by the registered LSP server for each language ID.
     lsp_roots: HashMap<String, Vec<PathBuf>>,
     /// Configured environment values that must not escape through notifications.
-    redaction_secrets: Vec<String>,
+    redaction_policy: RedactionPolicy,
     /// Maximum ancestor/recursive marker search depth.
     heuristics_max_depth: Option<usize>,
 }
 
 const fn shutdown_error_is_recoverable(error: &Error) -> bool {
     matches!(error, Error::ServerTerminated)
-}
-
-fn redact_message(message: &str, secrets: &[String]) -> String {
-    secrets
-        .iter()
-        .filter(|secret| !secret.is_empty())
-        .fold(message.to_owned(), |message, secret| {
-            message.replace(secret, "[REDACTED]")
-        })
 }
 
 async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
@@ -199,7 +191,7 @@ impl Translator {
             expected_languages: HashSet::new(),
             lsp_configs: HashMap::new(),
             lsp_roots: HashMap::new(),
-            redaction_secrets: Vec::new(),
+            redaction_policy: RedactionPolicy::default(),
             heuristics_max_depth: None,
         }
     }
@@ -283,12 +275,13 @@ impl Translator {
 
     /// Configure LSP server definitions used for lazy project-root switches.
     pub fn set_lsp_configs(&mut self, configs: Vec<LspServerConfig>, max_depth: Option<usize>) {
-        self.redaction_secrets = configs
-            .iter()
-            .flat_map(|config| config.env.values())
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .collect();
+        self.redaction_policy = RedactionPolicy::from_secrets(
+            configs
+                .iter()
+                .flat_map(|config| config.env.values())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         self.lsp_configs = configs
             .into_iter()
             .map(|config| (config.language_id.clone(), config))
@@ -2246,7 +2239,7 @@ impl Translator {
             .take(limit)
             .cloned()
             .map(|mut log| {
-                log.message = redact_message(&log.message, &self.redaction_secrets);
+                log.message = self.redaction_policy.redact(&log.message);
                 log
             })
             .collect();
@@ -2266,7 +2259,7 @@ impl Translator {
             .take(limit)
             .cloned()
             .map(|mut message| {
-                message.message = redact_message(&message.message, &self.redaction_secrets);
+                message.message = self.redaction_policy.redact(&message.message);
                 message
             })
             .collect();
