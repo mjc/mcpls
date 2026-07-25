@@ -796,7 +796,10 @@ impl ProjectState {
     }
 
     fn aggregate(states: impl IntoIterator<Item = Self>) -> Self {
-        let mut aggregate = Self::new(ProjectStatus::Starting, ProjectRuntimeSummary::default());
+        let mut states = states.into_iter();
+        let Some(mut aggregate) = states.next() else {
+            return Self::new(ProjectStatus::Starting, ProjectRuntimeSummary::default());
+        };
         for state in states {
             aggregate.merge(state);
         }
@@ -5661,6 +5664,16 @@ mod tests {
         let counts = registry.status_counts().await;
         assert_eq!(counts.failed, 1);
         assert_eq!(counts.ready, 0);
+    }
+
+    #[test]
+    fn project_status_aggregate_preserves_ready_for_one_actor() {
+        let state = ProjectState::aggregate([ProjectState::new(
+            ProjectStatus::Ready,
+            ProjectRuntimeSummary::default(),
+        )]);
+
+        assert_eq!(state.status(), ProjectStatus::Ready);
     }
 
     #[tokio::test]
