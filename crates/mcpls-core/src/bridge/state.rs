@@ -174,11 +174,8 @@ impl DocumentTracker {
 
     /// Snapshot all tracked documents for reopening after an LSP restart.
     #[must_use]
-    pub fn open_documents(&self) -> Vec<(PathBuf, DocumentState)> {
-        self.documents
-            .iter()
-            .map(|(path, state)| (path.clone(), state.clone()))
-            .collect()
+    pub fn open_documents(&self) -> Vec<DocumentState> {
+        self.documents.values().cloned().collect()
     }
 
     /// Ensure a document is open, opening it lazily if necessary.
@@ -926,7 +923,7 @@ mod tests {
 
         assert_eq!(
             documents,
-            vec![(path, tracker.get(Path::new("/a.rs")).unwrap().clone())]
+            vec![tracker.get(Path::new("/a.rs")).unwrap().clone()]
         );
     }
 

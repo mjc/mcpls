@@ -301,7 +301,7 @@ impl Translator {
     }
 
     async fn reopen_tracked_documents(&self) -> Result<()> {
-        for (_path, document) in self.document_tracker.open_documents() {
+        for document in self.document_tracker.open_documents() {
             let Some(client) = self.lsp_clients.get(&document.language_id) else {
                 continue;
             };
