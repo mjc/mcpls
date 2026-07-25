@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -506,6 +507,9 @@ fn rust_project_compatibility_key(
     }
 
     if let Some(template) = translator_template {
+        let toolchain_signature = rust_toolchain_signature(root)?;
+        hash_compatibility_field(&mut hasher, b"rustc-toolchain-v1");
+        hash_compatibility_field(&mut hasher, &toolchain_signature);
         hash_rust_server_config(&mut hasher, template)?;
     }
 
@@ -542,6 +546,42 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
             .to_le_bytes(),
     );
     Some(())
+}
+
+fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
+    let channel = ["rust-toolchain", "rust-toolchain.toml"]
+        .into_iter()
+        .find_map(|relative| {
+            let contents = std::fs::read_to_string(root.join(relative)).ok()?;
+            if relative.ends_with(".toml") {
+                let document = contents.parse::<toml::Value>().ok()?;
+                document
+                    .get("toolchain")
+                    .and_then(|toolchain| toolchain.get("channel"))
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_owned)
+            }
+        })?;
+    let output = Command::new("rustup")
+        .args(["run", &channel, "rustc", "-Vv"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .or_else(|| {
+            Command::new("rustc")
+                .arg(format!("+{channel}"))
+                .arg("-Vv")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        })?;
+    Some(output.stdout)
 }
 
 fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
@@ -4588,6 +4628,32 @@ mod tests {
         assert_ne!(
             rust_project_compatibility_key(root.path(), Some(&first.configuration_template())),
             rust_project_compatibility_key(root.path(), Some(&second.configuration_template())),
+        );
+    }
+
+    #[test]
+    fn rust_compatibility_key_rejects_unavailable_toolchains() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"mcpls-definitely-missing\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+
+        assert_eq!(
+            rust_project_compatibility_key(root.path(), Some(&translator.configuration_template())),
+            None
         );
     }
 
