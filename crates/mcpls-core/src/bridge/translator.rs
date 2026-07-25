@@ -1979,12 +1979,7 @@ impl Translator {
     ///
     /// Returns an error if the path is invalid or outside workspace boundaries.
     pub fn handle_cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult> {
-        let path = PathBuf::from(file_path);
-        let validated_path = self.validate_path(&path)?;
-
-        // Use path_to_uri (strips \\?\ on Windows) so the key matches what
-        // rust-analyzer stores in publishDiagnostics notifications.
-        let uri = path_to_uri(&validated_path).to_string();
+        let uri = self.diagnostic_uri(file_path)?;
 
         let diagnostics =
             self.notification_cache
@@ -2023,11 +2018,22 @@ impl Translator {
     }
 
     /// Return whether diagnostics have been cached for a document path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path cannot be validated against the
+    /// translator's workspace roots.
     pub fn has_cached_diagnostics(&self, file_path: &str) -> Result<bool> {
+        let uri = self.diagnostic_uri(file_path)?;
+        Ok(self.notification_cache.contains_diagnostics(&uri))
+    }
+
+    fn diagnostic_uri(&self, file_path: &str) -> Result<String> {
         let path = PathBuf::from(file_path);
         let validated_path = self.validate_path(&path)?;
-        let uri = path_to_uri(&validated_path).to_string();
-        Ok(self.notification_cache.contains_diagnostics(&uri))
+        // Use path_to_uri (strips \\?\ on Windows) so the key matches what
+        // rust-analyzer stores in publishDiagnostics notifications.
+        Ok(path_to_uri(&validated_path).to_string())
     }
 
     /// Handle server logs request.
