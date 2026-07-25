@@ -3102,13 +3102,7 @@ async fn run_project_actor(
         }
     }
     if state.status != ProjectStatus::Stopped {
-        runtime.begin_transition();
-        channels.publish_status(&mut state, ProjectStatus::Stopping);
-        if let Err(error) = runtime.shutdown().await {
-            state.last_error = Some(error);
-        }
-        state.sync_runtime(&runtime);
-        channels.publish_status(&mut state, ProjectStatus::Stopped);
+        stop_project_runtime(&channels, &mut state, &mut runtime, false).await;
     }
 }
 
@@ -3167,6 +3161,24 @@ fn publish_project_readiness(
         ProjectStatus::Ready
     };
     channels.publish_status(state, status);
+}
+
+async fn stop_project_runtime(
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+    clear_error: bool,
+) {
+    runtime.begin_transition();
+    if clear_error {
+        state.last_error = None;
+    }
+    channels.publish_status(state, ProjectStatus::Stopping);
+    if let Err(error) = runtime.shutdown().await {
+        state.last_error = Some(error);
+    }
+    state.sync_runtime(runtime);
+    channels.publish_status(state, ProjectStatus::Stopped);
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -3599,15 +3611,7 @@ async fn handle_project_request(
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
-            runtime.begin_transition();
-            state.sync_runtime(runtime);
-            state.last_error = None;
-            channels.publish_status(state, ProjectStatus::Stopping);
-            if let Err(error) = runtime.shutdown().await {
-                state.last_error = Some(error);
-            }
-            state.sync_runtime(runtime);
-            channels.publish_status(state, ProjectStatus::Stopped);
+            stop_project_runtime(channels, state, runtime, true).await;
             let _ = reply.send(());
             return true;
         }
