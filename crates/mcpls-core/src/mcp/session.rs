@@ -51,6 +51,12 @@ pub struct SessionEventSink {
     tasks: Mutex<HashMap<ProjectId, JoinHandle<()>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardOutcome {
+    Continue,
+    Disconnect,
+}
+
 impl SessionEventSink {
     pub(crate) fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
         Self {
@@ -96,12 +102,13 @@ impl SessionEventSink {
         let task = tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(event)
-                        if !forward_event(&subscriptions, notifier.as_ref(), &event).await =>
-                    {
-                        break;
+                    Ok(event) => {
+                        if forward_event(&subscriptions, notifier.as_ref(), &event).await
+                            == ForwardOutcome::Disconnect
+                        {
+                            break;
+                        }
                     }
-                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "session event sink lagged; polling can resync");
                     }
@@ -117,14 +124,18 @@ async fn forward_event(
     subscriptions: &ResourceSubscriptions,
     notifier: &dyn SessionNotifier,
     event: &ProjectEvent,
-) -> bool {
+) -> ForwardOutcome {
     let Some(resource_uri) = event_resource_uri(event) else {
-        return true;
+        return ForwardOutcome::Continue;
     };
     if !subscriptions.contains(&resource_uri).await {
-        return true;
+        return ForwardOutcome::Continue;
     }
-    notifier.notify_resource_updated(resource_uri).await.is_ok()
+    if notifier.notify_resource_updated(resource_uri).await.is_ok() {
+        ForwardOutcome::Continue
+    } else {
+        ForwardOutcome::Disconnect
+    }
 }
 
 impl Drop for SessionEventSink {
@@ -146,6 +157,7 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::sync::{broadcast, mpsc};
+    use tokio::task::JoinHandle;
 
     use super::{SessionEventSink, SessionNotifier};
     use super::{diagnostics_resource_uri, event_resource_uri};
@@ -157,6 +169,15 @@ mod tests {
     impl SessionNotifier for TestNotifier {
         async fn notify_resource_updated(&self, uri: String) -> Result<(), ()> {
             self.0.send(uri).map_err(|_| ())
+        }
+    }
+
+    struct FailingNotifier;
+
+    #[async_trait]
+    impl SessionNotifier for FailingNotifier {
+        async fn notify_resource_updated(&self, _uri: String) -> Result<(), ()> {
+            Err(())
         }
     }
 
@@ -219,5 +240,41 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn session_sink_stops_after_notifier_disconnects() {
+        let uri = "lsp-diagnostics:///workspace/a.rs".to_string();
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(uri).await.unwrap();
+        let sink = SessionEventSink::new(subscriptions);
+        let (events_tx, events_rx) = broadcast::channel(8);
+        let project_id = ProjectId::new("a").unwrap();
+
+        sink.attach_receiver(project_id.clone(), events_rx, Arc::new(FailingNotifier));
+        events_tx
+            .send(ProjectEvent::DiagnosticsUpdated {
+                uri: "file:///workspace/a.rs".to_string(),
+                version: Some(1),
+                diagnostic_count: 1,
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if sink
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(&project_id)
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session sink did not stop after peer disconnect");
     }
 }
