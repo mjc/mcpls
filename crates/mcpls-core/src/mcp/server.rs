@@ -37,8 +37,8 @@ use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
-    CanonicalRoot, GitRepositoryIdentity, ProjectEvent, ProjectEventRecord, ProjectEventSnapshot,
-    ProjectHandle, ProjectId, ProjectIdentity, ProjectRegistry, ProjectState,
+    CanonicalRoot, GitRepositoryIdentity, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle,
+    ProjectId, ProjectIdentity, ProjectRegistry, ProjectState,
 };
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
@@ -93,34 +93,6 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
     })
 }
 
-fn project_event_json(record: &ProjectEventRecord) -> serde_json::Value {
-    let event = match record.event() {
-        ProjectEvent::StatusChanged { status, last_error } => serde_json::json!({
-            "kind": "status_changed",
-            "status": format!("{status:?}"),
-            "last_error": last_error,
-        }),
-        ProjectEvent::ServerExited { generation } => serde_json::json!({
-            "kind": "server_exited",
-            "generation": generation,
-        }),
-        ProjectEvent::DiagnosticsUpdated {
-            uri,
-            version,
-            diagnostic_count,
-        } => serde_json::json!({
-            "kind": "diagnostics_updated",
-            "uri": uri,
-            "version": version,
-            "diagnostic_count": diagnostic_count,
-        }),
-    };
-    serde_json::json!({
-        "sequence": record.sequence(),
-        "event": event,
-    })
-}
-
 fn project_events_json(
     project_id: &ProjectId,
     snapshot: &ProjectEventSnapshot,
@@ -129,7 +101,11 @@ fn project_events_json(
         "project_id": project_id.as_str(),
         "next_cursor": snapshot.next_sequence(),
         "resync_required": snapshot.resync_required(),
-        "events": snapshot.events().iter().map(project_event_json).collect::<Vec<_>>(),
+        "events": snapshot
+            .events()
+            .iter()
+            .map(ProjectEventRecord::json_value)
+            .collect::<Vec<_>>(),
     })
 }
 

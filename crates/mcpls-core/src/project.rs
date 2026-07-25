@@ -523,6 +523,34 @@ pub enum ProjectEvent {
     },
 }
 
+impl ProjectEvent {
+    /// Encode the stable wire representation used by project-event resources.
+    #[must_use]
+    pub fn json_value(&self) -> serde_json::Value {
+        match self {
+            Self::StatusChanged { status, last_error } => serde_json::json!({
+                "kind": "status_changed",
+                "status": format!("{status:?}"),
+                "last_error": last_error,
+            }),
+            Self::ServerExited { generation } => serde_json::json!({
+                "kind": "server_exited",
+                "generation": generation,
+            }),
+            Self::DiagnosticsUpdated {
+                uri,
+                version,
+                diagnostic_count,
+            } => serde_json::json!({
+                "kind": "diagnostics_updated",
+                "uri": uri,
+                "version": version,
+                "diagnostic_count": diagnostic_count,
+            }),
+        }
+    }
+}
+
 /// One ordered project event retained for cursor-based session polling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectEventRecord {
@@ -541,6 +569,15 @@ impl ProjectEventRecord {
     #[must_use]
     pub const fn event(&self) -> &ProjectEvent {
         &self.event
+    }
+
+    /// Encode this ordered event record for resource polling clients.
+    #[must_use]
+    pub fn json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sequence": self.sequence,
+            "event": self.event.json_value(),
+        })
     }
 }
 
