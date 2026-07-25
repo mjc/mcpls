@@ -1415,10 +1415,6 @@ impl ServerHandler for McplsServer {
             .required_project_for_path(&path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        actor
-            .validate_path(path.display().to_string())
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let has_cached_diagnostics = actor
             .has_cached_diagnostics(path.display().to_string())
             .await
