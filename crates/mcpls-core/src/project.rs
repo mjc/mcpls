@@ -7041,6 +7041,42 @@ while True:
     }
 
     #[tokio::test]
+    async fn project_actor_rejects_queued_semantic_work_after_restart_exhaustion() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/mcpls-language-server".to_string();
+        config.heuristics = None;
+        let mut extensions = HashMap::new();
+        extensions.insert("rs".to_string(), "rust".to_string());
+        let mut translator = Translator::new().with_extensions(extensions);
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], None);
+        let actor = spawn_project_actor_with_translator(2, translator);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+        let result = actor
+            .document_symbols(root.path().join("src/main.rs").display().to_string())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message == "language server exited"
+        ));
+    }
+
+    #[tokio::test]
     async fn project_actor_can_add_a_linked_workspace_root() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
