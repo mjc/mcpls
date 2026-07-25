@@ -3541,7 +3541,6 @@ impl ProjectRegistry {
                 .await?;
 
             let mut projects = self.projects.write().await;
-            self.lifecycle.ensure_accepting()?;
             if let Some(existing) = projects.get(identity.id()) {
                 if existing.identity.root() != identity.root() {
                     return Err(ProjectRegistryError::ConflictingProject {
@@ -3641,6 +3640,7 @@ impl ProjectRegistry {
     /// boundaries without holding the registry lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
         self.lifecycle.begin_shutdown();
+        let _mutation_guards = self.lock_project_mutations().await;
         let entries: Vec<_> = self
             .projects
             .read()
@@ -3668,6 +3668,29 @@ impl ProjectRegistry {
 
         report.sort();
         report
+    }
+
+    async fn lock_project_mutations(&self) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mutations = self
+            .projects
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.mutation.clone())
+            .fold(Vec::new(), |mut unique, mutation| {
+                if !unique
+                    .iter()
+                    .any(|existing| std::sync::Arc::ptr_eq(existing, &mutation))
+                {
+                    unique.push(mutation);
+                }
+                unique
+            });
+        let mut guards = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            guards.push(mutation.lock_owned().await);
+        }
+        guards
     }
 
     /// Return open-document paths grouped by the registered project IDs that
@@ -5379,6 +5402,42 @@ mod tests {
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].project_id, project_id);
         assert_eq!(report.failed[0].error, "shutdown timed out after 0ns");
+    }
+
+    #[tokio::test]
+    async fn project_registry_shutdown_waits_for_project_mutations() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let mutation = registry
+            .projects
+            .read()
+            .await
+            .get(&project_id)
+            .unwrap()
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+        let shutdown_registry = registry.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_registry.shutdown_all().await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
+                .await
+                .is_err()
+        );
+        drop(guard);
+
+        let report = shutdown.await.unwrap();
+        assert_eq!(report.stopped, vec![project_id]);
+        assert!(report.failed.is_empty());
     }
 
     #[tokio::test]
