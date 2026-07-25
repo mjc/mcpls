@@ -3287,6 +3287,25 @@ struct ProjectEntry {
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
 
+#[derive(Debug, Default)]
+struct RegistryLifecycle {
+    shutting_down: AtomicBool,
+}
+
+impl RegistryLifecycle {
+    fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    fn ensure_accepting(&self) -> Result<(), ProjectRegistryError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(ProjectRegistryError::ShuttingDown)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Process-wide registry of project identities and their actor handles.
 #[derive(Clone)]
 pub struct ProjectRegistry {
@@ -3294,7 +3313,7 @@ pub struct ProjectRegistry {
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
-    shutting_down: std::sync::Arc<AtomicBool>,
+    lifecycle: std::sync::Arc<RegistryLifecycle>,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -3363,14 +3382,6 @@ impl ProjectShutdownReport {
 }
 
 impl ProjectRegistry {
-    fn ensure_accepting(&self) -> Result<(), ProjectRegistryError> {
-        if self.shutting_down.load(Ordering::Acquire) {
-            Err(ProjectRegistryError::ShuttingDown)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Create an empty registry with a bounded actor queue capacity.
     #[must_use]
     pub fn new(actor_capacity: usize) -> Self {
@@ -3379,7 +3390,7 @@ impl ProjectRegistry {
             actor_capacity: actor_capacity.max(1),
             translator_template: None,
             persistence: None,
-            shutting_down: std::sync::Arc::new(AtomicBool::new(false)),
+            lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
         }
     }
 
@@ -3391,7 +3402,7 @@ impl ProjectRegistry {
             actor_capacity: actor_capacity.max(1),
             translator_template: Some(std::sync::Arc::new(template)),
             persistence: None,
-            shutting_down: std::sync::Arc::new(AtomicBool::new(false)),
+            lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
         }
     }
 
@@ -3460,7 +3471,7 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
         let mut projects = self.projects.write().await;
-        self.ensure_accepting()?;
+        self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
             if existing.identity.root() != identity.root() {
                 return Err(ProjectRegistryError::ConflictingProject {
@@ -3488,7 +3499,7 @@ impl ProjectRegistry {
             let mutation = existing.mutation.clone();
             drop(projects);
 
-            self.ensure_accepting()?;
+            self.lifecycle.ensure_accepting()?;
 
             let mutation_guard = mutation.lock().await;
             actor
@@ -3496,7 +3507,7 @@ impl ProjectRegistry {
                 .await?;
 
             let mut projects = self.projects.write().await;
-            self.ensure_accepting()?;
+            self.lifecycle.ensure_accepting()?;
             if let Some(existing) = projects.get(identity.id()) {
                 if existing.identity.root() != identity.root() {
                     return Err(ProjectRegistryError::ConflictingProject {
@@ -3595,7 +3606,7 @@ impl ProjectRegistry {
     /// processed before its shutdown request, preserving edit commit
     /// boundaries without holding the registry lock across the await.
     pub async fn shutdown_all(&self) -> ProjectShutdownReport {
-        self.shutting_down.store(true, Ordering::Release);
+        self.lifecycle.begin_shutdown();
         let entries: Vec<_> = self
             .projects
             .read()
