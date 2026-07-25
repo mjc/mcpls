@@ -549,25 +549,7 @@ fn hash_rust_server_config(hasher: &mut Sha256, template: &TranslatorTemplate) -
 }
 
 fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
-    let channel = ["rust-toolchain", "rust-toolchain.toml"]
-        .into_iter()
-        .find_map(|relative| {
-            let contents = std::fs::read_to_string(root.join(relative)).ok()?;
-            if relative.ends_with(".toml") {
-                let document = contents.parse::<toml::Value>().ok()?;
-                document
-                    .get("toolchain")
-                    .and_then(|toolchain| toolchain.get("channel"))
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_owned)
-            } else {
-                contents
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(str::to_owned)
-            }
-        })?;
+    let channel = rust_toolchain_channel(root)?;
     let output = Command::new("rustup")
         .args(["run", &channel, "rustc", "-Vv"])
         .output()
@@ -582,6 +564,28 @@ fn rust_toolchain_signature(root: &Path) -> Option<Vec<u8>> {
                 .filter(|output| output.status.success())
         })?;
     Some(output.stdout)
+}
+
+fn rust_toolchain_channel(root: &Path) -> Option<String> {
+    ["rust-toolchain", "rust-toolchain.toml"]
+        .into_iter()
+        .find_map(|relative| {
+            let contents = std::fs::read_to_string(root.join(relative)).ok()?;
+            if relative == "rust-toolchain.toml" {
+                let document = contents.parse::<toml::Value>().ok()?;
+                document
+                    .get("toolchain")
+                    .and_then(|toolchain| toolchain.get("channel"))
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_owned)
+            }
+        })
 }
 
 fn hash_compatibility_field(hasher: &mut Sha256, field: &[u8]) {
