@@ -1340,8 +1340,13 @@ impl McplsServer {
             min_level,
         }): Parameters<ServerLogsParams>,
     ) -> Result<String, McpError> {
-        let actor = self.actor_for_project(project_id).await?;
-        encode_tool_result(actor.server_logs(limit, min_level).await)
+        let id = parse_project_id(project_id)?;
+        encode_tool_result(
+            self.context
+                .project_registry
+                .server_logs(&id, limit, min_level)
+                .await,
+        )
     }
 
     /// Get recent LSP server messages.
@@ -1352,8 +1357,13 @@ impl McplsServer {
         &self,
         Parameters(ServerMessagesParams { project_id, limit }): Parameters<ServerMessagesParams>,
     ) -> Result<String, McpError> {
-        let actor = self.actor_for_project(project_id).await?;
-        encode_tool_result(actor.server_messages(limit).await)
+        let id = parse_project_id(project_id)?;
+        encode_tool_result(
+            self.context
+                .project_registry
+                .server_messages(&id, limit)
+                .await,
+        )
     }
 
     /// Inspect negotiated capabilities for a registered project's active servers.

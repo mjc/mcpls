@@ -15,10 +15,10 @@ use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
-    ProjectActivation, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, Translator, TranslatorTemplate,
-    WorkspaceSymbolResult,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, LogEntry, LogLevel,
+    OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult, RenameResult,
+    ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult, SignatureHelpResult,
+    Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
@@ -2455,6 +2455,56 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    async fn server_logs_unchecked(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send_unchecked(ProjectRequest::ServerLogs {
+                limit,
+                min_level,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    async fn server_messages_unchecked(
+        &self,
+        limit: usize,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send_unchecked(ProjectRequest::ServerMessages { limit, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    async fn server_capabilities_unchecked(
+        &self,
+        language_id: Option<String>,
+    ) -> Result<Vec<ServerCapability>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send_unchecked(ProjectRequest::ServerCapabilities { language_id, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Return negotiated capabilities for this project's active language servers.
     ///
     /// # Errors
@@ -4029,6 +4079,92 @@ struct ProjectRemovalSnapshot {
     root: PathBuf,
 }
 
+const RETAINED_PROJECT_HISTORY_CAPACITY: usize = 16;
+const RETAINED_LOG_CAPACITY: usize = 100;
+const RETAINED_MESSAGE_CAPACITY: usize = 50;
+
+/// Bounded, in-memory history retained after a project is removed.
+///
+/// Retention is deliberately process-local and limited to the most recent 16
+/// removed projects. It is not persisted and is cleared when a project ID is
+/// registered again.
+#[derive(Debug, Default)]
+struct RetainedProjectHistories {
+    entries: HashMap<ProjectId, RetainedProjectHistory>,
+    order: VecDeque<ProjectId>,
+}
+
+#[derive(Debug, Default)]
+struct RetainedProjectHistory {
+    logs: Vec<LogEntry>,
+    messages: Vec<ServerMessage>,
+    capabilities: Vec<ProjectServerCapability>,
+}
+
+impl RetainedProjectHistory {
+    fn server_logs(
+        &self,
+        limit: usize,
+        min_level: Option<&str>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
+        let min_level = min_level
+            .map(str::to_ascii_lowercase)
+            .map(|level| match level.as_str() {
+                "error" => Ok(LogLevel::Error),
+                "warning" => Ok(LogLevel::Warning),
+                "info" => Ok(LogLevel::Info),
+                "debug" => Ok(LogLevel::Debug),
+                _ => Err(ProjectActorError::Operation(format!(
+                    "Invalid min_level: '{level}'. Valid values: error, warning, info, debug"
+                ))),
+            })
+            .transpose()?;
+        Ok(ServerLogsResult {
+            logs: self
+                .logs
+                .iter()
+                .filter(|log| {
+                    min_level.is_none_or(|min| match min {
+                        LogLevel::Error => matches!(log.level, LogLevel::Error),
+                        LogLevel::Warning => {
+                            matches!(log.level, LogLevel::Error | LogLevel::Warning)
+                        }
+                        LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                        LogLevel::Debug => true,
+                    })
+                })
+                .take(limit)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn server_messages(&self, limit: usize) -> ServerMessagesResult {
+        ServerMessagesResult {
+            messages: self.messages.iter().take(limit).cloned().collect(),
+        }
+    }
+}
+
+impl RetainedProjectHistories {
+    fn insert(&mut self, id: ProjectId, history: RetainedProjectHistory) {
+        self.entries.remove(&id);
+        self.order.retain(|existing| existing != &id);
+        self.entries.insert(id.clone(), history);
+        self.order.push_back(id);
+        while self.order.len() > RETAINED_PROJECT_HISTORY_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, id: &ProjectId) {
+        self.entries.remove(id);
+        self.order.retain(|existing| existing != id);
+    }
+}
+
 impl ProjectRemovalSnapshot {
     fn reject_new_work(&self) {
         reject_new_actor_work(&self.actors);
@@ -4210,6 +4346,7 @@ impl RegistryLifecycle {
 #[derive(Clone)]
 pub struct ProjectRegistry {
     projects: std::sync::Arc<RwLock<HashMap<ProjectId, ProjectEntry>>>,
+    retained_history: std::sync::Arc<RwLock<RetainedProjectHistories>>,
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
@@ -4407,6 +4544,7 @@ impl ProjectRegistry {
     ) -> Self {
         Self {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            retained_history: std::sync::Arc::new(RwLock::new(RetainedProjectHistories::default())),
             actor_capacity: actor_capacity.max(1),
             translator_template: translator_template.map(std::sync::Arc::new),
             persistence: None,
@@ -4690,6 +4828,7 @@ impl ProjectRegistry {
         }
 
         let primary_root = identity.root.clone();
+        let project_id = identity.id().clone();
         let actor = self.spawn_actor(&primary_root, translator_template.as_deref());
         let mutation = std::sync::Arc::new(Mutex::new(()));
         projects.insert(
@@ -4704,6 +4843,7 @@ impl ProjectRegistry {
             ),
         );
         drop(projects);
+        self.retained_history.write().await.remove(&project_id);
         self.persist().await?;
         Ok(actor)
     }
@@ -4913,6 +5053,41 @@ impl ProjectRegistry {
         Err(error)
     }
 
+    async fn capture_removal_history(
+        &self,
+        removal: &ProjectRemovalSnapshot,
+    ) -> RetainedProjectHistory {
+        let mut history = RetainedProjectHistory::default();
+        for (group_id, actor) in removal.actors.iter().enumerate() {
+            if let Ok(logs) = actor.server_logs_unchecked(usize::MAX, None).await {
+                history.logs.extend(logs.logs);
+            }
+            if let Ok(messages) = actor.server_messages_unchecked(usize::MAX).await {
+                history.messages.extend(messages.messages);
+            }
+            if let Ok(capabilities) = actor.server_capabilities_unchecked(None).await {
+                history.capabilities.extend(
+                    capabilities.into_iter().map(|capability| {
+                        ProjectServerCapability::from_server(group_id, capability)
+                    }),
+                );
+            }
+        }
+        history
+            .logs
+            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+        history.logs.truncate(RETAINED_LOG_CAPACITY);
+        history
+            .messages
+            .sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
+        history.messages.truncate(RETAINED_MESSAGE_CAPACITY);
+        history
+    }
+
+    async fn retain_history(&self, id: ProjectId, history: RetainedProjectHistory) {
+        self.retained_history.write().await.insert(id, history);
+    }
+
     /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
@@ -4921,6 +5096,7 @@ impl ProjectRegistry {
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
         let removal = self.begin_project_removal(&id).await?;
         let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
+        let history = self.capture_removal_history(&removal).await;
         if let Err(error) = removal.shutdown(&id).await {
             return self.abort_project_removal(&id, &removal, error).await;
         }
@@ -4928,6 +5104,7 @@ impl ProjectRegistry {
             self.lifecycle.end_removal(&id).await;
             return Err(ProjectRegistryError::ProjectNotFound(id));
         }
+        self.retain_history(id.clone(), history).await;
         let persisted = self.persist().await;
         self.lifecycle.end_removal(&id).await;
         persisted
@@ -4958,7 +5135,28 @@ impl ProjectRegistry {
         id: &ProjectId,
         language_id: Option<String>,
     ) -> Result<Vec<ProjectServerCapability>, ProjectRegistryError> {
-        let (_, actors) = self.actor_entries(id).await?;
+        let actors = match self.actor_entries(id).await {
+            Ok((_, actors)) => actors,
+            Err(ProjectRegistryError::ProjectNotFound(_)) => {
+                let history = self
+                    .retained_history
+                    .read()
+                    .await
+                    .entries
+                    .get(id)
+                    .map(|history| history.capabilities.clone())
+                    .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+                return Ok(history
+                    .into_iter()
+                    .filter(|capability| {
+                        language_id
+                            .as_deref()
+                            .is_none_or(|language| capability.language_id == language)
+                    })
+                    .collect());
+            }
+            Err(error) => return Err(error),
+        };
         let mut capabilities = Vec::new();
         for (group_id, (actor, _)) in actors.into_iter().enumerate() {
             for capability in actor.server_capabilities(language_id.clone()).await? {
@@ -4974,30 +5172,60 @@ impl ProjectRegistry {
     }
 
     /// Return recent logs from a project's primary actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, its actor closes,
+    /// or the requested log-level filter is invalid.
     pub async fn server_logs(
         &self,
         id: &ProjectId,
         limit: usize,
         min_level: Option<String>,
     ) -> Result<ServerLogsResult, ProjectRegistryError> {
-        self.actor(id)
-            .await?
-            .server_logs(limit, min_level)
-            .await
-            .map_err(ProjectRegistryError::from)
+        match self.actor(id).await {
+            Ok(actor) => actor
+                .server_logs(limit, min_level)
+                .await
+                .map_err(ProjectRegistryError::from),
+            Err(ProjectRegistryError::ProjectNotFound(_)) => self
+                .retained_history
+                .read()
+                .await
+                .entries
+                .get(id)
+                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?
+                .server_logs(limit, min_level.as_deref())
+                .map_err(ProjectRegistryError::from),
+            Err(error) => Err(error),
+        }
     }
 
     /// Return recent messages from a project's primary actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or its actor closes.
     pub async fn server_messages(
         &self,
         id: &ProjectId,
         limit: usize,
     ) -> Result<ServerMessagesResult, ProjectRegistryError> {
-        self.actor(id)
-            .await?
-            .server_messages(limit)
-            .await
-            .map_err(ProjectRegistryError::from)
+        match self.actor(id).await {
+            Ok(actor) => actor
+                .server_messages(limit)
+                .await
+                .map_err(ProjectRegistryError::from),
+            Err(ProjectRegistryError::ProjectNotFound(_)) => Ok(self
+                .retained_history
+                .read()
+                .await
+                .entries
+                .get(id)
+                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?
+                .server_messages(limit)),
+            Err(error) => Err(error),
+        }
     }
 
     /// List code actions with project-owned opaque references.
@@ -7144,6 +7372,8 @@ while True:
             })
             .await
             .unwrap();
+
+        assert_eq!(actor.server_logs(10, None).await.unwrap().logs.len(), 1);
 
         registry.remove(project_id.clone()).await.unwrap();
 
