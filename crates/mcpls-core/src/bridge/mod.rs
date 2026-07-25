@@ -17,10 +17,11 @@ pub use resources::ResourceSubscriptions;
 pub use state::{DocumentState, DocumentTracker, ResourceLimits, path_to_uri, uri_to_path};
 pub(crate) use translator::convert_code_action_or_command;
 pub use translator::{
-    CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult, DefinitionResult,
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, Location,
-    LocationsResult, OutgoingCallsResult, Position2D, Range, ReferencesResult, RenameResult,
-    ServerCapability, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Symbol,
-    TextEdit, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
+    DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges,
+    DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
+    InlayHintsResult, Location, LocationsResult, OutgoingCallsResult, Position2D,
+    ProjectActivation, Range, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, Symbol, TextEdit, Translator, TranslatorTemplate,
+    WorkspaceSymbolResult,
 };

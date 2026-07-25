@@ -23,7 +23,47 @@ use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
 use crate::config::{LspServerConfig, ProjectConfig};
 use crate::error::{Error, Result};
-use crate::lsp::{LspClient, LspServer, ServerInitConfig};
+use crate::lsp::{LspClient, LspNotification, LspServer, ServerInitConfig};
+
+/// Health of a project activation across its configured language servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationHealth {
+    /// Every applicable language server initialized successfully.
+    Ready,
+    /// At least one applicable language server failed while another started.
+    Degraded,
+}
+
+/// Language-server handles produced by one project activation.
+#[derive(Debug)]
+pub struct ProjectActivation {
+    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    health: ActivationHealth,
+}
+
+impl ProjectActivation {
+    pub(crate) const fn new(
+        notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+        health: ActivationHealth,
+    ) -> Self {
+        Self {
+            notification_receivers,
+            health,
+        }
+    }
+
+    /// Return the activation health.
+    #[must_use]
+    pub const fn health(&self) -> ActivationHealth {
+        self.health
+    }
+
+    /// Consume the activation and return notification streams for its servers.
+    #[must_use]
+    pub fn into_notification_receivers(self) -> Vec<mpsc::Receiver<LspNotification>> {
+        self.notification_receivers
+    }
+}
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 #[derive(Debug)]
@@ -264,10 +304,7 @@ impl Translator {
     ///
     /// Returns an error when no configured server applies or a server cannot be
     /// started. Background workspace loading does not block activation.
-    pub async fn activate_project(
-        &mut self,
-        root: PathBuf,
-    ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
+    pub async fn activate_project(&mut self, root: PathBuf) -> Result<ProjectActivation> {
         self.activate_project_with_roots(vec![root]).await
     }
 
@@ -280,7 +317,7 @@ impl Translator {
     pub async fn activate_project_with_roots(
         &mut self,
         roots: Vec<PathBuf>,
-    ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
+    ) -> Result<ProjectActivation> {
         if roots.is_empty() {
             return Err(Error::NoServerConfigured);
         }
@@ -324,7 +361,7 @@ impl Translator {
 
         if pending.is_empty() {
             self.set_workspace_roots(roots);
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
         }
 
         let expected_languages = pending
@@ -358,6 +395,11 @@ impl Translator {
             return Err(Error::LspInitFailed { message });
         }
 
+        let health = if result.partial_success() {
+            ActivationHealth::Degraded
+        } else {
+            ActivationHealth::Ready
+        };
         self.set_workspace_roots(roots);
         let mut notification_receivers = Vec::new();
         for (language_id, mut server) in result.servers {
@@ -370,7 +412,7 @@ impl Translator {
         }
         self.reopen_tracked_documents().await?;
         self.clear_expected_languages();
-        Ok(notification_receivers)
+        Ok(ProjectActivation::new(notification_receivers, health))
     }
 
     async fn reopen_tracked_documents(&self) -> Result<()> {
@@ -406,18 +448,15 @@ impl Translator {
     ///
     /// Returns an error when active servers cannot be restarted for the
     /// expanded root set.
-    pub async fn add_workspace_root(
-        &mut self,
-        root: PathBuf,
-    ) -> Result<Vec<mpsc::Receiver<crate::lsp::LspNotification>>> {
+    pub async fn add_workspace_root(&mut self, root: PathBuf) -> Result<ProjectActivation> {
         if self.workspace_roots.contains(&root) {
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
         }
         let mut roots = self.workspace_roots.clone();
         roots.push(root);
         if self.lsp_clients.is_empty() || self.lsp_configs.is_empty() {
             self.set_workspace_roots(roots);
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
         }
         self.shutdown().await?;
         self.activate_project_with_roots(roots).await

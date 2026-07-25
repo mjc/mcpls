@@ -13,11 +13,12 @@ use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
-    CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
-    DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
+    DefinitionResult, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
-    ReferencesResult, RenameResult, ServerCapability, ServerLogsResult, ServerMessagesResult,
-    SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    ProjectActivation, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, Translator, TranslatorTemplate,
+    WorkspaceSymbolResult,
 };
 use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
@@ -3098,30 +3099,27 @@ impl ProjectRuntime {
     async fn activate_workspace_roots(
         &mut self,
         roots: Vec<PathBuf>,
-    ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+    ) -> Result<ProjectActivation, String> {
         self.translator
             .activate_project_with_roots(roots)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn add_workspace_root(
-        &mut self,
-        root: PathBuf,
-    ) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+    async fn add_workspace_root(&mut self, root: PathBuf) -> Result<ProjectActivation, String> {
         self.translator
             .add_workspace_root(root)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn restart(&mut self) -> Result<Vec<mpsc::Receiver<LspNotification>>, String> {
+    async fn restart(&mut self) -> Result<ProjectActivation, String> {
         let roots = self.translator.workspace_roots().to_vec();
         if roots.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
         }
         if self.translator.configured_language_ids().is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
         }
         self.shutdown().await?;
         self.translator
@@ -3317,28 +3315,43 @@ async fn forward_lsp_notifications(
 }
 
 fn mark_project_started(
-    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    activation: ProjectActivation,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
 ) {
-    spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
-    publish_project_readiness(channels, state, runtime);
+    let health = activation.health();
+    spawn_notification_forwarders(
+        activation.into_notification_receivers(),
+        actor_sender,
+        runtime.generation(),
+    );
+    publish_project_readiness(channels, state, runtime, health);
+}
+
+const fn activation_status(health: ActivationHealth, initializing: bool) -> ProjectStatus {
+    if initializing {
+        ProjectStatus::Starting
+    } else {
+        match health {
+            ActivationHealth::Ready => ProjectStatus::Ready,
+            ActivationHealth::Degraded => ProjectStatus::Degraded,
+        }
+    }
 }
 
 fn publish_project_readiness(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
+    health: ActivationHealth,
 ) {
     state.sync_runtime(runtime);
-    let status = if runtime.translator.is_initializing() {
-        ProjectStatus::Starting
-    } else {
-        ProjectStatus::Ready
-    };
-    channels.publish_status(state, status);
+    channels.publish_status(
+        state,
+        activation_status(health, runtime.translator.is_initializing()),
+    );
 }
 
 async fn stop_project_runtime(
@@ -3740,7 +3753,12 @@ async fn handle_project_request(
             let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, notification);
             if was_initializing && !runtime.translator.is_initializing() {
-                publish_project_readiness(channels, state, runtime);
+                let health = if state.status == ProjectStatus::Degraded {
+                    ActivationHealth::Degraded
+                } else {
+                    ActivationHealth::Ready
+                };
+                publish_project_readiness(channels, state, runtime, health);
             }
         }
         ProjectRequest::ServerExited { generation } => {
