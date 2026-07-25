@@ -456,7 +456,8 @@ impl McplsServer {
         translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
     ) -> Self {
-        let context = Arc::new(HandlerContext::new(translator, subscriptions));
+        let _ = translator;
+        let context = Arc::new(HandlerContext::new(subscriptions));
         Self { context }
     }
 
@@ -467,11 +468,8 @@ impl McplsServer {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
-        let context = Arc::new(HandlerContext::with_registry(
-            translator,
-            subscriptions,
-            project_registry,
-        ));
+        let _ = translator;
+        let context = Arc::new(HandlerContext::with_registry(subscriptions, project_registry));
         Self { context }
     }
 

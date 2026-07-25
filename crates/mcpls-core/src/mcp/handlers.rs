@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use tokio::sync::Mutex;
 
-use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::bridge::ResourceSubscriptions;
 use crate::edit_plan::PlanId;
 use crate::mcp::session::SessionEventSink;
 use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
@@ -41,17 +41,13 @@ pub struct HandlerContext {
 impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
-    pub fn new(
-        translator: Arc<Mutex<Translator>>,
-        subscriptions: Arc<ResourceSubscriptions>,
-    ) -> Self {
-        Self::with_registry(translator, subscriptions, ProjectRegistry::new(32))
+    pub fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
+        Self::with_registry(subscriptions, ProjectRegistry::new(32))
     }
 
     /// Create a handler context with an existing shared project registry.
     #[must_use]
     pub fn with_registry(
-        _translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
@@ -159,14 +155,12 @@ impl HandlerContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::Translator;
     use crate::edit_plan::PlanId;
 
     #[test]
     fn test_handler_context_creation() {
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let context = HandlerContext::new(translator, subscriptions);
+        let context = HandlerContext::new(subscriptions);
         assert_eq!(Arc::strong_count(&context.subscriptions), 2);
     }
 
@@ -178,9 +172,8 @@ mod tests {
 
     #[tokio::test]
     async fn edit_plan_ownership_is_local_to_one_session() {
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let context = HandlerContext::new(translator, subscriptions);
+        let context = HandlerContext::new(subscriptions);
         let session = context.for_session();
         let plan_id = PlanId::new();
 
