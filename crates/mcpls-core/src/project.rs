@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
@@ -1080,6 +1080,104 @@ pub enum ProjectActorError {
     Operation(String),
 }
 
+#[derive(Clone)]
+struct ProjectRequestGate {
+    accepting: std::sync::Arc<AtomicBool>,
+    rejected: std::sync::Arc<Notify>,
+}
+
+impl ProjectRequestGate {
+    fn new() -> Self {
+        Self {
+            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            rejected: std::sync::Arc::new(Notify::new()),
+        }
+    }
+
+    fn reject_new_work(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.rejected.notify_waiters();
+    }
+
+    fn accept_new_work(&self) {
+        self.accepting.store(true, Ordering::Release);
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_rejection(&self) {
+        self.rejected.notified().await;
+    }
+}
+
+#[derive(Clone)]
+struct ProjectRequestSender {
+    sender: mpsc::Sender<ProjectRequest>,
+    gate: ProjectRequestGate,
+}
+
+impl ProjectRequestSender {
+    fn new(sender: mpsc::Sender<ProjectRequest>) -> Self {
+        Self {
+            sender,
+            gate: ProjectRequestGate::new(),
+        }
+    }
+
+    fn queue_pressure(&self) -> ProjectQueuePressure {
+        ProjectQueuePressure {
+            queued: self.sender.max_capacity() - self.sender.capacity(),
+            capacity: self.sender.max_capacity(),
+        }
+    }
+
+    fn same_channel(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    fn reject_new_work(&self) {
+        self.gate.reject_new_work();
+    }
+
+    fn accept_new_work(&self) {
+        self.gate.accept_new_work();
+    }
+
+    async fn send(
+        &self,
+        request: ProjectRequest,
+    ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
+        if !self.gate.is_accepting() {
+            return Err(mpsc::error::SendError(request));
+        }
+
+        let permit = tokio::select! {
+            result = self.sender.clone().reserve_owned() => match result {
+                Ok(permit) => permit,
+                Err(_) => return Err(mpsc::error::SendError(request)),
+            },
+            () = self.gate.wait_for_rejection() => {
+                return Err(mpsc::error::SendError(request));
+            }
+        };
+        if !self.gate.is_accepting() {
+            return Err(mpsc::error::SendError(request));
+        }
+        permit.send(request);
+        Ok(())
+    }
+
+    // Lifecycle control must still reach the actor after normal work is rejected.
+    async fn send_unchecked(
+        &self,
+        request: ProjectRequest,
+    ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
+        self.sender.send(request).await
+    }
+}
+
 /// Result of consuming and applying one project-owned edit plan.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AppliedEditPlan {
@@ -1335,10 +1433,67 @@ enum ProjectRequest {
     },
 }
 
+impl ProjectRequest {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
+                reply.is_closed()
+            }
+            Self::SetStatus { reply, .. } | Self::Fail { reply, .. } => reply.is_closed(),
+            Self::Activate { reply, .. } | Self::ActivateWorkspaceRoots { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::Hover { reply, .. } => reply.is_closed(),
+            Self::Definition { reply, .. } => reply.is_closed(),
+            Self::References { reply, .. } => reply.is_closed(),
+            Self::Diagnostics { reply, .. } | Self::CachedDiagnostics { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::Rename { reply, .. } => reply.is_closed(),
+            Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::Completions { reply, .. } => reply.is_closed(),
+            Self::DocumentSymbols { reply, .. } => reply.is_closed(),
+            Self::FormatDocument { reply, .. } => reply.is_closed(),
+            Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
+            Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::CodeActionPreview { reply, .. } | Self::PreviewEdit { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::PrepareCallHierarchy { reply, .. } => reply.is_closed(),
+            Self::IncomingCalls { reply, .. } => reply.is_closed(),
+            Self::OutgoingCalls { reply, .. } => reply.is_closed(),
+            Self::SignatureHelp { reply, .. } => reply.is_closed(),
+            Self::InlayHints { reply, .. } => reply.is_closed(),
+            Self::GoToImplementation { reply, .. } | Self::GoToTypeDefinition { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::HasCachedDiagnostics { reply, .. } => reply.is_closed(),
+            Self::OpenDocumentPaths { reply } => reply.is_closed(),
+            Self::ValidatePath { reply, .. } | Self::StoreEditPlan { reply, .. } => {
+                reply.is_closed()
+            }
+            Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
+            Self::TakeEditPlan { reply, .. } => reply.is_closed(),
+            Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
+            Self::ServerLogs { reply, .. } => reply.is_closed(),
+            Self::ServerMessages { reply, .. } => reply.is_closed(),
+            Self::ServerCapabilities { reply, .. } => reply.is_closed(),
+            Self::PublishEvent { .. }
+            | Self::Shutdown { .. }
+            | Self::Notification { .. }
+            | Self::ServerExited { .. } => false,
+        }
+    }
+}
+
 /// Cloneable handle for querying and controlling one project actor.
 #[derive(Clone)]
 pub struct ProjectHandle {
-    sender: mpsc::Sender<ProjectRequest>,
+    sender: ProjectRequestSender,
     status: watch::Receiver<ProjectStatus>,
     events: broadcast::Sender<ProjectEvent>,
     event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
@@ -1348,10 +1503,7 @@ impl ProjectHandle {
     /// Return the actor request queue depth and fixed capacity without awaiting it.
     #[must_use]
     pub fn queue_pressure(&self) -> ProjectQueuePressure {
-        ProjectQueuePressure {
-            queued: self.sender.max_capacity() - self.sender.capacity(),
-            capacity: self.sender.max_capacity(),
-        }
+        self.sender.queue_pressure()
     }
 
     /// Subscribe to lifecycle changes for this project.
@@ -1375,10 +1527,18 @@ impl ProjectHandle {
             .snapshot_since(cursor)
     }
 
+    fn reject_new_work(&self) {
+        self.sender.reject_new_work();
+    }
+
+    fn accept_new_work(&self) {
+        self.sender.accept_new_work();
+    }
+
     async fn publish_event(&self, event: ProjectEvent) -> Result<(), ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::PublishEvent { event, reply })
+            .send_unchecked(ProjectRequest::PublishEvent { event, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -2353,7 +2513,7 @@ impl ProjectHandle {
     pub async fn shutdown(&self) -> Result<(), ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::Shutdown { reply })
+            .send_unchecked(ProjectRequest::Shutdown { reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -3017,7 +3177,8 @@ pub fn spawn_project_actor_with_translator(
     translator: Translator,
 ) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
-    let actor_sender = sender.clone();
+    let actor_sender = sender.downgrade();
+    let sender = ProjectRequestSender::new(sender);
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
     let event_sender = event_tx.clone();
@@ -3090,49 +3251,74 @@ impl ProjectActorChannels {
 
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
-    actor_sender: mpsc::Sender<ProjectRequest>,
+    actor_sender: mpsc::WeakSender<ProjectRequest>,
     channels: ProjectActorChannels,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
 ) {
-    while let Some(request) = receiver.recv().await {
+    while let Some(request) = next_project_request(&mut receiver).await {
         if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
         {
             break;
         }
     }
+    if state.status != ProjectStatus::Stopped {
+        stop_project_runtime(&channels, &mut state, &mut runtime, false).await;
+    }
+}
+
+async fn next_project_request(
+    receiver: &mut mpsc::Receiver<ProjectRequest>,
+) -> Option<ProjectRequest> {
+    while let Some(request) = receiver.recv().await {
+        if !request.is_cancelled() {
+            return Some(request);
+        }
+    }
+    None
 }
 
 fn spawn_notification_forwarders(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
-    actor_sender: &mpsc::Sender<ProjectRequest>,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
     generation: u64,
 ) {
-    for mut receiver in notification_receivers {
+    for receiver in notification_receivers {
         let sender = actor_sender.clone();
-        tokio::spawn(async move {
-            while let Some(notification) = receiver.recv().await {
-                if sender
-                    .send(ProjectRequest::Notification {
-                        generation,
-                        notification,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            let _ = sender
-                .send(ProjectRequest::ServerExited { generation })
-                .await;
-        });
+        tokio::spawn(forward_lsp_notifications(receiver, sender, generation));
+    }
+}
+
+async fn forward_lsp_notifications(
+    mut receiver: mpsc::Receiver<LspNotification>,
+    sender: mpsc::WeakSender<ProjectRequest>,
+    generation: u64,
+) {
+    while let Some(notification) = receiver.recv().await {
+        let Some(sender) = sender.upgrade() else {
+            break;
+        };
+        if sender
+            .send(ProjectRequest::Notification {
+                generation,
+                notification,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    if let Some(sender) = sender.upgrade() {
+        let _ = sender
+            .send(ProjectRequest::ServerExited { generation })
+            .await;
     }
 }
 
 fn mark_project_started(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
-    actor_sender: &mpsc::Sender<ProjectRequest>,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
@@ -3155,13 +3341,31 @@ fn publish_project_readiness(
     channels.publish_status(state, status);
 }
 
+async fn stop_project_runtime(
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+    clear_error: bool,
+) {
+    runtime.begin_transition();
+    if clear_error {
+        state.last_error = None;
+    }
+    channels.publish_status(state, ProjectStatus::Stopping);
+    if let Err(error) = runtime.shutdown().await {
+        state.last_error = Some(error);
+    }
+    state.sync_runtime(runtime);
+    channels.publish_status(state, ProjectStatus::Stopped);
+}
+
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::large_stack_frames)]
 async fn handle_project_request(
     request: ProjectRequest,
-    actor_sender: &mpsc::Sender<ProjectRequest>,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
@@ -3585,15 +3789,7 @@ async fn handle_project_request(
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
-            runtime.begin_transition();
-            state.sync_runtime(runtime);
-            state.last_error = None;
-            channels.publish_status(state, ProjectStatus::Stopping);
-            if let Err(error) = runtime.shutdown().await {
-                state.last_error = Some(error);
-            }
-            state.sync_runtime(runtime);
-            channels.publish_status(state, ProjectStatus::Stopped);
+            stop_project_runtime(channels, state, runtime, true).await;
             let _ = reply.send(());
             return true;
         }
@@ -3637,6 +3833,9 @@ pub enum ProjectRegistryError {
     /// No project with this stable ID is registered.
     #[error("project is not registered: {0}")]
     ProjectNotFound(ProjectId),
+    /// A project with this stable ID is already being removed.
+    #[error("project is being removed: {0}")]
+    ProjectRemoving(ProjectId),
     /// The daemon is draining projects and no new registrations are accepted.
     #[error("project registry is shutting down")]
     ShuttingDown,
@@ -3677,6 +3876,40 @@ struct ProjectEntry {
     config: Option<ProjectConfig>,
 }
 
+struct ProjectRemovalSnapshot {
+    actors: Vec<ProjectHandle>,
+    mutations: Vec<MutationGate>,
+    root: PathBuf,
+}
+
+impl ProjectRemovalSnapshot {
+    fn reject_new_work(&self) {
+        for actor in &self.actors {
+            actor.reject_new_work();
+        }
+    }
+
+    fn accept_new_work(&self) {
+        for actor in &self.actors {
+            actor.accept_new_work();
+        }
+    }
+
+    async fn shutdown(&self, project_id: &ProjectId) -> Result<(), ProjectRegistryError> {
+        for actor in &self.actors {
+            actor
+                .publish_event(ProjectEvent::ProjectRemoved {
+                    project_id: project_id.clone(),
+                    root: self.root.clone(),
+                })
+                .await
+                .map_err(ProjectRegistryError::from)?;
+            actor.shutdown().await.map_err(ProjectRegistryError::from)?;
+        }
+        Ok(())
+    }
+}
+
 impl ProjectEntry {
     fn new(
         identity: ProjectIdentity,
@@ -3702,6 +3935,19 @@ impl ProjectEntry {
 
     fn primary(&self) -> &ProjectActorEntry {
         &self.actors[0]
+    }
+
+    fn removal_snapshot(&self) -> ProjectRemovalSnapshot {
+        let (actors, mutations): (Vec<_>, Vec<_>) = self
+            .actors
+            .iter()
+            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
+            .unzip();
+        ProjectRemovalSnapshot {
+            actors,
+            mutations,
+            root: self.identity.root().as_path().to_path_buf(),
+        }
     }
 
     fn actor_for_root(&self, root: &Path) -> Option<&ProjectActorEntry> {
@@ -3771,6 +4017,7 @@ type MutationGate = std::sync::Arc<Mutex<()>>;
 #[derive(Debug, Default)]
 struct RegistryLifecycle {
     shutting_down: AtomicBool,
+    removing: Mutex<HashSet<ProjectId>>,
 }
 
 const DEFAULT_PROJECT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3786,6 +4033,31 @@ impl RegistryLifecycle {
         } else {
             Ok(())
         }
+    }
+
+    async fn ensure_project_available(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<(), ProjectRegistryError> {
+        self.ensure_accepting()?;
+        if self.removing.lock().await.contains(project_id) {
+            Err(ProjectRegistryError::ProjectRemoving(project_id.clone()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn begin_removal(&self, project_id: &ProjectId) -> Result<(), ProjectRegistryError> {
+        let mut removing = self.removing.lock().await;
+        if removing.insert(project_id.clone()) {
+            Ok(())
+        } else {
+            Err(ProjectRegistryError::ProjectRemoving(project_id.clone()))
+        }
+    }
+
+    async fn end_removal(&self, project_id: &ProjectId) {
+        self.removing.lock().await.remove(project_id);
     }
 }
 
@@ -4164,7 +4436,9 @@ impl ProjectRegistry {
             rust_project_compatibility_key(identity.root.as_path(), translator_template.as_deref())
                 .await;
         let mut projects = self.projects.write().await;
-        self.lifecycle.ensure_accepting()?;
+        self.lifecycle
+            .ensure_project_available(identity.id())
+            .await?;
         if let Some(existing) = projects.get(identity.id()) {
             if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
                 if translator_templates_match(
@@ -4450,42 +4724,50 @@ impl ProjectRegistry {
         Ok(paths)
     }
 
+    async fn begin_project_removal(
+        &self,
+        id: &ProjectId,
+    ) -> Result<ProjectRemovalSnapshot, ProjectRegistryError> {
+        let projects = self.projects.read().await;
+        let entry = projects
+            .get(id)
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        self.lifecycle.begin_removal(id).await?;
+        let removal = entry.removal_snapshot();
+        drop(projects);
+        removal.reject_new_work();
+        Ok(removal)
+    }
+
+    async fn abort_project_removal(
+        &self,
+        id: &ProjectId,
+        removal: &ProjectRemovalSnapshot,
+        error: ProjectRegistryError,
+    ) -> Result<(), ProjectRegistryError> {
+        removal.accept_new_work();
+        self.lifecycle.end_removal(id).await;
+        Err(error)
+    }
+
     /// Remove a project and shut down its actor when no linked project remains.
     ///
     /// # Errors
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        // Reserve the registry write lock before waiting on actor mutation gates.
-        // Otherwise a concurrent add can mutate this entry after the snapshot
-        // below but before removal, and have its registration deleted silently.
-        let mut projects = self.projects.write().await;
-        let entry = projects
-            .get(&id)
-            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        let (actors, mutations): (Vec<_>, Vec<_>) = entry
-            .actors
-            .iter()
-            .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
-            .unzip();
-        let root = entry.identity.root().as_path().to_path_buf();
-        let _mutation_guards = self.lock_mutation_gates(mutations).await;
-        projects
-            .remove(&id)
-            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-        drop(projects);
-        self.persist().await?;
-        for actor in actors {
-            actor
-                .publish_event(ProjectEvent::ProjectRemoved {
-                    project_id: id.clone(),
-                    root: root.clone(),
-                })
-                .await
-                .map_err(ProjectRegistryError::from)?;
-            actor.shutdown().await.map_err(ProjectRegistryError::from)?;
+        let removal = self.begin_project_removal(&id).await?;
+        let _mutation_guards = self.lock_mutation_gates(removal.mutations.clone()).await;
+        if let Err(error) = removal.shutdown(&id).await {
+            return self.abort_project_removal(&id, &removal, error).await;
         }
-        Ok(())
+        if self.projects.write().await.remove(&id).is_none() {
+            self.lifecycle.end_removal(&id).await;
+            return Err(ProjectRegistryError::ProjectNotFound(id));
+        }
+        let persisted = self.persist().await;
+        self.lifecycle.end_removal(&id).await;
+        persisted
     }
 
     /// Query a project's actor state without holding the registry lock during the await.
@@ -5380,6 +5662,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_skips_cancelled_queued_mutation() {
+        let actor = spawn_project_actor(2);
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        actor
+            .sender
+            .send(ProjectRequest::SetStatus {
+                status: ProjectStatus::Ready,
+                reply,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            actor.query().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_delivers_active_mutation_after_response_cancellation() {
+        let (status_tx, _) = watch::channel(ProjectStatus::Starting);
+        let (event_tx, _) = broadcast::channel(1);
+        let channels = ProjectActorChannels {
+            status_tx,
+            event_tx,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        let actor_sender = sender.downgrade();
+        let mut runtime = ProjectRuntime::new(Translator::new());
+        let mut state = ProjectState::new(ProjectStatus::Starting, runtime.summary());
+        let (reply, response) = oneshot::channel();
+        drop(response);
+
+        assert!(
+            !handle_project_request(
+                ProjectRequest::SetStatus {
+                    status: ProjectStatus::Ready,
+                    reply,
+                },
+                &actor_sender,
+                &channels,
+                &mut state,
+                &mut runtime,
+            )
+            .await
+        );
+        assert_eq!(state.status(), ProjectStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn project_request_waiting_on_full_queue_is_rejected_when_work_closes() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sender = ProjectRequestSender::new(sender);
+        sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let (reply, _response) = oneshot::channel();
+        let mut pending = tokio::spawn({
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(ProjectRequest::SetStatus {
+                        status: ProjectStatus::Ready,
+                        reply,
+                    })
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        sender.reject_new_work();
+        let _ = receiver.recv().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn project_actor_publishes_typed_status_events() {
         let handle = spawn_project_actor(4);
         let mut events = handle.subscribe_events();
@@ -5496,6 +5867,25 @@ mod tests {
             handle.set_status(ProjectStatus::Ready).await,
             Err(ProjectActorError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn dropping_last_project_handle_stops_actor() {
+        let handle = spawn_project_actor(1);
+        let mut status = handle.status();
+
+        drop(handle);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while *status.borrow() != ProjectStatus::Stopped {
+                    status.changed().await.unwrap();
+                }
+            })
+            .await
+            .is_ok(),
+            "actor did not stop after its last handle was dropped"
+        );
     }
 
     #[tokio::test]
@@ -6325,6 +6715,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_keeps_failed_removal_registered_and_persisted() {
+        let root = TempDir::new().unwrap();
+        let state_path = root.path().join("state/projects.json");
+        let store = ProjectRegistrationStore::new(&state_path);
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        let project_id = ProjectId::new("failed-removal").unwrap();
+        let identity =
+            ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (events, _) = broadcast::channel(1);
+        registry.projects.write().await.insert(
+            project_id.clone(),
+            ProjectEntry {
+                identity: identity.clone(),
+                actors: vec![ProjectActorEntry {
+                    actor: ProjectHandle {
+                        sender: ProjectRequestSender::new(sender),
+                        status,
+                        events,
+                        event_history: std::sync::Arc::new(std::sync::Mutex::new(
+                            ProjectEventHistory::new(1),
+                        )),
+                    },
+                    mutation: std::sync::Arc::new(Mutex::new(())),
+                    compatibility_key: None,
+                    translator_template: None,
+                    roots: vec![identity.root().clone()],
+                }],
+                config: None,
+            },
+        );
+        store
+            .save(&[PersistedProject {
+                project_id: project_id.to_string(),
+                root: identity.root().as_path().to_path_buf(),
+                additional_roots: Vec::new(),
+                config: None,
+            }])
+            .unwrap();
+
+        let result = registry.remove(project_id.clone()).await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Closed))
+        ));
+        assert_eq!(registry.list().await, vec![identity]);
+        assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registry_reopens_work_after_failed_actor_shutdown() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("retry-removal").unwrap();
+        let identity =
+            ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let (sender, mut receiver) = mpsc::channel(2);
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    ProjectRequest::PublishEvent { reply, .. }
+                    | ProjectRequest::SetStatus { reply, .. } => {
+                        let _ = reply.send(());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (events, _) = broadcast::channel(1);
+        let actor = ProjectHandle {
+            sender: ProjectRequestSender::new(sender),
+            status,
+            events,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
+        registry.projects.write().await.insert(
+            project_id.clone(),
+            ProjectEntry {
+                identity,
+                actors: vec![ProjectActorEntry {
+                    actor: actor.clone(),
+                    mutation: std::sync::Arc::new(Mutex::new(())),
+                    compatibility_key: None,
+                    translator_template: None,
+                    roots: vec![CanonicalRoot::new(root.path()).unwrap()],
+                }],
+                config: None,
+            },
+        );
+
+        assert!(matches!(
+            registry.remove(project_id).await,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Cancelled))
+        ));
+        assert!(actor.set_status(ProjectStatus::Ready).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn project_registry_reports_persistence_and_shutdown_state() {
         let transient = ProjectRegistry::new(2);
         assert!(!transient.persistence_configured());
@@ -6580,16 +7072,53 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), registry.add(identity.clone()),)
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(10), registry.add(identity.clone()))
                 .await
-                .is_err()
-        );
+                .unwrap(),
+            Err(ProjectRegistryError::ProjectRemoving(project)) if project == id
+        ));
 
         drop(guard);
         assert!(remove.await.unwrap().is_ok());
         registry.add(identity).await.unwrap();
         assert_eq!(registry.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registry_removal_rejects_new_actor_requests() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let id = ProjectId::new("removing").unwrap();
+        let identity = ProjectIdentity::new(id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let actor = registry.add(identity.clone()).await.unwrap();
+
+        let mutation = registry.projects.read().await.get(&id).unwrap().actors[0]
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+        let remove_registry = registry.clone();
+        let remove_id = id.clone();
+        let remove = tokio::spawn(async move { remove_registry.remove(remove_id).await });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            registry.add(identity).await,
+            Err(ProjectRegistryError::ProjectRemoving(project)) if project == id
+        ));
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                actor.set_status(ProjectStatus::Ready)
+            )
+            .await,
+            Ok(Err(ProjectActorError::Closed))
+        ));
+
+        drop(guard);
+        assert!(remove.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -6652,7 +7181,7 @@ mod tests {
         let (_, status) = watch::channel(ProjectStatus::Starting);
         let (events, _) = broadcast::channel(1);
         let actor = ProjectHandle {
-            sender,
+            sender: ProjectRequestSender::new(sender),
             status,
             events,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),

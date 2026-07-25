@@ -138,6 +138,11 @@ enum ForwardOutcome {
     Disconnect,
 }
 
+enum QueuedEvent {
+    Event(ProjectEvent),
+    Lagged { skipped: u64 },
+}
+
 impl SessionEventSink {
     pub(crate) fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
         Self {
@@ -210,15 +215,18 @@ impl SessionEventSink {
                 loop {
                     match events.recv().await {
                         Ok(event) => {
-                            if event_tx.send(event).await.is_err() {
+                            if event_tx.send(QueuedEvent::Event(event)).await.is_err() {
                                 break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                skipped,
-                                "session actor event sink lagged; polling can resync"
-                            );
+                            if event_tx
+                                .send(QueuedEvent::Lagged { skipped })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -227,13 +235,15 @@ impl SessionEventSink {
         }
         drop(event_tx);
         let task = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                let outcome =
-                    forward_event(&subscriptions, notifier.as_ref(), &event_project_id, &event)
-                        .await;
-                let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
-                    && event.belongs_to(&event_project_id);
-                if removed {
+            while let Some(queued_event) = event_rx.recv().await {
+                let (outcome, removed_event) = forward_queued_event(
+                    queued_event,
+                    &subscriptions,
+                    notifier.as_ref(),
+                    &event_project_id,
+                )
+                .await;
+                if let Some(event) = removed_event {
                     cleanup_removed_project_subscriptions(
                         &subscriptions,
                         &project_resources,
@@ -252,6 +262,35 @@ impl SessionEventSink {
     }
 }
 
+async fn forward_queued_event(
+    queued_event: QueuedEvent,
+    subscriptions: &ResourceSubscriptions,
+    notifier: &dyn SessionNotifier,
+    project_id: &ProjectId,
+) -> (ForwardOutcome, Option<ProjectEvent>) {
+    match queued_event {
+        QueuedEvent::Event(event) => {
+            let outcome = forward_event(subscriptions, notifier, project_id, &event).await;
+            let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
+                && event.belongs_to(project_id);
+            (outcome, removed.then_some(event))
+        }
+        QueuedEvent::Lagged { skipped } => {
+            tracing::warn!(
+                skipped,
+                "session actor event sink lagged; notifying polling resync"
+            );
+            let outcome = notify_subscribed_resource(
+                subscriptions,
+                notifier,
+                project_events_resource_uri(project_id),
+            )
+            .await;
+            (outcome, None)
+        }
+    }
+}
+
 async fn forward_event(
     subscriptions: &ResourceSubscriptions,
     notifier: &dyn SessionNotifier,
@@ -259,18 +298,27 @@ async fn forward_event(
     event: &ProjectEvent,
 ) -> ForwardOutcome {
     for resource_uri in event_resource_uris(project_id, event) {
-        if !subscriptions.contains(&resource_uri).await {
-            continue;
-        }
-        if notifier
-            .notify_resource_updated(resource_uri)
-            .await
-            .is_err()
+        if notify_subscribed_resource(subscriptions, notifier, resource_uri).await
+            == ForwardOutcome::Disconnect
         {
             return ForwardOutcome::Disconnect;
         }
     }
     ForwardOutcome::Continue
+}
+
+async fn notify_subscribed_resource(
+    subscriptions: &ResourceSubscriptions,
+    notifier: &dyn SessionNotifier,
+    resource_uri: String,
+) -> ForwardOutcome {
+    if !subscriptions.contains(&resource_uri).await {
+        return ForwardOutcome::Continue;
+    }
+    notifier
+        .notify_resource_updated(resource_uri)
+        .await
+        .map_or(ForwardOutcome::Disconnect, |()| ForwardOutcome::Continue)
 }
 
 async fn cleanup_removed_project_subscriptions(
@@ -483,6 +531,39 @@ mod tests {
         assert_eq!(updates_rx.recv().await.unwrap(), resource);
         drop(first_tx);
         drop(second_tx);
+    }
+
+    #[tokio::test]
+    async fn session_sink_notifies_project_events_after_broadcast_lag() {
+        let project_id = ProjectId::new("a").unwrap();
+        let event_uri = project_events_resource_uri(&project_id);
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(event_uri.clone()).await.unwrap();
+        let sink = SessionEventSink::new(subscriptions);
+        let (events_tx, events_rx) = broadcast::channel(1);
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+
+        sink.attach_receivers(
+            project_id,
+            vec![events_rx],
+            Arc::new(TestNotifier(updates_tx)),
+        );
+        for generation in 1..=3 {
+            events_tx
+                .send(ProjectEvent::ServerExited { generation })
+                .unwrap();
+        }
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), updates_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), updates_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, event_uri);
+        assert_eq!(second, event_uri);
     }
 
     #[tokio::test]
