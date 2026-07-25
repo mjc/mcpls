@@ -98,6 +98,7 @@ fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<Stri
         ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => {
             uris.push(project_status_resource_uri(project_id));
         }
+        ProjectEvent::FilesChanged { .. } | ProjectEvent::EditApplied { .. } => {}
     }
     uris
 }

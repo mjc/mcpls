@@ -521,6 +521,20 @@ pub enum ProjectEvent {
         /// Number of diagnostics in the replacement set.
         diagnostic_count: usize,
     },
+    /// Files changed by a completed workspace edit.
+    FilesChanged {
+        /// Files written, created, renamed, or deleted by the edit.
+        paths: Vec<PathBuf>,
+    },
+    /// A workspace edit plan completed successfully.
+    EditApplied {
+        /// Opaque identifier of the consumed edit plan.
+        plan_id: PlanId,
+        /// Files changed by the completed edit.
+        committed_files: Vec<PathBuf>,
+        /// Number of text and resource operations in the plan.
+        operation_count: usize,
+    },
 }
 
 impl ProjectEvent {
@@ -546,6 +560,20 @@ impl ProjectEvent {
                 "uri": uri,
                 "version": version,
                 "diagnostic_count": diagnostic_count,
+            }),
+            Self::FilesChanged { paths } => serde_json::json!({
+                "kind": "files_changed",
+                "paths": paths,
+            }),
+            Self::EditApplied {
+                plan_id,
+                committed_files,
+                operation_count,
+            } => serde_json::json!({
+                "kind": "edit_applied",
+                "plan_id": plan_id.as_str(),
+                "committed_files": committed_files,
+                "operation_count": operation_count,
             }),
         }
     }
@@ -2656,6 +2684,17 @@ impl ProjectActorChannels {
         }
     }
 
+    fn publish_applied_edit(&self, applied: &AppliedEditPlan) {
+        self.publish(ProjectEvent::FilesChanged {
+            paths: applied.committed_files.clone(),
+        });
+        self.publish(ProjectEvent::EditApplied {
+            plan_id: applied.plan_id.clone(),
+            committed_files: applied.committed_files.clone(),
+            operation_count: applied.operations.len(),
+        });
+    }
+
     fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
         state.status = status;
         let _ = self.status_tx.send(status);
@@ -3068,7 +3107,11 @@ async fn handle_project_request(
             root,
             reply,
         } => {
-            let _ = reply.send(runtime.apply_edit_plan(&plan_id, &project_id, &root).await);
+            let result = runtime.apply_edit_plan(&plan_id, &project_id, &root).await;
+            if let Ok(applied) = &result {
+                channels.publish_applied_edit(applied);
+            }
+            let _ = reply.send(result);
         }
         ProjectRequest::ServerLogs {
             limit,
@@ -3916,6 +3959,50 @@ mod tests {
         assert_eq!(snapshot.events().len(), 2);
         assert_eq!(snapshot.events()[0].sequence(), 2);
         assert_eq!(snapshot.events()[1].sequence(), 3);
+    }
+
+    #[test]
+    fn project_event_history_retains_edit_completion_and_file_change_payloads() {
+        let mut history = ProjectEventHistory::new(4);
+        let plan_id = PlanId::parse("plan-1").unwrap();
+        history.record(ProjectEvent::FilesChanged {
+            paths: vec![PathBuf::from("/workspace/main.rs")],
+        });
+        history.record(ProjectEvent::EditApplied {
+            plan_id: plan_id.clone(),
+            committed_files: vec![PathBuf::from("/workspace/main.rs")],
+            operation_count: 1,
+        });
+
+        let snapshot = history.snapshot_since(None);
+        assert!(matches!(
+            snapshot.events()[0].event(),
+            ProjectEvent::FilesChanged { paths } if paths.len() == 1
+        ));
+        assert!(matches!(
+            snapshot.events()[1].event(),
+            ProjectEvent::EditApplied {
+                plan_id: actual,
+                operation_count: 1,
+                ..
+            } if actual == &plan_id
+        ));
+        assert_eq!(
+            snapshot.events()[0].event().json_value(),
+            serde_json::json!({
+                "kind": "files_changed",
+                "paths": ["/workspace/main.rs"],
+            })
+        );
+        assert_eq!(
+            snapshot.events()[1].event().json_value(),
+            serde_json::json!({
+                "kind": "edit_applied",
+                "plan_id": "plan-1",
+                "committed_files": ["/workspace/main.rs"],
+                "operation_count": 1,
+            })
+        );
     }
 
     #[tokio::test]
