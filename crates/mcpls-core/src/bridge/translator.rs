@@ -116,6 +116,42 @@ async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+fn server_readiness_timeout(
+    configs: &HashMap<String, LspServerConfig>,
+    language_id: &str,
+) -> Duration {
+    configs
+        .get(language_id)
+        .map_or(Duration::from_secs(30), |config| {
+            Duration::from_secs(config.timeout_seconds)
+        })
+}
+
+async fn wait_for_server_readiness(
+    servers: HashMap<String, LspServer>,
+    configs: &HashMap<String, LspServerConfig>,
+) -> Result<HashMap<String, LspServer>> {
+    let mut ready = HashMap::with_capacity(servers.len());
+    for (language_id, server) in servers {
+        if let Err(error) = server
+            .wait_until_quiescent(server_readiness_timeout(configs, &language_id))
+            .await
+        {
+            let mut remaining = ready;
+            remaining.insert(language_id, server);
+            if let Err(shutdown_error) = shutdown_servers(remaining).await {
+                tracing::warn!(
+                    %shutdown_error,
+                    "failed to clean up LSP servers after readiness failure"
+                );
+            }
+            return Err(error);
+        }
+        ready.insert(language_id, server);
+    }
+    Ok(ready)
+}
+
 /// Configuration snapshot used to construct an isolated project translator.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct TranslatorTemplate {
@@ -456,7 +492,7 @@ impl Translator {
         }
 
         let failures = result.failures;
-        let servers = match self.wait_for_server_readiness(result.servers).await {
+        let servers = match wait_for_server_readiness(result.servers, &self.lsp_configs).await {
             Ok(servers) => servers,
             Err(error) => {
                 self.clear_expected_languages();
@@ -481,34 +517,6 @@ impl Translator {
         self.reopen_tracked_documents().await?;
         self.clear_expected_languages();
         Ok(ProjectActivation::new(notification_receivers, health))
-    }
-
-    async fn wait_for_server_readiness(
-        &self,
-        servers: HashMap<String, LspServer>,
-    ) -> Result<HashMap<String, LspServer>> {
-        let mut ready = HashMap::with_capacity(servers.len());
-        for (language_id, server) in servers {
-            let timeout = self
-                .lsp_configs
-                .get(&language_id)
-                .map_or(Duration::from_secs(30), |config| {
-                    Duration::from_secs(config.timeout_seconds)
-                });
-            if let Err(error) = server.wait_until_quiescent(timeout).await {
-                let mut remaining = ready;
-                remaining.insert(language_id, server);
-                if let Err(shutdown_error) = shutdown_servers(remaining).await {
-                    tracing::warn!(
-                        %shutdown_error,
-                        "failed to clean up LSP servers after readiness failure"
-                    );
-                }
-                return Err(error);
-            }
-            ready.insert(language_id, server);
-        }
-        Ok(ready)
     }
 
     fn same_workspace_roots(existing: &[PathBuf], requested: &[PathBuf]) -> bool {
@@ -3116,7 +3124,7 @@ mod tests {
         let server = root.path().join("handshake-only-lsp.py");
         fs::write(
             &server,
-            r##"#!/usr/bin/env python3
+            r#"#!/usr/bin/env python3
 import json
 import sys
 
@@ -3149,7 +3157,7 @@ while True:
     elif message.get("method") == "shutdown":
         send_message({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
-"##,
+"#,
         )
         .unwrap();
         let mut permissions = fs::metadata(&server).unwrap().permissions();

@@ -7315,10 +7315,11 @@ mod tests {
             registry.status(&second_id).await.unwrap().status(),
             ProjectStatus::Ready
         );
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(50), second_events.recv()).await,
-            Err(_)
-        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_events.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
