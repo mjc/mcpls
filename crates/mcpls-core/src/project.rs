@@ -2951,18 +2951,7 @@ impl ProjectRegistry {
             ));
         }
 
-        let shared = identity.repository_identity().and_then(|repository| {
-            projects.values().find(|project| {
-                project
-                    .identity
-                    .repository_identity()
-                    .is_some_and(|existing| {
-                        existing == repository
-                            && compatibility_key.is_some()
-                            && project.compatibility_key == compatibility_key
-                    })
-            })
-        });
+        let shared = compatible_project(&projects, &identity, compatibility_key);
         if let Some(existing) = shared {
             let actor = existing.actor.clone();
             let mutation = existing.mutation.clone();
@@ -3369,6 +3358,23 @@ impl ProjectRegistry {
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
+}
+
+fn compatible_project<'a>(
+    projects: &'a HashMap<ProjectId, ProjectEntry>,
+    identity: &ProjectIdentity,
+    compatibility_key: Option<ProjectCompatibilityKey>,
+) -> Option<&'a ProjectEntry> {
+    let repository = identity.repository_identity()?;
+    let compatibility_key = compatibility_key?;
+    projects.values().find(|project| {
+        project
+            .identity
+            .repository_identity()
+            .is_some_and(|existing| {
+                existing == repository && project.compatibility_key == Some(compatibility_key)
+            })
+    })
 }
 
 #[cfg(test)]
