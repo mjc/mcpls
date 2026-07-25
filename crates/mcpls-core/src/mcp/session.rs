@@ -1,6 +1,7 @@
 //! Per-MCP-session delivery of project events.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -9,7 +10,7 @@ use rmcp::{Peer, RoleServer};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::bridge::resources::make_uri;
+use crate::bridge::resources::{ResourceUriError, make_uri, parse_uri};
 use crate::bridge::{ResourceSubscriptions, uri_to_path};
 use crate::project::{ProjectEvent, ProjectHandle, ProjectId};
 
@@ -25,6 +26,23 @@ pub fn parse_project_status_resource_uri(uri: &str) -> Option<ProjectId> {
     uri.strip_prefix(PROJECT_STATUS_PREFIX)
         .filter(|value| !value.is_empty() && !value.contains('/'))
         .and_then(|value| ProjectId::new(value.to_string()).ok())
+}
+
+/// Resource scopes understood by a session subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionResource {
+    /// Cached diagnostics for one absolute file path.
+    Diagnostics(PathBuf),
+    /// Lifecycle state for one registered project.
+    ProjectStatus(ProjectId),
+}
+
+/// Parse either a diagnostics or project-status resource URI.
+pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, ResourceUriError> {
+    if let Some(project_id) = parse_project_status_resource_uri(uri) {
+        return Ok(SessionResource::ProjectStatus(project_id));
+    }
+    parse_uri(uri).map(SessionResource::Diagnostics)
 }
 
 /// Convert an LSP file URI from a diagnostics event into the MCP resource URI
@@ -185,8 +203,8 @@ mod tests {
 
     use super::{SessionEventSink, SessionNotifier};
     use super::{
-        diagnostics_resource_uri, event_resource_uri, parse_project_status_resource_uri,
-        project_status_resource_uri,
+        SessionResource, diagnostics_resource_uri, event_resource_uri,
+        parse_project_status_resource_uri, parse_session_resource_uri, project_status_resource_uri,
     };
     use crate::project::{ProjectEvent, ProjectId, ProjectStatus};
 
@@ -232,6 +250,15 @@ mod tests {
         assert_eq!(
             parse_project_status_resource_uri(&project_status_resource_uri(&project_id)),
             Some(project_id)
+        );
+        assert_eq!(
+            parse_session_resource_uri(&project_status_resource_uri(&ProjectId::new("a").unwrap()))
+                .unwrap(),
+            SessionResource::ProjectStatus(ProjectId::new("a").unwrap())
+        );
+        assert_eq!(
+            parse_session_resource_uri("lsp-diagnostics:///workspace/a.rs").unwrap(),
+            SessionResource::Diagnostics(std::path::PathBuf::from("/workspace/a.rs"))
         );
     }
 

@@ -17,7 +17,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
-use super::session::{parse_project_status_resource_uri, project_status_resource_uri};
+use super::session::{SessionResource, parse_session_resource_uri, project_status_resource_uri};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
@@ -28,7 +28,7 @@ use super::tools::{
     SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
     WorkspaceSymbolParams,
 };
-use crate::bridge::resources::{make_uri, parse_uri};
+use crate::bridge::resources::make_uri;
 use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
 use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
@@ -1181,7 +1181,12 @@ impl ServerHandler for McplsServer {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        if let Some(project_id) = parse_project_status_resource_uri(&request.uri) {
+        let resource = parse_session_resource_uri(&request.uri)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let SessionResource::Diagnostics(path) = resource else {
+            let SessionResource::ProjectStatus(project_id) = resource else {
+                unreachable!("session resource parser returned an unknown scope");
+            };
             let identity = self
                 .context
                 .project_registry
@@ -1199,10 +1204,7 @@ impl ServerHandler for McplsServer {
                 json,
                 request.uri,
             )]));
-        }
-
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        };
 
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
         // in the response shape. Currently both return `{"diagnostics":null}` which is
@@ -1234,7 +1236,9 @@ impl ServerHandler for McplsServer {
         request: SubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        if let Some(project_id) = parse_project_status_resource_uri(&request.uri) {
+        let resource = parse_session_resource_uri(&request.uri)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        if let SessionResource::ProjectStatus(project_id) = resource {
             let actor = self
                 .context
                 .project_registry
@@ -1246,8 +1250,9 @@ impl ServerHandler for McplsServer {
             return Ok(());
         }
 
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let SessionResource::Diagnostics(path) = resource else {
+            unreachable!("project status resource handled above");
+        };
 
         let (project_id, actor) = self
             .context
@@ -1275,9 +1280,8 @@ impl ServerHandler for McplsServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         // Parse the URI for consistency with subscribe validation.
-        if parse_project_status_resource_uri(&request.uri).is_none() {
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
+        parse_session_resource_uri(&request.uri)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         self.context.subscriptions.unsubscribe(&request.uri).await;
         Ok(())
     }
@@ -1313,6 +1317,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::bridge::resources::parse_uri;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
     use tempfile::TempDir;
 
