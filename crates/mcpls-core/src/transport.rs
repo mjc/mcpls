@@ -351,14 +351,11 @@ mod tests {
         async fn test_run_http_binds() {
             use std::sync::Arc;
 
-            use tokio::sync::Mutex;
-
-            use crate::bridge::{ResourceSubscriptions, Translator};
+            use crate::bridge::ResourceSubscriptions;
             use crate::mcp::McplsServer;
 
-            let translator = Arc::new(Mutex::new(Translator::new()));
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server = McplsServer::new(translator, subs);
+            let server = McplsServer::new(subs);
 
             // Bind port 0 so the OS assigns a free port.
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -389,18 +386,15 @@ mod tests {
         async fn test_run_http_bind_error() {
             use std::sync::Arc;
 
-            use tokio::sync::Mutex;
-
-            use crate::bridge::{ResourceSubscriptions, Translator};
+            use crate::bridge::ResourceSubscriptions;
             use crate::mcp::McplsServer;
 
             // Hold a listener to make the port unavailable.
             let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = occupied.local_addr().unwrap();
 
-            let translator = Arc::new(Mutex::new(Translator::new()));
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server = McplsServer::new(translator, subs);
+            let server = McplsServer::new(subs);
 
             let cfg = HttpConfig {
                 bind: addr,
