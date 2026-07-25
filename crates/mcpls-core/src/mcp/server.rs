@@ -494,7 +494,7 @@ impl McplsServer {
 
     /// Preview an LSP `WorkspaceEdit` without changing any files.
     #[tool(
-        description = "Preview a project-scoped LSP WorkspaceEdit. The result includes a plan ID, unified diff, affected files, preconditions, conflicts, unsupported operations, and explicit safety state."
+        description = "Preview a project-scoped LSP WorkspaceEdit. The returned plan is owned by this MCP session and includes a plan ID, unified diff, affected files, preconditions, conflicts, unsupported operations, and explicit safety state."
     )]
     async fn workspace_edit_preview(
         &self,
@@ -513,7 +513,7 @@ impl McplsServer {
 
     /// Request a rename from the project LSP and preview the resulting edit.
     #[tool(
-        description = "Preview an LSP rename as a project-owned workspace edit plan. Apply the returned plan with workspace_edit_apply."
+        description = "Preview an LSP rename as a session-owned workspace edit plan. Apply the returned plan from this MCP session with workspace_edit_apply."
     )]
     async fn rename_preview(
         &self,
@@ -544,7 +544,7 @@ impl McplsServer {
 
     /// Request document formatting from the project LSP and preview the edit.
     #[tool(
-        description = "Preview LSP document formatting as a project-owned workspace edit plan. Apply the returned plan with workspace_edit_apply."
+        description = "Preview LSP document formatting as a session-owned workspace edit plan. Apply the returned plan from this MCP session with workspace_edit_apply."
     )]
     async fn format_preview(
         &self,
@@ -572,9 +572,9 @@ impl McplsServer {
         self.preview_project_edit(&id, edit, encoding).await
     }
 
-    /// Apply a previously previewed, project-owned workspace edit plan.
+    /// Apply a previously previewed, session-owned workspace edit plan.
     #[tool(
-        description = "Apply one previously previewed workspace edit plan by its project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced."
+        description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced."
     )]
     async fn workspace_edit_apply(
         &self,
@@ -957,7 +957,9 @@ impl McplsServer {
     }
 
     /// Resolve and preview one project-scoped code action.
-    #[tool(description = "Preview a code action using its project-scoped reference.")]
+    #[tool(
+        description = "Preview a code action using its project-scoped reference; the returned plan is owned by this MCP session."
+    )]
     async fn code_action_preview(
         &self,
         Parameters(CodeActionPreviewParams {
@@ -980,8 +982,8 @@ impl McplsServer {
         encode_json(&preview_artifact_json(&result, id.as_str()))
     }
 
-    /// Apply a previously previewed code action plan.
-    #[tool(description = "Apply a code action preview plan for a project.")]
+    /// Apply a code action plan previewed by this MCP session.
+    #[tool(description = "Apply a code action preview plan owned by this MCP session.")]
     async fn code_action_apply(
         &self,
         Parameters(CodeActionApplyParams {
