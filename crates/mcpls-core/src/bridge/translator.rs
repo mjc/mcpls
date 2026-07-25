@@ -372,7 +372,8 @@ impl Translator {
                 .lsp_roots
                 .get(language_id)
                 .is_some_and(|existing_roots| {
-                    roots.iter().all(|root| existing_roots.contains(root))
+                    existing_roots.len() == roots.len()
+                        && roots.iter().all(|root| existing_roots.contains(root))
                 })
                 && self.lsp_clients.contains_key(language_id);
 
