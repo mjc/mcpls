@@ -1866,6 +1866,10 @@ impl ProjectRuntime {
         self.generation
     }
 
+    const fn owns_generation(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
         self.edit_plans
             .insert(plan)
@@ -2836,12 +2840,12 @@ async fn handle_project_request(
             generation,
             notification,
         } => {
-            if generation == runtime.generation() {
+            if runtime.owns_generation(generation) {
                 runtime.notification(notification);
             }
         }
         ProjectRequest::ServerExited { generation } => {
-            if generation == runtime.generation()
+            if runtime.owns_generation(generation)
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
                 state.status = ProjectStatus::Failed;
