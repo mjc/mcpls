@@ -468,6 +468,12 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProjectCompatibilityKey([u8; 32]);
 
+fn has_dynamic_project_environment(root: &Path) -> bool {
+    [".envrc", "flake.nix"]
+        .into_iter()
+        .any(|marker| root.join(marker).is_file())
+}
+
 /// Return a conservative fingerprint for the inputs that shape Rust analysis.
 ///
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
@@ -486,7 +492,7 @@ fn rust_project_compatibility_key(
         ".cargo/config.toml",
     ];
 
-    if root.join(".envrc").is_file() || root.join("flake.nix").is_file() {
+    if has_dynamic_project_environment(root) {
         return None;
     }
 
