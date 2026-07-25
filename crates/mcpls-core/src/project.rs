@@ -1080,6 +1080,53 @@ pub enum ProjectActorError {
     Operation(String),
 }
 
+#[derive(Clone)]
+struct ProjectRequestSender {
+    sender: mpsc::Sender<ProjectRequest>,
+    accepting: std::sync::Arc<AtomicBool>,
+}
+
+impl ProjectRequestSender {
+    fn new(sender: mpsc::Sender<ProjectRequest>) -> Self {
+        Self {
+            sender,
+            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn queue_pressure(&self) -> ProjectQueuePressure {
+        ProjectQueuePressure {
+            queued: self.sender.max_capacity() - self.sender.capacity(),
+            capacity: self.sender.max_capacity(),
+        }
+    }
+
+    fn same_channel(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    fn reject_new_work(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    async fn send(
+        &self,
+        request: ProjectRequest,
+    ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(mpsc::error::SendError(request));
+        }
+        self.sender.send(request).await
+    }
+
+    async fn send_control(
+        &self,
+        request: ProjectRequest,
+    ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
+        self.sender.send(request).await
+    }
+}
+
 /// Result of consuming and applying one project-owned edit plan.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AppliedEditPlan {
@@ -1338,7 +1385,7 @@ enum ProjectRequest {
 /// Cloneable handle for querying and controlling one project actor.
 #[derive(Clone)]
 pub struct ProjectHandle {
-    sender: mpsc::Sender<ProjectRequest>,
+    sender: ProjectRequestSender,
     status: watch::Receiver<ProjectStatus>,
     events: broadcast::Sender<ProjectEvent>,
     event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
@@ -1348,10 +1395,7 @@ impl ProjectHandle {
     /// Return the actor request queue depth and fixed capacity without awaiting it.
     #[must_use]
     pub fn queue_pressure(&self) -> ProjectQueuePressure {
-        ProjectQueuePressure {
-            queued: self.sender.max_capacity() - self.sender.capacity(),
-            capacity: self.sender.max_capacity(),
-        }
+        self.sender.queue_pressure()
     }
 
     /// Subscribe to lifecycle changes for this project.
@@ -1375,10 +1419,14 @@ impl ProjectHandle {
             .snapshot_since(cursor)
     }
 
+    fn reject_new_work(&self) {
+        self.sender.reject_new_work();
+    }
+
     async fn publish_event(&self, event: ProjectEvent) -> Result<(), ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::PublishEvent { event, reply })
+            .send_control(ProjectRequest::PublishEvent { event, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -2353,7 +2401,7 @@ impl ProjectHandle {
     pub async fn shutdown(&self) -> Result<(), ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::Shutdown { reply })
+            .send_control(ProjectRequest::Shutdown { reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response.await.map_err(|_| ProjectActorError::Cancelled)
@@ -3018,6 +3066,7 @@ pub fn spawn_project_actor_with_translator(
 ) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.downgrade();
+    let sender = ProjectRequestSender::new(sender);
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
     let event_sender = event_tx.clone();
@@ -4558,6 +4607,9 @@ impl ProjectRegistry {
             drop(projects);
             removal
         };
+        for actor in &removal.actors {
+            actor.reject_new_work();
+        }
         let _mutation_guards = self.lock_mutation_gates(removal.mutations).await;
         if let Err(error) = shutdown_project_actors(&id, &removal.root, removal.actors).await {
             self.lifecycle.end_removal(&id).await;
@@ -6446,7 +6498,7 @@ mod tests {
                 identity: identity.clone(),
                 actors: vec![ProjectActorEntry {
                     actor: ProjectHandle {
-                        sender,
+                        sender: ProjectRequestSender::new(sender),
                         status,
                         events,
                         event_history: std::sync::Arc::new(std::sync::Mutex::new(
@@ -6750,6 +6802,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_removal_rejects_new_actor_requests() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let id = ProjectId::new("removing").unwrap();
+        let identity = ProjectIdentity::new(id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let actor = registry.add(identity.clone()).await.unwrap();
+
+        let mutation = registry.projects.read().await.get(&id).unwrap().actors[0]
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+        let remove_registry = registry.clone();
+        let remove_id = id.clone();
+        let remove = tokio::spawn(async move { remove_registry.remove(remove_id).await });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            registry.add(identity).await,
+            Err(ProjectRegistryError::ProjectRemoving(project)) if project == id
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(10), actor.set_status(ProjectStatus::Ready))
+                .await,
+            Ok(Err(ProjectActorError::Closed))
+        ));
+
+        drop(guard);
+        assert!(remove.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn project_registry_shuts_down_all_registered_actors() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
@@ -6809,7 +6894,7 @@ mod tests {
         let (_, status) = watch::channel(ProjectStatus::Starting);
         let (events, _) = broadcast::channel(1);
         let actor = ProjectHandle {
-            sender,
+            sender: ProjectRequestSender::new(sender),
             status,
             events,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
