@@ -43,7 +43,7 @@ pub struct ServerConfig {
 }
 
 /// Configuration for daemon-owned runtime state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Optional JSON state file for dynamic project registrations.
@@ -53,6 +53,15 @@ pub struct DaemonConfig {
     /// Maximum time to wait for each project actor during daemon shutdown.
     #[serde(default = "default_shutdown_timeout_seconds")]
     pub shutdown_timeout_seconds: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            state_file: None,
+            shutdown_timeout_seconds: default_shutdown_timeout_seconds(),
+        }
+    }
 }
 
 const fn default_shutdown_timeout_seconds() -> u64 {
@@ -518,6 +527,13 @@ mod tests {
         assert_eq!(config.daemon.shutdown_timeout_seconds, 7);
         let encoded = toml::to_string(&config).unwrap();
         assert!(encoded.contains("state_file"));
+    }
+
+    #[test]
+    fn daemon_default_keeps_shutdown_timeout_when_section_is_omitted() {
+        let config: ServerConfig = toml::from_str("").unwrap();
+
+        assert_eq!(config.daemon.shutdown_timeout_seconds, 30);
     }
 
     #[test]
