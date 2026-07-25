@@ -138,7 +138,7 @@ pub(crate) async fn run_http(
     http_cfg.cancellation_token = cancel.clone();
 
     let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(mcp_for_factory.clone()),
+        move || Ok::<_, std::io::Error>(mcp_for_factory.for_session()),
         session_manager,
         http_cfg,
     );

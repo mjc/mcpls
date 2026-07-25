@@ -200,6 +200,17 @@ impl McplsServer {
         Self { context }
     }
 
+    /// Clone the server for one MCP session while sharing project actors.
+    ///
+    /// Session-local subscriptions are intentionally not shared with the
+    /// source server or any other session.
+    #[must_use]
+    pub fn for_session(&self) -> Self {
+        Self {
+            context: Arc::new(self.context.for_session()),
+        }
+    }
+
     /// Register a project root for long-lived lifecycle and routing operations.
     #[tool(description = "Register a project root under a stable project ID.")]
     async fn project_add(
@@ -1225,6 +1236,43 @@ mod tests {
         let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         McplsServer::new(translator, subscriptions)
+    }
+
+    #[tokio::test]
+    async fn http_session_clones_have_independent_subscriptions() {
+        let server = create_test_server();
+        let session = server.for_session();
+        let uri = "lsp-diagnostics:///tmp/session.rs".to_string();
+
+        server
+            .context
+            .subscriptions
+            .subscribe(uri.clone())
+            .await
+            .unwrap();
+
+        assert!(server.context.subscriptions.contains(&uri).await);
+        assert!(!session.context.subscriptions.contains(&uri).await);
+    }
+
+    #[tokio::test]
+    async fn http_session_clones_share_project_registry() {
+        let server = create_test_server();
+        let session = server.for_session();
+        let root = TempDir::new().unwrap();
+        let identity = ProjectIdentity::new(
+            ProjectId::new("shared").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+
+        server
+            .context
+            .project_registry
+            .add(identity)
+            .await
+            .unwrap();
+
+        assert_eq!(session.context.project_registry.list().await.len(), 1);
     }
 
     async fn create_test_server_with_project() -> McplsServer {

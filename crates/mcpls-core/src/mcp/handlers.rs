@@ -46,6 +46,16 @@ impl HandlerContext {
         }
     }
 
+    /// Create a session-local context that shares project actors but not
+    /// resource subscriptions with another MCP session.
+    #[must_use]
+    pub fn for_session(&self) -> Self {
+        Self {
+            subscriptions: Arc::new(ResourceSubscriptions::new()),
+            project_registry: self.project_registry.clone(),
+        }
+    }
+
     /// Return the actor owning a path or the registry's explicit routing error.
     ///
     /// Semantic tools use this path so an unregistered file cannot fall back to
