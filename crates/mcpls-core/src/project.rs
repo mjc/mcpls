@@ -925,15 +925,17 @@ pub struct ProjectRuntimeSummary {
     configured_language_ids: Vec<String>,
     active_language_ids: Vec<String>,
     open_document_count: usize,
+    generation: u64,
 }
 
 impl ProjectRuntimeSummary {
-    fn from_translator(translator: &Translator) -> Self {
+    fn from_translator(translator: &Translator, generation: u64) -> Self {
         Self {
             workspace_roots: translator.workspace_roots().to_vec(),
             configured_language_ids: translator.configured_language_ids(),
             active_language_ids: translator.active_language_ids(),
             open_document_count: translator.open_document_count(),
+            generation,
         }
     }
 
@@ -961,12 +963,19 @@ impl ProjectRuntimeSummary {
         self.open_document_count
     }
 
+    /// Return the actor's current LSP lifecycle generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn merge(&mut self, other: Self) {
         self.workspace_roots.extend(other.workspace_roots);
         self.configured_language_ids
             .extend(other.configured_language_ids);
         self.active_language_ids.extend(other.active_language_ids);
         self.open_document_count += other.open_document_count;
+        self.generation = self.generation.max(other.generation);
         self.workspace_roots.sort();
         self.workspace_roots.dedup();
         self.configured_language_ids.sort();
@@ -2840,7 +2849,7 @@ impl ProjectRuntime {
     }
 
     fn summary(&self) -> ProjectRuntimeSummary {
-        ProjectRuntimeSummary::from_translator(&self.translator)
+        ProjectRuntimeSummary::from_translator(&self.translator, self.generation)
     }
 
     fn open_document_paths(&self) -> Vec<PathBuf> {
