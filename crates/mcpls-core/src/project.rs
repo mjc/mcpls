@@ -2756,7 +2756,11 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn notification(&mut self, notification: LspNotification) -> Option<ProjectEvent> {
+    fn notification(
+        &mut self,
+        generation: u64,
+        notification: LspNotification,
+    ) -> Option<ProjectEvent> {
         match notification {
             LspNotification::PublishDiagnostics(params) => {
                 let event = ProjectEvent::DiagnosticsUpdated {
@@ -2774,13 +2778,13 @@ impl ProjectRuntime {
             LspNotification::LogMessage(params) => {
                 self.translator
                     .notification_cache_mut()
-                    .store_log(params.typ.into(), params.message);
+                    .store_log_with_generation(generation, params.typ.into(), params.message);
                 None
             }
             LspNotification::ShowMessage(params) => {
                 self.translator
                     .notification_cache_mut()
-                    .store_message(params.typ.into(), params.message);
+                    .store_message_with_generation(generation, params.typ.into(), params.message);
                 None
             }
             LspNotification::ServerStatus(status) => {
@@ -2932,7 +2936,7 @@ impl ProjectActorChannels {
         if !runtime.owns_generation(generation) {
             return;
         }
-        if let Some(event) = runtime.notification(notification) {
+        if let Some(event) = runtime.notification(generation, notification) {
             self.publish(event);
         }
     }
@@ -5348,6 +5352,7 @@ mod tests {
         let result = actor.server_logs(10, None).await.unwrap();
         assert_eq!(result.logs.len(), 1);
         assert_eq!(result.logs[0].message, "project log");
+        assert_eq!(result.logs[0].generation, 0);
     }
 
     #[tokio::test]

@@ -43,6 +43,8 @@ pub struct DiagnosticInfo {
 /// A log entry from the LSP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Actor/LSP lifecycle generation that produced the entry.
+    pub generation: u64,
     /// Log level.
     pub level: LogLevel,
     /// Log message.
@@ -80,6 +82,8 @@ impl From<lsp_types::MessageType> for LogLevel {
 /// A message from the LSP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerMessage {
+    /// Actor/LSP lifecycle generation that produced the message.
+    pub generation: u64,
     /// Message type.
     pub message_type: MessageType,
     /// Message content.
@@ -164,7 +168,13 @@ impl NotificationCache {
     ///
     /// Maintains a maximum of `MAX_LOG_ENTRIES` entries, removing oldest when full.
     pub fn store_log(&mut self, level: LogLevel, message: String) {
+        self.store_log_with_generation(0, level, message);
+    }
+
+    /// Store a log entry associated with an actor/LSP lifecycle generation.
+    pub fn store_log_with_generation(&mut self, generation: u64, level: LogLevel, message: String) {
         let entry = LogEntry {
+            generation,
             level,
             message,
             timestamp: Utc::now(),
@@ -180,7 +190,18 @@ impl NotificationCache {
     ///
     /// Maintains a maximum of `MAX_SERVER_MESSAGES` entries, removing oldest when full.
     pub fn store_message(&mut self, message_type: MessageType, message: String) {
+        self.store_message_with_generation(0, message_type, message);
+    }
+
+    /// Store a server message associated with an actor/LSP lifecycle generation.
+    pub fn store_message_with_generation(
+        &mut self,
+        generation: u64,
+        message_type: MessageType,
+        message: String,
+    ) {
         let msg = ServerMessage {
+            generation,
             message_type,
             message,
             timestamp: Utc::now(),
@@ -371,6 +392,13 @@ mod tests {
     }
 
     #[test]
+    fn test_store_log_preserves_generation() {
+        let mut cache = NotificationCache::new();
+        cache.store_log_with_generation(7, LogLevel::Info, "generation".to_string());
+        assert_eq!(cache.get_logs().front().unwrap().generation, 7);
+    }
+
+    #[test]
     fn test_logs_max_capacity() {
         let mut cache = NotificationCache::new();
 
@@ -413,6 +441,13 @@ mod tests {
         assert_eq!(messages[0].message, "error msg");
         assert_eq!(messages[1].message_type, MessageType::Warning);
         assert_eq!(messages[1].message, "warning msg");
+    }
+
+    #[test]
+    fn test_store_message_preserves_generation() {
+        let mut cache = NotificationCache::new();
+        cache.store_message_with_generation(9, MessageType::Info, "generation".to_string());
+        assert_eq!(cache.get_messages().front().unwrap().generation, 9);
     }
 
     #[test]
