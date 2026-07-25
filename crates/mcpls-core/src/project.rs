@@ -1282,6 +1282,15 @@ pub struct ProjectHandle {
 }
 
 impl ProjectHandle {
+    /// Return the actor request queue depth and fixed capacity without awaiting it.
+    #[must_use]
+    pub fn queue_pressure(&self) -> ProjectQueuePressure {
+        ProjectQueuePressure {
+            queued: self.sender.max_capacity() - self.sender.capacity(),
+            capacity: self.sender.max_capacity(),
+        }
+    }
+
     /// Subscribe to lifecycle changes for this project.
     #[must_use]
     pub fn status(&self) -> watch::Receiver<ProjectStatus> {
@@ -3657,6 +3666,13 @@ impl ProjectEntry {
             roots,
         }
     }
+
+    fn queue_pressure(&self) -> ProjectQueuePressure {
+        self.actors
+            .iter()
+            .map(|actor| actor.actor.queue_pressure())
+            .fold(ProjectQueuePressure::default(), ProjectQueuePressure::add)
+    }
 }
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
@@ -3725,6 +3741,24 @@ pub struct ProjectStatusSummary {
     pub roots: Vec<PathBuf>,
 }
 
+/// Bounded actor request queue usage across the registry snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectQueuePressure {
+    /// Requests currently occupying actor queue slots.
+    pub queued: usize,
+    /// Total bounded request queue slots.
+    pub capacity: usize,
+}
+
+impl ProjectQueuePressure {
+    const fn add(self, other: Self) -> Self {
+        Self {
+            queued: self.queued + other.queued,
+            capacity: self.capacity + other.capacity,
+        }
+    }
+}
+
 /// Coherent, non-blocking snapshot of registered project lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRegistryStatusSnapshot {
@@ -3734,6 +3768,8 @@ pub struct ProjectRegistryStatusSnapshot {
     pub actor_groups: usize,
     /// Per-project lifecycle summaries.
     pub summaries: Vec<ProjectStatusSummary>,
+    /// Aggregate bounded actor queue usage.
+    pub queue_pressure: ProjectQueuePressure,
 }
 
 /// Negotiated capability data for one actor group in a logical project.
@@ -4107,11 +4143,13 @@ impl ProjectRegistry {
             counts: ProjectStatusCounts::default(),
             actor_groups: 0,
             summaries: Vec::with_capacity(projects.len()),
+            queue_pressure: ProjectQueuePressure::default(),
         };
         for entry in projects.values() {
             snapshot.counts.record(entry.status());
             snapshot.actor_groups += entry.actors.len();
             snapshot.summaries.push(entry.status_summary());
+            snapshot.queue_pressure = snapshot.queue_pressure.add(entry.queue_pressure());
         }
         drop(projects);
         snapshot

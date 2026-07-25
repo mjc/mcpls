@@ -38,8 +38,8 @@ use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle,
-    ProjectId, ProjectIdentity, ProjectRegistry, ProjectServerCapability, ProjectState,
-    ProjectStatusCounts, ProjectStatusSummary,
+    ProjectId, ProjectIdentity, ProjectQueuePressure, ProjectRegistry, ProjectServerCapability,
+    ProjectState, ProjectStatusCounts, ProjectStatusSummary,
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
@@ -107,6 +107,7 @@ struct DaemonSnapshot {
     persistence: DaemonPersistenceSnapshot,
     transport: TransportSnapshot,
     session_count: usize,
+    queue_pressure: ProjectQueuePressure,
     shutting_down: bool,
 }
 
@@ -270,6 +271,7 @@ impl McplsServer {
             },
             transport: (*self.context.transport).clone(),
             session_count: self.context.session_count().await,
+            queue_pressure: projects.queue_pressure,
             shutting_down: self.context.project_registry.is_shutting_down(),
         }
     }
@@ -592,6 +594,10 @@ impl McplsServer {
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
             "session_count": snapshot.session_count,
+            "queue_pressure": {
+                "queued": snapshot.queue_pressure.queued,
+                "capacity": snapshot.queue_pressure.capacity,
+            },
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -612,6 +618,10 @@ impl McplsServer {
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
             "session_count": snapshot.session_count,
+            "queue_pressure": {
+                "queued": snapshot.queue_pressure.queued,
+                "capacity": snapshot.queue_pressure.capacity,
+            },
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
@@ -1882,6 +1892,8 @@ mod tests {
         assert_eq!(status["persistence"]["configured"], false);
         assert_eq!(status["transport"]["mode"], "stdio");
         assert_eq!(status["session_count"], 0);
+        assert_eq!(status["queue_pressure"]["queued"], 0);
+        assert_eq!(status["queue_pressure"]["capacity"], 32);
         assert_eq!(status["projects"]["starting"], 1);
         assert_eq!(status["actor_groups"], 1);
         assert_eq!(status["project_summaries"][0]["project_id"], "health");
