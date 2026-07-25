@@ -3778,6 +3778,23 @@ mod tests {
     }
 
     #[test]
+    fn project_redaction_patterns_flow_to_notifications() {
+        let config = ProjectConfig {
+            redaction_patterns: Some(vec!["configured-pattern".to_string()]),
+            ..ProjectConfig::default()
+        };
+        let template = TranslatorTemplate::default().with_project_config(&config);
+        let mut translator = template.translator_for_root(std::env::temp_dir());
+        translator.notification_cache_mut().store_message(
+            crate::bridge::notifications::MessageType::Info,
+            "configured-pattern".to_string(),
+        );
+
+        let messages = translator.handle_server_messages(10).unwrap();
+        assert_eq!(messages.messages[0].message, "[REDACTED]");
+    }
+
+    #[test]
     fn test_handle_server_messages_limit() {
         use crate::bridge::notifications::MessageType;
 
