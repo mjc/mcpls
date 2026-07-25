@@ -2625,12 +2625,13 @@ impl ProjectRuntime {
             && self.has_active_workspace_roots(roots)
     }
 
-    fn next_automatic_restart_backoff(&mut self) -> Option<Duration> {
+    fn next_automatic_restart(&mut self) -> Option<(usize, Duration)> {
+        let attempt = self.automatic_restart_attempts + 1;
         let delay = AUTOMATIC_RESTART_BACKOFF
             .get(self.automatic_restart_attempts)
             .copied()?;
-        self.automatic_restart_attempts += 1;
-        Some(delay)
+        self.automatic_restart_attempts = attempt;
+        Some((attempt, delay))
     }
 
     fn reset_automatic_restart_attempts(&mut self) {
@@ -3168,6 +3169,43 @@ impl ProjectRuntime {
             .open_paths()
             .map(PathBuf::from)
             .collect()
+    }
+}
+
+async fn recover_project_after_server_exit(
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) {
+    let Some((attempt, backoff)) = runtime.next_automatic_restart() else {
+        state.last_error = Some("language server exited".to_string());
+        channels.publish_status(state, ProjectStatus::Failed);
+        return;
+    };
+
+    runtime.begin_transition();
+    state.last_error = Some(format!(
+        "language server exited; restarting (attempt {attempt}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})"
+    ));
+    channels.publish_status(state, ProjectStatus::Restarting);
+    tokio::time::sleep(backoff).await;
+    match runtime.restart().await {
+        Ok(notification_receivers) => {
+            state.last_error = None;
+            mark_project_started(
+                notification_receivers,
+                actor_sender,
+                channels,
+                state,
+                runtime,
+            );
+        }
+        Err(error) => {
+            state.sync_runtime(runtime);
+            state.last_error = Some(error);
+            channels.publish_status(state, ProjectStatus::Failed);
+        }
     }
 }
 
@@ -3807,35 +3845,7 @@ async fn handle_project_request(
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
                 channels.publish(ProjectEvent::ServerExited { generation });
-                if let Some(backoff) = runtime.next_automatic_restart_backoff() {
-                    runtime.begin_transition();
-                    state.last_error = Some(format!(
-                        "language server exited; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
-                        runtime.automatic_restart_attempts
-                    ));
-                    channels.publish_status(state, ProjectStatus::Restarting);
-                    tokio::time::sleep(backoff).await;
-                    match runtime.restart().await {
-                        Ok(notification_receivers) => {
-                            state.last_error = None;
-                            mark_project_started(
-                                notification_receivers,
-                                actor_sender,
-                                channels,
-                                state,
-                                runtime,
-                            );
-                        }
-                        Err(error) => {
-                            state.sync_runtime(runtime);
-                            state.last_error = Some(error);
-                            channels.publish_status(state, ProjectStatus::Failed);
-                        }
-                    }
-                } else {
-                    state.last_error = Some("language server exited".to_string());
-                    channels.publish_status(state, ProjectStatus::Failed);
-                }
+                recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
@@ -5960,9 +5970,7 @@ mod tests {
             events.recv().await.unwrap(),
             ProjectEvent::StatusChanged {
                 status: ProjectStatus::Restarting,
-                last_error: Some(
-                    "language server exited; restarting (attempt 1/3)".to_string(),
-                ),
+                last_error: Some("language server exited; restarting (attempt 1/3)".to_string(),),
             }
         );
         assert_eq!(
@@ -6574,23 +6582,23 @@ mod tests {
         let mut runtime = ProjectRuntime::new(Translator::new());
 
         assert_eq!(
-            runtime.next_automatic_restart_backoff(),
-            Some(Duration::from_millis(100))
+            runtime.next_automatic_restart(),
+            Some((1, Duration::from_millis(100)))
         );
         assert_eq!(
-            runtime.next_automatic_restart_backoff(),
-            Some(Duration::from_millis(500))
+            runtime.next_automatic_restart(),
+            Some((2, Duration::from_millis(500)))
         );
         assert_eq!(
-            runtime.next_automatic_restart_backoff(),
-            Some(Duration::from_secs(2))
+            runtime.next_automatic_restart(),
+            Some((3, Duration::from_secs(2)))
         );
-        assert_eq!(runtime.next_automatic_restart_backoff(), None);
+        assert_eq!(runtime.next_automatic_restart(), None);
 
         runtime.reset_automatic_restart_attempts();
         assert_eq!(
-            runtime.next_automatic_restart_backoff(),
-            Some(Duration::from_millis(100))
+            runtime.next_automatic_restart(),
+            Some((1, Duration::from_millis(100)))
         );
     }
 
