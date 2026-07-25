@@ -2526,7 +2526,7 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     code_actions: CodeActionStore,
     generation: u64,
-    automatic_restart_attempts: usize,
+    automatic_restart: AutomaticRestartPolicy,
 }
 
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
@@ -2535,6 +2535,24 @@ const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(500),
     Duration::from_secs(2),
 ];
+
+#[derive(Debug, Default)]
+struct AutomaticRestartPolicy {
+    attempts: usize,
+}
+
+impl AutomaticRestartPolicy {
+    fn next(&mut self) -> Option<(usize, Duration)> {
+        let attempt = self.attempts + 1;
+        let delay = AUTOMATIC_RESTART_BACKOFF.get(self.attempts).copied()?;
+        self.attempts = attempt;
+        Some((attempt, delay))
+    }
+
+    const fn reset(&mut self) {
+        self.attempts = 0;
+    }
+}
 
 struct StoredCodeAction {
     file_path: String,
@@ -2600,7 +2618,7 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             code_actions: CodeActionStore::new(),
             generation: 0,
-            automatic_restart_attempts: 0,
+            automatic_restart: AutomaticRestartPolicy::default(),
         }
     }
 
@@ -2623,19 +2641,6 @@ impl ProjectRuntime {
     fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
         matches!(status, ProjectStatus::Ready | ProjectStatus::Degraded)
             && self.has_active_workspace_roots(roots)
-    }
-
-    fn next_automatic_restart(&mut self) -> Option<(usize, Duration)> {
-        let attempt = self.automatic_restart_attempts + 1;
-        let delay = AUTOMATIC_RESTART_BACKOFF
-            .get(self.automatic_restart_attempts)
-            .copied()?;
-        self.automatic_restart_attempts = attempt;
-        Some((attempt, delay))
-    }
-
-    fn reset_automatic_restart_attempts(&mut self) {
-        self.automatic_restart_attempts = 0;
     }
 
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
@@ -3178,7 +3183,7 @@ async fn recover_project_after_server_exit(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) {
-    let Some((attempt, backoff)) = runtime.next_automatic_restart() else {
+    let Some((attempt, backoff)) = runtime.automatic_restart.next() else {
         state.last_error = Some("language server exited".to_string());
         channels.publish_status(state, ProjectStatus::Failed);
         return;
@@ -3389,7 +3394,7 @@ fn mark_project_started(
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) {
-    runtime.reset_automatic_restart_attempts();
+    runtime.automatic_restart.reset();
     let health = activation.health();
     spawn_notification_forwarders(
         activation.into_notification_receivers(),
@@ -6579,27 +6584,15 @@ mod tests {
 
     #[test]
     fn automatic_restart_policy_is_bounded_and_resettable() {
-        let mut runtime = ProjectRuntime::new(Translator::new());
+        let mut policy = AutomaticRestartPolicy::default();
 
-        assert_eq!(
-            runtime.next_automatic_restart(),
-            Some((1, Duration::from_millis(100)))
-        );
-        assert_eq!(
-            runtime.next_automatic_restart(),
-            Some((2, Duration::from_millis(500)))
-        );
-        assert_eq!(
-            runtime.next_automatic_restart(),
-            Some((3, Duration::from_secs(2)))
-        );
-        assert_eq!(runtime.next_automatic_restart(), None);
+        assert_eq!(policy.next(), Some((1, Duration::from_millis(100))));
+        assert_eq!(policy.next(), Some((2, Duration::from_millis(500))));
+        assert_eq!(policy.next(), Some((3, Duration::from_secs(2))));
+        assert_eq!(policy.next(), None);
 
-        runtime.reset_automatic_restart_attempts();
-        assert_eq!(
-            runtime.next_automatic_restart(),
-            Some((1, Duration::from_millis(100)))
-        );
+        policy.reset();
+        assert_eq!(policy.next(), Some((1, Duration::from_millis(100))));
     }
 
     #[tokio::test]
