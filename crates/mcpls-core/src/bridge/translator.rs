@@ -92,12 +92,23 @@ pub struct Translator {
     lsp_configs: HashMap<String, LspServerConfig>,
     /// Workspace roots used by the registered LSP server for each language ID.
     lsp_roots: HashMap<String, Vec<PathBuf>>,
+    /// Configured environment values that must not escape through notifications.
+    redaction_secrets: Vec<String>,
     /// Maximum ancestor/recursive marker search depth.
     heuristics_max_depth: Option<usize>,
 }
 
 const fn shutdown_error_is_recoverable(error: &Error) -> bool {
     matches!(error, Error::ServerTerminated)
+}
+
+fn redact_message(message: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(message.to_owned(), |message, secret| {
+            message.replace(secret, "[REDACTED]")
+        })
 }
 
 async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
@@ -188,6 +199,7 @@ impl Translator {
             expected_languages: HashSet::new(),
             lsp_configs: HashMap::new(),
             lsp_roots: HashMap::new(),
+            redaction_secrets: Vec::new(),
             heuristics_max_depth: None,
         }
     }
@@ -271,6 +283,12 @@ impl Translator {
 
     /// Configure LSP server definitions used for lazy project-root switches.
     pub fn set_lsp_configs(&mut self, configs: Vec<LspServerConfig>, max_depth: Option<usize>) {
+        self.redaction_secrets = configs
+            .iter()
+            .flat_map(|config| config.env.values())
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
         self.lsp_configs = configs
             .into_iter()
             .map(|config| (config.language_id.clone(), config))
@@ -2227,6 +2245,10 @@ impl Translator {
             })
             .take(limit)
             .cloned()
+            .map(|mut log| {
+                log.message = redact_message(&log.message, &self.redaction_secrets);
+                log
+            })
             .collect();
 
         Ok(ServerLogsResult { logs })
@@ -2239,7 +2261,15 @@ impl Translator {
     /// This method does not return errors.
     pub fn handle_server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult> {
         let all_messages = self.notification_cache.get_messages();
-        let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
+        let messages: Vec<_> = all_messages
+            .iter()
+            .take(limit)
+            .cloned()
+            .map(|mut message| {
+                message.message = redact_message(&message.message, &self.redaction_secrets);
+                message
+            })
+            .collect();
         Ok(ServerMessagesResult { messages })
     }
 
@@ -3726,10 +3756,9 @@ mod tests {
 
         let mut translator = Translator::new();
         translator.set_lsp_configs(vec![config], None);
-        translator.notification_cache_mut().store_log(
-            LogLevel::Error,
-            "server failed with env-secret".to_string(),
-        );
+        translator
+            .notification_cache_mut()
+            .store_log(LogLevel::Error, "server failed with env-secret".to_string());
 
         let result = translator.handle_server_logs(10, None).unwrap();
         assert_eq!(result.logs[0].message, "server failed with [REDACTED]");
