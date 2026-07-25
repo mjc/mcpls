@@ -73,6 +73,19 @@ pub struct HttpConfig {
     pub path: String,
 }
 
+#[cfg(feature = "transport-http")]
+impl HttpConfig {
+    fn validate(&self) -> Result<(), crate::Error> {
+        if self.bind.ip().is_loopback() {
+            return Ok(());
+        }
+        Err(crate::Error::Config(
+            "non-loopback HTTP requires an authenticated reverse proxy; bind mcpls to loopback"
+                .to_string(),
+        ))
+    }
+}
+
 use rmcp::ServiceExt as _;
 
 /// Run the MCP server over stdio.
@@ -116,17 +129,6 @@ pub(crate) async fn run_stdio(
 /// stdio is kept as-is. Clients can still poll diagnostics via the existing
 /// MCP tools. A follow-up issue will add per-session broadcast.
 #[cfg(feature = "transport-http")]
-fn validate_http_bind(bind: std::net::SocketAddr) -> Result<(), crate::Error> {
-    if bind.ip().is_loopback() {
-        return Ok(());
-    }
-    Err(crate::Error::Config(
-        "non-loopback HTTP requires an authenticated reverse proxy; bind mcpls to loopback"
-            .to_string(),
-    ))
-}
-
-#[cfg(feature = "transport-http")]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
@@ -139,7 +141,7 @@ pub(crate) async fn run_http(
     };
     use tokio_util::sync::CancellationToken;
 
-    validate_http_bind(cfg.bind)?;
+    cfg.validate()?;
 
     let session_manager = Arc::new(LocalSessionManager::default());
     let cancel = CancellationToken::new();
@@ -248,8 +250,12 @@ mod tests {
 
         #[test]
         fn non_loopback_http_bind_is_rejected_without_an_auth_boundary() {
+            let cfg = HttpConfig {
+                bind: "0.0.0.0:3000".parse().unwrap(),
+                path: "/mcp".to_string(),
+            };
             assert!(matches!(
-                super::super::validate_http_bind("0.0.0.0:3000".parse().unwrap()),
+                cfg.validate(),
                 Err(error) if error.to_string().contains("authenticated reverse proxy")
             ));
         }
