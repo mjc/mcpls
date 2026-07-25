@@ -817,7 +817,11 @@ enum ProjectRequest {
         reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
     },
     Notification {
+        generation: u64,
         notification: LspNotification,
+    },
+    ServerExited {
+        generation: u64,
     },
     Restart {
         reply: oneshot::Sender<ProjectState>,
@@ -1784,6 +1788,7 @@ struct ProjectRuntime {
     translator: Translator,
     edit_plans: EditPlanStore,
     code_actions: CodeActionStore,
+    generation: u64,
 }
 
 struct StoredCodeAction {
@@ -1849,7 +1854,20 @@ impl ProjectRuntime {
             translator,
             edit_plans: EditPlanStore::for_project(),
             code_actions: CodeActionStore::new(),
+            generation: 0,
         }
+    }
+
+    const fn begin_transition(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    const fn owns_generation(&self, generation: u64) -> bool {
+        self.generation == generation
     }
 
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
@@ -2425,21 +2443,41 @@ async fn run_project_actor(
 fn spawn_notification_forwarders(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
     actor_sender: &mpsc::Sender<ProjectRequest>,
+    generation: u64,
 ) {
     for mut receiver in notification_receivers {
         let sender = actor_sender.clone();
         tokio::spawn(async move {
             while let Some(notification) = receiver.recv().await {
                 if sender
-                    .send(ProjectRequest::Notification { notification })
+                    .send(ProjectRequest::Notification {
+                        generation,
+                        notification,
+                    })
                     .await
                     .is_err()
                 {
                     break;
                 }
             }
+            let _ = sender
+                .send(ProjectRequest::ServerExited { generation })
+                .await;
         });
     }
+}
+
+fn mark_project_ready(
+    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    actor_sender: &mpsc::Sender<ProjectRequest>,
+    status_tx: &watch::Sender<ProjectStatus>,
+    state: &mut ProjectState,
+    runtime: &ProjectRuntime,
+) {
+    spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
+    state.sync_runtime(runtime);
+    state.status = ProjectStatus::Ready;
+    let _ = status_tx.send(ProjectStatus::Ready);
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -2459,15 +2497,19 @@ async fn handle_project_request(
             let _ = reply.send(state.clone());
         }
         ProjectRequest::Activate { root, reply } => {
+            runtime.begin_transition();
             state.status = ProjectStatus::Starting;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(notification_receivers, actor_sender);
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
+                    mark_project_ready(
+                        notification_receivers,
+                        actor_sender,
+                        status_tx,
+                        state,
+                        runtime,
+                    );
                     let _ = reply.send(Ok(state.clone()));
                 }
                 Err(error) => {
@@ -2480,15 +2522,19 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
+            runtime.begin_transition();
             state.status = ProjectStatus::Starting;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(notification_receivers, actor_sender);
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
+                    mark_project_ready(
+                        notification_receivers,
+                        actor_sender,
+                        status_tx,
+                        state,
+                        runtime,
+                    );
                     let _ = reply.send(Ok(state.clone()));
                 }
                 Err(error) => {
@@ -2739,15 +2785,19 @@ async fn handle_project_request(
             let _ = reply.send(runtime.validate_path(&file_path));
         }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
+            runtime.begin_transition();
             state.status = ProjectStatus::Restarting;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(notification_receivers, actor_sender);
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
+                    mark_project_ready(
+                        notification_receivers,
+                        actor_sender,
+                        status_tx,
+                        state,
+                        runtime,
+                    );
                     let _ = reply.send(Ok(state.clone()));
                 }
                 Err(error) => {
@@ -2796,8 +2846,22 @@ async fn handle_project_request(
         ProjectRequest::ServerMessages { limit, reply } => {
             let _ = reply.send(runtime.server_messages(limit));
         }
-        ProjectRequest::Notification { notification } => {
-            runtime.notification(notification);
+        ProjectRequest::Notification {
+            generation,
+            notification,
+        } => {
+            if runtime.owns_generation(generation) {
+                runtime.notification(notification);
+            }
+        }
+        ProjectRequest::ServerExited { generation } => {
+            if runtime.owns_generation(generation)
+                && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
+            {
+                state.status = ProjectStatus::Failed;
+                state.last_error = Some("language server exited".to_string());
+                let _ = status_tx.send(ProjectStatus::Failed);
+            }
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -2807,16 +2871,20 @@ async fn handle_project_request(
             let _ = reply.send(());
         }
         ProjectRequest::Restart { reply } => {
+            runtime.begin_transition();
             state.sync_runtime(runtime);
             state.status = ProjectStatus::Restarting;
             state.last_error = None;
             let _ = status_tx.send(ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
-                    spawn_notification_forwarders(notification_receivers, actor_sender);
-                    state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Ready;
-                    let _ = status_tx.send(ProjectStatus::Ready);
+                    mark_project_ready(
+                        notification_receivers,
+                        actor_sender,
+                        status_tx,
+                        state,
+                        runtime,
+                    );
                     let _ = reply.send(state.clone());
                 }
                 Err(error) => {
@@ -2836,6 +2904,7 @@ async fn handle_project_request(
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
+            runtime.begin_transition();
             state.sync_runtime(runtime);
             state.status = ProjectStatus::Stopping;
             state.last_error = None;
@@ -2951,18 +3020,7 @@ impl ProjectRegistry {
             ));
         }
 
-        let shared = identity.repository_identity().and_then(|repository| {
-            projects.values().find(|project| {
-                project
-                    .identity
-                    .repository_identity()
-                    .is_some_and(|existing| {
-                        existing == repository
-                            && compatibility_key.is_some()
-                            && project.compatibility_key == compatibility_key
-                    })
-            })
-        });
+        let shared = compatible_project(&projects, &identity, compatibility_key);
         if let Some(existing) = shared {
             let actor = existing.actor.clone();
             let mutation = existing.mutation.clone();
@@ -3369,6 +3427,23 @@ impl ProjectRegistry {
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
+}
+
+fn compatible_project<'a>(
+    projects: &'a HashMap<ProjectId, ProjectEntry>,
+    identity: &ProjectIdentity,
+    compatibility_key: Option<ProjectCompatibilityKey>,
+) -> Option<&'a ProjectEntry> {
+    let repository = identity.repository_identity()?;
+    let compatibility_key = compatibility_key?;
+    projects.values().find(|project| {
+        project
+            .identity
+            .repository_identity()
+            .is_some_and(|existing| {
+                existing == repository && project.compatibility_key == Some(compatibility_key)
+            })
+    })
 }
 
 #[cfg(test)]
@@ -3942,13 +4017,46 @@ mod tests {
         );
         actor
             .sender
-            .send(ProjectRequest::Notification { notification })
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification,
+            })
             .await
             .unwrap();
 
         let result = actor.server_logs(10, None).await.unwrap();
         assert_eq!(result.logs.len(), 1);
         assert_eq!(result.logs[0].message, "project log");
+    }
+
+    #[tokio::test]
+    async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
+        let actor = spawn_project_actor(2);
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 99 })
+            .await
+            .unwrap();
+        assert_eq!(actor.query().await.unwrap().status(), ProjectStatus::Ready);
+
+        actor.restart().await.unwrap();
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+        assert_eq!(actor.query().await.unwrap().status(), ProjectStatus::Ready);
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 1 })
+            .await
+            .unwrap();
+        let state = actor.query().await.unwrap();
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(state.last_error(), Some("language server exited"));
     }
 
     #[tokio::test]
