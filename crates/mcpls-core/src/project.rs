@@ -3210,10 +3210,7 @@ async fn run_project_actor(
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
 ) {
-    while let Some(request) = receiver.recv().await {
-        if request.is_cancelled() {
-            continue;
-        }
+    while let Some(request) = next_project_request(&mut receiver).await {
         if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
         {
             break;
@@ -3222,6 +3219,17 @@ async fn run_project_actor(
     if state.status != ProjectStatus::Stopped {
         stop_project_runtime(&channels, &mut state, &mut runtime, false).await;
     }
+}
+
+async fn next_project_request(
+    receiver: &mut mpsc::Receiver<ProjectRequest>,
+) -> Option<ProjectRequest> {
+    while let Some(request) = receiver.recv().await {
+        if !request.is_cancelled() {
+            return Some(request);
+        }
+    }
+    None
 }
 
 fn spawn_notification_forwarders(
