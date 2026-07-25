@@ -1048,12 +1048,16 @@ impl Translator {
         })
     }
 
+    fn registered_workspace_root(&self, path: &Path) -> Option<PathBuf> {
+        crate::project::longest_matching_root(path, &self.workspace_roots).map(Path::to_path_buf)
+    }
+
     fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> PathBuf {
         // Registered project roots own the daemon's LSP lifecycle. Prefer the
         // most specific one before manifest heuristics so a nested Cargo.toml
         // does not replace an already-active workspace server on every request.
-        if let Some(root) = crate::project::longest_matching_root(path, &self.workspace_roots) {
-            return root.to_path_buf();
+        if let Some(root) = self.registered_workspace_root(path) {
+            return root;
         }
 
         let start = path.parent().unwrap_or(path);
@@ -2903,7 +2907,11 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let nested = workspace.path().join("crates/mcpls-core");
         fs::create_dir_all(&nested).unwrap();
-        fs::write(workspace.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[]\n",
+        )
+        .unwrap();
         fs::write(nested.join("Cargo.toml"), "[package]\nname=\"nested\"\n").unwrap();
 
         let mut translator = Translator::new();
