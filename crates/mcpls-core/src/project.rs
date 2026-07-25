@@ -2526,7 +2526,15 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     code_actions: CodeActionStore,
     generation: u64,
+    automatic_restart_attempts: usize,
 }
+
+const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
+const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
 
 struct StoredCodeAction {
     file_path: String,
@@ -2592,6 +2600,7 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             code_actions: CodeActionStore::new(),
             generation: 0,
+            automatic_restart_attempts: 0,
         }
     }
 
@@ -2614,6 +2623,18 @@ impl ProjectRuntime {
     fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
         matches!(status, ProjectStatus::Ready | ProjectStatus::Degraded)
             && self.has_active_workspace_roots(roots)
+    }
+
+    fn next_automatic_restart_backoff(&mut self) -> Option<Duration> {
+        let delay = AUTOMATIC_RESTART_BACKOFF
+            .get(self.automatic_restart_attempts)
+            .copied()?;
+        self.automatic_restart_attempts += 1;
+        Some(delay)
+    }
+
+    fn reset_automatic_restart_attempts(&mut self) {
+        self.automatic_restart_attempts = 0;
     }
 
     fn store_edit_plan(&mut self, plan: EditPlan) -> Result<(), String> {
@@ -3328,8 +3349,9 @@ fn mark_project_started(
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
-    runtime: &ProjectRuntime,
+    runtime: &mut ProjectRuntime,
 ) {
+    runtime.reset_automatic_restart_attempts();
     let health = activation.health();
     spawn_notification_forwarders(
         activation.into_notification_receivers(),
@@ -3784,9 +3806,36 @@ async fn handle_project_request(
             if runtime.owns_generation(generation)
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
-                state.last_error = Some("language server exited".to_string());
                 channels.publish(ProjectEvent::ServerExited { generation });
-                channels.publish_status(state, ProjectStatus::Failed);
+                if let Some(backoff) = runtime.next_automatic_restart_backoff() {
+                    runtime.begin_transition();
+                    state.last_error = Some(format!(
+                        "language server exited; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
+                        runtime.automatic_restart_attempts
+                    ));
+                    channels.publish_status(state, ProjectStatus::Restarting);
+                    tokio::time::sleep(backoff).await;
+                    match runtime.restart().await {
+                        Ok(notification_receivers) => {
+                            state.last_error = None;
+                            mark_project_started(
+                                notification_receivers,
+                                actor_sender,
+                                channels,
+                                state,
+                                runtime,
+                            );
+                        }
+                        Err(error) => {
+                            state.sync_runtime(runtime);
+                            state.last_error = Some(error);
+                            channels.publish_status(state, ProjectStatus::Failed);
+                        }
+                    }
+                } else {
+                    state.last_error = Some("language server exited".to_string());
+                    channels.publish_status(state, ProjectStatus::Failed);
+                }
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
@@ -5891,7 +5940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_actor_publishes_server_exit_events_before_failure_status() {
+    async fn project_actor_publishes_server_exit_events_before_recovery_status() {
         let handle = spawn_project_actor(4);
         let mut events = handle.subscribe_events();
         handle.set_status(ProjectStatus::Ready).await.unwrap();
@@ -5910,8 +5959,17 @@ mod tests {
         assert_eq!(
             events.recv().await.unwrap(),
             ProjectEvent::StatusChanged {
-                status: ProjectStatus::Failed,
-                last_error: Some("language server exited".to_string()),
+                status: ProjectStatus::Restarting,
+                last_error: Some(
+                    "language server exited; restarting (attempt 1/3)".to_string(),
+                ),
+            }
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::StatusChanged {
+                status: ProjectStatus::Ready,
+                last_error: None,
             }
         );
     }
@@ -6480,8 +6538,8 @@ mod tests {
             .await
             .unwrap();
         let state = actor.query().await.unwrap();
-        assert_eq!(state.status(), ProjectStatus::Failed);
-        assert_eq!(state.last_error(), Some("language server exited"));
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(state.runtime().generation(), 2);
     }
 
     #[tokio::test]
@@ -6509,6 +6567,31 @@ mod tests {
 
         assert_eq!(state.status(), ProjectStatus::Ready);
         assert_eq!(state.runtime().generation(), 1);
+    }
+
+    #[test]
+    fn automatic_restart_policy_is_bounded_and_resettable() {
+        let mut runtime = ProjectRuntime::new(Translator::new());
+
+        assert_eq!(
+            runtime.next_automatic_restart_backoff(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            runtime.next_automatic_restart_backoff(),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            runtime.next_automatic_restart_backoff(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(runtime.next_automatic_restart_backoff(), None);
+
+        runtime.reset_automatic_restart_attempts();
+        assert_eq!(
+            runtime.next_automatic_restart_backoff(),
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[tokio::test]
