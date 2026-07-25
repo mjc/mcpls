@@ -657,6 +657,9 @@ pub struct WorkspaceSymbolResult {
 /// A single code action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeAction {
+    /// Opaque project-scoped reference for previewing this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
     /// Title of the code action.
     pub title: String,
     /// Kind of code action (quickfix, refactor, etc.).
@@ -668,12 +671,21 @@ pub struct CodeAction {
     /// Workspace edit to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit: Option<WorkspaceEditDescription>,
+    /// Lossless raw workspace edit, including document changes and resource operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_edit: Option<serde_json::Value>,
     /// Command to execute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<CommandDescription>,
     /// Whether this is the preferred action.
     #[serde(default)]
     pub is_preferred: bool,
+    /// LSP-disabled reason, when the action cannot currently run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
+    /// Opaque LSP data used by `codeAction/resolve`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Description of a workspace edit.
@@ -1637,6 +1649,49 @@ impl Translator {
             kind_filter.as_deref(),
         )?;
 
+        let response_vec = self
+            .request_code_actions(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await?;
+        let mut actions = Vec::with_capacity(response_vec.len());
+
+        for action_or_command in response_vec {
+            let action = convert_code_action_or_command(action_or_command, None);
+            actions.push(action);
+        }
+
+        Ok(CodeActionsResult { actions })
+    }
+
+    /// Request raw code actions for a range so an actor can retain action data
+    /// for a later resolve/preview operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is outside the workspace or the LSP
+    /// request fails.
+    pub async fn request_code_actions(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<Vec<lsp_types::CodeActionOrCommand>> {
+        validate_code_action_params(
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter.as_deref(),
+        )?;
         let path = PathBuf::from(&file_path);
         let validated_path = self.validate_path(&path)?;
         self.ensure_client_for_file(&validated_path).await?;
@@ -1645,63 +1700,43 @@ impl Translator {
             .document_tracker
             .ensure_open(&validated_path, &client)
             .await?;
-
-        let range = lsp_types::Range {
-            start: mcp_to_lsp_position(start_line, start_character),
-            end: mcp_to_lsp_position(end_line, end_character),
-        };
-
-        // Build context with optional kind filter
-        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
-
-        // Pass empty diagnostics context — rust-analyzer generates code actions
-        // based on cursor position and its internal analysis state, not on the
-        // passed diagnostics.  Passing stale cached diagnostics (which may lack
-        // the internal `data` field ra uses for fix mapping) suppresses results.
-        let context_diagnostics: Vec<lsp_types::Diagnostic> = vec![];
-
         let params = lsp_types::CodeActionParams {
             text_document: TextDocumentIdentifier { uri },
-            range,
+            range: lsp_types::Range {
+                start: mcp_to_lsp_position(start_line, start_character),
+                end: mcp_to_lsp_position(end_line, end_character),
+            },
             context: lsp_types::CodeActionContext {
-                diagnostics: context_diagnostics,
-                only,
+                diagnostics: Vec::new(),
+                only: kind_filter.map(|kind| vec![lsp_types::CodeActionKind::from(kind)]),
                 trigger_kind: Some(lsp_types::CodeActionTriggerKind::INVOKED),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-
-        let timeout_duration = Duration::from_secs(30);
         let response: Option<lsp_types::CodeActionResponse> = client
-            .request("textDocument/codeAction", params, timeout_duration)
+            .request("textDocument/codeAction", params, Duration::from_secs(30))
             .await?;
-        let response_vec = response.unwrap_or_default();
-        let mut actions = Vec::with_capacity(response_vec.len());
+        Ok(response.unwrap_or_default())
+    }
 
-        for action_or_command in response_vec {
-            let action = match action_or_command {
-                lsp_types::CodeActionOrCommand::CodeAction(action) => convert_code_action(action),
-                lsp_types::CodeActionOrCommand::Command(cmd) => {
-                    let arguments = cmd.arguments.unwrap_or_else(Vec::new);
-                    CodeAction {
-                        title: cmd.title.clone(),
-                        kind: None,
-                        diagnostics: Vec::new(),
-                        edit: None,
-                        command: Some(CommandDescription {
-                            title: cmd.title,
-                            command: cmd.command,
-                            arguments,
-                        }),
-                        is_preferred: false,
-                    }
-                }
-            };
-            actions.push(action);
-        }
-
-        Ok(CodeActionsResult { actions })
+    /// Resolve one raw code action through `codeAction/resolve`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is outside the workspace or the LSP
+    /// server rejects the resolve request.
+    pub async fn resolve_code_action(
+        &mut self,
+        file_path: &str,
+        action: lsp_types::CodeAction,
+    ) -> Result<lsp_types::CodeAction> {
+        let validated_path = self.validate_path(Path::new(file_path))?;
+        self.ensure_client_for_file(&validated_path).await?;
+        let client = self.get_client_for_file(&validated_path)?;
+        client
+            .request("codeAction/resolve", action, Duration::from_secs(30))
+            .await
     }
 
     /// Handle call hierarchy prepare request.
@@ -2481,7 +2516,41 @@ fn convert_call_hierarchy_item(item: CallHierarchyItem) -> CallHierarchyItemResu
 }
 
 /// Convert LSP code action to MCP code action.
-fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
+pub fn convert_code_action_or_command(
+    action: lsp_types::CodeActionOrCommand,
+    action_id: Option<String>,
+) -> CodeAction {
+    match action {
+        lsp_types::CodeActionOrCommand::CodeAction(action) => {
+            convert_code_action(action, action_id)
+        }
+        lsp_types::CodeActionOrCommand::Command(cmd) => {
+            let arguments = cmd.arguments.unwrap_or_default();
+            CodeAction {
+                action_id,
+                title: cmd.title.clone(),
+                kind: None,
+                diagnostics: Vec::new(),
+                edit: None,
+                workspace_edit: None,
+                command: Some(CommandDescription {
+                    title: cmd.title,
+                    command: cmd.command,
+                    arguments,
+                }),
+                is_preferred: false,
+                disabled: None,
+                data: None,
+            }
+        }
+    }
+}
+
+pub fn convert_code_action(action: lsp_types::CodeAction, action_id: Option<String>) -> CodeAction {
+    let workspace_edit = action
+        .edit
+        .as_ref()
+        .and_then(|edit| serde_json::to_value(edit).ok());
     let diagnostics = action.diagnostics.map_or_else(Vec::new, |diags| {
         let mut result = Vec::with_capacity(diags.len());
         for d in diags {
@@ -2538,12 +2607,16 @@ fn convert_code_action(action: lsp_types::CodeAction) -> CodeAction {
     });
 
     CodeAction {
+        action_id,
         title: action.title,
         kind: action.kind.map(|k| k.as_str().to_string()),
         diagnostics,
         edit,
+        workspace_edit,
         command,
         is_preferred: action.is_preferred.unwrap_or(false),
+        disabled: action.disabled.map(|disabled| disabled.reason),
+        data: action.data,
     }
 }
 
@@ -2928,7 +3001,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, None);
         assert_eq!(result.title, "Fix issue");
         assert!(result.kind.is_none());
         assert!(result.diagnostics.is_empty());
@@ -3034,7 +3107,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, None);
         assert_eq!(result.diagnostics.len(), 4);
         assert!(matches!(
             result.diagnostics[0].severity,
@@ -3096,7 +3169,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, None);
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
@@ -3123,7 +3196,7 @@ mod tests {
             data: None,
         };
 
-        let result = convert_code_action(lsp_action);
+        let result = convert_code_action(lsp_action, None);
         assert!(result.command.is_some());
         let cmd = result.command.unwrap();
         assert_eq!(cmd.title, "Execute refactor");

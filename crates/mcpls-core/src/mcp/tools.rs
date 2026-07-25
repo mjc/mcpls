@@ -220,6 +220,50 @@ pub struct CodeActionsParams {
     pub kind_filter: Option<String>,
 }
 
+/// Parameters for listing project-scoped code actions with reusable references.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for listing project-scoped code actions.")]
+pub struct CodeActionListParams {
+    /// Registered project that owns the file.
+    pub project_id: String,
+    /// Absolute path to the file.
+    pub file_path: String,
+    /// Start line (1-based).
+    pub start_line: u32,
+    /// Start character (1-based).
+    pub start_character: u32,
+    /// End line (1-based).
+    pub end_line: u32,
+    /// End character (1-based).
+    pub end_character: u32,
+    /// Optional filter by action kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+}
+
+/// Parameters for previewing one project-scoped code action.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for previewing a stored code action.")]
+pub struct CodeActionPreviewParams {
+    /// Registered project that owns the action.
+    pub project_id: String,
+    /// Opaque action reference returned by `get_code_actions`.
+    pub action_id: String,
+    /// Position encoding used by the language server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_encoding: Option<String>,
+}
+
+/// Parameters for applying a code-action preview plan.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for applying a code-action preview plan.")]
+pub struct CodeActionApplyParams {
+    /// Registered project that owns the plan.
+    pub project_id: String,
+    /// Opaque plan ID returned by `code_action_preview`.
+    pub plan_id: String,
+}
+
 /// Parameters for the `prepare_call_hierarchy` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for preparing call hierarchy at a position.")]

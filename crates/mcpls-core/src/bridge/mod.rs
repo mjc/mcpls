@@ -15,6 +15,7 @@ pub use notifications::{
 };
 pub use resources::ResourceSubscriptions;
 pub use state::{DocumentState, DocumentTracker, ResourceLimits, path_to_uri, uri_to_path};
+pub(crate) use translator::convert_code_action_or_command;
 pub use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult, DefinitionResult,
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges, DocumentSymbolsResult,

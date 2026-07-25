@@ -3,10 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
+use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
@@ -712,6 +714,22 @@ enum ProjectRequest {
         kind_filter: Option<String>,
         reply: oneshot::Sender<Result<CodeActionsResult, String>>,
     },
+    CodeActionList {
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+        reply: oneshot::Sender<Result<CodeActionsResult, String>>,
+    },
+    CodeActionPreview {
+        action_id: PlanId,
+        project_id: String,
+        encoding: PositionEncoding,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<PreviewArtifact, String>>,
+    },
     PrepareCallHierarchy {
         file_path: String,
         line: u32,
@@ -1244,6 +1262,70 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// List code actions and retain bounded project-local references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is unavailable or the language server
+    /// rejects the request.
+    pub async fn code_action_list(
+        &self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::CodeActionList {
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Preview one retained code action reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is unavailable, the action is stale, or
+    /// its command/edit cannot be safely previewed.
+    pub async fn preview_code_action(
+        &self,
+        action_id: PlanId,
+        project_id: String,
+        encoding: PositionEncoding,
+        root: PathBuf,
+    ) -> Result<PreviewArtifact, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::CodeActionPreview {
+                action_id,
+                project_id,
+                encoding,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Route call-hierarchy preparation through this project's actor-owned translator.
     ///
     /// # Errors
@@ -1701,6 +1783,64 @@ impl ProjectHandle {
 struct ProjectRuntime {
     translator: Translator,
     edit_plans: EditPlanStore,
+    code_actions: CodeActionStore,
+}
+
+struct StoredCodeAction {
+    file_path: String,
+    action: lsp_types::CodeActionOrCommand,
+    created_at: Instant,
+}
+
+struct CodeActionStore {
+    entries: HashMap<PlanId, StoredCodeAction>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl CodeActionStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(15 * 60),
+            max_entries: 256,
+        }
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.created_at) < self.ttl);
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self.entries.len() >= self.max_entries {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn insert(&mut self, action: StoredCodeAction) -> PlanId {
+        self.prune();
+        self.enforce_capacity();
+        let id = PlanId::new();
+        self.entries.insert(id.clone(), action);
+        id
+    }
+
+    fn take(&mut self, id: &PlanId) -> Result<StoredCodeAction, String> {
+        self.prune();
+        self.entries
+            .remove(id)
+            .ok_or_else(|| format!("code action reference is missing or expired: {id}"))
+    }
 }
 
 impl ProjectRuntime {
@@ -1708,6 +1848,7 @@ impl ProjectRuntime {
         Self {
             translator,
             edit_plans: EditPlanStore::for_project(),
+            code_actions: CodeActionStore::new(),
         }
     }
 
@@ -1933,6 +2074,81 @@ impl ProjectRuntime {
             )
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn code_action_list(
+        &mut self,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, String> {
+        let actions = self
+            .translator
+            .request_code_actions(
+                file_path.clone(),
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut result = Vec::with_capacity(actions.len());
+        for action in actions {
+            let id = self.code_actions.insert(StoredCodeAction {
+                file_path: file_path.clone(),
+                action: action.clone(),
+                created_at: Instant::now(),
+            });
+            result.push(convert_code_action_or_command(action, Some(id.to_string())));
+        }
+        Ok(CodeActionsResult { actions: result })
+    }
+
+    async fn preview_code_action(
+        &mut self,
+        action_id: PlanId,
+        project_id: &str,
+        encoding: PositionEncoding,
+        root: &Path,
+    ) -> Result<PreviewArtifact, String> {
+        let stored = self.code_actions.take(&action_id)?;
+        let action = match stored.action {
+            lsp_types::CodeActionOrCommand::Command(_) => {
+                return Err("command-only code actions are unsupported".to_string());
+            }
+            lsp_types::CodeActionOrCommand::CodeAction(mut action) => {
+                if let Some(reason) = action
+                    .disabled
+                    .as_ref()
+                    .map(|disabled| disabled.reason.clone())
+                {
+                    return Err(format!("code action is disabled: {reason}"));
+                }
+                if action.command.is_some() {
+                    return Err("code actions with commands are unsupported".to_string());
+                }
+                if action.edit.is_none() {
+                    if action.data.is_none() {
+                        return Err("code action has no workspace edit".to_string());
+                    }
+                    action = self
+                        .translator
+                        .resolve_code_action(&stored.file_path, action)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                action
+            }
+        };
+        let edit = action
+            .edit
+            .ok_or_else(|| "resolved code action has no workspace edit".to_string())?;
+        self.preview_edit(project_id, edit, encoding, root)
     }
 
     async fn prepare_call_hierarchy(
@@ -2219,6 +2435,7 @@ fn spawn_notification_forwarders(
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::large_stack_frames)]
 async fn handle_project_request(
     request: ProjectRequest,
     actor_sender: &mpsc::Sender<ProjectRequest>,
@@ -2394,6 +2611,41 @@ async fn handle_project_request(
                         end_character,
                         kind_filter,
                     )
+                    .await,
+            );
+        }
+        ProjectRequest::CodeActionList {
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .code_action_list(
+                        file_path,
+                        start_line,
+                        start_character,
+                        end_line,
+                        end_character,
+                        kind_filter,
+                    )
+                    .await,
+            );
+        }
+        ProjectRequest::CodeActionPreview {
+            action_id,
+            project_id,
+            encoding,
+            root,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .preview_code_action(action_id, &project_id, encoding, &root)
                     .await,
             );
         }
@@ -2857,6 +3109,70 @@ impl ProjectRegistry {
             .map_err(ProjectRegistryError::from)
     }
 
+    /// List code actions with project-owned opaque references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project or file is not registered, or when
+    /// the actor rejects the request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn code_action_list(
+        &self,
+        id: &ProjectId,
+        file_path: String,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        kind_filter: Option<String>,
+    ) -> Result<CodeActionsResult, ProjectRegistryError> {
+        let (identity, actor, _) = self.entry(id).await?;
+        let path = canonicalize(Path::new(&file_path))?;
+        if !path.starts_with(identity.root().as_path()) {
+            return Err(ProjectIdentityError::ProjectPathMismatch {
+                id: id.clone(),
+                path,
+            }
+            .into());
+        }
+        actor
+            .code_action_list(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Preview one project-owned code-action reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered or the action
+    /// cannot be resolved and safely previewed.
+    pub async fn preview_code_action(
+        &self,
+        id: &ProjectId,
+        action_id: PlanId,
+        encoding: PositionEncoding,
+    ) -> Result<PreviewArtifact, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .preview_code_action(
+                action_id,
+                id.as_str().to_string(),
+                encoding,
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
     /// Activate a registered project's actor-owned language servers.
     ///
     /// # Errors
@@ -3053,6 +3369,36 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn code_action_store_references_are_bounded_and_single_use() {
+        let mut store = CodeActionStore {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(60),
+            max_entries: 1,
+        };
+        let first = store.insert(StoredCodeAction {
+            file_path: "first.rs".to_string(),
+            action: lsp_types::CodeActionOrCommand::Command(lsp_types::Command {
+                title: "first".to_string(),
+                command: "first".to_string(),
+                arguments: None,
+            }),
+            created_at: Instant::now(),
+        });
+        let second = store.insert(StoredCodeAction {
+            file_path: "second.rs".to_string(),
+            action: lsp_types::CodeActionOrCommand::Command(lsp_types::Command {
+                title: "second".to_string(),
+                command: "second".to_string(),
+                arguments: None,
+            }),
+            created_at: Instant::now(),
+        });
+        assert!(store.take(&first).is_err());
+        assert!(store.take(&second).is_ok());
+        assert!(store.take(&second).is_err());
+    }
 
     #[test]
     fn git_identity_resolves_main_checkout_and_linked_worktree() {

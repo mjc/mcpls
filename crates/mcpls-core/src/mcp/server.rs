@@ -19,12 +19,13 @@ use tokio::sync::Mutex;
 use super::handlers::HandlerContext;
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
-    CodeActionsParams, CompletionsParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, GoToImplementationParams,
-    GoToTypeDefinitionParams, HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams,
-    ProjectListParams, ReferencesParams, RenameParams, RenamePreviewParams, ServerLogsParams,
-    ServerMessagesParams, SignatureHelpParams, WorkspaceEditApplyParams,
-    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
+    CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
+    CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
+    FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
+    HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams, ProjectListParams,
+    ReferencesParams, RenameParams, RenamePreviewParams, ServerLogsParams, ServerMessagesParams,
+    SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
+    WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
 use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
@@ -741,6 +742,81 @@ impl McplsServer {
                 .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None)),
             Err(e) => Err(McpError::internal_error(e, None)),
         }
+    }
+
+    /// List project-scoped code actions with bounded reusable references.
+    #[tool(description = "List code actions and return project-scoped references for preview.")]
+    async fn code_action_list(
+        &self,
+        Parameters(CodeActionListParams {
+            project_id,
+            file_path,
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+            kind_filter,
+        }): Parameters<CodeActionListParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let result = self
+            .context
+            .project_registry
+            .code_action_list(
+                &id,
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await;
+        encode_tool_result(result)
+    }
+
+    /// Resolve and preview one project-scoped code action.
+    #[tool(description = "Preview a code action using its project-scoped reference.")]
+    async fn code_action_preview(
+        &self,
+        Parameters(CodeActionPreviewParams {
+            project_id,
+            action_id,
+            position_encoding,
+        }): Parameters<CodeActionPreviewParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let action_id = PlanId::parse(action_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let encoding = parse_position_encoding(position_encoding.as_deref())?;
+        let result = self
+            .context
+            .project_registry
+            .preview_code_action(&id, action_id, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&preview_artifact_json(&result, id.as_str()))
+    }
+
+    /// Apply a previously previewed code action plan.
+    #[tool(description = "Apply a code action preview plan for a project.")]
+    async fn code_action_apply(
+        &self,
+        Parameters(CodeActionApplyParams {
+            project_id,
+            plan_id,
+        }): Parameters<CodeActionApplyParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let plan_id = PlanId::parse(plan_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = self
+            .context
+            .project_registry
+            .apply_edit_plan(&id, plan_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&applied_edit_plan_json(&result, id.as_str()))
     }
 
     /// Prepare call hierarchy at a position.
