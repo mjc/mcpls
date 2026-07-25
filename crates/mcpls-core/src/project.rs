@@ -1446,7 +1446,7 @@ impl ProjectRequest {
 
         macro_rules! reject {
             ($reply:expr) => {{
-                let _ = $reply.send(Err("language server exited".to_string()));
+                let _ = $reply.send(Err(LANGUAGE_SERVER_EXITED.to_string()));
                 return Err(());
             }};
         }
@@ -2622,6 +2622,7 @@ struct ProjectRuntime {
     automatic_restart: AutomaticRestartPolicy,
 }
 
+const LANGUAGE_SERVER_EXITED: &str = "language server exited";
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
@@ -3297,12 +3298,12 @@ async fn recover_project_after_server_exit(
 ) {
     loop {
         let Some(attempt) = runtime.begin_automatic_restart() else {
-            channels.publish_failure(state, "language server exited");
+            channels.publish_failure(state, LANGUAGE_SERVER_EXITED);
             return;
         };
 
         state.last_error = Some(format!(
-            "language server exited; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
+            "{LANGUAGE_SERVER_EXITED}; restarting (attempt {}/{MAX_AUTOMATIC_RESTART_ATTEMPTS})",
             attempt.number
         ));
         channels.publish_status(state, ProjectStatus::Restarting);
@@ -3352,7 +3353,7 @@ async fn handle_server_exit(
             recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
         }
         ProjectStatus::Starting | ProjectStatus::Restarting => {
-            channels.publish_failure(state, "language server exited");
+            channels.publish_failure(state, LANGUAGE_SERVER_EXITED);
         }
         ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
     }
