@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ProjectConfig;
 use crate::project::{ProjectId, ProjectIdentity};
 
 /// Current on-disk schema for the dynamic project registration store.
@@ -22,6 +23,9 @@ pub struct PersistedProject {
     /// Additional linked worktree roots owned by the logical project.
     #[serde(default)]
     pub additional_roots: Vec<PathBuf>,
+    /// Optional project-specific translator override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ProjectConfig>,
 }
 
 impl PersistedProject {
@@ -37,7 +41,19 @@ impl PersistedProject {
                 .skip(1)
                 .map(|root| root.as_path().to_path_buf())
                 .collect(),
+            config: None,
         }
+    }
+
+    /// Capture a durable registration and its project-specific override.
+    #[must_use]
+    pub fn from_identity_with_config(
+        identity: &ProjectIdentity,
+        config: Option<ProjectConfig>,
+    ) -> Self {
+        let mut persisted = Self::from_identity(identity);
+        persisted.config = config;
+        persisted
     }
 
     /// Parse the stable ID without canonicalizing the possibly moved root.
@@ -217,6 +233,7 @@ mod tests {
             project_id: "demo".to_string(),
             root: PathBuf::from("/workspace/demo"),
             additional_roots: Vec::new(),
+            config: None,
         }];
 
         store.save(&projects).unwrap();

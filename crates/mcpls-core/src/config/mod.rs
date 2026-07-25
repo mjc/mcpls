@@ -48,7 +48,7 @@ pub struct ServerConfig {
 /// Omitted fields inherit the daemon defaults. An explicitly empty
 /// `lsp_servers` list disables the daemon's configured language servers for
 /// that project.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     /// Project-specific language-server definitions.

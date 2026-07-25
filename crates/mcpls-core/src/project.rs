@@ -3674,6 +3674,7 @@ impl ProjectActorEntry {
 struct ProjectEntry {
     identity: ProjectIdentity,
     actors: Vec<ProjectActorEntry>,
+    config: Option<ProjectConfig>,
 }
 
 impl ProjectEntry {
@@ -3683,6 +3684,7 @@ impl ProjectEntry {
         mutation: MutationGate,
         compatibility_key: Option<ProjectCompatibilityKey>,
         translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
+        config: Option<ProjectConfig>,
     ) -> Self {
         let root = identity.root.clone();
         Self {
@@ -3694,6 +3696,7 @@ impl ProjectEntry {
                 translator_template,
                 root,
             )],
+            config,
         }
     }
 
@@ -4024,12 +4027,19 @@ impl ProjectRegistry {
         let Some(store) = self.persistence.clone() else {
             return Ok(());
         };
-        let projects = self
-            .list()
+        let mut projects = self
+            .projects
+            .read()
             .await
-            .iter()
-            .map(PersistedProject::from_identity)
+            .values()
+            .map(|project| {
+                PersistedProject::from_identity_with_config(
+                    &project.identity,
+                    project.config.clone(),
+                )
+            })
             .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         save_persisted_state(store, projects).await
     }
 
@@ -4061,7 +4071,8 @@ impl ProjectRegistry {
                 }
                 _ => ProjectIdentity::new(id.clone(), root),
             };
-            self.add(identity).await?;
+            self.add_with_config(identity, persisted.config.clone())
+                .await?;
             for additional_root in &persisted.additional_roots {
                 let Ok(additional_root) = CanonicalRoot::new(additional_root) else {
                     continue;
@@ -4071,9 +4082,10 @@ impl ProjectRegistry {
                 else {
                     continue;
                 };
-                self.add(
+                self.add_with_config(
                     ProjectIdentity::new(id.clone(), additional_root)
                         .with_repository_identity(repository),
+                    persisted.config.clone(),
                 )
                 .await?;
             }
@@ -4093,7 +4105,7 @@ impl ProjectRegistry {
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.add_with_template(identity, None).await
+        self.add_registration(identity, None, None).await
     }
 
     /// Add a project with an optional JSON-facing configuration override.
@@ -4107,14 +4119,15 @@ impl ProjectRegistry {
         identity: ProjectIdentity,
         config: Option<ProjectConfig>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        let template = config.filter(|config| !config.is_empty()).map(|config| {
+        let config = config.filter(|config| !config.is_empty());
+        let template = config.as_ref().map(|config| {
             self.translator_template
                 .as_deref()
                 .cloned()
                 .unwrap_or_default()
-                .with_project_config(&config)
+                .with_project_config(config)
         });
-        self.add_with_template(identity, template).await
+        self.add_registration(identity, config, template).await
     }
 
     /// Add a project with an optional runtime translator configuration.
@@ -4131,6 +4144,17 @@ impl ProjectRegistry {
     pub async fn add_with_template(
         &self,
         identity: ProjectIdentity,
+        translator_template: Option<TranslatorTemplate>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.add_registration(identity, None, translator_template)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn add_registration(
+        &self,
+        identity: ProjectIdentity,
+        config: Option<ProjectConfig>,
         translator_template: Option<TranslatorTemplate>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let translator_template = translator_template
@@ -4239,6 +4263,7 @@ impl ProjectRegistry {
                 mutation,
                 compatibility_key,
                 translator_template,
+                config,
             ),
         );
         drop(projects);
@@ -6324,11 +6349,13 @@ mod tests {
                     project_id: "existing".to_string(),
                     root: root.path().to_path_buf(),
                     additional_roots: Vec::new(),
+                    config: None,
                 },
                 PersistedProject {
                     project_id: "missing".to_string(),
                     root: root.path().join("gone"),
                     additional_roots: Vec::new(),
+                    config: None,
                 },
             ])
             .unwrap();
@@ -6338,6 +6365,51 @@ mod tests {
         assert_eq!(registry.list().await.len(), 1);
         assert_eq!(registry.list().await[0].id().as_str(), "existing");
         assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registry_persists_project_configuration() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let store = ProjectRegistrationStore::new(root.path().join("state/projects.json"));
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        let mut server = crate::config::LspServerConfig::rust_analyzer();
+        server.command = "/definitely/missing/rust-analyzer".to_string();
+        let config = ProjectConfig {
+            lsp_servers: Some(vec![server]),
+            heuristics_max_depth: Some(3),
+        };
+
+        registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    ProjectId::new("configured").unwrap(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ),
+                Some(config.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.load().unwrap().projects[0].config, Some(config));
+
+        let restored = ProjectRegistry::new(2).with_persistence(store);
+        assert_eq!(restored.restore_from_persistence().await.unwrap(), 1);
+        let state = restored
+            .actor_for_project(&ProjectId::new("configured").unwrap())
+            .await
+            .unwrap()
+            .query()
+            .await
+            .unwrap();
+        assert_eq!(
+            state.runtime().configured_language_ids(),
+            vec!["rust".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -6423,6 +6495,7 @@ mod tests {
             ProjectIdentity::new(project_id.clone(), primary_root.clone()),
             primary,
             std::sync::Arc::new(Mutex::new(())),
+            None,
             None,
             None,
         );
@@ -6598,6 +6671,7 @@ mod tests {
                     translator_template: None,
                     roots: vec![CanonicalRoot::new(root.path()).unwrap()],
                 }],
+                config: None,
             },
         );
 

@@ -35,7 +35,7 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
 ///
 /// Used to prevent spawning servers in projects where they are not applicable
 /// (e.g., rust-analyzer in a Python-only project).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHeuristics {
     /// Files or directories that indicate this server is applicable.
@@ -143,7 +143,7 @@ impl ServerHeuristics {
 }
 
 /// Configuration for a single LSP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspServerConfig {
     /// Language identifier (e.g., "rust", "python", "typescript").
