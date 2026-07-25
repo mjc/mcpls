@@ -353,6 +353,19 @@ pub struct ProjectIdParams {
     pub project_id: String,
 }
 
+/// Parameters previewing an LSP workspace edit for one project.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Preview a project-scoped LSP WorkspaceEdit without changing files.")]
+pub struct WorkspaceEditPreviewParams {
+    /// Stable project identifier that owns the workspace roots and plan.
+    pub project_id: String,
+    /// LSP `WorkspaceEdit` object returned by a language server.
+    pub workspace_edit: serde_json::Value,
+    /// Negotiated LSP position encoding, defaulting to UTF-8 for this API.
+    #[serde(default)]
+    pub position_encoding: Option<String>,
+}
+
 /// Parameters applying one project-owned workspace edit plan.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Apply one previously previewed project-owned workspace edit plan.")]

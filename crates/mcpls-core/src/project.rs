@@ -10,14 +10,16 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use crate::bridge::{
     CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult, DefinitionResult,
     DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, ReferencesResult,
-    RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, Translator,
-    TranslatorTemplate, WorkspaceSymbolResult,
+    IncomingCallsResult, InlayHintsResult, LocationsResult, OutgoingCallsResult, PositionEncoding,
+    ReferencesResult, RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
+    Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 use crate::edit_apply::{ApplyReport, apply_plan};
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
+use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::LspNotification;
+use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -764,6 +766,13 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
     },
+    PreviewEdit {
+        project_id: String,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<PreviewArtifact, String>>,
+    },
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
@@ -1425,6 +1434,36 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Preview and store one project-owned LSP workspace edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the edit cannot be safely
+    /// planned, or the bounded plan store rejects the resulting artifact.
+    pub async fn preview_edit(
+        &self,
+        project_id: String,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+        root: PathBuf,
+    ) -> Result<PreviewArtifact, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PreviewEdit {
+                project_id,
+                edit,
+                encoding,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Consume one project-owned workspace edit preview.
     ///
     /// # Errors
@@ -1588,6 +1627,29 @@ impl ProjectRuntime {
         self.edit_plans
             .insert(plan)
             .map_err(|error| error.to_string())
+    }
+
+    fn preview_edit(
+        &mut self,
+        project_id: &str,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+        root: &Path,
+    ) -> Result<PreviewArtifact, String> {
+        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let artifact = preview_workspace_edit(
+            &boundary,
+            project_id,
+            edit,
+            encoding,
+            self.translator.document_tracker(),
+            PreviewLimits::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.edit_plans
+            .insert(artifact.plan.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(artifact)
     }
 
     fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
@@ -2272,6 +2334,15 @@ async fn handle_project_request(
         ProjectRequest::StoreEditPlan { plan, reply } => {
             let _ = reply.send(runtime.store_edit_plan(plan));
         }
+        ProjectRequest::PreviewEdit {
+            project_id,
+            edit,
+            encoding,
+            root,
+            reply,
+        } => {
+            let _ = reply.send(runtime.preview_edit(&project_id, edit, encoding, &root));
+        }
         ProjectRequest::TakeEditPlan {
             plan_id,
             project_id,
@@ -2680,6 +2751,32 @@ impl ProjectRegistry {
             .apply_edit_plan(
                 plan_id,
                 id.as_str().to_string(),
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Preview and retain a project-owned LSP workspace edit under the
+    /// registry's project mutation gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, preview
+    /// validation fails, or the bounded plan store rejects the artifact.
+    pub async fn preview_edit(
+        &self,
+        id: &ProjectId,
+        edit: WorkspaceEdit,
+        encoding: PositionEncoding,
+    ) -> Result<PreviewArtifact, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .preview_edit(
+                id.as_str().to_string(),
+                edit,
+                encoding,
                 identity.root().as_path().to_path_buf(),
             )
             .await

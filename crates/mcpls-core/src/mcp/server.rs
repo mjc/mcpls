@@ -23,11 +23,13 @@ use super::tools::{
     DocumentSymbolsParams, FormatDocumentParams, GoToImplementationParams,
     GoToTypeDefinitionParams, HoverParams, InlayHintsParams, ProjectAddParams, ProjectIdParams,
     ProjectListParams, ReferencesParams, RenameParams, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceSymbolParams,
+    SignatureHelpParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
+    WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{make_uri, parse_uri};
-use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
 use crate::edit_plan::PlanId;
+use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectHandle, ProjectId, ProjectIdentity,
@@ -85,6 +87,36 @@ fn applied_edit_plan_json(result: &AppliedEditPlan, project_id: &str) -> serde_j
         "committed_files": result.committed_files,
         "operations": result.operations,
         "unified_diff": result.unified_diff,
+    })
+}
+
+fn preview_artifact_json(result: &PreviewArtifact, project_id: &str) -> serde_json::Value {
+    let preconditions = result
+        .plan
+        .files()
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.path(),
+                "source": match file.source() {
+                    crate::edit_plan::SnapshotSource::Disk => "disk",
+                    crate::edit_plan::SnapshotSource::OpenDocument => "open_document",
+                },
+                "version": file.version(),
+                "sha256": file.content_hash(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "project_id": project_id,
+        "plan_id": result.plan.id().as_str(),
+        "unified_diff": result.plan.unified_diff(),
+        "affected_files": result.affected_files,
+        "operations": result.plan.operations(),
+        "preconditions": preconditions,
+        "conflicts": result.conflicts,
+        "unsupported": result.unsupported,
+        "safe_to_apply": result.plan.safe_to_apply(),
     })
 }
 
@@ -247,6 +279,36 @@ impl McplsServer {
             "project_id": id.as_str(),
             "removed": true,
         }))
+    }
+
+    /// Preview an LSP `WorkspaceEdit` without changing any files.
+    #[tool(
+        description = "Preview a project-scoped LSP WorkspaceEdit. The result includes a plan ID, unified diff, affected files, preconditions, conflicts, unsupported operations, and explicit safety state."
+    )]
+    async fn workspace_edit_preview(
+        &self,
+        Parameters(WorkspaceEditPreviewParams {
+            project_id,
+            workspace_edit,
+            position_encoding,
+        }): Parameters<WorkspaceEditPreviewParams>,
+    ) -> Result<String, McpError> {
+        let id = parse_project_id(project_id)?;
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(workspace_edit)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let encoding = match position_encoding {
+            Some(value) => PositionEncoding::from_lsp(&value).ok_or_else(|| {
+                McpError::invalid_params(format!("unsupported position encoding: {value}"), None)
+            })?,
+            None => PositionEncoding::Utf8,
+        };
+        let artifact = self
+            .context
+            .project_registry
+            .preview_edit(&id, edit, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_json(&preview_artifact_json(&artifact, id.as_str()))
     }
 
     /// Apply a previously previewed, project-owned workspace edit plan.
@@ -1241,6 +1303,60 @@ mod tests {
             }))
             .await;
         assert!(second.is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_edit_preview_returns_plan_for_lsp_workspace_edit() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        std::fs::write(&file, "before\n").unwrap();
+
+        let registry = ProjectRegistry::new(2);
+        let identity = ProjectIdentity::new(
+            ProjectId::new("project").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+        registry.add(identity).await.unwrap();
+
+        let server = McplsServer::new_with_registry(
+            Arc::new(Mutex::new(Translator::new())),
+            Arc::new(ResourceSubscriptions::new()),
+            registry,
+        );
+        let uri = url::Url::from_file_path(&file).unwrap().to_string();
+        let result = server
+            .workspace_edit_preview(Parameters(WorkspaceEditPreviewParams {
+                project_id: "project".to_string(),
+                workspace_edit: serde_json::json!({
+                    "changes": {
+                        uri: [{
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 6}
+                            },
+                            "newText": "after"
+                        }]
+                    }
+                }),
+                position_encoding: Some("utf-8".to_string()),
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(!result["plan_id"].as_str().unwrap().is_empty());
+        assert!(result["unified_diff"].as_str().unwrap().contains("-before"));
+        assert_eq!(result["affected_files"].as_array().unwrap().len(), 1);
+        assert_eq!(result["safe_to_apply"], true);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+
+        server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_string(),
+                plan_id: result["plan_id"].as_str().unwrap().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "after\n");
     }
 
     #[tokio::test]

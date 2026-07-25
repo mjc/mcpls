@@ -40,6 +40,7 @@ pub mod edit_paths;
 pub mod edit_plan;
 pub mod edit_planner;
 pub mod edit_policy;
+pub mod edit_preview;
 pub mod error;
 pub mod lsp;
 pub mod mcp;

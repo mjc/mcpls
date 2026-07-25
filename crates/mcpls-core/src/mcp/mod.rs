@@ -12,5 +12,5 @@ pub use tools::{
     CallHierarchyCallsParams, CallHierarchyPrepareParams, CompletionsParams, DefinitionParams,
     DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, HoverParams, ProjectAddParams,
     ProjectIdParams, ProjectListParams, ReferencesParams, RenameParams, WorkspaceEditApplyParams,
-    WorkspaceSymbolParams,
+    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
