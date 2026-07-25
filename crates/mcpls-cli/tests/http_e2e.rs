@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::{Value, json};
@@ -75,6 +75,33 @@ impl HttpClient {
         })
     }
 
+    fn subscribe(&mut self, uri: &str) {
+        let request_id = self.next_request_id();
+        let response = self.request(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "resources/subscribe",
+            "params": {"uri": uri}
+        }));
+        assert_eq!(
+            response["_status"].as_u64(),
+            Some(200),
+            "subscribe failed: {response}"
+        );
+        assert!(
+            response.get("error").is_none(),
+            "subscribe failed: {response}"
+        );
+    }
+
+    fn open_events(&self, last_event_id: Option<&str>) -> HttpEventStream {
+        HttpEventStream::open(
+            self.address,
+            self.session_id.as_deref().unwrap(),
+            last_event_id,
+        )
+    }
+
     const fn next_request_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -101,6 +128,67 @@ impl HttpClient {
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
         parse_response(&bytes)
+    }
+}
+
+struct HttpEventStream {
+    stream: TcpStream,
+}
+
+impl HttpEventStream {
+    fn open(address: SocketAddr, session_id: &str, last_event_id: Option<&str>) -> Self {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let last_event_header =
+            last_event_id.map_or(String::new(), |id| format!("Last-Event-ID: {id}\r\n"));
+        let request = format!(
+            "GET /mcp HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nMCP-Session-Id: {session_id}\r\n{last_event_header}Connection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut headers = Vec::new();
+        let mut byte = [0; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let status = headers
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| line.split(|byte| *byte == b' ').nth(1))
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .and_then(|code| code.trim().parse::<u16>().ok())
+            .unwrap();
+        assert_eq!(
+            status,
+            200,
+            "SSE GET failed: {}",
+            String::from_utf8_lossy(&headers)
+        );
+        Self { stream }
+    }
+
+    fn wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let needle = needle.as_bytes();
+        let mut bytes = Vec::new();
+        while Instant::now() < deadline {
+            let mut chunk = [0; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(length) => {
+                    bytes.extend_from_slice(&chunk[..length]);
+                    if bytes.windows(needle.len()).any(|window| window == needle) {
+                        return true;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return false,
+                Err(error) => panic!("reading SSE stream failed: {error}"),
+            }
+        }
+        false
     }
 }
 
@@ -402,6 +490,22 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "2"
+    );
+
+    let events_uri = "mcpls-project-events:///project-a";
+    first.subscribe(events_uri);
+    let mut events = first.open_events(None);
+    second.call_tool("project_restart_lsp", json!({"project_id": "project-a"}));
+    assert!(
+        events.wait_for("notifications/resources/updated", Duration::from_secs(10)),
+        "subscribed session did not receive a project event"
+    );
+    drop(events);
+
+    let mut resumed_events = first.open_events(Some("0"));
+    assert!(
+        resumed_events.wait_for("notifications/resources/updated", Duration::from_secs(10)),
+        "reconnected session did not resume project events"
     );
 
     let removed = second.call_tool("project_remove", json!({"project_id": "project-b"}));
