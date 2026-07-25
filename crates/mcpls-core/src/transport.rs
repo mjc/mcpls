@@ -122,12 +122,10 @@ pub(crate) async fn run_stdio(
 /// inside those clones is shared, so project actors and LSP state remain
 /// daemon-scoped rather than being recreated per HTTP session.
 ///
-/// # Note
-///
-/// Diagnostic push notifications (`resources/updated`) are not forwarded to
-/// HTTP sessions in this release — the single-peer pump architecture from
-/// stdio is kept as-is. Clients can still poll diagnostics via the existing
-/// MCP tools. A follow-up issue will add per-session broadcast.
+/// Each HTTP session owns a per-session event sink. Subscribed project status,
+/// project event, and diagnostic resources receive `resources/updated`
+/// notifications from the daemon's shared project actors; polling remains
+/// available as the recovery path after a client falls behind.
 #[cfg(feature = "transport-http")]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,

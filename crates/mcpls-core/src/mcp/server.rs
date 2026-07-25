@@ -201,7 +201,7 @@ impl McplsServer {
     async fn attach_subscription(
         &self,
         project_id: ProjectId,
-        actor: &ProjectHandle,
+        actors: &[ProjectHandle],
         uri: String,
         peer: rmcp::Peer<RoleServer>,
     ) -> Result<(), McpError> {
@@ -213,7 +213,7 @@ impl McplsServer {
         self.context
             .event_sink
             .track_subscription(project_id.clone(), uri);
-        self.context.event_sink.attach(project_id, actor, peer);
+        self.context.event_sink.attach(project_id, actors, peer);
         Ok(())
     }
 
@@ -1378,26 +1378,26 @@ impl ServerHandler for McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let path = match resource {
             SessionResource::ProjectStatus(project_id) => {
-                let actor = self
+                let actors = self
                     .context
                     .project_registry
-                    .actor_for_project(&project_id)
+                    .actors_for_project(&project_id)
                     .await
                     .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                self.attach_subscription(project_id, &actor, request.uri, context.peer)
+                self.attach_subscription(project_id, &actors, request.uri, context.peer)
                     .await?;
                 return Ok(());
             }
             SessionResource::ProjectEvents { project_id, .. } => {
-                let actor = self
+                let actors = self
                     .context
                     .project_registry
-                    .actor_for_project(&project_id)
+                    .actors_for_project(&project_id)
                     .await
                     .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
                 self.attach_subscription(
                     project_id.clone(),
-                    &actor,
+                    &actors,
                     project_events_resource_uri(&project_id),
                     context.peer,
                 )
@@ -1421,8 +1421,13 @@ impl ServerHandler for McplsServer {
         // notify_resource_updated so clients subscribing after initial workspace indexing
         // don't have to wait for the next LSP push. Requires peer access from HandlerContext.
         // Track as follow-up issue.
-        self.attach_subscription(project_id, &actor, request.uri.clone(), context.peer)
-            .await?;
+        self.attach_subscription(
+            project_id,
+            std::slice::from_ref(&actor),
+            request.uri.clone(),
+            context.peer,
+        )
+        .await?;
 
         Ok(())
     }

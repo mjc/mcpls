@@ -4244,6 +4244,32 @@ impl ProjectRegistry {
         self.actor(id).await
     }
 
+    /// Resolve every actor group belonging to one logical project.
+    ///
+    /// Compatible linked worktrees share one returned actor; incompatible
+    /// worktrees remain separate actors under the same stable project ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the ID is not registered.
+    pub async fn actors_for_project(
+        &self,
+        id: &ProjectId,
+    ) -> Result<Vec<ProjectHandle>, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| {
+                project
+                    .actors
+                    .iter()
+                    .map(|actor| actor.actor.clone())
+                    .collect()
+            })
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
     async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
         self.projects
             .read()
