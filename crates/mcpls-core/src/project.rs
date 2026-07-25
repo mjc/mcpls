@@ -4285,33 +4285,29 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let (actors, mutations, root) = self
-            .projects
-            .read()
-            .await
+        // Reserve the registry write lock before waiting on actor mutation gates.
+        // Otherwise a concurrent add can mutate this entry after the snapshot
+        // below but before removal, and have its registration deleted silently.
+        let mut projects = self.projects.write().await;
+        let entry = projects
             .get(&id)
-            .map(|entry| {
-                (
-                    entry
-                        .actors
-                        .iter()
-                        .map(|actor| actor.actor.clone())
-                        .collect::<Vec<_>>(),
-                    entry
-                        .actors
-                        .iter()
-                        .map(|actor| actor.mutation.clone())
-                        .collect::<Vec<_>>(),
-                    entry.identity.root().as_path().to_path_buf(),
-                )
-            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        let actors = entry
+            .actors
+            .iter()
+            .map(|actor| actor.actor.clone())
+            .collect::<Vec<_>>();
+        let mutations = entry
+            .actors
+            .iter()
+            .map(|actor| actor.mutation.clone())
+            .collect::<Vec<_>>();
+        let root = entry.identity.root().as_path().to_path_buf();
         let _mutation_guards = self.lock_mutation_gates(mutations).await;
-        self.projects
-            .write()
-            .await
+        projects
             .remove(&id)
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        drop(projects);
         self.persist().await?;
         for actor in actors {
             actor
@@ -6234,6 +6230,37 @@ mod tests {
         assert!(restart.is_ok() || matches!(restart, Err(ProjectRegistryError::Actor(_))));
         assert!(remove.is_ok());
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_remove_blocks_re_registration_until_removal_finishes() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let id = ProjectId::new("race").unwrap();
+        let identity = ProjectIdentity::new(id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        registry.add(identity.clone()).await.unwrap();
+
+        let mutation = registry.projects.read().await.get(&id).unwrap().actors[0]
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+        let remove_registry = registry.clone();
+        let remove_id = id.clone();
+        let remove = tokio::spawn(async move { remove_registry.remove(remove_id).await });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), registry.add(identity.clone()),)
+                .await
+                .is_err()
+        );
+
+        drop(guard);
+        assert!(remove.await.unwrap().is_ok());
+        registry.add(identity).await.unwrap();
+        assert_eq!(registry.list().await.len(), 1);
     }
 
     #[tokio::test]
