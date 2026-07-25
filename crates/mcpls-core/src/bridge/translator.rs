@@ -279,8 +279,7 @@ impl Translator {
             configs
                 .iter()
                 .flat_map(|config| config.env.values())
-                .cloned()
-                .collect::<Vec<_>>(),
+                .cloned(),
         );
         self.lsp_configs = configs
             .into_iter()
