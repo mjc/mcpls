@@ -543,6 +543,17 @@ pub enum ProjectEvent {
 }
 
 impl ProjectEvent {
+    /// Return whether this event belongs to the project receiving it.
+    #[must_use]
+    pub(crate) fn belongs_to(&self, project_id: &ProjectId) -> bool {
+        !matches!(
+            self,
+            Self::ProjectRemoved {
+                project_id: removed_project,
+            } if removed_project != project_id
+        )
+    }
+
     /// Encode the stable wire representation used by project-event resources.
     #[must_use]
     pub fn json_value(&self) -> serde_json::Value {

@@ -88,12 +88,7 @@ pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
 }
 
 fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<String> {
-    if matches!(
-        event,
-        ProjectEvent::ProjectRemoved {
-            project_id: removed_project,
-        } if removed_project != project_id
-    ) {
+    if !event.belongs_to(project_id) {
         return Vec::new();
     }
     let mut uris = vec![project_events_resource_uri(project_id)];
