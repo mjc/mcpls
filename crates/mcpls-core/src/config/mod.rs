@@ -39,8 +39,12 @@ pub struct ServerConfig {
     pub lsp_servers: Vec<LspServerConfig>,
 
     /// Long-lived daemon settings.
-    #[serde(default)]
+    #[serde(default = "default_daemon_config")]
     pub daemon: DaemonConfig,
+}
+
+fn default_daemon_config() -> DaemonConfig {
+    DaemonConfig::default()
 }
 
 /// Configuration for daemon-owned runtime state.
