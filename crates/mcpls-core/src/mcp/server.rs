@@ -465,8 +465,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let actor = self
             .context
-            .project_registry
-            .actor_for_path(&file_path)
+            .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
@@ -495,8 +494,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let actor = self
             .context
-            .project_registry
-            .actor_for_path(&file_path)
+            .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
@@ -526,8 +524,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let actor = self
             .context
-            .project_registry
-            .actor_for_path(&file_path)
+            .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
@@ -552,8 +549,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let actor = self
             .context
-            .project_registry
-            .actor_for_path(&file_path)
+            .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor

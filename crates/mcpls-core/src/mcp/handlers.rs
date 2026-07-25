@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::{ResourceSubscriptions, Translator};
-use crate::project::{ProjectHandle, ProjectRegistry};
+use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
 
 /// Shared context for all tool handlers.
 ///
@@ -55,6 +55,17 @@ impl HandlerContext {
     /// callers that still rely on the daemon translator fallback.
     pub async fn actor_for_path(&self, path: impl AsRef<std::path::Path>) -> Option<ProjectHandle> {
         self.project_registry.actor_for_path(path).await.ok()
+    }
+
+    /// Return the actor owning a path or the registry's explicit routing error.
+    ///
+    /// Semantic tools use this path so an unregistered file cannot fall back to
+    /// a process-global translator.
+    pub async fn required_actor_for_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.project_registry.actor_for_path(path).await
     }
 }
 
