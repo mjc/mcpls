@@ -162,36 +162,35 @@ impl SessionEventSink {
     }
 
     pub(crate) fn untrack_subscription(&self, uri: &str) {
-        let empty_projects = {
-            let mut resources = self
-                .project_resources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for subscriptions in resources.values_mut() {
-                subscriptions.remove(uri);
-            }
-            let empty_projects = resources
-                .iter()
-                .filter(|(_, subscriptions)| subscriptions.is_empty())
-                .map(|(project_id, _)| project_id.clone())
-                .collect::<Vec<_>>();
-            resources.retain(|_, subscriptions| !subscriptions.is_empty());
-            empty_projects
-        };
-
-        for project_id in empty_projects {
-            self.stop_project_task(&project_id);
-        }
+        self.stop_project_tasks(self.remove_tracked_resource(uri));
     }
 
-    fn stop_project_task(&self, project_id: &ProjectId) {
-        let task = self
+    fn remove_tracked_resource(&self, uri: &str) -> Vec<ProjectId> {
+        let mut resources = self
+            .project_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for subscriptions in resources.values_mut() {
+            subscriptions.remove(uri);
+        }
+        let empty_projects = resources
+            .iter()
+            .filter(|(_, subscriptions)| subscriptions.is_empty())
+            .map(|(project_id, _)| project_id.clone())
+            .collect::<Vec<_>>();
+        resources.retain(|_, subscriptions| !subscriptions.is_empty());
+        empty_projects
+    }
+
+    fn stop_project_tasks(&self, project_ids: impl IntoIterator<Item = ProjectId>) {
+        let mut tasks = self
             .tasks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(project_id);
-        if let Some(task) = task {
-            task.abort();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for project_id in project_ids {
+            if let Some(task) = tasks.remove(&project_id) {
+                task.abort();
+            }
         }
     }
 
