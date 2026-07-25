@@ -5923,6 +5923,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_reports_persistence_and_shutdown_state() {
+        let transient = ProjectRegistry::new(2);
+        assert!(!transient.persistence_configured().await);
+        assert!(!transient.is_shutting_down());
+
+        let state_path = tempfile::tempdir().unwrap().path().join("projects.json");
+        let persistent =
+            ProjectRegistry::new(2).with_persistence(ProjectRegistrationStore::new(state_path));
+        assert!(persistent.persistence_configured().await);
+        persistent.shutdown_all().await;
+        assert!(persistent.is_shutting_down());
+    }
+
+    #[tokio::test]
     async fn project_registry_restores_existing_roots_and_prunes_missing_roots() {
         let root = TempDir::new().unwrap();
         let state_path = root.path().join("state/projects.json");

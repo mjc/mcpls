@@ -93,11 +93,16 @@ struct ProjectLspCapabilitiesResponse {
     servers: Vec<ProjectServerCapability>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct DaemonPersistenceSnapshot {
+    configured: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DaemonSnapshot {
     project_counts: ProjectStatusCounts,
     actor_groups: usize,
-    persistence_configured: bool,
+    persistence: DaemonPersistenceSnapshot,
     shutting_down: bool,
 }
 
@@ -243,7 +248,9 @@ impl McplsServer {
                 .project_registry
                 .total_actor_group_count()
                 .await,
-            persistence_configured: self.context.project_registry.persistence_configured().await,
+            persistence: DaemonPersistenceSnapshot {
+                configured: self.context.project_registry.persistence_configured().await,
+            },
             shutting_down: self.context.project_registry.is_shutting_down(),
         }
     }
@@ -545,7 +552,7 @@ impl McplsServer {
         encode_json(&serde_json::json!({
             "status": if snapshot.project_counts.failed == 0 { "healthy" } else { "degraded" },
             "lifecycle": snapshot.lifecycle(),
-            "persistence": { "configured": snapshot.persistence_configured },
+            "persistence": snapshot.persistence,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
         }))
@@ -562,7 +569,7 @@ impl McplsServer {
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
             "lifecycle": snapshot.lifecycle(),
-            "persistence": { "configured": snapshot.persistence_configured },
+            "persistence": snapshot.persistence,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
         }))
