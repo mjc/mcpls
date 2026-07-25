@@ -52,8 +52,8 @@ impl PersistedProject {
         config: Option<ProjectConfig>,
     ) -> Self {
         let mut persisted = Self::from_identity(identity);
-        persisted.config = config.map(|config| config.for_persistence());
-        persisted
+        persisted.config = config;
+        persisted.for_persistence()
     }
 
     /// Return the representation safe to write to the registration store.
