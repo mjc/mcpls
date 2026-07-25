@@ -1179,14 +1179,14 @@ impl ServerHandler for McplsServer {
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        let actor = self
+        let (project_id, actor) = self
             .context
-            .required_actor_for_path(&path)
+            .required_project_for_path(&path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         actor
@@ -1200,9 +1200,14 @@ impl ServerHandler for McplsServer {
         // Track as follow-up issue.
         self.context
             .subscriptions
-            .subscribe(request.uri)
+            .subscribe(request.uri.clone())
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
+
+        self.context
+            .event_sink
+            .attach(project_id, actor, context.peer)
+            .await;
 
         Ok(())
     }

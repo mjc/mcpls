@@ -3447,6 +3447,23 @@ impl ProjectRegistry {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.project_for_path(path).await.map(|(_, actor)| actor)
+    }
+
+    /// Resolve a file path to its owning project ID and actor.
+    ///
+    /// This is the identity-preserving form of [`Self::actor_for_path`], used
+    /// by session event sinks that must keep subscriptions scoped to one
+    /// project actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error when the path cannot be canonicalized or is
+    /// not contained by a registered project.
+    pub async fn project_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(ProjectId, ProjectHandle), ProjectRegistryError> {
         let canonical = canonicalize(path.as_ref())?;
         self.projects
             .read()
@@ -3454,7 +3471,7 @@ impl ProjectRegistry {
             .values()
             .filter(|project| canonical.starts_with(project.identity.root().as_path()))
             .max_by_key(|project| project.identity.root().as_path().components().count())
-            .map(|project| project.actor.clone())
+            .map(|project| (project.identity.id().clone(), project.actor.clone()))
             .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
     }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::{ResourceSubscriptions, Translator};
+use crate::mcp::session::SessionEventSink;
 use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
 
 /// Shared context for all tool handlers.
@@ -21,6 +22,8 @@ pub struct HandlerContext {
     pub subscriptions: Arc<ResourceSubscriptions>,
     /// Shared registry for project lifecycle operations.
     pub project_registry: ProjectRegistry,
+    /// Per-session event forwarding tasks.
+    pub(crate) event_sink: Arc<SessionEventSink>,
 }
 
 impl HandlerContext {
@@ -46,13 +49,15 @@ impl HandlerContext {
     /// Create a handler context from the shared project registry and
     /// session-owned subscriptions.
     #[must_use]
-    pub const fn from_registry(
+    pub fn from_registry(
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
+        let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
             subscriptions,
             project_registry,
+            event_sink,
         }
     }
 
@@ -60,9 +65,11 @@ impl HandlerContext {
     /// resource subscriptions with another MCP session.
     #[must_use]
     pub fn for_session(&self) -> Self {
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
         Self {
-            subscriptions: Arc::new(ResourceSubscriptions::new()),
+            subscriptions: Arc::clone(&subscriptions),
             project_registry: self.project_registry.clone(),
+            event_sink: Arc::new(SessionEventSink::new(subscriptions)),
         }
     }
 
@@ -75,6 +82,14 @@ impl HandlerContext {
         path: impl AsRef<std::path::Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         self.project_registry.actor_for_path(path).await
+    }
+
+    /// Return the owning project identity and actor for a path.
+    pub async fn required_project_for_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(crate::project::ProjectId, ProjectHandle), ProjectRegistryError> {
+        self.project_registry.project_for_path(path).await
     }
 }
 
