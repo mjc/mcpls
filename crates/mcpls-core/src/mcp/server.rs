@@ -1950,17 +1950,23 @@ while True:
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn http_sessions_share_one_project_actor_and_lsp_process() {
-        let root = TempDir::new().unwrap();
+    fn write_rust_fixture(root: &std::path::Path) -> std::path::PathBuf {
         std::fs::write(
-            root.path().join("Cargo.toml"),
+            root.join("Cargo.toml"),
             "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
         )
         .unwrap();
-        std::fs::create_dir(root.path().join("src")).unwrap();
-        let file = root.path().join("src/main.rs");
+        std::fs::create_dir(root.join("src")).unwrap();
+        let file = root.join("src/main.rs");
         std::fs::write(&file, "fn main() {}\n").unwrap();
+        file
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_sessions_share_one_project_actor_and_lsp_process() {
+        let root = TempDir::new().unwrap();
+        let file = write_rust_fixture(root.path());
         let counter = root.path().join("spawn-count");
         let config = write_concurrency_lsp(root.path(), &counter, None, None, None);
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
@@ -2011,15 +2017,8 @@ while True:
     async fn blocked_project_does_not_delay_other_project_and_removal_keeps_it_ready() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
-        for root in [first_root.path(), second_root.path()] {
-            std::fs::write(
-                root.join("Cargo.toml"),
-                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
-            )
-            .unwrap();
-            std::fs::create_dir(root.join("src")).unwrap();
-            std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-        }
+        write_rust_fixture(first_root.path());
+        write_rust_fixture(second_root.path());
         let counter = first_root.path().join("spawn-count");
         let entered = first_root.path().join("request-entered");
         let release = first_root.path().join("request-release");
