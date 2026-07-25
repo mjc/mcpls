@@ -43,6 +43,23 @@ pub struct ServerConfig {
     pub daemon: DaemonConfig,
 }
 
+/// Optional configuration supplied when registering one project at runtime.
+///
+/// Omitted fields inherit the daemon defaults. An explicitly empty
+/// `lsp_servers` list disables the daemon's configured language servers for
+/// that project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Project-specific language-server definitions.
+    #[serde(default)]
+    pub lsp_servers: Option<Vec<LspServerConfig>>,
+
+    /// Override the recursive project-marker search depth.
+    #[serde(default)]
+    pub heuristics_max_depth: Option<usize>,
+}
+
 fn default_daemon_config() -> DaemonConfig {
     DaemonConfig::default()
 }

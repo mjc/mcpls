@@ -19,6 +19,7 @@ use crate::bridge::{
     ReferencesResult, RenameResult, ServerCapability, ServerLogsResult, ServerMessagesResult,
     SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
+use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
@@ -3648,6 +3649,7 @@ struct ProjectActorEntry {
     actor: ProjectHandle,
     mutation: MutationGate,
     compatibility_key: Option<ProjectCompatibilityKey>,
+    translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     roots: Vec<CanonicalRoot>,
 }
 
@@ -3656,12 +3658,14 @@ impl ProjectActorEntry {
         actor: ProjectHandle,
         mutation: MutationGate,
         compatibility_key: Option<ProjectCompatibilityKey>,
+        translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
         root: CanonicalRoot,
     ) -> Self {
         Self {
             actor,
             mutation,
             compatibility_key,
+            translator_template,
             roots: vec![root],
         }
     }
@@ -3678,6 +3682,7 @@ impl ProjectEntry {
         actor: ProjectHandle,
         mutation: MutationGate,
         compatibility_key: Option<ProjectCompatibilityKey>,
+        translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     ) -> Self {
         let root = identity.root.clone();
         Self {
@@ -3686,6 +3691,7 @@ impl ProjectEntry {
                 actor,
                 mutation,
                 compatibility_key,
+                translator_template,
                 root,
             )],
         }
@@ -3961,8 +3967,12 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
 }
 
 impl ProjectRegistry {
-    fn spawn_actor(&self, root: &CanonicalRoot) -> ProjectHandle {
-        self.translator_template.as_deref().map_or_else(
+    fn spawn_actor(
+        &self,
+        root: &CanonicalRoot,
+        translator_template: Option<&TranslatorTemplate>,
+    ) -> ProjectHandle {
+        translator_template.map_or_else(
             || spawn_project_actor_for_root(self.actor_capacity, root),
             |template| {
                 spawn_project_actor_for_root_with_template(self.actor_capacity, root, template)
@@ -4083,16 +4093,57 @@ impl ProjectRegistry {
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        let compatibility_key = rust_project_compatibility_key(
-            identity.root.as_path(),
-            self.translator_template.as_deref(),
-        )
-        .await;
+        self.add_with_template(identity, None).await
+    }
+
+    /// Add a project with an optional JSON-facing configuration override.
+    pub async fn add_with_config(
+        &self,
+        identity: ProjectIdentity,
+        config: Option<ProjectConfig>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let template = config.map(|config| {
+            self.translator_template
+                .as_deref()
+                .cloned()
+                .unwrap_or_default()
+                .with_project_config(&config)
+        });
+        self.add_with_template(identity, template).await
+    }
+
+    /// Add a project with an optional runtime translator configuration.
+    ///
+    /// When no override is supplied, actors inherit the daemon template. A
+    /// project ID/root pair can only be reused with the same effective
+    /// translator configuration.
+    #[allow(clippy::too_many_lines)]
+    pub async fn add_with_template(
+        &self,
+        identity: ProjectIdentity,
+        translator_template: Option<TranslatorTemplate>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let translator_template = translator_template
+            .map(std::sync::Arc::new)
+            .or_else(|| self.translator_template.clone());
+        let compatibility_key =
+            rust_project_compatibility_key(identity.root.as_path(), translator_template.as_deref())
+                .await;
         let mut projects = self.projects.write().await;
         self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
             if let Some(actor) = existing.actor_for_root(identity.root().as_path()) {
-                return Ok(actor.actor.clone());
+                if translator_templates_match(
+                    actor.translator_template.as_deref(),
+                    translator_template.as_deref(),
+                ) {
+                    return Ok(actor.actor.clone());
+                }
+                return Err(ProjectRegistryError::ConflictingProject {
+                    id: identity.id().clone(),
+                    existing_root: identity.root().as_path().to_path_buf(),
+                    requested_root: identity.root().as_path().to_path_buf(),
+                });
             }
             let compatible = (existing.identity.repository_identity()
                 == identity.repository_identity())
@@ -4132,7 +4183,7 @@ impl ProjectRegistry {
                     requested_root: identity.root().as_path().to_path_buf(),
                 });
             }
-            let actor = self.spawn_actor(identity.root());
+            let actor = self.spawn_actor(identity.root(), translator_template.as_deref());
             let mutation = std::sync::Arc::new(Mutex::new(()));
             drop(projects);
             let mut projects = self.projects.write().await;
@@ -4142,6 +4193,7 @@ impl ProjectRegistry {
                     actor.clone(),
                     mutation,
                     compatibility_key,
+                    translator_template.clone(),
                     identity.root.clone(),
                 ));
             }
@@ -4167,11 +4219,17 @@ impl ProjectRegistry {
         }
 
         let primary_root = identity.root.clone();
-        let actor = self.spawn_actor(&primary_root);
+        let actor = self.spawn_actor(&primary_root, translator_template.as_deref());
         let mutation = std::sync::Arc::new(Mutex::new(()));
         projects.insert(
             identity.id().clone(),
-            ProjectEntry::new(identity, actor.clone(), mutation, compatibility_key),
+            ProjectEntry::new(
+                identity,
+                actor.clone(),
+                mutation,
+                compatibility_key,
+                translator_template,
+            ),
         );
         drop(projects);
         self.persist().await?;
@@ -4892,6 +4950,19 @@ fn compatible_project<'a>(
         project.identity.repository_identity() == Some(repository)
             && project.has_compatible_actor(Some(compatibility_key))
     })
+}
+
+fn translator_templates_match(
+    left: Option<&TranslatorTemplate>,
+    right: Option<&TranslatorTemplate>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
+        }
+        _ => false,
+    }
 }
 
 async fn save_persisted_state(
@@ -6345,11 +6416,13 @@ mod tests {
             primary,
             std::sync::Arc::new(Mutex::new(())),
             None,
+            None,
         );
         entry.identity.add_root(secondary_root.clone());
         entry.actors.push(ProjectActorEntry::new(
             secondary,
             std::sync::Arc::new(Mutex::new(())),
+            None,
             None,
             secondary_root,
         ));
@@ -6514,6 +6587,7 @@ mod tests {
                     actor,
                     mutation: std::sync::Arc::new(Mutex::new(())),
                     compatibility_key: None,
+                    translator_template: None,
                     roots: vec![CanonicalRoot::new(root.path()).unwrap()],
                 }],
             },

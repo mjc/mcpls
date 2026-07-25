@@ -526,10 +526,14 @@ impl McplsServer {
         Parameters(ProjectAddParams {
             project_id,
             root,
-            config: _,
+            config,
         }): Parameters<ProjectAddParams>,
     ) -> Result<String, McpError> {
         let id = parse_project_id(project_id)?;
+        let config = config
+            .map(serde_json::from_value::<crate::config::ProjectConfig>)
+            .transpose()
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let canonical_root = CanonicalRoot::new(&root)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let repository = GitRepositoryIdentity::discover(canonical_root.as_path())
@@ -544,7 +548,7 @@ impl McplsServer {
         let actor = self
             .context
             .project_registry
-            .add(identity.clone())
+            .add_with_config(identity.clone(), config)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let identity = self
@@ -1876,6 +1880,40 @@ mod tests {
                 .await
                 .unwrap()
                 .contains("demo")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_add_applies_project_lsp_configuration() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let server = create_test_server();
+
+        let added = server
+            .project_add(Parameters(ProjectAddParams {
+                project_id: "configured".to_string(),
+                root: root.path().display().to_string(),
+                config: Some(serde_json::json!({
+                    "lsp_servers": [{
+                        "language_id": "rust",
+                        "command": "/definitely/missing/rust-analyzer",
+                        "file_patterns": ["**/*.rs"],
+                        "heuristics": {"project_markers": ["Cargo.toml"]}
+                    }],
+                    "heuristics_max_depth": 3
+                })),
+            }))
+            .await
+            .unwrap();
+        let added: serde_json::Value = serde_json::from_str(&added).unwrap();
+
+        assert_eq!(
+            added["configured_language_servers"],
+            serde_json::json!(["rust"])
         );
     }
 

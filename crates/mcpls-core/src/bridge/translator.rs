@@ -21,7 +21,7 @@ use tokio::{sync::mpsc, time::Duration};
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
 use crate::bridge::encoding::mcp_to_lsp_position;
-use crate::config::LspServerConfig;
+use crate::config::{LspServerConfig, ProjectConfig};
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
@@ -70,7 +70,7 @@ async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
 }
 
 /// Configuration snapshot used to construct an isolated project translator.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct TranslatorTemplate {
     extension_map: HashMap<String, String>,
     lsp_configs: Vec<LspServerConfig>,
@@ -86,6 +86,18 @@ impl TranslatorTemplate {
 
     pub(crate) const fn heuristics_max_depth(&self) -> Option<usize> {
         self.heuristics_max_depth
+    }
+
+    /// Apply optional runtime project overrides to a daemon configuration.
+    #[must_use]
+    pub fn with_project_config(mut self, config: &ProjectConfig) -> Self {
+        if let Some(lsp_servers) = &config.lsp_servers {
+            self.lsp_configs = lsp_servers.clone();
+        }
+        if let Some(max_depth) = config.heuristics_max_depth {
+            self.heuristics_max_depth = Some(max_depth);
+        }
+        self
     }
 }
 
