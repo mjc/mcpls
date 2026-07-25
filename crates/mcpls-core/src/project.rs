@@ -3204,8 +3204,7 @@ async fn recover_project_after_server_exit(
 ) {
     loop {
         let Some(attempt) = runtime.begin_automatic_restart() else {
-            state.last_error = Some("language server exited".to_string());
-            channels.publish_status(state, ProjectStatus::Failed);
+            channels.publish_failure(state, "language server exited");
             return;
         };
 
@@ -3236,8 +3235,7 @@ async fn recover_project_after_server_exit(
             }
             Err(error) => {
                 state.sync_runtime(runtime);
-                state.last_error = Some(error);
-                channels.publish_status(state, ProjectStatus::Failed);
+                channels.publish_failure(state, error);
                 return;
             }
         }
@@ -3261,8 +3259,7 @@ async fn handle_server_exit(
             recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
         }
         ProjectStatus::Starting | ProjectStatus::Restarting => {
-            state.last_error = Some("language server exited".to_string());
-            channels.publish_status(state, ProjectStatus::Failed);
+            channels.publish_failure(state, "language server exited");
         }
         ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
     }
@@ -3371,6 +3368,11 @@ impl ProjectActorChannels {
             status,
             last_error: state.last_error.clone(),
         });
+    }
+
+    fn publish_failure(&self, state: &mut ProjectState, error: impl Into<String>) {
+        state.last_error = Some(error.into());
+        self.publish_status(state, ProjectStatus::Failed);
     }
 }
 
@@ -3538,8 +3540,7 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error.to_string());
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error.to_string());
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
@@ -3566,8 +3567,7 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error.clone());
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error.clone());
                     let _ = reply.send(Err(error));
                 }
             }
@@ -3830,8 +3830,7 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error.clone());
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error.clone());
                     let _ = reply.send(Err(error));
                 }
             }
@@ -3926,16 +3925,14 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.last_error = Some(error);
-                    channels.publish_status(state, ProjectStatus::Failed);
+                    channels.publish_failure(state, error);
                     let _ = reply.send(state.clone());
                 }
             }
         }
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
-            state.last_error = Some(message);
-            channels.publish_status(state, ProjectStatus::Failed);
+            channels.publish_failure(state, message);
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
