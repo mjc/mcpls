@@ -260,13 +260,15 @@ impl Translator {
 
         let server_configs = pending
             .iter()
-            .map(|config| ServerInitConfig {
-                server_config: config.clone(),
-                workspace_roots: roots.clone(),
-                initialization_options: config.initialization_options.clone(),
-                notification_tx: None,
+            .map(|config| {
+                Ok(ServerInitConfig {
+                    server_config: config.clone(),
+                    workspace_roots: roots.clone(),
+                    initialization_options: linked_project_initialization_options(config, &roots)?,
+                    notification_tx: None,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let result = LspServer::spawn_batch(&server_configs).await;
 
         if result.all_failed() {
@@ -428,6 +430,60 @@ impl Translator {
     // Initialize and shutdown are now handled by LspServer in lifecycle.rs
 
     // Future implementation will use LspServer instead of LspClient directly
+}
+
+/// Add rust-analyzer's explicit linked-project manifests for a shared actor.
+///
+/// The registry only joins projects after a fail-closed compatibility check,
+/// so a multi-root actor can safely give rust-analyzer every member manifest.
+/// Existing initialization options are preserved and an existing array is
+/// extended without duplicates.
+fn linked_project_initialization_options(
+    config: &LspServerConfig,
+    roots: &[PathBuf],
+) -> Result<Option<serde_json::Value>> {
+    if roots.len() < 2 || !config.language_id.eq_ignore_ascii_case("rust") {
+        return Ok(config.initialization_options.clone());
+    }
+
+    let mut options = match config.initialization_options.clone() {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(options)) => options,
+        Some(_) => {
+            return Err(Error::InvalidConfig(
+                "rust linked-project initialization_options must be a JSON object".to_string(),
+            ));
+        }
+    };
+
+    let mut linked_projects = match options.remove("linkedProjects") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(projects)) => projects,
+        Some(_) => {
+            return Err(Error::InvalidConfig(
+                "rust-analyzer linkedProjects must be a JSON array".to_string(),
+            ));
+        }
+    };
+
+    for root in roots {
+        let manifest = root.join("Cargo.toml");
+        if !manifest.is_file() {
+            return Err(Error::InvalidConfig(format!(
+                "shared rust project has no Cargo.toml: {}",
+                root.display()
+            )));
+        }
+        let manifest = serde_json::Value::String(manifest.to_string_lossy().into_owned());
+        if !linked_projects.contains(&manifest) {
+            linked_projects.push(manifest);
+        }
+    }
+    options.insert(
+        "linkedProjects".to_string(),
+        serde_json::Value::Array(linked_projects),
+    );
+    Ok(Some(serde_json::Value::Object(options)))
 }
 
 impl TranslatorTemplate {
@@ -2636,6 +2692,84 @@ mod tests {
         let roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
         translator.set_workspace_roots(roots.clone());
         assert_eq!(translator.workspace_roots, roots);
+    }
+
+    #[test]
+    fn linked_project_options_include_all_cargo_manifests() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        fs::write(first.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::write(
+            second.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[]\n",
+        )
+        .unwrap();
+        let config = LspServerConfig::rust_analyzer();
+
+        let options = linked_project_initialization_options(
+            &config,
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            options,
+            Some(serde_json::json!({
+                "linkedProjects": [
+                    first.path().join("Cargo.toml"),
+                    second.path().join("Cargo.toml")
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn linked_project_options_merge_existing_settings_without_duplicates() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        fs::write(first.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::write(
+            second.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[]\n",
+        )
+        .unwrap();
+        let mut config = LspServerConfig::rust_analyzer();
+        config.initialization_options = Some(serde_json::json!({
+            "cargo": {"buildScripts": {"enable": true}},
+            "linkedProjects": [first.path().join("Cargo.toml")]
+        }));
+
+        let options = linked_project_initialization_options(
+            &config,
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(options["cargo"]["buildScripts"]["enable"], true);
+        assert_eq!(options["linkedProjects"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn linked_project_options_fail_closed_for_invalid_inputs() {
+        let root = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        let config = LspServerConfig::rust_analyzer();
+        let missing_manifest = linked_project_initialization_options(
+            &config,
+            &[root.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        assert!(matches!(missing_manifest, Err(Error::InvalidConfig(_))));
+
+        let mut invalid = LspServerConfig::rust_analyzer();
+        invalid.initialization_options = Some(serde_json::json!({"linkedProjects": "nope"}));
+        assert!(matches!(
+            linked_project_initialization_options(
+                &invalid,
+                &[root.path().to_path_buf(), root.path().to_path_buf()]
+            ),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 
     #[tokio::test]
