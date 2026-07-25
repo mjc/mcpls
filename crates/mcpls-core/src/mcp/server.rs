@@ -211,6 +211,48 @@ impl McplsServer {
         Ok(())
     }
 
+    async fn read_project_status_resource(
+        &self,
+        project_id: ProjectId,
+        uri: String,
+    ) -> Result<ReadResourceResult, McpError> {
+        let identity = self
+            .context
+            .project_registry
+            .identity(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let state = self
+            .context
+            .project_registry
+            .status(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let json = encode_json(&project_state_json(&identity, &state))?;
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            json, uri,
+        )]))
+    }
+
+    async fn read_project_events_resource(
+        &self,
+        project_id: ProjectId,
+        cursor: Option<u64>,
+        uri: String,
+    ) -> Result<ReadResourceResult, McpError> {
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let snapshot = actor.event_snapshot(cursor);
+        let json = encode_json(&project_events_json(&project_id, &snapshot))?;
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            json, uri,
+        )]))
+    }
+
     async fn preview_project_edit(
         &self,
         id: &ProjectId,
@@ -1230,37 +1272,14 @@ impl ServerHandler for McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let path = match resource {
             SessionResource::ProjectStatus(project_id) => {
-                let identity = self
-                    .context
-                    .project_registry
-                    .identity(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                let state = self
-                    .context
-                    .project_registry
-                    .status(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                let json = encode_json(&project_state_json(&identity, &state))?;
-                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    json,
-                    request.uri,
-                )]));
+                return self
+                    .read_project_status_resource(project_id, request.uri)
+                    .await;
             }
             SessionResource::ProjectEvents { project_id, cursor } => {
-                let actor = self
-                    .context
-                    .project_registry
-                    .actor_for_project(&project_id)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                let snapshot = actor.event_snapshot(cursor);
-                let json = encode_json(&project_events_json(&project_id, &snapshot))?;
-                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    json,
-                    request.uri,
-                )]));
+                return self
+                    .read_project_events_resource(project_id, cursor, request.uri)
+                    .await;
             }
             SessionResource::Diagnostics(path) => path,
         };
