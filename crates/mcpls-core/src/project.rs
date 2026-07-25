@@ -5499,6 +5499,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_last_project_handle_stops_actor() {
+        let handle = spawn_project_actor(1);
+        let mut status = handle.status();
+
+        drop(handle);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while *status.borrow() != ProjectStatus::Stopped {
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("actor did not stop after its last handle was dropped");
+    }
+
+    #[tokio::test]
     async fn project_actor_exposes_typed_query_refresh_restart_and_failure() {
         let handle = spawn_project_actor(4);
 
