@@ -2659,9 +2659,13 @@ impl ProjectRuntime {
                     .store_message(params.typ.into(), params.message);
                 None
             }
-            LspNotification::Progress { .. }
-            | LspNotification::ServerStatus(_)
-            | LspNotification::Other { .. } => None,
+            LspNotification::ServerStatus(status) => {
+                if status.quiescent {
+                    self.translator.clear_expected_languages();
+                }
+                None
+            }
+            LspNotification::Progress { .. } | LspNotification::Other { .. } => None,
         }
     }
 
@@ -2876,7 +2880,14 @@ fn mark_project_ready(
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
     state.sync_runtime(runtime);
-    channels.publish_status(state, ProjectStatus::Ready);
+    channels.publish_status(
+        state,
+        if runtime.translator.is_initializing() {
+            ProjectStatus::Starting
+        } else {
+            ProjectStatus::Ready
+        },
+    );
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -3251,7 +3262,12 @@ async fn handle_project_request(
             generation,
             notification,
         } => {
+            let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, notification);
+            if was_initializing && !runtime.translator.is_initializing() {
+                state.sync_runtime(runtime);
+                channels.publish_status(state, ProjectStatus::Ready);
+            }
         }
         ProjectRequest::ServerExited { generation } => {
             if runtime.owns_generation(generation)
@@ -5143,6 +5159,30 @@ mod tests {
                 diagnostic_count: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn project_actor_becomes_ready_when_server_status_reaches_quiescence() {
+        let mut translator = Translator::new();
+        translator.set_expected_languages(HashSet::from(["rust".to_string()]));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "experimental/serverStatus",
+                    Some(serde_json::json!({
+                        "health": "ok",
+                        "quiescent": true
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(actor.query().await.unwrap().status(), ProjectStatus::Ready);
     }
 
     #[tokio::test]

@@ -141,6 +141,13 @@ impl Translator {
         self.expected_languages.clear();
     }
 
+    /// Return whether any configured language server is still loading its
+    /// workspace after the LSP handshake completed.
+    #[must_use]
+    pub fn is_initializing(&self) -> bool {
+        !self.expected_languages.is_empty()
+    }
+
     /// Configure custom file extension mappings.
     ///
     /// This method sets the extension map and updates the document tracker
@@ -173,17 +180,19 @@ impl Translator {
         self.lsp_roots.insert(language_id, roots);
     }
 
-    /// Activate one project and wait for its applicable language servers to be ready.
+    /// Start one project and track language-server readiness asynchronously.
     ///
     /// This is the explicit project boundary used by the `project_activate`
     /// MCP tool. A server is not exposed to code-intelligence requests until
     /// its initialization completes; rust-analyzer additionally has to report
-    /// that its background project load is quiescent.
+    /// that its background project load is tracked asynchronously after the
+    /// initial LSP handshake.
     ///
     /// # Errors
     ///
-    /// Returns an error when no configured server applies, a server cannot be
-    /// started, or project loading does not reach a ready state in time.
+    /// Returns an error when no configured server applies or a server cannot be
+    /// started. The project remains `Starting` until its server reports that
+    /// background loading is quiescent.
     pub async fn activate_project(
         &mut self,
         root: PathBuf,
@@ -195,8 +204,9 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error when no configured server applies, a server cannot be
-    /// started, or project loading does not reach a ready state in time.
+    /// Returns an error when no configured server applies or a server cannot be
+    /// started. The project remains `Starting` until its server reports that
+    /// background loading is quiescent.
     pub async fn activate_project_with_roots(
         &mut self,
         roots: Vec<PathBuf>,
@@ -231,11 +241,6 @@ impl Translator {
                 && self.lsp_clients.contains_key(language_id);
 
             if same_root {
-                if let Some(server) = self.lsp_servers.get(language_id) {
-                    server
-                        .wait_until_quiescent(Duration::from_secs(config.timeout_seconds))
-                        .await?;
-                }
                 continue;
             }
 
@@ -254,6 +259,7 @@ impl Translator {
 
         let expected_languages = pending
             .iter()
+            .filter(|config| config.language_id.eq_ignore_ascii_case("rust"))
             .map(|config| config.language_id.clone())
             .collect();
         self.set_expected_languages(expected_languages);
@@ -282,16 +288,6 @@ impl Translator {
             return Err(Error::LspInitFailed { message });
         }
 
-        for server in result.servers.values() {
-            let timeout = pending
-                .iter()
-                .find(|config| config.language_id == server.client().language_id())
-                .map_or(30, |config| config.timeout_seconds);
-            server
-                .wait_until_quiescent(Duration::from_secs(timeout))
-                .await?;
-        }
-
         self.set_workspace_roots(roots);
         let mut notification_receivers = Vec::new();
         for (language_id, mut server) in result.servers {
@@ -302,7 +298,6 @@ impl Translator {
             self.register_client(language_id.clone(), client);
             self.register_server(language_id, server);
         }
-        self.clear_expected_languages();
         Ok(notification_receivers)
     }
 
@@ -1004,6 +999,9 @@ impl Translator {
     }
 
     async fn wait_for_language_ready(&self, language_id: &str) -> Result<()> {
+        if self.expected_languages.contains(language_id) {
+            return Err(Error::ServerInitializing(language_id.to_string()));
+        }
         let Some(client) = self.lsp_clients.get(language_id) else {
             return Ok(());
         };
@@ -2867,6 +2865,22 @@ mod tests {
 
         let err = translator.get_client_for_file(&path).unwrap_err();
         assert!(matches!(err, Error::NoServerForLanguage(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_language_ready_reports_initializing_without_waiting() {
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![LspServerConfig::rust_analyzer()], None);
+        translator.set_expected_languages(HashSet::from(["rust".to_string()]));
+
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                translator.wait_for_language_ready("rust"),
+            )
+            .await,
+            Ok(Err(Error::ServerInitializing(language))) if language == "rust"
+        ));
     }
 
     #[test]

@@ -403,9 +403,9 @@ impl McplsServer {
         encode_json(&project_state_json(&identity, &state))
     }
 
-    /// Activate a registered project and wait for its language servers to load.
+    /// Activate a registered project and return while its language servers load.
     #[tool(
-        description = "Activate a registered project. Blocks until its applicable language servers finish loading and are ready for code intelligence."
+        description = "Activate a registered project. Starts its applicable language servers and returns while they load; poll project_status until it is Ready for code intelligence."
     )]
     async fn project_activate(
         &self,
