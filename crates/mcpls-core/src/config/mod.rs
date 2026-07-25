@@ -494,6 +494,23 @@ mod tests {
     }
 
     #[test]
+    fn daemon_state_file_round_trips_through_toml() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+                [daemon]
+                state_file = "/tmp/mcpls-projects.json"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.daemon.state_file,
+            Some(PathBuf::from("/tmp/mcpls-projects.json"))
+        );
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("state_file"));
+    }
+
+    #[test]
     fn test_load_from_nonexistent_file() {
         let result = ServerConfig::load_from(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
