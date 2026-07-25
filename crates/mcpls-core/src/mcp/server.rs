@@ -38,7 +38,8 @@ use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle,
-    ProjectId, ProjectIdentity, ProjectRegistry, ProjectState, ProjectStatusCounts,
+    ProjectId, ProjectIdentity, ProjectRegistry, ProjectServerCapability, ProjectState,
+    ProjectStatusCounts,
 };
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
@@ -84,6 +85,12 @@ fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpErro
 struct ActorGroupState {
     group_id: usize,
     roots: Vec<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct ProjectLspCapabilitiesResponse {
+    project_id: String,
+    servers: Vec<ProjectServerCapability>,
 }
 
 fn actor_group_states(actor_group_roots: Vec<Vec<PathBuf>>) -> Vec<ActorGroupState> {
@@ -1213,10 +1220,10 @@ impl McplsServer {
             .server_capabilities(&id, language_id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&serde_json::json!({
-            "project_id": id.as_str(),
-            "servers": servers,
-        }))
+        encode_json(&ProjectLspCapabilitiesResponse {
+            project_id: id.as_str().to_string(),
+            servers,
+        })
     }
 
     /// Get signature help at a position.
