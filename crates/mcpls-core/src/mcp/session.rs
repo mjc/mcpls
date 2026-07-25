@@ -184,15 +184,22 @@ impl SessionEventSink {
             loop {
                 match events.recv().await {
                     Ok(event) => {
-                        if forward_event(
+                        let outcome = forward_event(
                             &subscriptions,
                             notifier.as_ref(),
                             &event_project_id,
                             &event,
                         )
-                        .await
-                            == ForwardOutcome::Disconnect
-                        {
+                        .await;
+                        let removed = matches!(event, ProjectEvent::ProjectRemoved { .. })
+                            && event.belongs_to(&event_project_id);
+                        if removed {
+                            for uri in event_resource_uris(&event_project_id, &event) {
+                                subscriptions.unsubscribe(&uri).await;
+                            }
+                            break;
+                        }
+                        if outcome == ForwardOutcome::Disconnect {
                             break;
                         }
                     }
@@ -422,5 +429,58 @@ mod tests {
         })
         .await
         .expect("session sink did not stop after peer disconnect");
+    }
+
+    #[tokio::test]
+    async fn removal_notification_cleans_project_subscriptions_and_sink() {
+        let project_id = ProjectId::new("a").unwrap();
+        let event_uri = project_events_resource_uri(&project_id);
+        let status_uri = project_status_resource_uri(&project_id);
+        let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions.subscribe(event_uri.clone()).await.unwrap();
+        subscriptions.subscribe(status_uri.clone()).await.unwrap();
+        let sink = SessionEventSink::new(Arc::clone(&subscriptions));
+        let (events_tx, events_rx) = broadcast::channel(8);
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+
+        sink.attach_receiver(
+            project_id.clone(),
+            events_rx,
+            Arc::new(TestNotifier(updates_tx)),
+        );
+        events_tx
+            .send(ProjectEvent::ProjectRemoved {
+                project_id: project_id.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(updates_rx.recv().await.unwrap(), event_uri);
+        assert_eq!(updates_rx.recv().await.unwrap(), status_uri);
+        assert!(
+            !subscriptions
+                .contains(&project_events_resource_uri(&project_id))
+                .await
+        );
+        assert!(
+            !subscriptions
+                .contains(&project_status_resource_uri(&project_id))
+                .await
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if sink
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(&project_id)
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session sink did not stop after project removal");
     }
 }
