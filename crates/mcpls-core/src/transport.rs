@@ -389,7 +389,7 @@ pub(crate) async fn run_http(
     let session_manager = Arc::new(CappedSessionManager::new(cfg.max_concurrent_sessions));
     let cancel = CancellationToken::new();
 
-    let mcp_for_factory = mcp_server.clone();
+    let mcp_for_factory = mcp_server;
     // StreamableHttpServerConfig is #[non_exhaustive]; construct via Default then mutate.
     let mut http_cfg = StreamableHttpServerConfig::default();
     http_cfg.cancellation_token = cancel.clone();

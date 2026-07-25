@@ -32,7 +32,6 @@ use crate::bridge::{
 };
 
 /// MCP server that exposes LSP capabilities as tools.
-#[derive(Clone)]
 pub struct McplsServer {
     context: Arc<BridgeContext>,
 }
@@ -813,8 +812,38 @@ impl ServerHandler for McplsServer {
         request: SubscribeRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let path =
-            parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let resource = parse_session_resource_uri(&request.uri)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let path = match resource {
+            SessionResource::ProjectStatus(project_id) => {
+                let actor = self
+                    .context
+                    .project_registry
+                    .actor_for_project(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                self.attach_subscription(project_id, &actor, request.uri, context.peer)
+                    .await?;
+                return Ok(());
+            }
+            SessionResource::ProjectEvents { project_id, .. } => {
+                let actor = self
+                    .context
+                    .project_registry
+                    .actor_for_project(&project_id)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                self.attach_subscription(
+                    project_id.clone(),
+                    &actor,
+                    project_events_resource_uri(&project_id),
+                    context.peer,
+                )
+                .await?;
+                return Ok(());
+            }
+            SessionResource::Diagnostics(path) => path,
+        };
 
         // Enforce workspace-root containment (same invariant as every LSP tool).
         // Validated against a lock-free snapshot of workspace_roots so subscribing
@@ -925,6 +954,7 @@ impl ServerHandler for McplsServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::bridge::resources::parse_uri;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
     use tempfile::TempDir;
 
@@ -944,6 +974,38 @@ mod tests {
             subscriptions,
             project_config_ignored,
         )
+    }
+
+    #[tokio::test]
+    async fn http_session_clones_have_independent_subscriptions() {
+        let server = create_test_server();
+        let session = server.clone();
+        let uri = "lsp-diagnostics:///tmp/session.rs".to_string();
+
+        server
+            .context
+            .subscriptions
+            .subscribe(uri.clone())
+            .await
+            .unwrap();
+
+        assert!(server.context.subscriptions.contains(&uri).await);
+        assert!(!session.context.subscriptions.contains(&uri).await);
+    }
+
+    #[tokio::test]
+    async fn http_session_clones_share_project_registry() {
+        let server = create_test_server();
+        let session = server.for_session();
+        let root = TempDir::new().unwrap();
+        let identity = ProjectIdentity::new(
+            ProjectId::new("shared").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+
+        server.context.project_registry.add(identity).await.unwrap();
+
+        assert_eq!(session.context.project_registry.list().await.len(), 1);
     }
 
     async fn create_test_server_with_project() -> McplsServer {

@@ -5,6 +5,7 @@
 
 mod handlers;
 mod server;
+mod session;
 mod tools;
 
 pub use server::McplsServer;

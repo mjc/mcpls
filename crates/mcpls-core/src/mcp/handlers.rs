@@ -68,6 +68,24 @@ impl BridgeContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
+        Self::from_registry(subscriptions, project_registry)
+    }
+
+    /// Create a handler context from the shared project registry and
+    /// session-owned subscriptions.
+    #[must_use]
+    pub fn from_registry(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
+        Self::with_subscriptions(subscriptions, project_registry)
+    }
+
+    fn with_subscriptions(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
+        let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
             translator,
             notification_cache,
@@ -75,6 +93,16 @@ impl BridgeContext {
             subscriptions,
             project_config_ignored,
         }
+    }
+
+    /// Create a session-local context that shares project actors but not
+    /// resource subscriptions with another MCP session.
+    #[must_use]
+    pub fn for_session(&self) -> Self {
+        Self::from_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            self.project_registry.clone(),
+        )
     }
 
     /// Return the actor owning a path or the registry's explicit routing error.
@@ -86,6 +114,14 @@ impl BridgeContext {
         path: impl AsRef<std::path::Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         self.project_registry.actor_for_path(path).await
+    }
+
+    /// Return the owning project identity and actor for a path.
+    pub async fn required_project_for_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(crate::project::ProjectId, ProjectHandle), ProjectRegistryError> {
+        self.project_registry.project_for_path(path).await
     }
 }
 

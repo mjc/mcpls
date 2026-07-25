@@ -1,12 +1,12 @@
 //! Project identity and canonical path routing primitives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
@@ -496,6 +496,224 @@ pub enum ProjectStatus {
     Failed,
 }
 
+/// Typed events emitted by a project actor for session-facing delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProjectEvent {
+    /// The actor's lifecycle status changed.
+    StatusChanged {
+        /// New lifecycle status.
+        status: ProjectStatus,
+        /// Failure detail associated with the new status, if any.
+        last_error: Option<String>,
+    },
+    /// The current language-server notification stream ended unexpectedly.
+    ServerExited {
+        /// Runtime generation that exited.
+        generation: u64,
+    },
+    /// A language server published diagnostics for one document.
+    DiagnosticsUpdated {
+        /// Document URI whose diagnostics were replaced.
+        uri: String,
+        /// LSP document version, when provided by the server.
+        version: Option<i32>,
+        /// Number of diagnostics in the replacement set.
+        diagnostic_count: usize,
+    },
+    /// Files changed by a completed workspace edit.
+    FilesChanged {
+        /// Files written, created, renamed, or deleted by the edit.
+        paths: Vec<PathBuf>,
+    },
+    /// A workspace edit plan completed successfully.
+    EditApplied {
+        /// Opaque identifier of the consumed edit plan.
+        plan_id: PlanId,
+        /// Files changed by the completed edit.
+        committed_files: Vec<PathBuf>,
+        /// Number of text and resource operations in the plan.
+        operation_count: usize,
+    },
+    /// A registered project identity was removed from the shared registry.
+    ProjectRemoved {
+        /// Stable identity that is no longer routable.
+        project_id: ProjectId,
+        /// Canonical worktree root whose file resources are no longer valid.
+        root: PathBuf,
+    },
+}
+
+impl ProjectEvent {
+    /// Return whether this event belongs to the project receiving it.
+    #[must_use]
+    pub(crate) fn belongs_to(&self, project_id: &ProjectId) -> bool {
+        !matches!(
+            self,
+            Self::ProjectRemoved {
+                project_id: removed_project,
+                ..
+            } if removed_project != project_id
+        )
+    }
+
+    /// Encode the stable wire representation used by project-event resources.
+    #[must_use]
+    pub fn json_value(&self) -> serde_json::Value {
+        match self {
+            Self::StatusChanged { status, last_error } => serde_json::json!({
+                "kind": "status_changed",
+                "status": format!("{status:?}"),
+                "last_error": last_error,
+            }),
+            Self::ServerExited { generation } => serde_json::json!({
+                "kind": "server_exited",
+                "generation": generation,
+            }),
+            Self::DiagnosticsUpdated {
+                uri,
+                version,
+                diagnostic_count,
+            } => serde_json::json!({
+                "kind": "diagnostics_updated",
+                "uri": uri,
+                "version": version,
+                "diagnostic_count": diagnostic_count,
+            }),
+            Self::FilesChanged { paths } => serde_json::json!({
+                "kind": "files_changed",
+                "paths": paths,
+            }),
+            Self::EditApplied {
+                plan_id,
+                committed_files,
+                operation_count,
+            } => serde_json::json!({
+                "kind": "edit_applied",
+                "plan_id": plan_id.as_str(),
+                "committed_files": committed_files,
+                "operation_count": operation_count,
+            }),
+            Self::ProjectRemoved { project_id, root } => serde_json::json!({
+                "kind": "project_removed",
+                "project_id": project_id.as_str(),
+                "root": root,
+            }),
+        }
+    }
+}
+
+/// One ordered project event retained for cursor-based session polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEventRecord {
+    sequence: u64,
+    event: ProjectEvent,
+}
+
+impl ProjectEventRecord {
+    /// Return the monotonically increasing event sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Return the typed event payload.
+    #[must_use]
+    pub const fn event(&self) -> &ProjectEvent {
+        &self.event
+    }
+
+    /// Encode this ordered event record for resource polling clients.
+    #[must_use]
+    pub fn json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sequence": self.sequence,
+            "event": self.event.json_value(),
+        })
+    }
+}
+
+/// Bounded event history snapshot returned to session polling clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEventSnapshot {
+    events: Vec<ProjectEventRecord>,
+    resync_required: bool,
+    next_sequence: u64,
+}
+
+impl ProjectEventSnapshot {
+    /// Return events newer than the requested cursor.
+    #[must_use]
+    pub fn events(&self) -> &[ProjectEventRecord] {
+        &self.events
+    }
+
+    /// Whether the requested cursor predates the retained bounded history.
+    #[must_use]
+    pub const fn resync_required(&self) -> bool {
+        self.resync_required
+    }
+
+    /// Return the next cursor clients should use for a subsequent poll.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+}
+
+/// Bounded actor-owned project event history.
+#[derive(Debug)]
+pub struct ProjectEventHistory {
+    records: VecDeque<ProjectEventRecord>,
+    capacity: usize,
+    next_sequence: u64,
+}
+
+impl ProjectEventHistory {
+    /// Create a bounded history with at least one retained event.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+            next_sequence: 1,
+        }
+    }
+
+    /// Record one event and return its assigned sequence.
+    pub fn record(&mut self, event: ProjectEvent) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.records.len() == self.capacity {
+            self.records.pop_front();
+        }
+        self.records
+            .push_back(ProjectEventRecord { sequence, event });
+        sequence
+    }
+
+    /// Return retained events newer than `cursor`, marking overflow when needed.
+    #[must_use]
+    pub fn snapshot_since(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+        let oldest = self
+            .records
+            .front()
+            .map_or(self.next_sequence, |record| record.sequence);
+        let resync_required = cursor.is_some_and(|cursor| cursor < oldest.saturating_sub(1));
+        let events = self
+            .records
+            .iter()
+            .filter(|record| cursor.is_none_or(|cursor| record.sequence > cursor))
+            .cloned()
+            .collect();
+        ProjectEventSnapshot {
+            events,
+            resync_required,
+            next_sequence: self.next_sequence,
+        }
+    }
+}
+
 /// Observable project state, including the most recent failure detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectState {
@@ -618,6 +836,21 @@ pub struct AppliedEditPlan {
     pub unified_diff: String,
     /// Files replaced successfully.
     pub committed_files: Vec<PathBuf>,
+}
+
+impl AppliedEditPlan {
+    fn project_events(&self) -> [ProjectEvent; 2] {
+        [
+            ProjectEvent::FilesChanged {
+                paths: self.committed_files.clone(),
+            },
+            ProjectEvent::EditApplied {
+                plan_id: self.plan_id.clone(),
+                committed_files: self.committed_files.clone(),
+                operation_count: self.operations.len(),
+            },
+        ]
+    }
 }
 
 enum ProjectRequest {
@@ -800,6 +1033,10 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
     },
+    PublishEvent {
+        event: ProjectEvent,
+        reply: oneshot::Sender<()>,
+    },
     PreviewEdit {
         project_id: String,
         edit: WorkspaceEdit,
@@ -840,6 +1077,8 @@ enum ProjectRequest {
 pub struct ProjectHandle {
     sender: mpsc::Sender<ProjectRequest>,
     status: watch::Receiver<ProjectStatus>,
+    events: broadcast::Sender<ProjectEvent>,
+    event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
 }
 
 impl ProjectHandle {
@@ -847,6 +1086,30 @@ impl ProjectHandle {
     #[must_use]
     pub fn status(&self) -> watch::Receiver<ProjectStatus> {
         self.status.clone()
+    }
+
+    /// Subscribe to typed project lifecycle and failure events.
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ProjectEvent> {
+        self.events.subscribe()
+    }
+
+    /// Return retained project events newer than an optional polling cursor.
+    #[must_use]
+    pub fn event_snapshot(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+        self.event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_since(cursor)
+    }
+
+    async fn publish_event(&self, event: ProjectEvent) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PublishEvent { event, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
     }
 
     /// Query the actor's current state.
@@ -2296,26 +2559,36 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn notification(&mut self, notification: LspNotification) {
+    fn notification(&mut self, notification: LspNotification) -> Option<ProjectEvent> {
         match notification {
             LspNotification::PublishDiagnostics(params) => {
+                let event = ProjectEvent::DiagnosticsUpdated {
+                    uri: params.uri.to_string(),
+                    version: params.version,
+                    diagnostic_count: params.diagnostics.len(),
+                };
                 self.translator.notification_cache_mut().store_diagnostics(
                     &params.uri,
                     params.version,
                     params.diagnostics,
                 );
+                Some(event)
             }
-            LspNotification::LogMessage(params) => self
-                .translator
-                .notification_cache_mut()
-                .store_log(params.typ.into(), params.message),
-            LspNotification::ShowMessage(params) => self
-                .translator
-                .notification_cache_mut()
-                .store_message(params.typ.into(), params.message),
+            LspNotification::LogMessage(params) => {
+                self.translator
+                    .notification_cache_mut()
+                    .store_log(params.typ.into(), params.message);
+                None
+            }
+            LspNotification::ShowMessage(params) => {
+                self.translator
+                    .notification_cache_mut()
+                    .store_message(params.typ.into(), params.message);
+                None
+            }
             LspNotification::Progress { .. }
             | LspNotification::ServerStatus(_)
-            | LspNotification::Other { .. } => {}
+            | LspNotification::Other { .. } => None,
         }
     }
 
@@ -2410,30 +2683,84 @@ pub fn spawn_project_actor_with_translator(
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.clone();
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
+    let (event_tx, _) = broadcast::channel(256);
+    let event_sender = event_tx.clone();
+    let event_history = std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(256)));
+    let channels = ProjectActorChannels {
+        status_tx,
+        event_tx,
+        event_history: std::sync::Arc::clone(&event_history),
+    };
     let runtime = ProjectRuntime::new(translator);
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
-        status_tx,
+        channels,
         ProjectState::new(ProjectStatus::Starting, runtime.summary()),
         runtime,
     ));
     ProjectHandle {
         sender,
         status: status_rx,
+        events: event_sender,
+        event_history,
+    }
+}
+
+struct ProjectActorChannels {
+    status_tx: watch::Sender<ProjectStatus>,
+    event_tx: broadcast::Sender<ProjectEvent>,
+    event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
+}
+
+impl ProjectActorChannels {
+    fn publish(&self, event: ProjectEvent) {
+        self.event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(event.clone());
+        let _ = self.event_tx.send(event);
+    }
+
+    fn publish_notification(
+        &self,
+        runtime: &mut ProjectRuntime,
+        generation: u64,
+        notification: LspNotification,
+    ) {
+        if !runtime.owns_generation(generation) {
+            return;
+        }
+        if let Some(event) = runtime.notification(notification) {
+            self.publish(event);
+        }
+    }
+
+    fn publish_applied_edit(&self, applied: &AppliedEditPlan) {
+        for event in applied.project_events() {
+            self.publish(event);
+        }
+    }
+
+    fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
+        state.status = status;
+        let _ = self.status_tx.send(status);
+        self.publish(ProjectEvent::StatusChanged {
+            status,
+            last_error: state.last_error.clone(),
+        });
     }
 }
 
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     actor_sender: mpsc::Sender<ProjectRequest>,
-    status_tx: watch::Sender<ProjectStatus>,
+    channels: ProjectActorChannels,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
 ) {
     while let Some(request) = receiver.recv().await {
-        if handle_project_request(request, &actor_sender, &status_tx, &mut state, &mut runtime)
-            .await
+        if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
         {
             break;
         }
@@ -2470,14 +2797,13 @@ fn spawn_notification_forwarders(
 fn mark_project_ready(
     notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
     actor_sender: &mpsc::Sender<ProjectRequest>,
-    status_tx: &watch::Sender<ProjectStatus>,
+    channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
 ) {
     spawn_notification_forwarders(notification_receivers, actor_sender, runtime.generation());
     state.sync_runtime(runtime);
-    state.status = ProjectStatus::Ready;
-    let _ = status_tx.send(ProjectStatus::Ready);
+    channels.publish_status(state, ProjectStatus::Ready);
 }
 
 // This exhaustive dispatcher keeps actor state transitions in one place; each
@@ -2487,7 +2813,7 @@ fn mark_project_ready(
 async fn handle_project_request(
     request: ProjectRequest,
     actor_sender: &mpsc::Sender<ProjectRequest>,
-    status_tx: &watch::Sender<ProjectStatus>,
+    channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
 ) -> bool {
@@ -2498,15 +2824,14 @@ async fn handle_project_request(
         }
         ProjectRequest::Activate { root, reply } => {
             runtime.begin_transition();
-            state.status = ProjectStatus::Starting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Starting);
+            channels.publish_status(state, ProjectStatus::Starting);
             match runtime.translator.activate_project(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2514,24 +2839,22 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error.to_string());
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
         }
         ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
             runtime.begin_transition();
-            state.status = ProjectStatus::Starting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Starting);
+            channels.publish_status(state, ProjectStatus::Starting);
             match runtime.activate_workspace_roots(roots).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2539,9 +2862,8 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error.clone());
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2786,15 +3108,14 @@ async fn handle_project_request(
         }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             runtime.begin_transition();
-            state.status = ProjectStatus::Restarting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Restarting);
+            channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.add_workspace_root(root).await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2802,9 +3123,8 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error.clone());
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(Err(error));
                 }
             }
@@ -2834,7 +3154,15 @@ async fn handle_project_request(
             root,
             reply,
         } => {
-            let _ = reply.send(runtime.apply_edit_plan(&plan_id, &project_id, &root).await);
+            let result = runtime.apply_edit_plan(&plan_id, &project_id, &root).await;
+            if let Ok(applied) = &result {
+                channels.publish_applied_edit(applied);
+            }
+            let _ = reply.send(result);
+        }
+        ProjectRequest::PublishEvent { event, reply } => {
+            channels.publish(event);
+            let _ = reply.send(());
         }
         ProjectRequest::ServerLogs {
             limit,
@@ -2850,38 +3178,34 @@ async fn handle_project_request(
             generation,
             notification,
         } => {
-            if runtime.owns_generation(generation) {
-                runtime.notification(notification);
-            }
+            channels.publish_notification(runtime, generation, notification);
         }
         ProjectRequest::ServerExited { generation } => {
             if runtime.owns_generation(generation)
                 && matches!(state.status, ProjectStatus::Ready | ProjectStatus::Degraded)
             {
-                state.status = ProjectStatus::Failed;
                 state.last_error = Some("language server exited".to_string());
-                let _ = status_tx.send(ProjectStatus::Failed);
+                channels.publish(ProjectEvent::ServerExited { generation });
+                channels.publish_status(state, ProjectStatus::Failed);
             }
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
-            state.status = status;
             state.last_error = None;
-            let _ = status_tx.send(status);
+            channels.publish_status(state, status);
             let _ = reply.send(());
         }
         ProjectRequest::Restart { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Restarting;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Restarting);
+            channels.publish_status(state, ProjectStatus::Restarting);
             match runtime.restart().await {
                 Ok(notification_receivers) => {
                     mark_project_ready(
                         notification_receivers,
                         actor_sender,
-                        status_tx,
+                        channels,
                         state,
                         runtime,
                     );
@@ -2889,32 +3213,28 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    state.status = ProjectStatus::Failed;
                     state.last_error = Some(error);
-                    let _ = status_tx.send(ProjectStatus::Failed);
+                    channels.publish_status(state, ProjectStatus::Failed);
                     let _ = reply.send(state.clone());
                 }
             }
         }
         ProjectRequest::Fail { message, reply } => {
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Failed;
             state.last_error = Some(message);
-            let _ = status_tx.send(ProjectStatus::Failed);
+            channels.publish_status(state, ProjectStatus::Failed);
             let _ = reply.send(());
         }
         ProjectRequest::Shutdown { reply } => {
             runtime.begin_transition();
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Stopping;
             state.last_error = None;
-            let _ = status_tx.send(ProjectStatus::Stopping);
+            channels.publish_status(state, ProjectStatus::Stopping);
             if let Err(error) = runtime.shutdown().await {
                 state.last_error = Some(error);
             }
             state.sync_runtime(runtime);
-            state.status = ProjectStatus::Stopped;
-            let _ = status_tx.send(ProjectStatus::Stopped);
+            channels.publish_status(state, ProjectStatus::Stopped);
             let _ = reply.send(());
             return true;
         }
@@ -3138,25 +3458,38 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let (actor, mutation) = self
+        let (actor, mutation, root) = self
             .projects
             .read()
             .await
             .get(&id)
-            .map(|entry| (entry.actor.clone(), entry.mutation.clone()))
+            .map(|entry| {
+                (
+                    entry.actor.clone(),
+                    entry.mutation.clone(),
+                    entry.identity.root().as_path().to_path_buf(),
+                )
+            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
         let mutation_guard = mutation.lock().await;
         self.projects
             .write()
             .await
             .remove(&id)
-            .ok_or(ProjectRegistryError::ProjectNotFound(id))?;
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
         let has_linked_projects = self
             .projects
             .read()
             .await
             .values()
             .any(|entry| std::sync::Arc::ptr_eq(&entry.mutation, &mutation));
+        actor
+            .publish_event(ProjectEvent::ProjectRemoved {
+                project_id: id.clone(),
+                root,
+            })
+            .await
+            .map_err(ProjectRegistryError::from)?;
         drop(mutation_guard);
         if has_linked_projects {
             return Ok(());
@@ -3378,6 +3711,23 @@ impl ProjectRegistry {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.project_for_path(path).await.map(|(_, actor)| actor)
+    }
+
+    /// Resolve a file path to its owning project ID and actor.
+    ///
+    /// This is the identity-preserving form of [`Self::actor_for_path`], used
+    /// by session event sinks that must keep subscriptions scoped to one
+    /// project actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error when the path cannot be canonicalized or is
+    /// not contained by a registered project.
+    pub async fn project_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(ProjectId, ProjectHandle), ProjectRegistryError> {
         let canonical = canonicalize(path.as_ref())?;
         self.projects
             .read()
@@ -3385,7 +3735,7 @@ impl ProjectRegistry {
             .values()
             .filter(|project| canonical.starts_with(project.identity.root().as_path()))
             .max_by_key(|project| project.identity.root().as_path().components().count())
-            .map(|project| project.actor.clone())
+            .map(|project| (project.identity.id().clone(), project.actor.clone()))
             .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
     }
 
@@ -3637,6 +3987,112 @@ mod tests {
         handle.set_status(ProjectStatus::Ready).await.unwrap();
 
         assert_eq!(handle.status().borrow().clone(), ProjectStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn project_actor_publishes_typed_status_events() {
+        let handle = spawn_project_actor(4);
+        let mut events = handle.subscribe_events();
+
+        handle.set_status(ProjectStatus::Ready).await.unwrap();
+
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::StatusChanged {
+                status: ProjectStatus::Ready,
+                last_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn project_event_history_bounds_records_and_reports_cursor_resync() {
+        let mut history = ProjectEventHistory::new(2);
+        history.record(ProjectEvent::StatusChanged {
+            status: ProjectStatus::Starting,
+            last_error: None,
+        });
+        history.record(ProjectEvent::StatusChanged {
+            status: ProjectStatus::Ready,
+            last_error: None,
+        });
+        history.record(ProjectEvent::ServerExited { generation: 1 });
+
+        let snapshot = history.snapshot_since(Some(0));
+        assert!(snapshot.resync_required());
+        assert_eq!(snapshot.events().len(), 2);
+        assert_eq!(snapshot.events()[0].sequence(), 2);
+        assert_eq!(snapshot.events()[1].sequence(), 3);
+    }
+
+    #[test]
+    fn project_event_history_retains_edit_completion_and_file_change_payloads() {
+        let mut history = ProjectEventHistory::new(4);
+        let plan_id = PlanId::parse("plan-1").unwrap();
+        history.record(ProjectEvent::FilesChanged {
+            paths: vec![PathBuf::from("/workspace/main.rs")],
+        });
+        history.record(ProjectEvent::EditApplied {
+            plan_id: plan_id.clone(),
+            committed_files: vec![PathBuf::from("/workspace/main.rs")],
+            operation_count: 1,
+        });
+
+        let snapshot = history.snapshot_since(None);
+        assert!(matches!(
+            snapshot.events()[0].event(),
+            ProjectEvent::FilesChanged { paths } if paths.len() == 1
+        ));
+        assert!(matches!(
+            snapshot.events()[1].event(),
+            ProjectEvent::EditApplied {
+                plan_id: actual,
+                operation_count: 1,
+                ..
+            } if actual == &plan_id
+        ));
+        assert_eq!(
+            snapshot.events()[0].event().json_value(),
+            serde_json::json!({
+                "kind": "files_changed",
+                "paths": ["/workspace/main.rs"],
+            })
+        );
+        assert_eq!(
+            snapshot.events()[1].event().json_value(),
+            serde_json::json!({
+                "kind": "edit_applied",
+                "plan_id": "plan-1",
+                "committed_files": ["/workspace/main.rs"],
+                "operation_count": 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actor_publishes_server_exit_events_before_failure_status() {
+        let handle = spawn_project_actor(4);
+        let mut events = handle.subscribe_events();
+        handle.set_status(ProjectStatus::Ready).await.unwrap();
+        let _ = events.recv().await.unwrap();
+
+        handle
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::ServerExited { generation: 0 }
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ProjectEvent::StatusChanged {
+                status: ProjectStatus::Failed,
+                last_error: Some("language server exited".to_string()),
+            }
+        );
     }
 
     #[tokio::test]
@@ -4030,6 +4486,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_actor_publishes_diagnostics_events_for_notifications() {
+        let actor = spawn_project_actor(2);
+        let mut events = actor.subscribe_events();
+        let uri = "file:///project/src/main.rs";
+        let notification = LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(serde_json::json!({
+                "uri": uri,
+                "version": 7,
+                "diagnostics": []
+            })),
+        );
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 99,
+                notification: LspNotification::parse(
+                    "textDocument/publishDiagnostics",
+                    Some(serde_json::json!({
+                        "uri": "file:///project/src/stale.rs",
+                        "diagnostics": []
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProjectEvent::DiagnosticsUpdated {
+                uri: uri.to_string(),
+                version: Some(7),
+                diagnostic_count: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn project_actor_marks_current_server_exit_failed_but_ignores_stale_exit() {
         let actor = spawn_project_actor(2);
         actor.set_status(ProjectStatus::Ready).await.unwrap();
@@ -4332,6 +4838,19 @@ mod tests {
             .remove(ProjectId::new("demo").unwrap())
             .await
             .unwrap();
+        assert!(
+            duplicate
+                .event_snapshot(None)
+                .events()
+                .iter()
+                .any(|record| {
+                    record.event()
+                        == &ProjectEvent::ProjectRemoved {
+                            project_id: ProjectId::new("demo").unwrap(),
+                            root: root.path().canonicalize().unwrap(),
+                        }
+                })
+        );
         assert!(registry.list().await.is_empty());
     }
 
