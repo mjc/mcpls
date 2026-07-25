@@ -42,6 +42,10 @@ pub struct ProjectActivation {
 }
 
 impl ProjectActivation {
+    pub(crate) const fn ready() -> Self {
+        Self::new(Vec::new(), ActivationHealth::Ready)
+    }
+
     pub(crate) const fn new(
         notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
         health: ActivationHealth,
@@ -361,7 +365,7 @@ impl Translator {
 
         if pending.is_empty() {
             self.set_workspace_roots(roots);
-            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
+            return Ok(ProjectActivation::ready());
         }
 
         let expected_languages = pending
@@ -450,13 +454,13 @@ impl Translator {
     /// expanded root set.
     pub async fn add_workspace_root(&mut self, root: PathBuf) -> Result<ProjectActivation> {
         if self.workspace_roots.contains(&root) {
-            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
+            return Ok(ProjectActivation::ready());
         }
         let mut roots = self.workspace_roots.clone();
         roots.push(root);
         if self.lsp_clients.is_empty() || self.lsp_configs.is_empty() {
             self.set_workspace_roots(roots);
-            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
+            return Ok(ProjectActivation::ready());
         }
         self.shutdown().await?;
         self.activate_project_with_roots(roots).await

@@ -3116,10 +3116,10 @@ impl ProjectRuntime {
     async fn restart(&mut self) -> Result<ProjectActivation, String> {
         let roots = self.translator.workspace_roots().to_vec();
         if roots.is_empty() {
-            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
+            return Ok(ProjectActivation::ready());
         }
         if self.translator.configured_language_ids().is_empty() {
-            return Ok(ProjectActivation::new(Vec::new(), ActivationHealth::Ready));
+            return Ok(ProjectActivation::ready());
         }
         self.shutdown().await?;
         self.translator
