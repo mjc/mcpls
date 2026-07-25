@@ -13,8 +13,6 @@ use std::time::Duration;
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::{Value, json};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 struct HttpClient {
@@ -240,57 +238,74 @@ fn decode_chunked(body: &[u8]) -> Vec<u8> {
     decoded
 }
 
-#[cfg(unix)]
 fn write_mock_lsp(directory: &TempDir) -> (PathBuf, PathBuf) {
-    let command = directory.path().join("mock-lsp.py");
+    let source = directory.path().join("mock-lsp.rs");
+    let command = directory.path().join("mock-lsp");
     let counter = directory.path().join("lsp-spawns");
-    std::fs::write(
-        &command,
-        r#"#!/usr/bin/env python3
-import json
-import os
-import pathlib
-import sys
-
-counter = pathlib.Path(os.environ["MCPLS_SPAWN_COUNTER"])
-value = int(counter.read_text()) if counter.exists() else 0
-counter.write_text(str(value + 1))
-
-def read_message():
-    headers = b""
-    while b"\r\n\r\n" not in headers:
-        chunk = sys.stdin.buffer.read(1)
-        if not chunk:
-            return None
-        headers += chunk
-    length = next(
-        int(line.split(b":", 1)[1].strip())
-        for line in headers.split(b"\r\n")
-        if line.lower().startswith(b"content-length:")
-    )
-    return json.loads(sys.stdin.buffer.read(length))
-
-def send(message):
-    body = json.dumps(message, separators=(",", ":")).encode()
-    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
-    sys.stdout.buffer.flush()
-
-while True:
-    message = read_message()
-    if message is None:
-        break
-    if message.get("method") == "initialize":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {"positionEncoding": "utf-8"}}})
-        send({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"health": "ok", "quiescent": True}})
-    elif message.get("method") == "shutdown":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
-        break
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&source, MOCK_LSP_SOURCE).unwrap();
+    let status = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            source.to_str().unwrap(),
+            "-o",
+            command.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to compile mock LSP");
     (command, counter)
 }
+
+const MOCK_LSP_SOURCE: &str = r#"
+use std::env;
+use std::fs;
+use std::io::{self, Read, Write};
+
+fn read_message() -> Option<String> {
+    let mut headers = Vec::new();
+    let mut byte = [0; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        if io::stdin().read_exact(&mut byte).is_err() { return None; }
+        headers.push(byte[0]);
+    }
+    let headers = String::from_utf8(headers).ok()?;
+    let length = headers.lines().find_map(|line| {
+        line.strip_prefix("Content-Length:")?.trim().parse::<usize>().ok()
+    })?;
+    let mut body = vec![0; length];
+    io::stdin().read_exact(&mut body).ok()?;
+    String::from_utf8(body).ok()
+}
+
+fn request_id(body: &str) -> Option<&str> {
+    let start = body.find("\"id\"")?;
+    let value = body[start..].split_once(':')?.1.trim_start();
+    let end = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+    Some(&value[..end])
+}
+
+fn send(body: &str) {
+    print!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+    io::stdout().flush().unwrap();
+}
+
+fn main() {
+    let counter = env::var("MCPLS_SPAWN_COUNTER").unwrap();
+    let value = fs::read_to_string(&counter).ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+    fs::write(counter, (value + 1).to_string()).unwrap();
+    while let Some(message) = read_message() {
+        if message.contains("\"method\":\"initialize\"") {
+            let id = request_id(&message).unwrap();
+            send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"capabilities\":{{\"positionEncoding\":\"utf-8\"}}}}}}", id));
+            send("{\"jsonrpc\":\"2.0\",\"method\":\"experimental/serverStatus\",\"params\":{\"health\":\"ok\",\"quiescent\":true}}");
+        } else if message.contains("\"method\":\"shutdown\"") {
+            let id = request_id(&message).unwrap();
+            send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}", id));
+            break;
+        }
+    }
+}
+"#;
 
 #[cfg(unix)]
 fn write_config(
@@ -349,7 +364,6 @@ fn project_ids(client: &mut HttpClient) -> Vec<String> {
         .collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     let fixture = HttpFixture::new();
