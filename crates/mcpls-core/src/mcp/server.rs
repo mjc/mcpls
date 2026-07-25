@@ -14,6 +14,7 @@ use rmcp::model::{
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
@@ -31,8 +32,10 @@ use super::tools::{
     ServerLogsParams, ServerMessagesParams, SignatureHelpParams, SubscriptionListParams,
     WorkspaceEditApplyParams, WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
+#[cfg(test)]
+use crate::bridge::Translator;
 use crate::bridge::resources::make_uri;
-use crate::bridge::{PositionEncoding, ResourceSubscriptions, Translator};
+use crate::bridge::{PositionEncoding, ResourceSubscriptions};
 use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
@@ -452,10 +455,7 @@ impl McplsServer {
 
     /// Create a new MCP server with the given translator and subscriptions.
     #[must_use]
-    pub fn new(
-        _translator: Arc<Mutex<Translator>>,
-        subscriptions: Arc<ResourceSubscriptions>,
-    ) -> Self {
+    pub fn new(subscriptions: Arc<ResourceSubscriptions>) -> Self {
         let context = Arc::new(HandlerContext::new(subscriptions));
         Self { context }
     }
@@ -463,7 +463,6 @@ impl McplsServer {
     /// Create a server with an explicitly shared project registry.
     #[must_use]
     pub fn new_with_registry(
-        _translator: Arc<Mutex<Translator>>,
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
@@ -1693,9 +1692,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_server() -> McplsServer {
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        McplsServer::new(translator, subscriptions)
+        McplsServer::new(subscriptions)
     }
 
     #[test]
@@ -1777,7 +1775,6 @@ mod tests {
     }
 
     async fn create_test_server_with_project() -> McplsServer {
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -1787,7 +1784,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        McplsServer::new_with_registry(translator, subscriptions, registry)
+        McplsServer::new_with_registry(subscriptions, registry)
     }
 
     #[tokio::test]
@@ -2050,9 +2047,8 @@ mod tests {
         let plan_id = plan.id().as_str().to_string();
         actor.store_edit_plan(plan).await.unwrap();
 
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
         server
             .context
             .remember_plan(PlanId::parse(plan_id.clone()).unwrap())
@@ -2112,11 +2108,8 @@ mod tests {
         );
         registry.add(identity).await.unwrap();
 
-        let server = McplsServer::new_with_registry(
-            Arc::new(Mutex::new(Translator::new())),
-            Arc::new(ResourceSubscriptions::new()),
-            registry,
-        );
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
         let uri = url::Url::from_file_path(&file).unwrap().to_string();
         let result = server
             .workspace_edit_preview(Parameters(WorkspaceEditPreviewParams {
@@ -2209,11 +2202,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(
-            Arc::new(Mutex::new(Translator::new())),
-            Arc::new(ResourceSubscriptions::new()),
-            registry,
-        );
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
         let result = server
             .workspace_edit_preview(Parameters(WorkspaceEditPreviewParams {
                 project_id: "project".to_string(),
@@ -2256,10 +2246,9 @@ mod tests {
         config.command = "/definitely/missing/rust-analyzer".to_string();
         translator.set_lsp_configs(vec![config], Some(1));
         let template = translator.configuration_template();
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::with_translator_template(2, template);
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         server
             .project_add(Parameters(ProjectAddParams {
@@ -2289,10 +2278,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_can_share_an_injected_registry() {
-        let translator = Arc::new(Mutex::new(Translator::new()));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = crate::project::ProjectRegistry::new(2);
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry.clone());
+        let server = McplsServer::new_with_registry(subscriptions, registry.clone());
         let root = TempDir::new().unwrap();
         registry
             .add(crate::project::ProjectIdentity::new(
@@ -2344,13 +2332,9 @@ mod tests {
     #[tokio::test]
     async fn test_hover_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2360,7 +2344,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_hover(Parameters(HoverParams {
@@ -2377,13 +2361,9 @@ mod tests {
     #[tokio::test]
     async fn test_definition_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2393,7 +2373,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_definition(Parameters(DefinitionParams {
@@ -2410,13 +2390,9 @@ mod tests {
     #[tokio::test]
     async fn test_references_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2426,7 +2402,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_references(Parameters(ReferencesParams {
@@ -2444,13 +2420,9 @@ mod tests {
     #[tokio::test]
     async fn test_diagnostics_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2460,7 +2432,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_diagnostics(Parameters(DiagnosticsParams {
@@ -2475,13 +2447,9 @@ mod tests {
     #[tokio::test]
     async fn test_rename_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2491,7 +2459,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .rename_symbol(Parameters(RenameParams {
@@ -2509,13 +2477,9 @@ mod tests {
     #[tokio::test]
     async fn test_completions_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2525,7 +2489,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_completions(Parameters(CompletionsParams {
@@ -2543,13 +2507,9 @@ mod tests {
     #[tokio::test]
     async fn test_document_symbols_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2559,7 +2519,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_document_symbols(Parameters(DocumentSymbolsParams {
@@ -2574,13 +2534,9 @@ mod tests {
     #[tokio::test]
     async fn test_format_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2590,7 +2546,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .format_document(Parameters(FormatDocumentParams {
@@ -2607,13 +2563,9 @@ mod tests {
     #[tokio::test]
     async fn test_code_actions_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2623,7 +2575,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_code_actions(Parameters(CodeActionsParams {
@@ -2643,13 +2595,9 @@ mod tests {
     #[tokio::test]
     async fn test_call_hierarchy_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2659,7 +2607,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .prepare_call_hierarchy(Parameters(CallHierarchyPrepareParams {
@@ -2676,13 +2624,9 @@ mod tests {
     #[tokio::test]
     async fn test_signature_help_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2692,7 +2636,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_signature_help(Parameters(SignatureHelpParams {
@@ -2709,13 +2653,9 @@ mod tests {
     #[tokio::test]
     async fn test_inlay_hints_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2725,7 +2665,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_inlay_hints(Parameters(InlayHintsParams {
@@ -2744,12 +2684,8 @@ mod tests {
     #[tokio::test]
     async fn test_implementation_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2759,7 +2695,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .go_to_implementation(Parameters(GoToImplementationParams {
@@ -2776,12 +2712,8 @@ mod tests {
     #[tokio::test]
     async fn test_type_definition_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2791,7 +2723,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .go_to_type_definition(Parameters(GoToTypeDefinitionParams {
@@ -2808,12 +2740,8 @@ mod tests {
     #[tokio::test]
     async fn test_cached_diagnostics_routes_registered_paths_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -2823,7 +2751,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
             .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
@@ -3010,13 +2938,9 @@ mod tests {
     #[tokio::test]
     async fn test_incoming_calls_routes_registered_items_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -3026,7 +2950,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
         let item = serde_json::json!({
             "name": "test_function",
             "kind": 12,
@@ -3045,13 +2969,9 @@ mod tests {
     #[tokio::test]
     async fn test_outgoing_calls_routes_registered_items_to_project_actor() {
         let project_root = TempDir::new().unwrap();
-        let unrelated_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
 
-        let mut translator = Translator::new();
-        translator.set_workspace_roots(vec![unrelated_root.path().to_path_buf()]);
-        let translator = Arc::new(Mutex::new(translator));
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = ProjectRegistry::new(2);
         registry
@@ -3061,7 +2981,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let server = McplsServer::new_with_registry(translator, subscriptions, registry);
+        let server = McplsServer::new_with_registry(subscriptions, registry);
         let item = serde_json::json!({
             "name": "test_function",
             "kind": 12,
