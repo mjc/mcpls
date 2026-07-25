@@ -52,6 +52,10 @@ pub struct Translator {
     heuristics_max_depth: Option<usize>,
 }
 
+fn shutdown_error_is_recoverable(error: &Error) -> bool {
+    matches!(error, Error::ServerTerminated)
+}
+
 /// Configuration snapshot used to construct an isolated project translator.
 #[derive(Debug, Clone, Default)]
 pub struct TranslatorTemplate {
@@ -339,6 +343,7 @@ impl Translator {
         let mut first_error = None;
         for server in servers.into_values() {
             if let Err(error) = server.shutdown().await
+                && !shutdown_error_is_recoverable(&error)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -4128,5 +4133,11 @@ mod tests {
         // SymbolKind::FUNCTION is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");
+    }
+
+    #[test]
+    fn dead_lsp_shutdown_is_recoverable_during_restart() {
+        assert!(shutdown_error_is_recoverable(&Error::ServerTerminated));
+        assert!(!shutdown_error_is_recoverable(&Error::Timeout(30)));
     }
 }
