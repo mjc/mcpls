@@ -92,12 +92,16 @@ impl TranslatorTemplate {
     #[must_use]
     pub fn with_project_config(mut self, config: &ProjectConfig) -> Self {
         if let Some(lsp_servers) = &config.lsp_servers {
-            self.lsp_configs = lsp_servers.clone();
+            self.lsp_configs.clone_from(lsp_servers);
         }
         if let Some(max_depth) = config.heuristics_max_depth {
             self.heuristics_max_depth = Some(max_depth);
         }
         self
+    }
+
+    pub(crate) fn same_configuration(&self, other: &Self) -> bool {
+        serde_json::to_vec(self).ok() == serde_json::to_vec(other).ok()
     }
 }
 

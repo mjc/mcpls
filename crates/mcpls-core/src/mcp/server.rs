@@ -1833,7 +1833,7 @@ mod tests {
             .project_add(Parameters(ProjectAddParams {
                 project_id: "demo".to_string(),
                 root: root.path().display().to_string(),
-                config: Some(serde_json::json!({"ignored": true})),
+                config: Some(serde_json::json!({})),
             }))
             .await
             .unwrap();

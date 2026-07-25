@@ -432,7 +432,9 @@ pub struct ProjectAddParams {
     /// Existing directory to register as the project root.
     #[schemars(description = "Absolute or relative path to an existing project directory.")]
     pub root: String,
-    /// Optional project-specific configuration reserved for actor initialization.
+    /// Optional project-specific actor configuration. Supported fields are
+    /// `lsp_servers` and `heuristics_max_depth`; omitted fields inherit daemon
+    /// defaults.
     #[serde(default)]
     #[schemars(description = "Optional project-specific configuration.")]
     pub config: Option<serde_json::Value>,

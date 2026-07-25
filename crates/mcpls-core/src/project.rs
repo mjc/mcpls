@@ -4097,12 +4097,17 @@ impl ProjectRegistry {
     }
 
     /// Add a project with an optional JSON-facing configuration override.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if project identity, compatibility, actor, or
+    /// persistence validation fails.
     pub async fn add_with_config(
         &self,
         identity: ProjectIdentity,
         config: Option<ProjectConfig>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        let template = config.map(|config| {
+        let template = config.filter(|config| !config.is_empty()).map(|config| {
             self.translator_template
                 .as_deref()
                 .cloned()
@@ -4117,6 +4122,11 @@ impl ProjectRegistry {
     /// When no override is supplied, actors inherit the daemon template. A
     /// project ID/root pair can only be reused with the same effective
     /// translator configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if project identity, compatibility, actor, or
+    /// persistence validation fails.
     #[allow(clippy::too_many_lines)]
     pub async fn add_with_template(
         &self,
@@ -4958,9 +4968,7 @@ fn translator_templates_match(
 ) -> bool {
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => {
-            serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
-        }
+        (Some(left), Some(right)) => left.same_configuration(right),
         _ => false,
     }
 }

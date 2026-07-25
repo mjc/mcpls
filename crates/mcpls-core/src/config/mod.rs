@@ -60,6 +60,14 @@ pub struct ProjectConfig {
     pub heuristics_max_depth: Option<usize>,
 }
 
+impl ProjectConfig {
+    /// Return whether this payload leaves all daemon settings unchanged.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.lsp_servers.is_none() && self.heuristics_max_depth.is_none()
+    }
+}
+
 fn default_daemon_config() -> DaemonConfig {
     DaemonConfig::default()
 }
