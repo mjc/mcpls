@@ -427,7 +427,15 @@ impl LspClient {
         } else {
             debug!("Message loop exiting normally");
         }
+        Self::fail_pending_requests(&pending_requests).await;
         result
+    }
+
+    async fn fail_pending_requests(pending_requests: &Arc<Mutex<PendingRequests>>) {
+        let mut pending = pending_requests.lock().await;
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(Error::ServerTerminated));
+        }
     }
 
     async fn message_loop_inner(
@@ -735,6 +743,34 @@ mod tests {
 
         let value = response.unwrap();
         assert_eq!(value, Value::Null, "Should receive Value::Null");
+    }
+
+    #[tokio::test]
+    async fn transport_exit_fails_pending_request_without_waiting_for_timeout() {
+        use std::process::Stdio;
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = LspClient::from_transport(
+            LspServerConfig::rust_analyzer(),
+            LspTransport::new(stdin, stdout),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.request::<_, Value>("test/request", Value::Null, Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(Error::ServerTerminated)));
+        let _ = child.wait().await;
     }
 
     #[tokio::test]
