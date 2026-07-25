@@ -88,6 +88,14 @@ pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
 }
 
 fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<String> {
+    if matches!(
+        event,
+        ProjectEvent::ProjectRemoved {
+            project_id: removed_project,
+        } if removed_project != project_id
+    ) {
+        return Vec::new();
+    }
     let mut uris = vec![project_events_resource_uri(project_id)];
     match event {
         ProjectEvent::DiagnosticsUpdated { uri, .. } => {
@@ -95,7 +103,9 @@ fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<Stri
                 uris.push(uri);
             }
         }
-        ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => {
+        ProjectEvent::StatusChanged { .. }
+        | ProjectEvent::ServerExited { .. }
+        | ProjectEvent::ProjectRemoved { .. } => {
             uris.push(project_status_resource_uri(project_id));
         }
         ProjectEvent::FilesChanged { .. } | ProjectEvent::EditApplied { .. } => {}
@@ -296,7 +306,7 @@ mod tests {
         );
         assert_eq!(
             parse_project_status_resource_uri(&project_status_resource_uri(&project_id)),
-            Some(project_id)
+            Some(project_id.clone())
         );
         assert_eq!(
             parse_session_resource_uri(&project_status_resource_uri(&ProjectId::new("a").unwrap()))
@@ -306,6 +316,27 @@ mod tests {
         assert_eq!(
             parse_session_resource_uri("lsp-diagnostics:///workspace/a.rs").unwrap(),
             SessionResource::Diagnostics(std::path::PathBuf::from("/workspace/a.rs"))
+        );
+        assert_eq!(
+            event_resource_uris(
+                &project_id,
+                &ProjectEvent::ProjectRemoved {
+                    project_id: project_id.clone(),
+                },
+            ),
+            vec![
+                "mcpls-project-events:///a".to_string(),
+                "mcpls-project-status:///a".to_string(),
+            ]
+        );
+        assert!(
+            event_resource_uris(
+                &project_id,
+                &ProjectEvent::ProjectRemoved {
+                    project_id: ProjectId::new("other").unwrap(),
+                },
+            )
+            .is_empty()
         );
     }
 

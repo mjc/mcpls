@@ -535,6 +535,11 @@ pub enum ProjectEvent {
         /// Number of text and resource operations in the plan.
         operation_count: usize,
     },
+    /// A registered project identity was removed from the shared registry.
+    ProjectRemoved {
+        /// Stable identity that is no longer routable.
+        project_id: ProjectId,
+    },
 }
 
 impl ProjectEvent {
@@ -574,6 +579,10 @@ impl ProjectEvent {
                 "plan_id": plan_id.as_str(),
                 "committed_files": committed_files,
                 "operation_count": operation_count,
+            }),
+            Self::ProjectRemoved { project_id } => serde_json::json!({
+                "kind": "project_removed",
+                "project_id": project_id.as_str(),
             }),
         }
     }
@@ -1009,6 +1018,10 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
     },
+    PublishEvent {
+        event: ProjectEvent,
+        reply: oneshot::Sender<()>,
+    },
     PreviewEdit {
         project_id: String,
         edit: WorkspaceEdit,
@@ -1073,6 +1086,15 @@ impl ProjectHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot_since(cursor)
+    }
+
+    async fn publish_event(&self, event: ProjectEvent) -> Result<(), ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PublishEvent { event, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
     }
 
     /// Query the actor's current state.
@@ -3123,6 +3145,10 @@ async fn handle_project_request(
             }
             let _ = reply.send(result);
         }
+        ProjectRequest::PublishEvent { event, reply } => {
+            channels.publish(event);
+            let _ = reply.send(());
+        }
         ProjectRequest::ServerLogs {
             limit,
             min_level,
@@ -3429,13 +3455,19 @@ impl ProjectRegistry {
             .write()
             .await
             .remove(&id)
-            .ok_or(ProjectRegistryError::ProjectNotFound(id))?;
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
         let has_linked_projects = self
             .projects
             .read()
             .await
             .values()
             .any(|entry| std::sync::Arc::ptr_eq(&entry.mutation, &mutation));
+        actor
+            .publish_event(ProjectEvent::ProjectRemoved {
+                project_id: id.clone(),
+            })
+            .await
+            .map_err(ProjectRegistryError::from)?;
         drop(mutation_guard);
         if has_linked_projects {
             return Ok(());
@@ -4784,6 +4816,18 @@ mod tests {
             .remove(ProjectId::new("demo").unwrap())
             .await
             .unwrap();
+        assert!(
+            duplicate
+                .event_snapshot(None)
+                .events()
+                .iter()
+                .any(|record| {
+                    record.event()
+                        == &ProjectEvent::ProjectRemoved {
+                            project_id: ProjectId::new("demo").unwrap(),
+                        }
+                })
+        );
         assert!(registry.list().await.is_empty());
     }
 
