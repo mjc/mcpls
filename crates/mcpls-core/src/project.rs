@@ -3292,6 +3292,8 @@ struct RegistryLifecycle {
     shutting_down: AtomicBool,
 }
 
+const DEFAULT_PROJECT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl RegistryLifecycle {
     fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
@@ -3314,6 +3316,7 @@ pub struct ProjectRegistry {
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
     lifecycle: std::sync::Arc<RegistryLifecycle>,
+    shutdown_timeout: Duration,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -3374,6 +3377,17 @@ impl ProjectShutdownReport {
         }
     }
 
+    fn record_actor_timeout(&mut self, project_ids: Vec<ProjectId>, timeout: Duration) {
+        self.failed.extend(
+            project_ids
+                .into_iter()
+                .map(|project_id| ProjectShutdownFailure {
+                    project_id,
+                    error: format!("shutdown timed out after {timeout:?}"),
+                }),
+        );
+    }
+
     fn sort(&mut self) {
         self.stopped.sort();
         self.failed
@@ -3391,6 +3405,7 @@ impl ProjectRegistry {
             translator_template: None,
             persistence: None,
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
+            shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -3403,7 +3418,15 @@ impl ProjectRegistry {
             translator_template: Some(std::sync::Arc::new(template)),
             persistence: None,
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
+            shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
         }
+    }
+
+    /// Set the maximum time allowed for each actor shutdown request.
+    #[must_use]
+    pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
     }
 
     /// Attach a durable registration store to this registry.
@@ -3622,7 +3645,10 @@ impl ProjectRegistry {
         };
 
         for (actor, project_ids) in actors {
-            report.record_actor_result(project_ids, actor.shutdown().await);
+            match tokio::time::timeout(self.shutdown_timeout, actor.shutdown()).await {
+                Ok(result) => report.record_actor_result(project_ids, result),
+                Err(_) => report.record_actor_timeout(project_ids, self.shutdown_timeout),
+            }
         }
 
         report.sort();
@@ -5297,6 +5323,47 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ProjectRegistryError::ShuttingDown)));
+    }
+
+    #[tokio::test]
+    async fn project_registry_reports_shutdown_timeout() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2).with_shutdown_timeout(Duration::ZERO);
+        let project_id = ProjectId::new("slow").unwrap();
+        let (sender, mut requests) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(ProjectRequest::Shutdown { .. }) = requests.recv().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (events, _) = broadcast::channel(1);
+        registry.projects.write().await.insert(
+            project_id.clone(),
+            ProjectEntry {
+                identity: ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ),
+                actor: ProjectHandle {
+                    sender,
+                    status,
+                    events,
+                    event_history: std::sync::Arc::new(std::sync::Mutex::new(
+                        ProjectEventHistory::new(1),
+                    )),
+                },
+                mutation: std::sync::Arc::new(Mutex::new(())),
+                compatibility_key: None,
+            },
+        );
+
+        let report = registry.shutdown_all().await;
+
+        assert!(report.stopped.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].project_id, project_id);
+        assert_eq!(report.failed[0].error, "shutdown timed out after 0ns");
     }
 
     #[tokio::test]
