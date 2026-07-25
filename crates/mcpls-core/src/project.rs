@@ -492,7 +492,12 @@ async fn rust_project_compatibility_key(
         ".cargo/config.toml",
     ];
 
-    let project_environment = load_project_environment(root).await;
+    let project_environment =
+        if translator_template.is_some() || has_dynamic_project_environment(root) {
+            load_project_environment(root).await
+        } else {
+            None
+        };
     if has_dynamic_project_environment(root) && project_environment.is_none() {
         return None;
     }
