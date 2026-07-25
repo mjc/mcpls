@@ -3363,6 +3363,14 @@ impl ProjectShutdownReport {
 }
 
 impl ProjectRegistry {
+    fn ensure_accepting(&self) -> Result<(), ProjectRegistryError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(ProjectRegistryError::ShuttingDown)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Create an empty registry with a bounded actor queue capacity.
     #[must_use]
     pub fn new(actor_capacity: usize) -> Self {
@@ -3452,9 +3460,7 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
         let mut projects = self.projects.write().await;
-        if self.shutting_down.load(Ordering::Acquire) {
-            return Err(ProjectRegistryError::ShuttingDown);
-        }
+        self.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
             if existing.identity.root() != identity.root() {
                 return Err(ProjectRegistryError::ConflictingProject {
@@ -3482,9 +3488,7 @@ impl ProjectRegistry {
             let mutation = existing.mutation.clone();
             drop(projects);
 
-            if self.shutting_down.load(Ordering::Acquire) {
-                return Err(ProjectRegistryError::ShuttingDown);
-            }
+            self.ensure_accepting()?;
 
             let mutation_guard = mutation.lock().await;
             actor
@@ -3492,9 +3496,7 @@ impl ProjectRegistry {
                 .await?;
 
             let mut projects = self.projects.write().await;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return Err(ProjectRegistryError::ShuttingDown);
-            }
+            self.ensure_accepting()?;
             if let Some(existing) = projects.get(identity.id()) {
                 if existing.identity.root() != identity.root() {
                     return Err(ProjectRegistryError::ConflictingProject {
