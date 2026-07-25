@@ -39,7 +39,7 @@ use crate::project::AppliedEditPlan;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle,
     ProjectId, ProjectIdentity, ProjectRegistry, ProjectServerCapability, ProjectState,
-    ProjectStatusCounts,
+    ProjectStatusCounts, ProjectStatusSummary,
 };
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
@@ -98,16 +98,17 @@ struct DaemonPersistenceSnapshot {
     configured: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DaemonSnapshot {
     project_counts: ProjectStatusCounts,
     actor_groups: usize,
+    project_summaries: Vec<ProjectStatusSummary>,
     persistence: DaemonPersistenceSnapshot,
     shutting_down: bool,
 }
 
 impl DaemonSnapshot {
-    const fn lifecycle(self) -> &'static str {
+    const fn lifecycle(&self) -> &'static str {
         if self.shutting_down {
             "shutting_down"
         } else {
@@ -164,6 +165,23 @@ fn project_status_counts_json(counts: ProjectStatusCounts) -> serde_json::Value 
         "stopped": counts.stopped,
         "failed": counts.failed,
     })
+}
+
+fn project_status_summaries_json(
+    summaries: &[ProjectStatusSummary],
+) -> serde_json::Value {
+    summaries
+        .iter()
+        .map(|summary| {
+            serde_json::json!({
+                "project_id": summary.project_id.as_str(),
+                "status": format!("{:?}", summary.status),
+                "actor_group_count": summary.actor_group_count,
+                "roots": summary.roots,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 #[derive(Serialize)]
@@ -247,6 +265,11 @@ impl McplsServer {
                 .context
                 .project_registry
                 .total_actor_group_count()
+                .await,
+            project_summaries: self
+                .context
+                .project_registry
+                .status_summaries()
                 .await,
             persistence: DaemonPersistenceSnapshot {
                 configured: self.context.project_registry.persistence_configured(),
@@ -555,6 +578,7 @@ impl McplsServer {
             "persistence": snapshot.persistence,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
+            "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
         }))
     }
 
@@ -572,6 +596,7 @@ impl McplsServer {
             "persistence": snapshot.persistence,
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
+            "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
         }))
     }
 
@@ -1836,6 +1861,13 @@ mod tests {
         assert_eq!(status["persistence"]["configured"], false);
         assert_eq!(status["projects"]["starting"], 1);
         assert_eq!(status["actor_groups"], 1);
+        assert_eq!(status["project_summaries"][0]["project_id"], "health");
+        assert_eq!(status["project_summaries"][0]["status"], "Starting");
+        assert_eq!(status["project_summaries"][0]["actor_group_count"], 1);
+        assert_eq!(
+            status["project_summaries"][0]["roots"][0].as_str(),
+            Some(root.path().to_str().unwrap())
+        );
 
         server.context.project_registry.shutdown_all().await;
         let shutdown_health: serde_json::Value = serde_json::from_str(

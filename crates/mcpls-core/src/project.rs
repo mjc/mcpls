@@ -3679,6 +3679,19 @@ pub struct ProjectStatusCounts {
     pub failed: usize,
 }
 
+/// Cheap lifecycle summary for one registered logical project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStatusSummary {
+    /// Stable project identifier.
+    pub project_id: ProjectId,
+    /// Aggregate lifecycle status across the project's actor groups.
+    pub status: ProjectStatus,
+    /// Number of actor groups backing the logical project.
+    pub actor_group_count: usize,
+    /// Canonical roots owned by the project, sorted and deduplicated.
+    pub roots: Vec<PathBuf>,
+}
+
 /// Negotiated capability data for one actor group in a logical project.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectServerCapability {
@@ -4029,6 +4042,32 @@ impl ProjectRegistry {
         }
         drop(projects);
         counts
+    }
+
+    /// Read project lifecycle summaries without awaiting any actor request.
+    pub async fn status_summaries(&self) -> Vec<ProjectStatusSummary> {
+        let projects = self.projects.read().await;
+        let mut summaries = projects
+            .values()
+            .map(|entry| {
+                let mut roots = entry
+                    .actors
+                    .iter()
+                    .flat_map(|actor| actor.roots.iter().map(CanonicalRoot::as_path))
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>();
+                roots.sort();
+                roots.dedup();
+                ProjectStatusSummary {
+                    project_id: entry.identity.id().clone(),
+                    status: entry.status(),
+                    actor_group_count: entry.actors.len(),
+                    roots,
+                }
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        summaries
     }
 
     /// Return whether durable project registration is configured.
