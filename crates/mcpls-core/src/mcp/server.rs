@@ -200,6 +200,21 @@ impl McplsServer {
         Self { context }
     }
 
+    /// Create a server from the shared project registry without a global
+    /// mutable translator.
+    #[must_use]
+    pub fn from_registry(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
+        Self {
+            context: Arc::new(HandlerContext::from_registry(
+                subscriptions,
+                project_registry,
+            )),
+        }
+    }
+
     /// Clone the server for one MCP session while sharing project actors.
     ///
     /// Session-local subscriptions are intentionally not shared with the
@@ -1265,12 +1280,7 @@ mod tests {
             CanonicalRoot::new(root.path()).unwrap(),
         );
 
-        server
-            .context
-            .project_registry
-            .add(identity)
-            .await
-            .unwrap();
+        server.context.project_registry.add(identity).await.unwrap();
 
         assert_eq!(session.context.project_registry.list().await.len(), 1);
     }

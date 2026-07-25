@@ -60,7 +60,9 @@ pub use error::Error;
 use lsp::LspNotification;
 #[cfg(test)]
 use rmcp::model::ResourceUpdatedNotificationParam;
-use tokio::sync::{Mutex, OnceCell};
+#[cfg(test)]
+use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
@@ -320,7 +322,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // own all configured LSP processes; starting a second global batch here would
     // duplicate every server when a project is explicitly activated.
     let translator_template = translator.configuration_template();
-    let translator = Arc::new(Mutex::new(translator));
     let subscriptions = Arc::new(ResourceSubscriptions::new());
     // Peer cell is populated after the MCP transport is established (Phase B).
     let peer_cell = Arc::new(OnceCell::new());
@@ -330,11 +331,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     info!("Registered {registered} default workspace project(s)");
 
     info!("Starting MCP server with rmcp...");
-    let mcp_server = mcp::McplsServer::new_with_registry(
-        Arc::clone(&translator),
-        Arc::clone(&subscriptions),
-        project_registry,
-    );
+    let mcp_server = mcp::McplsServer::from_registry(Arc::clone(&subscriptions), project_registry);
     info!("MCPLS server initialized successfully");
 
     let result = match transport {

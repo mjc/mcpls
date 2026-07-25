@@ -40,6 +40,16 @@ impl HandlerContext {
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
     ) -> Self {
+        Self::from_registry(subscriptions, project_registry)
+    }
+
+    /// Create a handler context from the shared project registry and
+    /// session-owned subscriptions.
+    #[must_use]
+    pub const fn from_registry(
+        subscriptions: Arc<ResourceSubscriptions>,
+        project_registry: ProjectRegistry,
+    ) -> Self {
         Self {
             subscriptions,
             project_registry,
