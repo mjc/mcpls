@@ -3418,6 +3418,14 @@ impl ProjectEntry {
                 .any(|candidate| candidate.as_path() == root)
         })
     }
+
+    fn status(&self) -> ProjectStatus {
+        aggregate_statuses(
+            self.actors
+                .iter()
+                .map(|actor| *actor.actor.status().borrow()),
+        )
+    }
 }
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
@@ -3792,13 +3800,7 @@ impl ProjectRegistry {
         let projects = self.projects.read().await;
         let mut counts = ProjectStatusCounts::default();
         for entry in projects.values() {
-            let status = aggregate_statuses(
-                entry
-                    .actors
-                    .iter()
-                    .map(|actor| *actor.actor.status().borrow()),
-            );
-            counts.record(status);
+            counts.record(entry.status());
         }
         drop(projects);
         counts
