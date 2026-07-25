@@ -183,16 +183,14 @@ impl Translator {
     /// Start one project and track language-server readiness asynchronously.
     ///
     /// This is the explicit project boundary used by the `project_activate`
-    /// MCP tool. A server is not exposed to code-intelligence requests until
-    /// its initialization completes; rust-analyzer additionally has to report
-    /// that its background project load is tracked asynchronously after the
-    /// initial LSP handshake.
+    /// MCP tool. Servers are exposed to code-intelligence requests after their
+    /// initial LSP handshake; rust-analyzer continues loading its workspace in
+    /// the background.
     ///
     /// # Errors
     ///
     /// Returns an error when no configured server applies or a server cannot be
-    /// started. The project remains `Starting` until its server reports that
-    /// background loading is quiescent.
+    /// started. Background workspace loading does not block activation.
     pub async fn activate_project(
         &mut self,
         root: PathBuf,
@@ -205,8 +203,7 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error when no configured server applies or a server cannot be
-    /// started. The project remains `Starting` until its server reports that
-    /// background loading is quiescent.
+    /// started. Background workspace loading does not block activation.
     pub async fn activate_project_with_roots(
         &mut self,
         roots: Vec<PathBuf>,
@@ -298,6 +295,7 @@ impl Translator {
             self.register_client(language_id.clone(), client);
             self.register_server(language_id, server);
         }
+        self.clear_expected_languages();
         Ok(notification_receivers)
     }
 
@@ -998,20 +996,11 @@ impl Translator {
         start.to_path_buf()
     }
 
-    async fn wait_for_language_ready(&self, language_id: &str) -> Result<()> {
+    fn wait_for_language_ready(&self, language_id: &str) -> Result<()> {
         if self.expected_languages.contains(language_id) {
             return Err(Error::ServerInitializing(language_id.to_string()));
         }
-        let Some(client) = self.lsp_clients.get(language_id) else {
-            return Ok(());
-        };
-        let timeout = self
-            .lsp_configs
-            .get(language_id)
-            .map_or(30, |config| config.timeout_seconds);
-        client
-            .wait_until_quiescent(Duration::from_secs(timeout))
-            .await
+        Ok(())
     }
 
     async fn ensure_client_for_file(&mut self, path: &Path) -> Result<()> {
@@ -1029,7 +1018,7 @@ impl Translator {
             return Ok(());
         }
 
-        self.wait_for_language_ready(&language_id).await?;
+        self.wait_for_language_ready(&language_id)?;
 
         let root = self.project_root_for_file(path, &config);
 
@@ -1656,7 +1645,7 @@ impl Translator {
                     Error::ServerInitializing(lang.clone())
                 })
         })?;
-        self.wait_for_language_ready(client.language_id()).await?;
+        self.wait_for_language_ready(client.language_id())?;
 
         let params = LspWorkspaceSymbolParams {
             query,
@@ -2867,19 +2856,15 @@ mod tests {
         assert!(matches!(err, Error::NoServerForLanguage(_)));
     }
 
-    #[tokio::test]
-    async fn wait_for_language_ready_reports_initializing_without_waiting() {
+    #[test]
+    fn wait_for_language_ready_reports_initializing_without_waiting() {
         let mut translator = Translator::new();
         translator.set_lsp_configs(vec![LspServerConfig::rust_analyzer()], None);
         translator.set_expected_languages(HashSet::from(["rust".to_string()]));
 
         assert!(matches!(
-            tokio::time::timeout(
-                Duration::from_millis(50),
-                translator.wait_for_language_ready("rust"),
-            )
-            .await,
-            Ok(Err(Error::ServerInitializing(language))) if language == "rust"
+            translator.wait_for_language_ready("rust"),
+            Err(Error::ServerInitializing(language)) if language == "rust"
         ));
     }
 
