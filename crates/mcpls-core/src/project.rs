@@ -4033,7 +4033,7 @@ impl ProjectRegistry {
 
     /// Return whether durable project registration is configured.
     #[must_use]
-    pub async fn persistence_configured(&self) -> bool {
+    pub const fn persistence_configured(&self) -> bool {
         self.persistence.is_some()
     }
 
@@ -5925,13 +5925,13 @@ mod tests {
     #[tokio::test]
     async fn project_registry_reports_persistence_and_shutdown_state() {
         let transient = ProjectRegistry::new(2);
-        assert!(!transient.persistence_configured().await);
+        assert!(!transient.persistence_configured());
         assert!(!transient.is_shutting_down());
 
         let state_path = tempfile::tempdir().unwrap().path().join("projects.json");
         let persistent =
             ProjectRegistry::new(2).with_persistence(ProjectRegistrationStore::new(state_path));
-        assert!(persistent.persistence_configured().await);
+        assert!(persistent.persistence_configured());
         persistent.shutdown_all().await;
         assert!(persistent.is_shutting_down());
     }
