@@ -14,7 +14,7 @@ use crate::bridge::{
     ReferencesResult, RenameResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
     Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
-use crate::edit_apply::{ApplyReport, apply_plan};
+use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
@@ -1658,7 +1658,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn apply_edit_plan(
+    async fn apply_edit_plan(
         &mut self,
         plan_id: &PlanId,
         project_id: &str,
@@ -1669,8 +1669,27 @@ impl ProjectRuntime {
             .take_for_project(plan_id, project_id)
             .map_err(|error| error.to_string())?;
         let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let open_documents = plan
+            .files()
+            .iter()
+            .filter(|snapshot| snapshot.source() == crate::edit_plan::SnapshotSource::OpenDocument)
+            .map(|snapshot| {
+                (
+                    snapshot.path().clone(),
+                    snapshot.version().unwrap_or_default(),
+                    snapshot.planned_content().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
         let ApplyReport { committed_files } =
-            apply_plan(&boundary, &plan).map_err(|error| error.to_string())?;
+            apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker())
+                .map_err(|error| error.to_string())?;
+        for (path, version, content) in open_documents {
+            self.translator
+                .apply_open_document_content(&path, version, content)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(AppliedEditPlan {
             plan_id: plan.id().clone(),
             operations: plan.operations().to_vec(),
@@ -2356,7 +2375,7 @@ async fn handle_project_request(
             root,
             reply,
         } => {
-            let _ = reply.send(runtime.apply_edit_plan(&plan_id, &project_id, &root));
+            let _ = reply.send(runtime.apply_edit_plan(&plan_id, &project_id, &root).await);
         }
         ProjectRequest::ServerLogs {
             limit,

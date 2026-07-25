@@ -7,13 +7,13 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, CompletionParams,
-    CompletionTriggerKind, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    FormattingOptions, GotoDefinitionParams, Hover, HoverContents, HoverParams as LspHoverParams,
-    InlayHintLabel, InlayHintParams, MarkedString, PartialResultParams, ReferenceContext,
-    ReferenceParams, RenameParams as LspRenameParams,
-    SignatureHelpParams as LspSignatureHelpParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceSymbolParams as LspWorkspaceSymbolParams,
+    CompletionTriggerKind, DidChangeTextDocumentParams, DocumentFormattingParams, DocumentSymbol,
+    DocumentSymbolParams, FormattingOptions, GotoDefinitionParams, Hover, HoverContents,
+    HoverParams as LspHoverParams, InlayHintLabel, InlayHintParams, MarkedString,
+    PartialResultParams, ReferenceContext, ReferenceParams, RenameParams as LspRenameParams,
+    SignatureHelpParams as LspSignatureHelpParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentPositionParams, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::Duration};
@@ -360,6 +360,57 @@ impl Translator {
     /// Get a mutable reference to the document tracker.
     pub const fn document_tracker_mut(&mut self) -> &mut DocumentTracker {
         &mut self.document_tracker
+    }
+
+    /// Commit planned content to an open document and notify its LSP client.
+    ///
+    /// When no matching client is active, the actor-owned document tracker is
+    /// still updated; a later activation will observe the new content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document is not open, its version changed,
+    /// or the LSP change notification cannot be delivered.
+    pub async fn apply_open_document_content(
+        &mut self,
+        path: &Path,
+        expected_version: i32,
+        content: String,
+    ) -> Result<()> {
+        let Some(document) = self.document_tracker.get(path) else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
+        };
+        if document.version != expected_version {
+            return Err(Error::InvalidToolParams(format!(
+                "document version changed for {}: expected {}, got {}",
+                path.display(),
+                expected_version,
+                document.version
+            )));
+        }
+        let next_version = expected_version.saturating_add(1);
+        if let Some(client) = self
+            .lsp_clients
+            .get(&detect_language(path, &self.extension_map))
+            .cloned()
+        {
+            let params = DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: document.uri.clone(),
+                    version: next_version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: content.clone(),
+                }],
+            };
+            client.notify("textDocument/didChange", params).await?;
+        }
+        self.document_tracker
+            .update(path, content)
+            .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
+        Ok(())
     }
 
     /// Get the notification cache.
@@ -2489,6 +2540,26 @@ mod tests {
         let roots = vec![PathBuf::from("/test/root1"), PathBuf::from("/test/root2")];
         translator.set_workspace_roots(roots.clone());
         assert_eq!(translator.workspace_roots, roots);
+    }
+
+    #[tokio::test]
+    async fn applies_open_document_content_without_an_active_server() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("open.rs");
+        let mut translator = Translator::new();
+        translator
+            .document_tracker_mut()
+            .open(path.clone(), "dirty\n".to_string())
+            .unwrap();
+
+        translator
+            .apply_open_document_content(&path, 1, "updated\n".to_string())
+            .await
+            .unwrap();
+
+        let document = translator.document_tracker().get(&path).unwrap();
+        assert_eq!(document.version, 2);
+        assert_eq!(document.content, "updated\n");
     }
 
     #[test]

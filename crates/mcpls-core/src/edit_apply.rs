@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::bridge::DocumentTracker;
 use crate::edit_paths::PathSafetyError;
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{
@@ -32,9 +33,33 @@ pub fn apply_plan(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
 ) -> Result<ApplyReport, ApplyError> {
-    let prepared = PreparedPlan::new(boundary, plan)?;
+    apply_plan_internal(boundary, plan, None)
+}
+
+/// Apply a plan while validating open-document snapshots against the
+/// project's in-memory document tracker.
+///
+/// # Errors
+///
+/// Returns the same validation and filesystem errors as [`apply_plan`], and
+/// rejects an open-document snapshot when its tracked content or version is
+/// stale.
+pub fn apply_plan_with_documents(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    documents: &DocumentTracker,
+) -> Result<ApplyReport, ApplyError> {
+    apply_plan_internal(boundary, plan, Some(documents))
+}
+
+fn apply_plan_internal(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    documents: Option<&DocumentTracker>,
+) -> Result<ApplyReport, ApplyError> {
+    let prepared = PreparedPlan::new(boundary, plan, documents)?;
     let staged = prepared.stage()?;
-    prepared.revalidate(boundary, &staged)?;
+    prepared.revalidate(boundary, &staged, documents)?;
     PreparedPlan::commit(&staged)
 }
 
@@ -61,7 +86,11 @@ struct PreparedPlan<'a> {
 }
 
 impl<'a> PreparedPlan<'a> {
-    fn new(boundary: &WorkspaceBoundary, plan: &'a EditPlan) -> Result<Self, ApplyError> {
+    fn new(
+        boundary: &WorkspaceBoundary,
+        plan: &'a EditPlan,
+        documents: Option<&DocumentTracker>,
+    ) -> Result<Self, ApplyError> {
         if !plan.safe_to_apply() {
             return Err(ApplyError::UnsafePlan);
         }
@@ -72,7 +101,7 @@ impl<'a> PreparedPlan<'a> {
         let snapshots: Vec<_> = plan
             .files()
             .iter()
-            .map(|snapshot| validate_snapshot(boundary, snapshot))
+            .map(|snapshot| validate_snapshot(boundary, snapshot, documents))
             .collect::<Result<_, _>>()?;
         Ok(Self { plan, snapshots })
     }
@@ -100,11 +129,12 @@ impl<'a> PreparedPlan<'a> {
         &self,
         boundary: &WorkspaceBoundary,
         staged: &[StagedFile],
+        documents: Option<&DocumentTracker>,
     ) -> Result<(), ApplyError> {
         // Revalidate after staging and immediately before the first
         // destructive operation. This rejects a stale plan as one unit.
         for snapshot in &self.snapshots {
-            if let Err(error) = validate_snapshot(boundary, snapshot) {
+            if let Err(error) = validate_snapshot(boundary, snapshot, documents) {
                 cleanup_staged(staged);
                 return Err(error);
             }
@@ -199,10 +229,8 @@ struct StagedFile {
 fn validate_snapshot<'a>(
     boundary: &WorkspaceBoundary,
     snapshot: &'a FileSnapshot,
+    documents: Option<&DocumentTracker>,
 ) -> Result<&'a FileSnapshot, ApplyError> {
-    if snapshot.source() != SnapshotSource::Disk {
-        return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
-    }
     let canonical = boundary
         .validate_existing(snapshot.path())
         .map_err(|source| ApplyError::Path {
@@ -215,11 +243,29 @@ fn validate_snapshot<'a>(
             actual: canonical,
         });
     }
-    let current = fs::read_to_string(snapshot.path()).map_err(|source| ApplyError::Stage {
-        path: snapshot.path().clone(),
-        source,
-    })?;
-    snapshot.validate(&current, None)?;
+    match snapshot.source() {
+        SnapshotSource::Disk => {
+            let current =
+                fs::read_to_string(snapshot.path()).map_err(|source| ApplyError::Stage {
+                    path: snapshot.path().clone(),
+                    source,
+                })?;
+            snapshot.validate(&current, None)?;
+        }
+        SnapshotSource::OpenDocument => {
+            let Some(documents) = documents else {
+                return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
+            };
+            let Some(document) = documents.get(snapshot.path()) else {
+                return Err(ApplyError::Stale(SnapshotValidationError::VersionChanged {
+                    path: snapshot.path().clone(),
+                    expected: snapshot.version().unwrap_or_default(),
+                    actual: None,
+                }));
+            };
+            snapshot.validate(&document.content, Some(document.version))?;
+        }
+    }
     Ok(snapshot)
 }
 
@@ -245,12 +291,14 @@ fn cleanup_staged(files: &[StagedFile]) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::time::Duration;
 
     use tempfile::TempDir;
 
     use super::*;
+    use crate::bridge::{DocumentTracker, ResourceLimits};
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
 
     #[test]
@@ -361,6 +409,33 @@ mod tests {
             Err(ApplyError::UnsupportedSource(path)) if path == file
         ));
         assert_eq!(fs::read_to_string(file).unwrap(), "disk\n");
+    }
+
+    #[test]
+    fn applies_open_document_snapshot_against_tracked_content() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("open.rs");
+        fs::write(&file, "disk\n").unwrap();
+        let mut documents = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        documents.open(file.clone(), "dirty\n".to_string()).unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::OpenDocument,
+                Some(1),
+                "dirty\n",
+                "updated\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        apply_plan_with_documents(&boundary, &plan, &documents).unwrap();
+
+        assert_eq!(fs::read_to_string(file).unwrap(), "updated\n");
     }
 
     #[test]
