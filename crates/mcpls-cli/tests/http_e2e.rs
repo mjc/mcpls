@@ -24,7 +24,7 @@ struct HttpClient {
 }
 
 impl HttpClient {
-    fn new(address: SocketAddr) -> Self {
+    const fn new(address: SocketAddr) -> Self {
         Self {
             address,
             session_id: None,
@@ -34,7 +34,7 @@ impl HttpClient {
 
     fn initialize(&mut self) {
         let request_id = self.next_request_id();
-        let response = self.request(json!({
+        let response = self.request(&json!({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "initialize",
@@ -51,17 +51,18 @@ impl HttpClient {
             "initialize must return a session ID"
         );
 
-        let response = self.request(json!({
+        let response = self.request(&json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
             "params": {}
         }));
-        assert!(response["_status"].as_u64() == Some(202));
+        assert_eq!(response["_status"].as_u64(), Some(202));
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
         let request_id = self.next_request_id();
-        let response = self.request(json!({
+        let response = self.request(&json!({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "tools/call",
@@ -76,13 +77,13 @@ impl HttpClient {
         })
     }
 
-    fn next_request_id(&mut self) -> u64 {
+    const fn next_request_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
     }
 
-    fn request(&self, payload: Value) -> Value {
+    fn request(&self, payload: &Value) -> Value {
         let body = serde_json::to_vec(&payload).unwrap();
         let mut stream = TcpStream::connect(self.address).unwrap();
         stream
@@ -130,9 +131,10 @@ impl HttpDaemon {
             if TcpStream::connect(address).is_ok() {
                 return Self { child, address };
             }
-            if child.try_wait().unwrap().is_some() {
-                panic!("mcpls exited before binding HTTP listener");
-            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "mcpls exited before binding HTTP listener"
+            );
             thread::sleep(Duration::from_millis(50));
         }
         panic!("mcpls did not bind HTTP listener");
@@ -244,7 +246,7 @@ fn write_mock_lsp(directory: &TempDir) -> (PathBuf, PathBuf) {
     let counter = directory.path().join("lsp-spawns");
     std::fs::write(
         &command,
-        r##"#!/usr/bin/env python3
+        r#"#!/usr/bin/env python3
 import json
 import os
 import pathlib
@@ -283,7 +285,7 @@ while True:
     elif message.get("method") == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
-"##,
+"#,
     )
     .unwrap();
     std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -312,7 +314,7 @@ fn write_config(
 }
 
 struct HttpFixture {
-    _directory: TempDir,
+    directory: TempDir,
     config: PathBuf,
     spawn_counter: PathBuf,
 }
@@ -324,14 +326,14 @@ impl HttpFixture {
         let (lsp_command, spawn_counter) = write_mock_lsp(&directory);
         let config = write_config(&directory, &state_file, &lsp_command, &spawn_counter);
         Self {
-            _directory: directory,
+            directory,
             config,
             spawn_counter,
         }
     }
 
     fn project_root(&self, name: &str) -> PathBuf {
-        let root = self._directory.path().join(name);
+        let root = self.directory.path().join(name);
         std::fs::create_dir(&root).unwrap();
         root
     }
