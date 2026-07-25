@@ -193,13 +193,30 @@ fn project_queue_pressure_json(pressure: ProjectQueuePressure) -> serde_json::Va
     })
 }
 
-const fn health_status(counts: ProjectStatusCounts) -> &'static str {
+#[derive(Debug, Clone, Copy)]
+enum DaemonHealth {
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+impl DaemonHealth {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+const fn health_status(counts: ProjectStatusCounts) -> DaemonHealth {
     if counts.failed > 0 {
-        "failed"
+        DaemonHealth::Failed
     } else if counts.degraded > 0 || counts.restarting > 0 || counts.stopping > 0 {
-        "degraded"
+        DaemonHealth::Degraded
     } else {
-        "healthy"
+        DaemonHealth::Healthy
     }
 }
 
@@ -606,7 +623,7 @@ impl McplsServer {
     ) -> Result<String, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
-            "status": health_status(snapshot.project_counts),
+            "status": health_status(snapshot.project_counts).as_str(),
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
             "transport": snapshot.transport,
