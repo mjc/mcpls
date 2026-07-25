@@ -2274,6 +2274,184 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_and_format_wrappers_apply_stored_lsp_plans_without_re_requesting() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("src.rs");
+        let sibling = root.path().join("other.rs");
+        let counter = root.path().join("request-count");
+        fs::write(&source, "old_name\n").unwrap();
+        fs::write(&sibling, "old_name();\n").unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+
+        let lsp = root.path().join("fake-edit-lsp.py");
+        fs::write(
+            &lsp,
+            r##"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+counter = pathlib.Path(os.environ["MCPLS_COUNTER"])
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+def bump():
+    value = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(value + 1))
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-8"}
+        }})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"health": "ok", "quiescent": True}})
+    elif method == "textDocument/rename":
+        bump()
+        uri = message["params"]["textDocument"]["uri"]
+        sibling_uri = uri.replace("src.rs", "other.rs")
+        edit = {"changes": {
+            uri: [{"range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": 8}},
+                   "newText": "new_name"}],
+            sibling_uri: [{"range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 0, "character": 8}},
+                           "newText": "new_name"}],
+        }}
+        send({"jsonrpc": "2.0", "id": message["id"], "result": edit})
+    elif method == "textDocument/formatting":
+        bump()
+        uri = message["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [
+            {"range": {"start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 8}},
+             "newText": "formatted"}
+        ]})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut server_config = crate::config::LspServerConfig::rust_analyzer();
+        server_config.command = lsp.display().to_string();
+        server_config.heuristics = None;
+        server_config.env =
+            HashMap::from([("MCPLS_COUNTER".to_string(), counter.display().to_string())]);
+        let mut template_source = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        template_source.set_lsp_configs(vec![server_config.clone()], Some(3));
+        let registry =
+            ProjectRegistry::with_translator_template(4, template_source.configuration_template());
+        let project_id = ProjectId::new("fixture").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry.activate(&project_id).await.unwrap();
+
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let rename = server
+            .rename_preview(Parameters(RenamePreviewParams {
+                project_id: project_id.as_str().to_string(),
+                file_path: source.display().to_string(),
+                line: 1,
+                character: 1,
+                new_name: "new_name".to_string(),
+                position_encoding: Some("utf-8".to_string()),
+            }))
+            .await
+            .unwrap();
+        let rename: serde_json::Value = serde_json::from_str(&rename).unwrap();
+        assert_eq!(rename["affected_files"].as_array().unwrap().len(), 2);
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+
+        let applied = server
+            .rename_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: project_id.as_str().to_string(),
+                plan_id: rename["plan_id"].as_str().unwrap().to_string(),
+            }))
+            .await
+            .unwrap();
+        let applied: serde_json::Value = serde_json::from_str(&applied).unwrap();
+        assert_eq!(applied["committed_files"].as_array().unwrap().len(), 2);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "new_name\n");
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), "new_name();\n");
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+
+        let format = server
+            .format_preview(Parameters(FormatPreviewParams {
+                project_id: project_id.as_str().to_string(),
+                file_path: source.display().to_string(),
+                tab_size: 4,
+                insert_spaces: true,
+                position_encoding: Some("utf-8".to_string()),
+            }))
+            .await
+            .unwrap();
+        let format: serde_json::Value = serde_json::from_str(&format).unwrap();
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+        server
+            .format_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: project_id.as_str().to_string(),
+                plan_id: format["plan_id"].as_str().unwrap().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "formatted\n");
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+
+        let stale = server
+            .format_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: project_id.as_str().to_string(),
+                plan_id: format["plan_id"].as_str().unwrap().to_string(),
+            }))
+            .await;
+        assert!(stale.is_err());
+    }
+
     #[tokio::test]
     async fn workspace_edit_preview_and_apply_support_file_rename() {
         let root = TempDir::new().unwrap();
