@@ -5529,13 +5529,16 @@ mod tests {
 
         drop(handle);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while *status.borrow() != ProjectStatus::Stopped {
-                status.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("actor did not stop after its last handle was dropped");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while *status.borrow() != ProjectStatus::Stopped {
+                    status.changed().await.unwrap();
+                }
+            })
+            .await
+            .is_ok(),
+            "actor did not stop after its last handle was dropped"
+        );
     }
 
     #[tokio::test]
