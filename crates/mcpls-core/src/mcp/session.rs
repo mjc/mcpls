@@ -254,16 +254,13 @@ impl SessionEventSink {
                             skipped,
                             "session actor event sink lagged; notifying polling resync"
                         );
-                        let resource_uri = project_events_resource_uri(&event_project_id);
-                        if !subscriptions.contains(&resource_uri).await {
-                            (ForwardOutcome::Continue, None)
-                        } else {
-                            let outcome = notifier
-                                .notify_resource_updated(resource_uri)
-                                .await
-                                .map_or(ForwardOutcome::Disconnect, |_| ForwardOutcome::Continue);
-                            (outcome, None)
-                        }
+                        let outcome = notify_subscribed_resource(
+                            &subscriptions,
+                            notifier.as_ref(),
+                            project_events_resource_uri(&event_project_id),
+                        )
+                        .await;
+                        (outcome, None)
                     }
                 };
                 if let Some(event) = removed_event {
@@ -292,18 +289,27 @@ async fn forward_event(
     event: &ProjectEvent,
 ) -> ForwardOutcome {
     for resource_uri in event_resource_uris(project_id, event) {
-        if !subscriptions.contains(&resource_uri).await {
-            continue;
-        }
-        if notifier
-            .notify_resource_updated(resource_uri)
-            .await
-            .is_err()
+        if notify_subscribed_resource(subscriptions, notifier, resource_uri).await
+            == ForwardOutcome::Disconnect
         {
             return ForwardOutcome::Disconnect;
         }
     }
     ForwardOutcome::Continue
+}
+
+async fn notify_subscribed_resource(
+    subscriptions: &ResourceSubscriptions,
+    notifier: &dyn SessionNotifier,
+    resource_uri: String,
+) -> ForwardOutcome {
+    if !subscriptions.contains(&resource_uri).await {
+        return ForwardOutcome::Continue;
+    }
+    notifier
+        .notify_resource_updated(resource_uri)
+        .await
+        .map_or(ForwardOutcome::Disconnect, |_| ForwardOutcome::Continue)
 }
 
 async fn cleanup_removed_project_subscriptions(
