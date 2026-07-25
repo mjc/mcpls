@@ -3692,6 +3692,17 @@ pub struct ProjectServerCapability {
     pub capabilities: serde_json::Value,
 }
 
+impl ProjectServerCapability {
+    fn from_server(group_id: usize, capability: ServerCapability) -> Self {
+        Self {
+            group_id,
+            language_id: capability.language_id,
+            position_encoding: capability.position_encoding,
+            capabilities: capability.capabilities,
+        }
+    }
+}
+
 impl ProjectStatusCounts {
     const fn record(&mut self, status: ProjectStatus) {
         match status {
@@ -4194,12 +4205,7 @@ impl ProjectRegistry {
         let mut capabilities = Vec::new();
         for (group_id, (actor, _)) in actors.into_iter().enumerate() {
             for capability in actor.server_capabilities(language_id.clone()).await? {
-                capabilities.push(ProjectServerCapability {
-                    group_id,
-                    language_id: capability.language_id,
-                    position_encoding: capability.position_encoding,
-                    capabilities: capability.capabilities,
-                });
+                capabilities.push(ProjectServerCapability::from_server(group_id, capability));
             }
         }
         capabilities.sort_by(|left, right| {
