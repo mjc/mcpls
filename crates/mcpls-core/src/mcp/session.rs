@@ -179,14 +179,29 @@ impl SessionEventSink {
             empty_projects
         };
 
-        let mut tasks = self
+        for project_id in empty_projects {
+            self.stop_project_task(&project_id);
+        }
+    }
+
+    fn stop_project_task(&self, project_id: &ProjectId) {
+        let task = self
             .tasks
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(project_id);
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+
+    fn stop_all_tasks(&mut self) {
+        let tasks = self
+            .tasks
+            .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for project_id in empty_projects {
-            if let Some(task) = tasks.remove(&project_id) {
-                task.abort();
-            }
+        for task in tasks.drain().map(|(_, task)| task) {
+            task.abort();
         }
     }
 
@@ -363,13 +378,7 @@ async fn cleanup_removed_project_subscriptions(
 
 impl Drop for SessionEventSink {
     fn drop(&mut self) {
-        let tasks = self
-            .tasks
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for task in tasks.drain().map(|(_, task)| task) {
-            task.abort();
-        }
+        self.stop_all_tasks();
     }
 }
 
