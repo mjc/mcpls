@@ -45,13 +45,12 @@ pub enum Transport {
 /// Passed inside [`Transport::Http`] to control the TCP bind address and the
 /// URL path the MCP service is mounted at.
 ///
-/// # Note on DNS rebinding
+/// # Trust boundary
 ///
-/// `rmcp`'s `StreamableHttpService` validates the `Host` header against an
-/// allow-list that defaults to loopback addresses only (`localhost`,
-/// `127.0.0.1`, `::1`). If you bind to `0.0.0.0` or a non-loopback address,
-/// clients must send requests with a `Host` that matches the allow-list, or
-/// use a reverse proxy that rewrites the `Host` header.
+/// MCPLS binds only to loopback in the built-in HTTP transport. `Host`
+/// allow-listing in `rmcp` is DNS-rebinding protection, not authentication.
+/// Expose MCPLS through an authenticated reverse proxy if remote access is
+/// required; direct non-loopback binds are rejected.
 ///
 /// # Examples
 ///
@@ -117,6 +116,17 @@ pub(crate) async fn run_stdio(
 /// stdio is kept as-is. Clients can still poll diagnostics via the existing
 /// MCP tools. A follow-up issue will add per-session broadcast.
 #[cfg(feature = "transport-http")]
+fn validate_http_bind(bind: std::net::SocketAddr) -> Result<(), crate::Error> {
+    if bind.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(crate::Error::Config(
+        "non-loopback HTTP requires an authenticated reverse proxy; bind mcpls to loopback"
+            .to_string(),
+    ))
+}
+
+#[cfg(feature = "transport-http")]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
@@ -128,6 +138,8 @@ pub(crate) async fn run_http(
         StreamableHttpServerConfig, StreamableHttpService,
     };
     use tokio_util::sync::CancellationToken;
+
+    validate_http_bind(cfg.bind)?;
 
     let session_manager = Arc::new(LocalSessionManager::default());
     let cancel = CancellationToken::new();
@@ -152,15 +164,6 @@ pub(crate) async fn run_http(
         .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
 
     tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
-    if !cfg.bind.ip().is_loopback() {
-        tracing::warn!(
-            addr = %cfg.bind,
-            "binding to a non-loopback address: rmcp Host validation allows only \
-             localhost/127.0.0.1/::1 by default — use a reverse proxy for non-loopback deployments \
-             and ensure no authentication is required"
-        );
-    }
-
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             // On Unix, containers (Docker/systemd) send SIGTERM; handle both
@@ -241,6 +244,14 @@ mod tests {
             };
             let t = Transport::Http(cfg);
             assert!(matches!(t, Transport::Http(_)));
+        }
+
+        #[test]
+        fn non_loopback_http_bind_is_rejected_without_an_auth_boundary() {
+            assert!(matches!(
+                super::super::validate_http_bind("0.0.0.0:3000".parse().unwrap()),
+                Err(error) if error.to_string().contains("authenticated reverse proxy")
+            ));
         }
 
         /// Verifies `run_http` binds successfully and accepts TCP connections.
