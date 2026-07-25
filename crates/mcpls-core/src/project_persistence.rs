@@ -52,7 +52,18 @@ impl PersistedProject {
         config: Option<ProjectConfig>,
     ) -> Self {
         let mut persisted = Self::from_identity(identity);
-        persisted.config = config;
+        persisted.config = config.map(|config| config.for_persistence());
+        persisted
+    }
+
+    /// Return the representation safe to write to the registration store.
+    #[must_use]
+    fn for_persistence(&self) -> Self {
+        let mut persisted = self.clone();
+        persisted.config = persisted
+            .config
+            .as_ref()
+            .map(ProjectConfig::for_persistence);
         persisted
     }
 
@@ -163,7 +174,10 @@ impl ProjectRegistrationStore {
         }
         let state = ProjectRegistrationState {
             schema_version: SCHEMA_VERSION,
-            projects: projects.to_vec(),
+            projects: projects
+                .iter()
+                .map(PersistedProject::for_persistence)
+                .collect(),
         };
         let bytes = serde_json::to_vec_pretty(&state)?;
         let temporary = temporary_path(&self.path);
@@ -308,5 +322,44 @@ mod tests {
             .unwrap()[0]
             .env;
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn project_lsp_environment_persists_with_explicit_opt_in() {
+        let directory = TempDir::new().unwrap();
+        let store = ProjectRegistrationStore::new(directory.path().join("projects.json"));
+        let mut server = LspServerConfig::rust_analyzer();
+        server.env.insert(
+            "MCPLS_TEST_SAFE_VALUE".to_string(),
+            "safe-to-write".to_string(),
+        );
+        let project = PersistedProject {
+            project_id: "demo".to_string(),
+            root: PathBuf::from("/workspace/demo"),
+            additional_roots: Vec::new(),
+            config: Some(ProjectConfig {
+                lsp_servers: Some(vec![server]),
+                persist_environment: true,
+                ..ProjectConfig::default()
+            }),
+        };
+
+        store.save(&[project]).unwrap();
+
+        let contents = fs::read_to_string(store.path()).unwrap();
+        assert!(contents.contains("safe-to-write"));
+        let persisted = store.load().unwrap();
+        let env = &persisted.projects[0]
+            .config
+            .as_ref()
+            .unwrap()
+            .lsp_servers
+            .as_ref()
+            .unwrap()[0]
+            .env;
+        assert_eq!(
+            env.get("MCPLS_TEST_SAFE_VALUE"),
+            Some(&"safe-to-write".to_string())
+        );
     }
 }

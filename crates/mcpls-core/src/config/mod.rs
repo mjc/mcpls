@@ -62,6 +62,14 @@ pub struct ProjectConfig {
     /// Literal values to redact from project-scoped LSP notifications.
     #[serde(default)]
     pub redaction_patterns: Option<Vec<String>>,
+
+    /// Persist LSP environment values in the registration state file.
+    ///
+    /// This is disabled by default because environment values commonly carry
+    /// credentials. Enable it only when every configured value is explicitly
+    /// safe to store on disk.
+    #[serde(default)]
+    pub persist_environment: bool,
 }
 
 impl ProjectConfig {
@@ -71,6 +79,26 @@ impl ProjectConfig {
         self.lsp_servers.is_none()
             && self.heuristics_max_depth.is_none()
             && self.redaction_patterns.is_none()
+            && !self.persist_environment
+    }
+
+    /// Return the configuration representation safe for the registration store.
+    ///
+    /// Environment values are retained only when [`Self::persist_environment`]
+    /// explicitly opts into storing them.
+    #[must_use]
+    pub fn for_persistence(&self) -> Self {
+        if self.persist_environment {
+            return self.clone();
+        }
+
+        let mut persisted = self.clone();
+        if let Some(servers) = &mut persisted.lsp_servers {
+            for server in servers {
+                server.env.clear();
+            }
+        }
+        persisted
     }
 }
 
