@@ -2485,6 +2485,12 @@ impl ProjectActorChannels {
         let _ = self.event_tx.send(event);
     }
 
+    fn publish_notification(&self, runtime: &mut ProjectRuntime, notification: LspNotification) {
+        if let Some(event) = runtime.notification(notification) {
+            self.publish(event);
+        }
+    }
+
     fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
         state.status = status;
         let _ = self.status_tx.send(status);
@@ -2914,9 +2920,7 @@ async fn handle_project_request(
             notification,
         } => {
             if runtime.owns_generation(generation) {
-                if let Some(event) = runtime.notification(notification) {
-                    channels.publish(event);
-                }
+                channels.publish_notification(runtime, notification);
             }
         }
         ProjectRequest::ServerExited { generation } => {
