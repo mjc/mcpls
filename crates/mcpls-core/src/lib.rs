@@ -47,6 +47,7 @@ pub mod error;
 pub mod lsp;
 pub mod mcp;
 pub mod project;
+pub mod project_persistence;
 pub mod transport;
 mod util;
 
@@ -432,17 +433,11 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 ///   routing identity, two catch-alls, or the same tool claimed by both) --
 ///   see `config::ToolRouter::from_configs`
 ///
-/// # DNS rebinding protection (HTTP transport)
+/// # HTTP trust boundary
 ///
-/// When using `Transport::Http`, the underlying rmcp service validates the
-/// inbound `Host` header against an allowlist that defaults to loopback
-/// addresses only (`localhost`, `127.0.0.1`, `::1`). Requests with any other
-/// `Host` value are rejected with `421 Misdirected Request`.
-///
-/// If you bind to a non-loopback address (e.g. `0.0.0.0:3000`) and expose the
-/// service through a reverse proxy, the proxy must forward `Host: localhost`
-/// (or another loopback alias) to the mcpls process. Direct non-loopback
-/// access is intentionally blocked to prevent DNS-rebinding attacks.
+/// The built-in HTTP transport accepts loopback binds only. `rmcp` Host
+/// validation protects against DNS rebinding but is not authentication; put an
+/// authenticated reverse proxy in front of MCPLS for remote access.
 ///
 /// # Shutdown
 ///

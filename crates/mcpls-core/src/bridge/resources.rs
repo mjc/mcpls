@@ -177,6 +177,13 @@ impl ResourceSubscriptions {
     pub async fn snapshot(&self) -> Vec<String> {
         self.0.read().await.iter().cloned().collect()
     }
+
+    /// Return a deterministic sorted snapshot for session-facing APIs.
+    pub async fn sorted_snapshot(&self) -> Vec<String> {
+        let mut snapshot = self.snapshot().await;
+        snapshot.sort();
+        snapshot
+    }
 }
 
 #[cfg(test)]

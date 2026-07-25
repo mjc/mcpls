@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -21,6 +22,7 @@ use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::LspNotification;
+use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
@@ -3246,6 +3248,9 @@ async fn handle_project_request(
 #[non_exhaustive]
 /// Errors returned by the shared project registry.
 pub enum ProjectRegistryError {
+    /// Dynamic registration state could not be loaded or persisted.
+    #[error(transparent)]
+    Persistence(#[from] crate::project_persistence::ProjectPersistenceError),
     /// A project identity operation failed while resolving a request path.
     #[error(transparent)]
     Identity(#[from] ProjectIdentityError),
@@ -3265,6 +3270,9 @@ pub enum ProjectRegistryError {
     /// No project with this stable ID is registered.
     #[error("project is not registered: {0}")]
     ProjectNotFound(ProjectId),
+    /// The daemon is draining projects and no new registrations are accepted.
+    #[error("project registry is shutting down")]
+    ShuttingDown,
     /// The project actor could not service the request.
     #[error(transparent)]
     Actor(#[from] ProjectActorError),
@@ -3279,33 +3287,211 @@ struct ProjectEntry {
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
 
+#[derive(Debug, Default)]
+struct RegistryLifecycle {
+    shutting_down: AtomicBool,
+}
+
+const DEFAULT_PROJECT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl RegistryLifecycle {
+    fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    fn ensure_accepting(&self) -> Result<(), ProjectRegistryError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(ProjectRegistryError::ShuttingDown)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Process-wide registry of project identities and their actor handles.
 #[derive(Clone)]
 pub struct ProjectRegistry {
     projects: std::sync::Arc<RwLock<HashMap<ProjectId, ProjectEntry>>>,
     actor_capacity: usize,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
+    persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
+    lifecycle: std::sync::Arc<RegistryLifecycle>,
+    shutdown_timeout: Duration,
+}
+
+/// Bounded lifecycle counts for cheap daemon health reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectStatusCounts {
+    /// Projects that have not finished activation.
+    pub starting: usize,
+    /// Projects ready for requests.
+    pub ready: usize,
+    /// Projects with a degraded component.
+    pub degraded: usize,
+    /// Projects currently restarting.
+    pub restarting: usize,
+    /// Projects draining before shutdown.
+    pub stopping: usize,
+    /// Stopped projects still retained by the registry.
+    pub stopped: usize,
+    /// Failed projects.
+    pub failed: usize,
+}
+
+/// Result of a bounded daemon shutdown across all registered projects.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectShutdownReport {
+    /// Project IDs whose actor reached `Stopped` (including already-stopped actors).
+    pub stopped: Vec<ProjectId>,
+    /// Projects whose actor could not be shut down cleanly.
+    pub failed: Vec<ProjectShutdownFailure>,
+}
+
+/// One project shutdown failure and its actor error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectShutdownFailure {
+    /// Project ID associated with the failed actor.
+    pub project_id: ProjectId,
+    /// Human-readable shutdown failure.
+    pub error: String,
+}
+
+impl ProjectShutdownReport {
+    fn record_actor_result(
+        &mut self,
+        project_ids: Vec<ProjectId>,
+        result: Result<(), ProjectActorError>,
+    ) {
+        match result {
+            Ok(()) => self.stopped.extend(project_ids),
+            Err(error) => self
+                .failed
+                .extend(
+                    project_ids
+                        .into_iter()
+                        .map(|project_id| ProjectShutdownFailure {
+                            project_id,
+                            error: error.to_string(),
+                        }),
+                ),
+        }
+    }
+
+    fn record_actor_timeout(&mut self, project_ids: Vec<ProjectId>, timeout: Duration) {
+        self.failed.extend(
+            project_ids
+                .into_iter()
+                .map(|project_id| ProjectShutdownFailure {
+                    project_id,
+                    error: format!("shutdown timed out after {timeout:?}"),
+                }),
+        );
+    }
+
+    fn sort(&mut self) {
+        self.stopped.sort();
+        self.failed
+            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    }
+}
+
+enum ShutdownAttempt {
+    Completed(Result<(), ProjectActorError>),
+    TimedOut,
+}
+
+async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) -> ShutdownAttempt {
+    tokio::time::timeout(timeout, actor.shutdown())
+        .await
+        .map_or(ShutdownAttempt::TimedOut, ShutdownAttempt::Completed)
 }
 
 impl ProjectRegistry {
-    /// Create an empty registry with a bounded actor queue capacity.
-    #[must_use]
-    pub fn new(actor_capacity: usize) -> Self {
+    fn with_template(
+        actor_capacity: usize,
+        translator_template: Option<TranslatorTemplate>,
+    ) -> Self {
         Self {
             projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
             actor_capacity: actor_capacity.max(1),
-            translator_template: None,
+            translator_template: translator_template.map(std::sync::Arc::new),
+            persistence: None,
+            lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
+            shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
         }
+    }
+
+    /// Create an empty registry with a bounded actor queue capacity.
+    #[must_use]
+    pub fn new(actor_capacity: usize) -> Self {
+        Self::with_template(actor_capacity, None)
     }
 
     /// Create a registry whose actors inherit only the daemon translator's configuration.
     #[must_use]
     pub fn with_translator_template(actor_capacity: usize, template: TranslatorTemplate) -> Self {
-        Self {
-            projects: std::sync::Arc::new(RwLock::new(HashMap::new())),
-            actor_capacity: actor_capacity.max(1),
-            translator_template: Some(std::sync::Arc::new(template)),
+        Self::with_template(actor_capacity, Some(template))
+    }
+
+    /// Set the maximum time allowed for each actor shutdown request.
+    #[must_use]
+    pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Attach a durable registration store to this registry.
+    #[must_use]
+    pub fn with_persistence(mut self, store: ProjectRegistrationStore) -> Self {
+        self.persistence = Some(std::sync::Arc::new(store));
+        self
+    }
+
+    async fn persist(&self) -> Result<(), ProjectRegistryError> {
+        let Some(store) = self.persistence.clone() else {
+            return Ok(());
+        };
+        let projects = self
+            .list()
+            .await
+            .iter()
+            .map(PersistedProject::from_identity)
+            .collect::<Vec<_>>();
+        save_persisted_state(store, projects).await
+    }
+
+    /// Restore valid registrations from the attached store.
+    ///
+    /// Missing or moved roots are skipped and are removed from the next
+    /// successful save; no language server is activated during restoration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be loaded or a valid registration
+    /// cannot be added to the registry.
+    pub async fn restore_from_persistence(&self) -> Result<usize, ProjectRegistryError> {
+        let Some(store) = self.persistence.clone() else {
+            return Ok(0);
+        };
+        let state = load_persisted_state(store).await?;
+        let mut restored = 0;
+        for persisted in state.projects {
+            let Ok(id) = persisted.project_id() else {
+                continue;
+            };
+            let Ok(root) = CanonicalRoot::new(&persisted.root) else {
+                continue;
+            };
+            let mut identity = ProjectIdentity::new(id, root);
+            if let Ok(Some(repository)) = GitRepositoryIdentity::discover(identity.root().as_path())
+            {
+                identity = identity.with_repository_identity(repository);
+            }
+            self.add(identity).await?;
+            restored += 1;
         }
+        self.persist().await?;
+        Ok(restored)
     }
 
     /// Add a project, sharing an actor with a compatible linked worktree.
@@ -3319,6 +3505,7 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let compatibility_key = rust_project_compatibility_key(identity.root.as_path());
         let mut projects = self.projects.write().await;
+        self.lifecycle.ensure_accepting()?;
         if let Some(existing) = projects.get(identity.id()) {
             if existing.identity.root() != identity.root() {
                 return Err(ProjectRegistryError::ConflictingProject {
@@ -3345,6 +3532,8 @@ impl ProjectRegistry {
             let actor = existing.actor.clone();
             let mutation = existing.mutation.clone();
             drop(projects);
+
+            self.lifecycle.ensure_accepting()?;
 
             let mutation_guard = mutation.lock().await;
             actor
@@ -3381,6 +3570,7 @@ impl ProjectRegistry {
             );
             drop(projects);
             drop(mutation_guard);
+            self.persist().await?;
             return Ok(actor);
         }
 
@@ -3404,6 +3594,7 @@ impl ProjectRegistry {
             },
         );
         drop(projects);
+        self.persist().await?;
         Ok(actor)
     }
 
@@ -3418,6 +3609,77 @@ impl ProjectRegistry {
             .collect();
         projects.sort_by(|left, right| left.id().cmp(right.id()));
         projects
+    }
+
+    /// Read lifecycle watches without awaiting any actor request.
+    pub async fn status_counts(&self) -> ProjectStatusCounts {
+        let projects = self.projects.read().await;
+        let mut counts = ProjectStatusCounts::default();
+        for entry in projects.values() {
+            let status = *entry.actor.status().borrow();
+            match status {
+                ProjectStatus::Starting => counts.starting += 1,
+                ProjectStatus::Ready => counts.ready += 1,
+                ProjectStatus::Degraded => counts.degraded += 1,
+                ProjectStatus::Restarting => counts.restarting += 1,
+                ProjectStatus::Stopping => counts.stopping += 1,
+                ProjectStatus::Stopped => counts.stopped += 1,
+                ProjectStatus::Failed => counts.failed += 1,
+            }
+        }
+        drop(projects);
+        counts
+    }
+
+    /// Gracefully stop every registered project actor once.
+    ///
+    /// Shared linked-worktree actors are deduplicated by their request channel,
+    /// so one shutdown request drains the shared language-server runtime for
+    /// all of its project identities. Requests already queued on an actor are
+    /// processed before its shutdown request, preserving edit commit
+    /// boundaries without holding the registry lock across the await.
+    pub async fn shutdown_all(&self) -> ProjectShutdownReport {
+        self.lifecycle.begin_shutdown();
+        let _mutation_guards = self.lock_project_mutations().await;
+        let entries: Vec<_> = self
+            .projects
+            .read()
+            .await
+            .values()
+            .map(|entry| (entry.identity.id().clone(), entry.actor.clone()))
+            .collect();
+
+        let (stopped, actors) = shutdown_actor_groups(entries);
+        let mut report = ProjectShutdownReport {
+            stopped,
+            failed: Vec::new(),
+        };
+
+        for (actor, project_ids) in actors {
+            match shutdown_actor_with_timeout(actor, self.shutdown_timeout).await {
+                ShutdownAttempt::Completed(result) => {
+                    report.record_actor_result(project_ids, result);
+                }
+                ShutdownAttempt::TimedOut => {
+                    report.record_actor_timeout(project_ids, self.shutdown_timeout);
+                }
+            }
+        }
+
+        report.sort();
+        report
+    }
+
+    async fn lock_project_mutations(&self) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mutations = {
+            let projects = self.projects.read().await;
+            unique_mutation_gates(&projects)
+        };
+        let mut guards = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            guards.push(mutation.lock_owned().await);
+        }
+        guards
     }
 
     /// Return open-document paths grouped by the registered project IDs that
@@ -3483,6 +3745,7 @@ impl ProjectRegistry {
             .await
             .values()
             .any(|entry| std::sync::Arc::ptr_eq(&entry.mutation, &mutation));
+        self.persist().await?;
         actor
             .publish_event(ProjectEvent::ProjectRemoved {
                 project_id: id.clone(),
@@ -3779,6 +4042,41 @@ impl ProjectRegistry {
     }
 }
 
+fn unique_mutation_gates(projects: &HashMap<ProjectId, ProjectEntry>) -> Vec<MutationGate> {
+    let mut mutations = Vec::new();
+    for entry in projects.values() {
+        if !mutations
+            .iter()
+            .any(|existing| std::sync::Arc::ptr_eq(existing, &entry.mutation))
+        {
+            mutations.push(entry.mutation.clone());
+        }
+    }
+    mutations
+}
+
+fn shutdown_actor_groups(
+    entries: Vec<(ProjectId, ProjectHandle)>,
+) -> (Vec<ProjectId>, Vec<(ProjectHandle, Vec<ProjectId>)>) {
+    let mut stopped = Vec::new();
+    let mut actors: Vec<(ProjectHandle, Vec<ProjectId>)> = Vec::new();
+    for (id, actor) in entries {
+        if matches!(*actor.status().borrow(), ProjectStatus::Stopped) {
+            stopped.push(id);
+            continue;
+        }
+        if let Some((_, project_ids)) = actors
+            .iter_mut()
+            .find(|(existing, _)| existing.sender.same_channel(&actor.sender))
+        {
+            project_ids.push(id);
+        } else {
+            actors.push((actor, vec![id]));
+        }
+    }
+    (stopped, actors)
+}
+
 fn compatible_project<'a>(
     projects: &'a HashMap<ProjectId, ProjectEntry>,
     identity: &ProjectIdentity,
@@ -3794,6 +4092,33 @@ fn compatible_project<'a>(
                 existing == repository && project.compatibility_key == Some(compatibility_key)
             })
     })
+}
+
+async fn save_persisted_state(
+    store: std::sync::Arc<ProjectRegistrationStore>,
+    projects: Vec<PersistedProject>,
+) -> Result<(), ProjectRegistryError> {
+    tokio::task::spawn_blocking(move || store.save(&projects))
+        .await
+        .map_err(|error| {
+            crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(format!(
+                "persistence task failed: {error}"
+            )))
+        })??;
+    Ok(())
+}
+
+async fn load_persisted_state(
+    store: std::sync::Arc<ProjectRegistrationStore>,
+) -> Result<crate::project_persistence::ProjectRegistrationState, ProjectRegistryError> {
+    tokio::task::spawn_blocking(move || store.load())
+        .await
+        .map_err(|error| {
+            crate::project_persistence::ProjectPersistenceError::Io(std::io::Error::other(format!(
+                "persistence task failed: {error}"
+            )))
+        })?
+        .map_err(ProjectRegistryError::from)
 }
 
 #[cfg(test)]
@@ -4855,6 +5180,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_registry_persists_add_and_remove_mutations() {
+        let root = TempDir::new().unwrap();
+        let state_path = root.path().join("state/projects.json");
+        let store = ProjectRegistrationStore::new(&state_path);
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        let identity = ProjectIdentity::new(
+            ProjectId::new("persisted").unwrap(),
+            CanonicalRoot::new(root.path()).unwrap(),
+        );
+
+        registry.add(identity).await.unwrap();
+        assert_eq!(store.load().unwrap().projects.len(), 1);
+
+        registry
+            .remove(ProjectId::new("persisted").unwrap())
+            .await
+            .unwrap();
+        assert!(store.load().unwrap().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_restores_existing_roots_and_prunes_missing_roots() {
+        let root = TempDir::new().unwrap();
+        let state_path = root.path().join("state/projects.json");
+        let store = ProjectRegistrationStore::new(&state_path);
+        store
+            .save(&[
+                PersistedProject {
+                    project_id: "existing".to_string(),
+                    root: root.path().to_path_buf(),
+                },
+                PersistedProject {
+                    project_id: "missing".to_string(),
+                    root: root.path().join("gone"),
+                },
+            ])
+            .unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+
+        assert_eq!(registry.restore_from_persistence().await.unwrap(), 1);
+        assert_eq!(registry.list().await.len(), 1);
+        assert_eq!(registry.list().await[0].id().as_str(), "existing");
+        assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
     async fn project_registry_activation_uses_configuration_snapshot() {
         let root = TempDir::new().unwrap();
         fs::write(
@@ -4946,6 +5317,129 @@ mod tests {
         assert!(restart.is_ok() || matches!(restart, Err(ProjectRegistryError::Actor(_))));
         assert!(remove.is_ok());
         assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_shuts_down_all_registered_actors() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        let first_actor = registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let second_actor = registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let report = registry.shutdown_all().await;
+
+        assert!(report.failed.is_empty());
+        assert_eq!(report.stopped, vec![first_id, second_id]);
+        assert_eq!(*first_actor.status().borrow(), ProjectStatus::Stopped);
+        assert_eq!(*second_actor.status().borrow(), ProjectStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn project_registry_rejects_registration_after_shutdown_begins() {
+        let registry = ProjectRegistry::new(2);
+        registry.shutdown_all().await;
+
+        let root = TempDir::new().unwrap();
+        let result = registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("late").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await;
+
+        assert!(matches!(result, Err(ProjectRegistryError::ShuttingDown)));
+    }
+
+    #[tokio::test]
+    async fn project_registry_reports_shutdown_timeout() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2).with_shutdown_timeout(Duration::ZERO);
+        let project_id = ProjectId::new("slow").unwrap();
+        let (sender, mut requests) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(ProjectRequest::Shutdown { .. }) = requests.recv().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (events, _) = broadcast::channel(1);
+        registry.projects.write().await.insert(
+            project_id.clone(),
+            ProjectEntry {
+                identity: ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ),
+                actor: ProjectHandle {
+                    sender,
+                    status,
+                    events,
+                    event_history: std::sync::Arc::new(std::sync::Mutex::new(
+                        ProjectEventHistory::new(1),
+                    )),
+                },
+                mutation: std::sync::Arc::new(Mutex::new(())),
+                compatibility_key: None,
+            },
+        );
+
+        let report = registry.shutdown_all().await;
+
+        assert!(report.stopped.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].project_id, project_id);
+        assert_eq!(report.failed[0].error, "shutdown timed out after 0ns");
+    }
+
+    #[tokio::test]
+    async fn project_registry_shutdown_waits_for_project_mutations() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let mutation = registry
+            .projects
+            .read()
+            .await
+            .get(&project_id)
+            .unwrap()
+            .mutation
+            .clone();
+        let guard = mutation.lock().await;
+        let shutdown_registry = registry.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_registry.shutdown_all().await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
+                .await
+                .is_err()
+        );
+        drop(guard);
+
+        let report = shutdown.await.unwrap();
+        assert_eq!(report.stopped, vec![project_id]);
+        assert!(report.failed.is_empty());
     }
 
     #[tokio::test]

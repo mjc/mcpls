@@ -52,13 +52,12 @@ pub enum Transport {
 /// Passed inside [`Transport::Http`] to control the TCP bind address and the
 /// URL path the MCP service is mounted at.
 ///
-/// # Note on DNS rebinding
+/// # Trust boundary
 ///
-/// `rmcp`'s `StreamableHttpService` validates the `Host` header against an
-/// allow-list that defaults to loopback addresses only (`localhost`,
-/// `127.0.0.1`, `::1`). If you bind to `0.0.0.0` or a non-loopback address,
-/// clients must send requests with a `Host` that matches the allow-list, or
-/// use a reverse proxy that rewrites the `Host` header.
+/// MCPLS binds only to loopback in the built-in HTTP transport. `Host`
+/// allow-listing in `rmcp` is DNS-rebinding protection, not authentication.
+/// Expose MCPLS through an authenticated reverse proxy if remote access is
+/// required; direct non-loopback binds are rejected.
 ///
 /// # Examples
 ///
@@ -137,6 +136,19 @@ impl HttpConfig {
     pub const fn with_max_concurrent_sessions(mut self, max: usize) -> Self {
         self.max_concurrent_sessions = max;
         self
+    }
+}
+
+#[cfg(feature = "transport-http")]
+impl HttpConfig {
+    fn validate(&self) -> Result<(), crate::Error> {
+        if self.bind.ip().is_loopback() {
+            return Ok(());
+        }
+        Err(crate::Error::Config(
+            "non-loopback HTTP requires an authenticated reverse proxy; bind mcpls to loopback"
+                .to_string(),
+        ))
     }
 }
 

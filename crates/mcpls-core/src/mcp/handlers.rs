@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Mutex;
 
@@ -95,14 +96,26 @@ impl BridgeContext {
         }
     }
 
+    /// Remember a plan returned by a preview in this session.
+    pub(crate) async fn remember_plan(&self, plan_id: PlanId) {
+        self.owned_plan_ids.lock().await.insert(plan_id);
+    }
+
+    /// Claim a plan for application, consuming this session's ownership token.
+    pub(crate) async fn claim_plan(&self, plan_id: &PlanId) -> bool {
+        self.owned_plan_ids.lock().await.remove(plan_id)
+    }
+
     /// Create a session-local context that shares project actors but not
     /// resource subscriptions with another MCP session.
     #[must_use]
     pub fn for_session(&self) -> Self {
-        Self::from_registry(
+        let mut context = Self::from_registry(
             Arc::new(ResourceSubscriptions::new()),
             self.project_registry.clone(),
-        )
+        );
+        context.started_at = self.started_at;
+        context
     }
 
     /// Return the actor owning a path or the registry's explicit routing error.
@@ -129,6 +142,7 @@ impl BridgeContext {
 mod tests {
     use super::*;
     use crate::bridge::Translator;
+    use crate::edit_plan::PlanId;
 
     #[test]
     fn test_bridge_context_creation() {
@@ -144,5 +158,20 @@ mod tests {
             false,
         );
         assert_eq!(Arc::strong_count(&context.translator), 1);
+    }
+
+    #[tokio::test]
+    async fn edit_plan_ownership_is_local_to_one_session() {
+        let translator = Arc::new(Mutex::new(Translator::new()));
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let context = HandlerContext::new(translator, subscriptions);
+        let session = context.for_session();
+        let plan_id = PlanId::new();
+
+        context.remember_plan(plan_id.clone()).await;
+
+        assert!(context.claim_plan(&plan_id).await);
+        assert!(!context.claim_plan(&plan_id).await);
+        assert!(!session.claim_plan(&plan_id).await);
     }
 }

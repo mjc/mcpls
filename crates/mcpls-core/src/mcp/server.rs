@@ -469,7 +469,9 @@ impl McplsServer {
     }
 
     /// Resolve and preview one project-scoped code action.
-    #[tool(description = "Preview a code action using its project-scoped reference.")]
+    #[tool(
+        description = "Preview a code action using its project-scoped reference; the returned plan is owned by this MCP session."
+    )]
     async fn code_action_preview(
         &self,
         Parameters(CodeActionPreviewParams {
@@ -488,11 +490,12 @@ impl McplsServer {
             .preview_code_action(&id, action_id, encoding)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.context.remember_plan(result.plan.id().clone()).await;
         encode_json(&preview_artifact_json(&result, id.as_str()))
     }
 
-    /// Apply a previously previewed code action plan.
-    #[tool(description = "Apply a code action preview plan for a project.")]
+    /// Apply a code action plan previewed by this MCP session.
+    #[tool(description = "Apply a code action preview plan owned by this MCP session.")]
     async fn code_action_apply(
         &self,
         Parameters(CodeActionApplyParams {
@@ -991,6 +994,46 @@ mod tests {
 
         assert!(server.context.subscriptions.contains(&uri).await);
         assert!(!session.context.subscriptions.contains(&uri).await);
+    }
+
+    #[tokio::test]
+    async fn subscription_list_is_sorted_and_session_local() {
+        let server = create_test_server();
+        let session = server.for_session();
+        server
+            .context
+            .subscriptions
+            .subscribe("lsp-diagnostics:///z.rs".to_string())
+            .await
+            .unwrap();
+        server
+            .context
+            .subscriptions
+            .subscribe("lsp-diagnostics:///a.rs".to_string())
+            .await
+            .unwrap();
+
+        let result = server
+            .subscription_list(Parameters(SubscriptionListParams {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+            serde_json::json!({
+                "subscriptions": [
+                    "lsp-diagnostics:///a.rs",
+                    "lsp-diagnostics:///z.rs"
+                ]
+            })
+        );
+        let session_result = session
+            .subscription_list(Parameters(SubscriptionListParams {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&session_result).unwrap(),
+            serde_json::json!({"subscriptions": []})
+        );
     }
 
     #[tokio::test]
