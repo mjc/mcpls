@@ -50,7 +50,11 @@ pub enum Transport {
 pub(crate) type SessionManagerHandle = Option<Arc<LocalSessionManager>>;
 
 #[cfg(not(feature = "transport-http"))]
-pub(crate) type SessionManagerHandle = ();
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NoSessionManager;
+
+#[cfg(not(feature = "transport-http"))]
+pub(crate) type SessionManagerHandle = NoSessionManager;
 
 #[cfg(feature = "transport-http")]
 pub(crate) const fn no_session_manager() -> SessionManagerHandle {
@@ -58,7 +62,9 @@ pub(crate) const fn no_session_manager() -> SessionManagerHandle {
 }
 
 #[cfg(not(feature = "transport-http"))]
-pub(crate) const fn no_session_manager() -> SessionManagerHandle {}
+pub(crate) const fn no_session_manager() -> SessionManagerHandle {
+    NoSessionManager
+}
 
 #[cfg(feature = "transport-http")]
 pub(crate) fn session_manager_for(transport: &Transport) -> SessionManagerHandle {
@@ -69,7 +75,9 @@ pub(crate) fn session_manager_for(transport: &Transport) -> SessionManagerHandle
 }
 
 #[cfg(not(feature = "transport-http"))]
-pub(crate) const fn session_manager_for(_transport: &Transport) -> SessionManagerHandle {}
+pub(crate) const fn session_manager_for(_transport: &Transport) -> SessionManagerHandle {
+    NoSessionManager
+}
 
 #[cfg(feature = "transport-http")]
 pub(crate) async fn session_count(manager: &SessionManagerHandle) -> usize {
@@ -81,7 +89,7 @@ pub(crate) async fn session_count(manager: &SessionManagerHandle) -> usize {
 
 #[cfg(not(feature = "transport-http"))]
 pub(crate) async fn session_count(_manager: &SessionManagerHandle) -> usize {
-    0
+    std::future::ready(0).await
 }
 
 /// Safe, non-secret transport details included in daemon status snapshots.

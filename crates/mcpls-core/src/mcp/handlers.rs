@@ -68,7 +68,7 @@ impl HandlerContext {
         Self::with_subscriptions(
             subscriptions,
             project_registry,
-            TransportSnapshot::stdio(),
+            Arc::new(TransportSnapshot::stdio()),
             transport::no_session_manager(),
         )
     }
@@ -81,13 +81,18 @@ impl HandlerContext {
         transport: TransportSnapshot,
         session_manager: SessionManagerHandle,
     ) -> Self {
-        Self::with_subscriptions(subscriptions, project_registry, transport, session_manager)
+        Self::with_subscriptions(
+            subscriptions,
+            project_registry,
+            Arc::new(transport),
+            session_manager,
+        )
     }
 
     fn with_subscriptions(
         subscriptions: Arc<ResourceSubscriptions>,
         project_registry: ProjectRegistry,
-        transport: TransportSnapshot,
+        transport: Arc<TransportSnapshot>,
         session_manager: SessionManagerHandle,
     ) -> Self {
         let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
@@ -95,7 +100,7 @@ impl HandlerContext {
             subscriptions,
             project_registry,
             event_sink,
-            transport: Arc::new(transport),
+            transport,
             session_manager,
             started_at: Instant::now(),
             owned_plan_ids: Mutex::new(HashSet::new()),
@@ -116,12 +121,12 @@ impl HandlerContext {
     /// resource subscriptions with another MCP session.
     #[must_use]
     pub fn for_session(&self) -> Self {
-        let mut context = Self::from_registry(
+        let mut context = Self::with_subscriptions(
             Arc::new(ResourceSubscriptions::new()),
             self.project_registry.clone(),
+            Arc::clone(&self.transport),
+            self.session_manager.clone(),
         );
-        context.transport = Arc::clone(&self.transport);
-        context.session_manager.clone_from(&self.session_manager);
         context.started_at = self.started_at;
         context
     }
