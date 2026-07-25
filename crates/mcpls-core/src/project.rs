@@ -539,6 +539,8 @@ pub enum ProjectEvent {
     ProjectRemoved {
         /// Stable identity that is no longer routable.
         project_id: ProjectId,
+        /// Canonical worktree root whose file resources are no longer valid.
+        root: PathBuf,
     },
 }
 
@@ -550,6 +552,7 @@ impl ProjectEvent {
             self,
             Self::ProjectRemoved {
                 project_id: removed_project,
+                ..
             } if removed_project != project_id
         )
     }
@@ -591,9 +594,10 @@ impl ProjectEvent {
                 "committed_files": committed_files,
                 "operation_count": operation_count,
             }),
-            Self::ProjectRemoved { project_id } => serde_json::json!({
+            Self::ProjectRemoved { project_id, root } => serde_json::json!({
                 "kind": "project_removed",
                 "project_id": project_id.as_str(),
+                "root": root,
             }),
         }
     }
@@ -3454,12 +3458,18 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor cannot shut down.
     pub async fn remove(&self, id: ProjectId) -> Result<(), ProjectRegistryError> {
-        let (actor, mutation) = self
+        let (actor, mutation, root) = self
             .projects
             .read()
             .await
             .get(&id)
-            .map(|entry| (entry.actor.clone(), entry.mutation.clone()))
+            .map(|entry| {
+                (
+                    entry.actor.clone(),
+                    entry.mutation.clone(),
+                    entry.identity.root().as_path().to_path_buf(),
+                )
+            })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
         let mutation_guard = mutation.lock().await;
         self.projects
@@ -3476,6 +3486,7 @@ impl ProjectRegistry {
         actor
             .publish_event(ProjectEvent::ProjectRemoved {
                 project_id: id.clone(),
+                root,
             })
             .await
             .map_err(ProjectRegistryError::from)?;
@@ -4836,6 +4847,7 @@ mod tests {
                     record.event()
                         == &ProjectEvent::ProjectRemoved {
                             project_id: ProjectId::new("demo").unwrap(),
+                            root: root.path().canonicalize().unwrap(),
                         }
                 })
         );

@@ -161,6 +161,26 @@ impl ResourceSubscriptions {
         self.0.write().await.remove(uri)
     }
 
+    /// Remove diagnostics subscriptions whose canonical paths are under a
+    /// project root. Non-diagnostics resource URIs are left untouched.
+    pub async fn unsubscribe_under_path(&self, root: &Path) -> usize {
+        let mut set = self.0.write().await;
+        let removed: Vec<_> = set
+            .iter()
+            .filter_map(|uri| {
+                parse_uri(uri)
+                    .ok()
+                    .filter(|path| path.starts_with(root))
+                    .map(|_| uri.clone())
+            })
+            .collect();
+        let count = removed.len();
+        for uri in removed {
+            set.remove(&uri);
+        }
+        count
+    }
+
     /// Check if a URI is currently subscribed.
     pub async fn contains(&self, uri: &str) -> bool {
         self.0.read().await.contains(uri)

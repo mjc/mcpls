@@ -197,6 +197,9 @@ impl SessionEventSink {
                             for uri in event_resource_uris(&event_project_id, &event) {
                                 subscriptions.unsubscribe(&uri).await;
                             }
+                            if let ProjectEvent::ProjectRemoved { root, .. } = &event {
+                                subscriptions.unsubscribe_under_path(root).await;
+                            }
                             break;
                         }
                         if outcome == ForwardOutcome::Disconnect {
@@ -324,6 +327,7 @@ mod tests {
                 &project_id,
                 &ProjectEvent::ProjectRemoved {
                     project_id: project_id.clone(),
+                    root: std::path::PathBuf::from("/workspace"),
                 },
             ),
             vec![
@@ -336,6 +340,7 @@ mod tests {
                 &project_id,
                 &ProjectEvent::ProjectRemoved {
                     project_id: ProjectId::new("other").unwrap(),
+                    root: std::path::PathBuf::from("/workspace/other"),
                 },
             )
             .is_empty()
@@ -436,9 +441,14 @@ mod tests {
         let project_id = ProjectId::new("a").unwrap();
         let event_uri = project_events_resource_uri(&project_id);
         let status_uri = project_status_resource_uri(&project_id);
+        let diagnostics_uri = "lsp-diagnostics:///workspace/src/main.rs".to_string();
         let subscriptions = Arc::new(crate::bridge::ResourceSubscriptions::new());
         subscriptions.subscribe(event_uri.clone()).await.unwrap();
         subscriptions.subscribe(status_uri.clone()).await.unwrap();
+        subscriptions
+            .subscribe(diagnostics_uri.clone())
+            .await
+            .unwrap();
         let sink = SessionEventSink::new(Arc::clone(&subscriptions));
         let (events_tx, events_rx) = broadcast::channel(8);
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
@@ -451,6 +461,7 @@ mod tests {
         events_tx
             .send(ProjectEvent::ProjectRemoved {
                 project_id: project_id.clone(),
+                root: std::path::PathBuf::from("/workspace"),
             })
             .unwrap();
 
@@ -466,6 +477,7 @@ mod tests {
                 .contains(&project_status_resource_uri(&project_id))
                 .await
         );
+        assert!(!subscriptions.contains(&diagnostics_uri).await);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if sink
