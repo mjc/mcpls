@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::{Peer, RoleServer};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::bridge::resources::make_uri;
@@ -24,6 +25,23 @@ fn event_resource_uri(event: &ProjectEvent) -> Option<String> {
     match event {
         ProjectEvent::DiagnosticsUpdated { uri, .. } => diagnostics_resource_uri(uri),
         ProjectEvent::StatusChanged { .. } | ProjectEvent::ServerExited { .. } => None,
+    }
+}
+
+#[async_trait::async_trait]
+pub trait SessionNotifier: Send + Sync {
+    async fn notify_resource_updated(&self, uri: String) -> Result<(), ()>;
+}
+
+struct PeerNotifier(Peer<RoleServer>);
+
+#[async_trait::async_trait]
+impl SessionNotifier for PeerNotifier {
+    async fn notify_resource_updated(&self, uri: String) -> Result<(), ()> {
+        self.0
+            .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+            .await
+            .map_err(|_| ())
     }
 }
 
@@ -49,6 +67,19 @@ impl SessionEventSink {
         actor: &ProjectHandle,
         peer: Peer<RoleServer>,
     ) {
+        self.attach_receiver(
+            project_id,
+            actor.subscribe_events(),
+            Arc::new(PeerNotifier(peer)),
+        );
+    }
+
+    fn attach_receiver(
+        &self,
+        project_id: ProjectId,
+        mut events: broadcast::Receiver<ProjectEvent>,
+        notifier: Arc<dyn SessionNotifier>,
+    ) {
         let mut tasks = self
             .tasks
             .lock()
@@ -62,7 +93,6 @@ impl SessionEventSink {
         tasks.remove(&project_id);
 
         let subscriptions = Arc::clone(&self.subscriptions);
-        let mut events = actor.subscribe_events();
         let task = tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -73,10 +103,8 @@ impl SessionEventSink {
                         if !subscriptions.contains(&resource_uri).await {
                             continue;
                         }
-                        if peer
-                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                                resource_uri,
-                            ))
+                        if notifier
+                            .notify_resource_updated(resource_uri)
                             .await
                             .is_err()
                         {
@@ -108,8 +136,23 @@ impl Drop for SessionEventSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tokio::sync::{broadcast, mpsc};
+
+    use super::{SessionEventSink, SessionNotifier};
     use super::{diagnostics_resource_uri, event_resource_uri};
-    use crate::project::{ProjectEvent, ProjectStatus};
+    use crate::project::{ProjectEvent, ProjectId, ProjectStatus};
+
+    struct TestNotifier(mpsc::UnboundedSender<String>);
+
+    #[async_trait]
+    impl SessionNotifier for TestNotifier {
+        async fn notify_resource_updated(&self, uri: String) -> Result<(), ()> {
+            self.0.send(uri).map_err(|_| ())
+        }
+    }
 
     #[test]
     fn diagnostics_events_map_to_subscribable_resource_uris() {
@@ -127,6 +170,48 @@ mod tests {
                 last_error: None,
             }),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sinks_filter_shared_events_by_their_own_subscriptions() {
+        let file_a = "lsp-diagnostics:///workspace/a.rs".to_string();
+        let file_b = "lsp-diagnostics:///workspace/b.rs".to_string();
+        let subscriptions_a = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        let subscriptions_b = Arc::new(crate::bridge::ResourceSubscriptions::new());
+        subscriptions_a.subscribe(file_a.clone()).await.unwrap();
+        subscriptions_b.subscribe(file_b.clone()).await.unwrap();
+
+        let sink_a = SessionEventSink::new(Arc::clone(&subscriptions_a));
+        let sink_b = SessionEventSink::new(Arc::clone(&subscriptions_b));
+        let (events_tx, events_rx) = broadcast::channel(8);
+        let (updates_a_tx, mut updates_a_rx) = mpsc::unbounded_channel();
+        let (updates_b_tx, mut updates_b_rx) = mpsc::unbounded_channel();
+
+        sink_a.attach_receiver(
+            ProjectId::new("a").unwrap(),
+            events_rx.resubscribe(),
+            Arc::new(TestNotifier(updates_a_tx)),
+        );
+        sink_b.attach_receiver(
+            ProjectId::new("b").unwrap(),
+            events_rx,
+            Arc::new(TestNotifier(updates_b_tx)),
+        );
+
+        events_tx
+            .send(ProjectEvent::DiagnosticsUpdated {
+                uri: "file:///workspace/a.rs".to_string(),
+                version: Some(1),
+                diagnostic_count: 1,
+            })
+            .unwrap();
+
+        assert_eq!(updates_a_rx.recv().await.unwrap(), file_a);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), updates_b_rx.recv())
+                .await
+                .is_err()
         );
     }
 }
