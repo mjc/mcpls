@@ -512,6 +512,15 @@ pub enum ProjectEvent {
         /// Runtime generation that exited.
         generation: u64,
     },
+    /// A language server published diagnostics for one document.
+    DiagnosticsUpdated {
+        /// Document URI whose diagnostics were replaced.
+        uri: String,
+        /// LSP document version, when provided by the server.
+        version: Option<i32>,
+        /// Number of diagnostics in the replacement set.
+        diagnostic_count: usize,
+    },
 }
 
 /// Observable project state, including the most recent failure detail.
@@ -2321,26 +2330,36 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn notification(&mut self, notification: LspNotification) {
+    fn notification(&mut self, notification: LspNotification) -> Option<ProjectEvent> {
         match notification {
             LspNotification::PublishDiagnostics(params) => {
+                let event = ProjectEvent::DiagnosticsUpdated {
+                    uri: params.uri.to_string(),
+                    version: params.version,
+                    diagnostic_count: params.diagnostics.len(),
+                };
                 self.translator.notification_cache_mut().store_diagnostics(
                     &params.uri,
                     params.version,
                     params.diagnostics,
                 );
+                Some(event)
             }
-            LspNotification::LogMessage(params) => self
-                .translator
-                .notification_cache_mut()
-                .store_log(params.typ.into(), params.message),
-            LspNotification::ShowMessage(params) => self
-                .translator
-                .notification_cache_mut()
-                .store_message(params.typ.into(), params.message),
+            LspNotification::LogMessage(params) => {
+                self.translator
+                    .notification_cache_mut()
+                    .store_log(params.typ.into(), params.message);
+                None
+            }
+            LspNotification::ShowMessage(params) => {
+                self.translator
+                    .notification_cache_mut()
+                    .store_message(params.typ.into(), params.message);
+                None
+            }
             LspNotification::Progress { .. }
             | LspNotification::ServerStatus(_)
-            | LspNotification::Other { .. } => {}
+            | LspNotification::Other { .. } => None,
         }
     }
 
@@ -2895,7 +2914,9 @@ async fn handle_project_request(
             notification,
         } => {
             if runtime.owns_generation(generation) {
-                runtime.notification(notification);
+                if let Some(event) = runtime.notification(notification) {
+                    channels.publish(event);
+                }
             }
         }
         ProjectRequest::ServerExited { generation } => {
@@ -4107,6 +4128,42 @@ mod tests {
         let result = actor.server_logs(10, None).await.unwrap();
         assert_eq!(result.logs.len(), 1);
         assert_eq!(result.logs[0].message, "project log");
+    }
+
+    #[tokio::test]
+    async fn project_actor_publishes_diagnostics_events_for_notifications() {
+        let actor = spawn_project_actor(2);
+        let mut events = actor.subscribe_events();
+        let uri = "file:///project/src/main.rs";
+        let notification = LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(serde_json::json!({
+                "uri": uri,
+                "version": 7,
+                "diagnostics": []
+            })),
+        );
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProjectEvent::DiagnosticsUpdated {
+                uri: uri.to_string(),
+                version: Some(7),
+                diagnostic_count: 0,
+            }
+        );
     }
 
     #[tokio::test]
