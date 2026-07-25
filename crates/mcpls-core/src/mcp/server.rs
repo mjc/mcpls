@@ -257,14 +257,11 @@ impl Clone for McplsServer {
 #[tool_router]
 impl McplsServer {
     async fn daemon_snapshot(&self) -> DaemonSnapshot {
+        let projects = self.context.project_registry.status_snapshot().await;
         DaemonSnapshot {
-            project_counts: self.context.project_registry.status_counts().await,
-            actor_groups: self
-                .context
-                .project_registry
-                .total_actor_group_count()
-                .await,
-            project_summaries: self.context.project_registry.status_summaries().await,
+            project_counts: projects.counts,
+            actor_groups: projects.actor_groups,
+            project_summaries: projects.summaries,
             persistence: DaemonPersistenceSnapshot {
                 configured: self.context.project_registry.persistence_configured(),
             },

@@ -3640,6 +3640,23 @@ impl ProjectEntry {
                 .map(|actor| *actor.actor.status().borrow()),
         )
     }
+
+    fn status_summary(&self) -> ProjectStatusSummary {
+        let mut roots = self
+            .actors
+            .iter()
+            .flat_map(|actor| actor.roots.iter().map(CanonicalRoot::as_path))
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        ProjectStatusSummary {
+            project_id: self.identity.id().clone(),
+            status: self.status(),
+            actor_group_count: self.actors.len(),
+            roots,
+        }
+    }
 }
 
 type MutationGate = std::sync::Arc<Mutex<()>>;
@@ -3706,6 +3723,17 @@ pub struct ProjectStatusSummary {
     pub actor_group_count: usize,
     /// Canonical roots owned by the project, sorted and deduplicated.
     pub roots: Vec<PathBuf>,
+}
+
+/// Coherent, non-blocking snapshot of registered project lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRegistryStatusSnapshot {
+    /// Counts by lifecycle state.
+    pub counts: ProjectStatusCounts,
+    /// Total actor groups across all logical projects.
+    pub actor_groups: usize,
+    /// Per-project lifecycle summaries.
+    pub summaries: Vec<ProjectStatusSummary>,
 }
 
 /// Negotiated capability data for one actor group in a logical project.
@@ -4063,28 +4091,33 @@ impl ProjectRegistry {
     /// Read project lifecycle summaries without awaiting any actor request.
     pub async fn status_summaries(&self) -> Vec<ProjectStatusSummary> {
         let projects = self.projects.read().await;
-        let mut summaries = projects
+        let mut summaries: Vec<ProjectStatusSummary> = projects
             .values()
-            .map(|entry| {
-                let mut roots = entry
-                    .actors
-                    .iter()
-                    .flat_map(|actor| actor.roots.iter().map(CanonicalRoot::as_path))
-                    .map(Path::to_path_buf)
-                    .collect::<Vec<_>>();
-                roots.sort();
-                roots.dedup();
-                ProjectStatusSummary {
-                    project_id: entry.identity.id().clone(),
-                    status: entry.status(),
-                    actor_group_count: entry.actors.len(),
-                    roots,
-                }
-            })
-            .collect::<Vec<_>>();
+            .map(ProjectEntry::status_summary)
+            .collect();
         drop(projects);
         summaries.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         summaries
+    }
+
+    /// Read one coherent lifecycle snapshot without awaiting any actor request.
+    pub async fn status_snapshot(&self) -> ProjectRegistryStatusSnapshot {
+        let projects = self.projects.read().await;
+        let mut snapshot = ProjectRegistryStatusSnapshot {
+            counts: ProjectStatusCounts::default(),
+            actor_groups: 0,
+            summaries: Vec::with_capacity(projects.len()),
+        };
+        for entry in projects.values() {
+            snapshot.counts.record(entry.status());
+            snapshot.actor_groups += entry.actors.len();
+            snapshot.summaries.push(entry.status_summary());
+        }
+        drop(projects);
+        snapshot
+            .summaries
+            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        snapshot
     }
 
     /// Return whether durable project registration is configured.
