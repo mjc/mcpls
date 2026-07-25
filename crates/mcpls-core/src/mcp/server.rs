@@ -1963,6 +1963,32 @@ while True:
     }
 
     #[cfg(unix)]
+    fn project_params(project_id: &str) -> Parameters<ProjectIdParams> {
+        Parameters(ProjectIdParams {
+            project_id: project_id.to_string(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn project_add_params(
+        project_id: &str,
+        root: &std::path::Path,
+    ) -> Parameters<ProjectAddParams> {
+        Parameters(ProjectAddParams {
+            project_id: project_id.to_string(),
+            root: root.display().to_string(),
+            config: None,
+        })
+    }
+
+    #[cfg(unix)]
+    fn document_symbols_params(path: &std::path::Path) -> Parameters<DocumentSymbolsParams> {
+        Parameters(DocumentSymbolsParams {
+            file_path: path.display().to_string(),
+        })
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn http_sessions_share_one_project_actor_and_lsp_process() {
         let root = TempDir::new().unwrap();
@@ -1975,34 +2001,20 @@ while True:
         let first_session = server.for_session();
         let second_session = server.for_session();
 
-        let add_first = first_session.project_add(Parameters(ProjectAddParams {
-            project_id: "shared".to_string(),
-            root: root.path().display().to_string(),
-            config: None,
-        }));
-        let add_second = second_session.project_add(Parameters(ProjectAddParams {
-            project_id: "shared".to_string(),
-            root: root.path().display().to_string(),
-            config: None,
-        }));
+        let add_first = first_session.project_add(project_add_params("shared", root.path()));
+        let add_second = second_session.project_add(project_add_params("shared", root.path()));
         let (first, second) = tokio::join!(add_first, add_second);
         first.unwrap();
         second.unwrap();
 
-        let activate_first = first_session.project_activate(Parameters(ProjectIdParams {
-            project_id: "shared".to_string(),
-        }));
-        let activate_second = second_session.project_activate(Parameters(ProjectIdParams {
-            project_id: "shared".to_string(),
-        }));
+        let activate_first = first_session.project_activate(project_params("shared"));
+        let activate_second = second_session.project_activate(project_params("shared"));
         let (first, second) = tokio::join!(activate_first, activate_second);
         first.unwrap();
         second.unwrap();
 
         let status = first_session
-            .project_status(Parameters(ProjectIdParams {
-                project_id: "shared".to_string(),
-            }))
+            .project_status(project_params("shared"))
             .await
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
@@ -2063,9 +2075,7 @@ while True:
         let first_file = first_root.path().join("src/main.rs");
         let blocked = tokio::spawn(async move {
             blocked_server
-                .get_document_symbols(Parameters(DocumentSymbolsParams {
-                    file_path: first_file.display().to_string(),
-                }))
+                .get_document_symbols(document_symbols_params(&first_file))
                 .await
         });
         while !entered.exists() {
@@ -2075,9 +2085,7 @@ while True:
         let second_file = second_root.path().join("src/main.rs");
         let second_result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            server.get_document_symbols(Parameters(DocumentSymbolsParams {
-                file_path: second_file.display().to_string(),
-            })),
+            server.get_document_symbols(document_symbols_params(&second_file)),
         )
         .await;
         assert!(
@@ -2092,15 +2100,11 @@ while True:
         blocked.await.unwrap().unwrap();
 
         server
-            .project_remove(Parameters(ProjectIdParams {
-                project_id: first_id.as_str().to_string(),
-            }))
+            .project_remove(project_params(first_id.as_str()))
             .await
             .unwrap();
         let second_status = server
-            .project_status(Parameters(ProjectIdParams {
-                project_id: second_id.as_str().to_string(),
-            }))
+            .project_status(project_params(second_id.as_str()))
             .await
             .unwrap();
         let second_status: serde_json::Value = serde_json::from_str(&second_status).unwrap();
