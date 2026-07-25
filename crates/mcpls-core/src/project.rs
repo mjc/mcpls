@@ -3292,6 +3292,25 @@ pub struct ProjectRegistry {
     persistence: Option<std::sync::Arc<ProjectRegistrationStore>>,
 }
 
+/// Bounded lifecycle counts for cheap daemon health reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectStatusCounts {
+    /// Projects that have not finished activation.
+    pub starting: usize,
+    /// Projects ready for requests.
+    pub ready: usize,
+    /// Projects with a degraded component.
+    pub degraded: usize,
+    /// Projects currently restarting.
+    pub restarting: usize,
+    /// Projects draining before shutdown.
+    pub stopping: usize,
+    /// Stopped projects still retained by the registry.
+    pub stopped: usize,
+    /// Failed projects.
+    pub failed: usize,
+}
+
 impl ProjectRegistry {
     /// Create an empty registry with a bounded actor queue capacity.
     #[must_use]
@@ -3481,6 +3500,26 @@ impl ProjectRegistry {
             .collect();
         projects.sort_by(|left, right| left.id().cmp(right.id()));
         projects
+    }
+
+    /// Read lifecycle watches without awaiting any actor request.
+    pub async fn status_counts(&self) -> ProjectStatusCounts {
+        let projects = self.projects.read().await;
+        let mut counts = ProjectStatusCounts::default();
+        for entry in projects.values() {
+            let status = *entry.actor.status().borrow();
+            match status {
+                ProjectStatus::Starting => counts.starting += 1,
+                ProjectStatus::Ready => counts.ready += 1,
+                ProjectStatus::Degraded => counts.degraded += 1,
+                ProjectStatus::Restarting => counts.restarting += 1,
+                ProjectStatus::Stopping => counts.stopping += 1,
+                ProjectStatus::Stopped => counts.stopped += 1,
+                ProjectStatus::Failed => counts.failed += 1,
+            }
+        }
+        drop(projects);
+        counts
     }
 
     /// Return open-document paths grouped by the registered project IDs that

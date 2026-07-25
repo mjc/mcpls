@@ -38,7 +38,7 @@ use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
     CanonicalRoot, GitRepositoryIdentity, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle,
-    ProjectId, ProjectIdentity, ProjectRegistry, ProjectState,
+    ProjectId, ProjectIdentity, ProjectRegistry, ProjectState, ProjectStatusCounts,
 };
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
@@ -90,6 +90,18 @@ fn project_state_json(identity: &ProjectIdentity, state: &ProjectState) -> serde
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
+    })
+}
+
+fn project_status_counts_json(counts: ProjectStatusCounts) -> serde_json::Value {
+    serde_json::json!({
+        "starting": counts.starting,
+        "ready": counts.ready,
+        "degraded": counts.degraded,
+        "restarting": counts.restarting,
+        "stopping": counts.stopping,
+        "stopped": counts.stopped,
+        "failed": counts.failed,
     })
 }
 
@@ -389,6 +401,33 @@ impl McplsServer {
             })
             .collect();
         encode_json(&result)
+    }
+
+    /// Return a cheap process and project liveness snapshot.
+    #[tool(description = "Return daemon liveness and non-blocking project lifecycle counts.")]
+    async fn health(
+        &self,
+        Parameters(_params): Parameters<ProjectListParams>,
+    ) -> Result<String, McpError> {
+        let counts = self.context.project_registry.status_counts().await;
+        encode_json(&serde_json::json!({
+            "status": if counts.failed == 0 { "healthy" } else { "degraded" },
+            "projects": project_status_counts_json(counts),
+        }))
+    }
+
+    /// Return daemon version, uptime, and a cheap project status snapshot.
+    #[tool(description = "Return daemon version, uptime, and non-blocking project status.")]
+    async fn server_status(
+        &self,
+        Parameters(_params): Parameters<ProjectListParams>,
+    ) -> Result<String, McpError> {
+        let counts = self.context.project_registry.status_counts().await;
+        encode_json(&serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": self.context.started_at.elapsed().as_secs(),
+            "projects": project_status_counts_json(counts),
+        }))
     }
 
     /// Return the current state for one registered project.
@@ -1527,6 +1566,40 @@ mod tests {
                 .unwrap()
                 .contains("demo")
         );
+    }
+
+    #[tokio::test]
+    async fn health_and_server_status_use_non_blocking_project_snapshots() {
+        let server = create_test_server();
+        let health: serde_json::Value = serde_json::from_str(
+            &server
+                .health(Parameters(ProjectListParams {}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["projects"]["starting"], 0);
+
+        let root = TempDir::new().unwrap();
+        server
+            .context
+            .project_registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("health").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(
+            &server
+                .server_status(Parameters(ProjectListParams {}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(status["uptime_seconds"].is_number());
+        assert_eq!(status["projects"]["starting"], 1);
     }
 
     #[tokio::test]

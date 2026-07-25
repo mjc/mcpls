@@ -5,6 +5,7 @@
 //! and are defined in the `server` module.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Mutex;
 
@@ -24,6 +25,8 @@ pub struct HandlerContext {
     pub project_registry: ProjectRegistry,
     /// Per-session event forwarding tasks.
     pub(crate) event_sink: Arc<SessionEventSink>,
+    /// Monotonic daemon start point shared by session clones.
+    pub(crate) started_at: Instant,
 }
 
 impl HandlerContext {
@@ -65,6 +68,7 @@ impl HandlerContext {
             subscriptions,
             project_registry,
             event_sink,
+            started_at: Instant::now(),
         }
     }
 
@@ -72,10 +76,12 @@ impl HandlerContext {
     /// resource subscriptions with another MCP session.
     #[must_use]
     pub fn for_session(&self) -> Self {
-        Self::from_registry(
+        let mut context = Self::from_registry(
             Arc::new(ResourceSubscriptions::new()),
             self.project_registry.clone(),
-        )
+        );
+        context.started_at = self.started_at;
+        context
     }
 
     /// Return the actor owning a path or the registry's explicit routing error.
