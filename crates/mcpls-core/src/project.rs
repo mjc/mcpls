@@ -794,6 +794,50 @@ impl ProjectState {
     fn sync_runtime(&mut self, runtime: &ProjectRuntime) {
         self.runtime = runtime.summary();
     }
+
+    fn aggregate(states: impl IntoIterator<Item = Self>) -> Self {
+        let mut aggregate = Self::new(ProjectStatus::Starting, ProjectRuntimeSummary::default());
+        for state in states {
+            aggregate.merge(state);
+        }
+        aggregate
+    }
+
+    fn merge(&mut self, state: Self) {
+        let state_priority = project_status_priority(state.status);
+        if state_priority >= project_status_priority(self.status) {
+            self.status = state.status;
+            self.last_error = state.last_error;
+        }
+        self.runtime
+            .workspace_roots
+            .extend(state.runtime.workspace_roots);
+        self.runtime
+            .configured_language_ids
+            .extend(state.runtime.configured_language_ids);
+        self.runtime
+            .active_language_ids
+            .extend(state.runtime.active_language_ids);
+        self.runtime.open_document_count += state.runtime.open_document_count;
+        self.runtime.workspace_roots.sort();
+        self.runtime.workspace_roots.dedup();
+        self.runtime.configured_language_ids.sort();
+        self.runtime.configured_language_ids.dedup();
+        self.runtime.active_language_ids.sort();
+        self.runtime.active_language_ids.dedup();
+    }
+}
+
+fn project_status_priority(status: ProjectStatus) -> u8 {
+    match status {
+        ProjectStatus::Failed => 6,
+        ProjectStatus::Stopping => 5,
+        ProjectStatus::Restarting => 4,
+        ProjectStatus::Degraded => 3,
+        ProjectStatus::Starting => 2,
+        ProjectStatus::Ready => 1,
+        ProjectStatus::Stopped => 0,
+    }
 }
 
 /// Project-local state counts and roots owned by an actor.
@@ -3903,11 +3947,12 @@ impl ProjectRegistry {
     ///
     /// Returns an error when the project is not registered or its actor is unavailable.
     pub async fn status(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
-        self.actor(id)
-            .await?
-            .query()
-            .await
-            .map_err(ProjectRegistryError::from)
+        let (_, actors) = self.actor_entries(id).await?;
+        let mut states = Vec::with_capacity(actors.len());
+        for (actor, _) in actors {
+            states.push(actor.query().await?);
+        }
+        Ok(ProjectState::aggregate(states))
     }
 
     /// List code actions with project-owned opaque references.
@@ -5486,6 +5531,45 @@ mod tests {
                 .status(),
             ProjectStatus::Starting
         );
+    }
+
+    #[tokio::test]
+    async fn project_status_reports_failure_in_any_actor_group() {
+        let primary_root = TempDir::new().unwrap();
+        let secondary_root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("logical").unwrap();
+        let primary = spawn_project_actor(2);
+        let secondary = spawn_project_actor(2);
+        primary.set_status(ProjectStatus::Ready).await.unwrap();
+        secondary.fail("secondary toolchain failed").await.unwrap();
+
+        let primary_root = CanonicalRoot::new(primary_root.path()).unwrap();
+        let secondary_root = CanonicalRoot::new(secondary_root.path()).unwrap();
+        let mut entry = ProjectEntry::new(
+            ProjectIdentity::new(project_id.clone(), primary_root.clone()),
+            primary,
+            std::sync::Arc::new(Mutex::new(())),
+            None,
+        );
+        entry.identity.add_root(secondary_root.clone());
+        entry.actors.push(ProjectActorEntry::new(
+            secondary,
+            std::sync::Arc::new(Mutex::new(())),
+            None,
+            secondary_root,
+        ));
+
+        let registry = ProjectRegistry::new(2);
+        registry
+            .projects
+            .write()
+            .await
+            .insert(project_id.clone(), entry);
+
+        let state = registry.status(&project_id).await.unwrap();
+
+        assert_eq!(state.status(), ProjectStatus::Failed);
+        assert_eq!(state.last_error(), Some("secondary toolchain failed"));
     }
 
     #[tokio::test]
