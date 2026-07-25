@@ -4031,6 +4031,17 @@ impl ProjectRegistry {
         counts
     }
 
+    /// Count actor groups without awaiting any actor request.
+    #[must_use]
+    pub async fn total_actor_group_count(&self) -> usize {
+        self.projects
+            .read()
+            .await
+            .values()
+            .map(|project| project.actors.len())
+            .sum()
+    }
+
     /// Gracefully stop every registered project actor once.
     ///
     /// Requests already queued on an actor are processed before its shutdown

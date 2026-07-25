@@ -511,9 +511,15 @@ impl McplsServer {
         Parameters(_params): Parameters<ProjectListParams>,
     ) -> Result<String, McpError> {
         let counts = self.context.project_registry.status_counts().await;
+        let actor_groups = self
+            .context
+            .project_registry
+            .total_actor_group_count()
+            .await;
         encode_json(&serde_json::json!({
             "status": if counts.failed == 0 { "healthy" } else { "degraded" },
             "projects": project_status_counts_json(counts),
+            "actor_groups": actor_groups,
         }))
     }
 
@@ -524,10 +530,16 @@ impl McplsServer {
         Parameters(_params): Parameters<ProjectListParams>,
     ) -> Result<String, McpError> {
         let counts = self.context.project_registry.status_counts().await;
+        let actor_groups = self
+            .context
+            .project_registry
+            .total_actor_group_count()
+            .await;
         encode_json(&serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
             "projects": project_status_counts_json(counts),
+            "actor_groups": actor_groups,
         }))
     }
 
@@ -1766,6 +1778,7 @@ mod tests {
         .unwrap();
         assert_eq!(health["status"], "healthy");
         assert_eq!(health["projects"]["starting"], 0);
+        assert_eq!(health["actor_groups"], 0);
 
         let root = TempDir::new().unwrap();
         server
@@ -1786,6 +1799,7 @@ mod tests {
         .unwrap();
         assert!(status["uptime_seconds"].is_number());
         assert_eq!(status["projects"]["starting"], 1);
+        assert_eq!(status["actor_groups"], 1);
     }
 
     #[tokio::test]
