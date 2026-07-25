@@ -3716,6 +3716,26 @@ mod tests {
     }
 
     #[test]
+    fn server_logs_redact_configured_environment_values() {
+        use crate::bridge::notifications::LogLevel;
+
+        let mut config = LspServerConfig::rust_analyzer();
+        config
+            .env
+            .insert("MCPLS_TEST_SECRET".to_string(), "env-secret".to_string());
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![config], None);
+        translator.notification_cache_mut().store_log(
+            LogLevel::Error,
+            "server failed with env-secret".to_string(),
+        );
+
+        let result = translator.handle_server_logs(10, None).unwrap();
+        assert_eq!(result.logs[0].message, "server failed with [REDACTED]");
+    }
+
+    #[test]
     fn test_handle_server_messages_limit() {
         use crate::bridge::notifications::MessageType;
 
