@@ -95,6 +95,18 @@ impl ProjectRegistrationState {
             projects: Vec::new(),
         }
     }
+
+    /// Build the durable state at the serialization boundary.
+    #[must_use]
+    fn from_projects(projects: &[PersistedProject]) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            projects: projects
+                .iter()
+                .map(PersistedProject::for_persistence)
+                .collect(),
+        }
+    }
 }
 
 /// Errors returned by the registration store.
@@ -172,13 +184,7 @@ impl ProjectRegistrationStore {
         {
             fs::create_dir_all(parent)?;
         }
-        let state = ProjectRegistrationState {
-            schema_version: SCHEMA_VERSION,
-            projects: projects
-                .iter()
-                .map(PersistedProject::for_persistence)
-                .collect(),
-        };
+        let state = ProjectRegistrationState::from_projects(projects);
         let bytes = serde_json::to_vec_pretty(&state)?;
         let temporary = temporary_path(&self.path);
         let mut file = OpenOptions::new()
