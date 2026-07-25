@@ -577,18 +577,15 @@ impl McplsServer {
             new_name,
         }): Parameters<RenameParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .rename(file_path, line, character, new_name)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_rename(file_path, line, character, new_name)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .rename(file_path, line, character, new_name)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -610,18 +607,15 @@ impl McplsServer {
             trigger,
         }): Parameters<CompletionsParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .completions(file_path, line, character, trigger)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_completions(file_path, line, character, trigger)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .completions(file_path, line, character, trigger)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -638,18 +632,15 @@ impl McplsServer {
         &self,
         Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .document_symbols(file_path)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_document_symbols(file_path)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .document_symbols(file_path)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -670,18 +661,15 @@ impl McplsServer {
             insert_spaces,
         }): Parameters<FormatDocumentParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .format_document(file_path, tab_size, insert_spaces)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_format_document(file_path, tab_size, insert_spaces)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .format_document(file_path, tab_size, insert_spaces)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -731,32 +719,22 @@ impl McplsServer {
             kind_filter,
         }): Parameters<CodeActionsParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .code_actions(
-                    file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                    kind_filter,
-                )
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_code_actions(
-                    file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                    kind_filter,
-                )
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .code_actions(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+                kind_filter,
+            )
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -777,18 +755,15 @@ impl McplsServer {
             character,
         }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .prepare_call_hierarchy(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_call_hierarchy_prepare(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .prepare_call_hierarchy(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -806,18 +781,15 @@ impl McplsServer {
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
         let path = call_hierarchy_item_path(&item)?;
-        let result = if let Some(actor) = self.context.actor_for_path(&path).await {
-            actor
-                .incoming_calls(item)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_incoming_calls(item)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .incoming_calls(item)
+            .await
+            .map_err(|error| error.to_string());
 
         encode_tool_result(result)
     }
@@ -831,18 +803,15 @@ impl McplsServer {
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
         let path = call_hierarchy_item_path(&item)?;
-        let result = if let Some(actor) = self.context.actor_for_path(&path).await {
-            actor
-                .outgoing_calls(item)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_outgoing_calls(item)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .outgoing_calls(item)
+            .await
+            .map_err(|error| error.to_string());
 
         encode_tool_result(result)
     }
@@ -855,17 +824,15 @@ impl McplsServer {
         &self,
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .cached_diagnostics(file_path)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_cached_diagnostics(&file_path)
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .cached_diagnostics(file_path)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -914,18 +881,15 @@ impl McplsServer {
             character,
         }): Parameters<SignatureHelpParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .signature_help(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_signature_help(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .signature_help(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -946,18 +910,15 @@ impl McplsServer {
             character,
         }): Parameters<GoToImplementationParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .go_to_implementation(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_implementation(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .go_to_implementation(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -978,18 +939,15 @@ impl McplsServer {
             character,
         }): Parameters<GoToTypeDefinitionParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .go_to_type_definition(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_type_definition(file_path, line, character)
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .go_to_type_definition(file_path, line, character)
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -1012,30 +970,21 @@ impl McplsServer {
             end_character,
         }): Parameters<InlayHintsParams>,
     ) -> Result<String, McpError> {
-        let result = if let Some(actor) = self.context.actor_for_path(&file_path).await {
-            actor
-                .inlay_hints(
-                    file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                )
-                .await
-                .map_err(|error| error.to_string())
-        } else {
-            let mut translator = self.context.translator.lock().await;
-            translator
-                .handle_inlay_hints(
-                    file_path,
-                    start_line,
-                    start_character,
-                    end_line,
-                    end_character,
-                )
-                .await
-                .map_err(|error| error.to_string())
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .inlay_hints(
+                file_path,
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+            )
+            .await
+            .map_err(|error| error.to_string());
 
         match result {
             Ok(value) => serde_json::to_string(&value)
@@ -1092,36 +1041,24 @@ impl ServerHandler for McplsServer {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        let lsp_uri = crate::bridge::path_to_uri(&path);
-
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
         // in the response shape. Currently both return `{"diagnostics":null}` which is
         // ambiguous for clients that need to know whether analysis has run yet.
-        let json = if let Some(actor) = self.context.actor_for_path(&path).await {
-            actor
-                .validate_path(path.display().to_string())
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-            let diagnostics = actor
-                .cached_diagnostics(path.display().to_string())
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-            serde_json::to_string(&diagnostics)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?
-        } else {
-            let diagnostics = {
-                let translator = self.context.translator.lock().await;
-                translator
-                    .validate_path(&path)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                translator
-                    .notification_cache()
-                    .get_diagnostics(lsp_uri.as_str())
-                    .cloned()
-            };
-            serde_json::to_string(&diagnostics)
-                .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?
-        };
+        let actor = self
+            .context
+            .required_actor_for_path(&path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        actor
+            .validate_path(path.display().to_string())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let diagnostics = actor
+            .cached_diagnostics(path.display().to_string())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let json = serde_json::to_string(&diagnostics)
+            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
 
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             json,
@@ -1137,19 +1074,15 @@ impl ServerHandler for McplsServer {
         let path =
             parse_uri(&request.uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        // Registered projects own containment validation. Keep the daemon
-        // translator as a compatibility fallback for unregistered resources.
-        if let Some(actor) = self.context.actor_for_path(&path).await {
-            actor
-                .validate_path(path.display().to_string())
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        } else {
-            let translator = self.context.translator.lock().await;
-            translator
-                .validate_path(&path)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        }
+        let actor = self
+            .context
+            .required_actor_for_path(&path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        actor
+            .validate_path(path.display().to_string())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
 
         // TODO(S3): If diagnostics are already cached for this URI, emit a synthetic
         // notify_resource_updated so clients subscribing after initial workspace indexing
@@ -2330,7 +2263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cached_diagnostics_tool_with_params() {
+    async fn test_cached_diagnostics_tool_rejects_unregistered_paths() {
         use std::fs;
 
         use tempfile::TempDir;
@@ -2346,11 +2279,8 @@ mod tests {
         });
 
         let result = server.get_cached_diagnostics(params).await;
-        assert!(result.is_ok());
-
-        let json_str = result.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(parsed.get("diagnostics").is_some());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("path is not registered"), "{error}");
     }
 
     #[tokio::test]

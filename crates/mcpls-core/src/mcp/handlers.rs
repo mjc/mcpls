@@ -49,14 +49,6 @@ impl HandlerContext {
         }
     }
 
-    /// Return the actor owning a canonicalizable path, if it is registered.
-    ///
-    /// A missing actor is the compatibility signal used by legacy stdio
-    /// callers that still rely on the daemon translator fallback.
-    pub async fn actor_for_path(&self, path: impl AsRef<std::path::Path>) -> Option<ProjectHandle> {
-        self.project_registry.actor_for_path(path).await.ok()
-    }
-
     /// Return the actor owning a path or the registry's explicit routing error.
     ///
     /// Semantic tools use this path so an unregistered file cannot fall back to
