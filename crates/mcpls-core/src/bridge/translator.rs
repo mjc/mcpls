@@ -698,6 +698,7 @@ fn rust_analyzer_initialization_options(
     };
 
     merge_rust_analyzer_file_exclusions(&mut options, roots)?;
+    set_default_rust_analyzer_symbol_search(&mut options)?;
 
     if roots.len() >= 2 {
         let mut linked_projects = take_linked_projects(&mut options)?;
@@ -713,6 +714,27 @@ fn rust_analyzer_initialization_options(
     }
 
     Ok(Some(serde_json::Value::Object(options)))
+}
+
+fn set_default_rust_analyzer_symbol_search(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let mut current = options;
+    for key in ["workspace", "symbol", "search"] {
+        current = current
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "rust-analyzer initialization_options.{key} must be a JSON object"
+                ))
+            })?;
+    }
+    current
+        .entry("kind".to_string())
+        .or_insert_with(|| serde_json::json!("all_symbols"));
+    Ok(())
 }
 
 fn merge_rust_analyzer_file_exclusions(
@@ -3154,6 +3176,13 @@ mod tests {
                 "files": {
                     "exclude": [".direnv", "target", "web/node_modules"]
                 },
+                "workspace": {
+                    "symbol": {
+                        "search": {
+                            "kind": "all_symbols"
+                        }
+                    }
+                },
                 "linkedProjects": [
                     first.path().join("Cargo.toml"),
                     second.path().join("Cargo.toml")
@@ -3195,7 +3224,8 @@ mod tests {
         config.initialization_options = Some(serde_json::json!({
             "cargo": {"buildScripts": {"enable": true}},
             "files": {"exclude": ["custom", "target"]},
-            "linkedProjects": [first.path().join("Cargo.toml")]
+            "linkedProjects": [first.path().join("Cargo.toml")],
+            "workspace": {"symbol": {"search": {"kind": "only_types"}}}
         }));
 
         let options = rust_analyzer_initialization_options(
@@ -3209,6 +3239,10 @@ mod tests {
         assert_eq!(
             options["files"]["exclude"],
             serde_json::json!(["custom", "target"])
+        );
+        assert_eq!(
+            options["workspace"]["symbol"]["search"]["kind"],
+            "only_types"
         );
     }
 
