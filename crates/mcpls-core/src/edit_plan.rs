@@ -3,7 +3,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -387,6 +389,10 @@ pub enum EditAuditOutcome {
 /// Bounded audit record for one plan application attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditAuditRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    principal: Option<String>,
     timestamp_ms: u64,
     project_id: String,
     plan_id: String,
@@ -402,7 +408,19 @@ impl EditAuditRecord {
     /// Create an audit record containing plan metadata without file contents.
     #[must_use]
     pub fn for_plan(plan: &EditPlan) -> Self {
+        Self::for_plan_with_context(plan, None, None)
+    }
+
+    /// Create an audit record with optional caller context and no file contents.
+    #[must_use]
+    pub fn for_plan_with_context(
+        plan: &EditPlan,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Self {
         Self {
+            session_id,
+            principal,
             timestamp_ms: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -424,6 +442,18 @@ impl EditAuditRecord {
             },
             rollback: false,
         }
+    }
+
+    /// Return the caller session when the transport supplied one.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Return the authenticated or configured principal when available.
+    #[must_use]
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
     }
 
     /// Return a completed success record with committed file paths.
@@ -493,6 +523,65 @@ impl EditAuditRecord {
     }
 }
 
+/// Whether an audit sink failure blocks an otherwise successful edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditFailureMode {
+    /// Keep the bounded in-memory record and allow the edit to continue.
+    FailOpen,
+    /// Return an error after a successful edit when the durable record fails.
+    FailClosed,
+}
+
+/// Configuration for a bounded JSONL audit sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogPolicy {
+    path: PathBuf,
+    max_bytes: usize,
+    failure_mode: AuditFailureMode,
+}
+
+impl AuditLogPolicy {
+    /// Construct a bounded audit sink policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditLogError::InvalidMaxBytes`] when the sink limit is zero.
+    pub fn new(
+        path: impl Into<PathBuf>,
+        max_bytes: usize,
+        failure_mode: AuditFailureMode,
+    ) -> Result<Self, AuditLogError> {
+        if max_bytes == 0 {
+            return Err(AuditLogError::InvalidMaxBytes);
+        }
+        Ok(Self {
+            path: path.into(),
+            max_bytes,
+            failure_mode,
+        })
+    }
+
+    /// Return the JSONL destination path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the configured sink failure behavior.
+    #[must_use]
+    pub const fn failure_mode(&self) -> AuditFailureMode {
+        self.failure_mode
+    }
+}
+
+/// Invalid audit sink configuration.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AuditLogError {
+    /// The sink must have room for at least one byte.
+    #[error("audit log max bytes must be greater than zero")]
+    InvalidMaxBytes,
+}
+
 /// Errors returned by bounded plan storage and project-scoped lookup.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlanStoreError {
@@ -531,6 +620,14 @@ pub enum PlanStoreError {
         /// Current store generation.
         current_generation: u64,
     },
+    /// A configured durable audit sink could not accept a record.
+    #[error("failed to write audit log {path}: {error}")]
+    Audit {
+        /// Configured audit destination.
+        path: PathBuf,
+        /// Redacted write failure summary.
+        error: String,
+    },
 }
 
 /// Bounded, project-local in-memory plan storage.
@@ -546,6 +643,7 @@ pub struct EditPlanStore {
     policy_generation: u64,
     policy: EditPolicy,
     tombstones: PlanTombstones,
+    audit_log: Option<AuditLogPolicy>,
 }
 
 impl EditPlanStore {
@@ -570,6 +668,7 @@ impl EditPlanStore {
             policy_generation: 0,
             policy: EditPolicy::new(EditMode::Write),
             tombstones: PlanTombstones::new(max_plans),
+            audit_log: None,
         }
     }
 
@@ -704,6 +803,46 @@ impl EditPlanStore {
         self.audit_records.push_back(record);
     }
 
+    /// Configure a durable JSONL sink for future audit records.
+    pub fn set_audit_log(&mut self, policy: AuditLogPolicy) {
+        self.audit_log = Some(policy);
+    }
+
+    /// Append an audit record to the configured sink and bounded memory store.
+    ///
+    /// With [`AuditFailureMode::FailOpen`], sink errors are ignored after the
+    /// in-memory record is retained. With [`AuditFailureMode::FailClosed`], a
+    /// sink error is returned and the record is not retained in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanStoreError::Audit`] when a fail-closed sink rejects the
+    /// serialized record.
+    pub fn record_audit_with_policy(
+        &mut self,
+        record: EditAuditRecord,
+    ) -> Result<(), PlanStoreError> {
+        let Some(policy) = self.audit_log.as_ref() else {
+            self.record_audit(record);
+            return Ok(());
+        };
+        match append_audit_record(policy, &record) {
+            Ok(()) => {
+                self.record_audit(record);
+                Ok(())
+            }
+            Err(error) if policy.failure_mode() == AuditFailureMode::FailOpen => {
+                self.record_audit(record);
+                let _ = error;
+                Ok(())
+            }
+            Err(error) => Err(PlanStoreError::Audit {
+                path: policy.path().to_path_buf(),
+                error,
+            }),
+        }
+    }
+
     /// Return audit records from oldest to newest.
     pub fn audit_records(&self) -> impl Iterator<Item = &EditAuditRecord> {
         self.audit_records.iter()
@@ -736,6 +875,25 @@ impl EditPlanStore {
         }
         Ok(plan)
     }
+}
+
+fn append_audit_record(policy: &AuditLogPolicy, record: &EditAuditRecord) -> Result<(), String> {
+    let mut line = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    line.push(b'\n');
+    let existing = std::fs::metadata(policy.path()).map_or(0, |metadata| metadata.len());
+    let total = existing
+        .checked_add(u64::try_from(line.len()).map_err(|_| "audit record is too large".to_owned())?)
+        .ok_or_else(|| "audit log size overflow".to_owned())?;
+    if total > u64::try_from(policy.max_bytes).unwrap_or(u64::MAX) {
+        return Err(format!("audit log exceeds {} byte limit", policy.max_bytes));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(policy.path())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&line).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
@@ -826,9 +984,13 @@ fn unified_diff(snapshot: &FileSnapshot) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -999,6 +1161,73 @@ mod tests {
             Err(PlanStoreError::Evicted(id)) if id == first_id
         ));
         Ok(())
+    }
+
+    #[test]
+    fn durable_audit_records_keep_context_without_source_content() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("audit.jsonl");
+        let policy = AuditLogPolicy::new(&path, 4_096, AuditFailureMode::FailClosed).unwrap();
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            vec![FileSnapshot::from_contents(
+                PathBuf::from("src/lib.rs"),
+                SnapshotSource::Disk,
+                None,
+                "secret source\n",
+                "updated\n",
+            )],
+            vec!["replace text".to_string()],
+            true,
+            Duration::from_secs(60),
+        );
+        let record = EditAuditRecord::for_plan_with_context(
+            &plan,
+            Some("session-a".to_string()),
+            Some("principal-a".to_string()),
+        )
+        .committed(vec![PathBuf::from("src/lib.rs")]);
+        let mut store = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        store.set_audit_log(policy);
+
+        store.record_audit_with_policy(record).unwrap();
+
+        let line = fs::read_to_string(path).unwrap();
+        assert!(line.contains("\"session_id\":\"session-a\""));
+        assert!(line.contains("\"principal\":\"principal-a\""));
+        assert!(line.contains("\"precondition_hashes\""));
+        assert!(!line.contains("secret source"));
+        assert_eq!(store.audit_records().count(), 1);
+    }
+
+    #[test]
+    fn audit_sink_failure_mode_controls_memory_fallback() {
+        let root = TempDir::new().unwrap();
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let record = EditAuditRecord::for_plan(&plan);
+
+        let mut fail_closed = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        fail_closed.set_audit_log(
+            AuditLogPolicy::new(root.path(), 4_096, AuditFailureMode::FailClosed).unwrap(),
+        );
+        assert!(matches!(
+            fail_closed.record_audit_with_policy(record.clone()),
+            Err(PlanStoreError::Audit { .. })
+        ));
+        assert_eq!(fail_closed.audit_records().count(), 0);
+
+        let mut fail_open = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        fail_open.set_audit_log(
+            AuditLogPolicy::new(root.path(), 4_096, AuditFailureMode::FailOpen).unwrap(),
+        );
+        fail_open.record_audit_with_policy(record).unwrap();
+        assert_eq!(fail_open.audit_records().count(), 1);
     }
 
     #[test]

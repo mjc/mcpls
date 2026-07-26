@@ -121,15 +121,36 @@ pub fn apply_stored_plan(
     project_id: &str,
     plan_id: &PlanId,
 ) -> Result<ApplyReport, ApplyError> {
+    apply_stored_plan_with_context(store, boundary, project_id, plan_id, None, None)
+}
+
+/// Consume and apply a stored plan while retaining optional caller context in
+/// its audit record.
+///
+/// # Errors
+///
+/// Returns a plan lookup, application, or fail-closed audit error.
+pub fn apply_stored_plan_with_context(
+    store: &mut EditPlanStore,
+    boundary: &WorkspaceBoundary,
+    project_id: &str,
+    plan_id: &PlanId,
+    session_id: Option<String>,
+    principal: Option<String>,
+) -> Result<ApplyReport, ApplyError> {
     let plan = store.take_for_project(plan_id, project_id)?;
-    let audit = EditAuditRecord::for_plan(&plan);
+    let audit = EditAuditRecord::for_plan_with_context(&plan, session_id, principal);
     let result = apply_plan(boundary, &plan);
     let audit = match &result {
         Ok(report) => audit.committed(report.committed_files.clone()),
         Err(error) => audit.failed(error.to_string(), false),
     };
-    store.record_audit(audit);
-    result
+    let audit_result = store.record_audit_with_policy(audit);
+    match (result, audit_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Ok(_), Err(error)) => Err(ApplyError::Audit(error)),
+        (Err(error), _) => Err(error),
+    }
 }
 
 struct PreparedPlan<'a> {
@@ -371,6 +392,9 @@ pub enum ApplyError {
     /// A fail-closed backup could not be created before writing.
     #[error("failed to create edit backup: {0}")]
     Backup(#[source] BackupError),
+    /// A fail-closed audit sink rejected a completed edit record.
+    #[error("failed to record edit audit: {0}")]
+    Audit(#[source] PlanStoreError),
 }
 
 #[derive(Debug)]
@@ -461,7 +485,9 @@ mod tests {
     use super::*;
     use crate::bridge::{DocumentTracker, ResourceLimits};
     use crate::edit_paths::FileOperation;
-    use crate::edit_plan::{EditAuditOutcome, EditPlan, FileSnapshot, SnapshotSource};
+    use crate::edit_plan::{
+        AuditFailureMode, AuditLogPolicy, EditAuditOutcome, EditPlan, FileSnapshot, SnapshotSource,
+    };
 
     #[test]
     fn applies_all_disk_snapshots_after_revalidating_preconditions() {
@@ -758,6 +784,81 @@ mod tests {
         );
         assert!(!record.rollback());
         assert!(record.committed_files().is_empty());
+    }
+
+    #[test]
+    fn stored_application_persists_context_and_reports_closed_sink_failure() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("context.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        let audit_path = root.path().join("audit.jsonl");
+        store.set_audit_log(
+            AuditLogPolicy::new(&audit_path, 4_096, AuditFailureMode::FailClosed).unwrap(),
+        );
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        apply_stored_plan_with_context(
+            &mut store,
+            &boundary,
+            "project",
+            &plan_id,
+            Some("session-1".to_string()),
+            Some("principal-1".to_string()),
+        )
+        .unwrap();
+
+        let record = store.audit_records().next().unwrap();
+        assert_eq!(record.session_id(), Some("session-1"));
+        assert_eq!(record.principal(), Some("principal-1"));
+        assert!(
+            fs::read_to_string(audit_path)
+                .unwrap()
+                .contains("session-1")
+        );
+
+        store.set_audit_log(
+            AuditLogPolicy::new(root.path(), 4_096, AuditFailureMode::FailClosed).unwrap(),
+        );
+        let failed_plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "after\n",
+                "final\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let failed_id = failed_plan.id().clone();
+        store.insert(failed_plan).unwrap();
+        let error = apply_stored_plan_with_context(
+            &mut store, &boundary, "project", &failed_id, None, None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ApplyError::Audit(PlanStoreError::Audit { .. })
+        ));
+        assert_eq!(fs::read_to_string(file).unwrap(), "final\n");
     }
 
     #[test]
