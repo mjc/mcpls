@@ -23,7 +23,7 @@ use crate::bridge::{
 use crate::config::ProjectConfig;
 use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
 use crate::edit_paths::WorkspaceBoundary;
-use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
+use crate::edit_plan::{EditAuditRecord, EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
@@ -2815,15 +2815,32 @@ impl ProjectRuntime {
                 )
             })
             .collect::<Vec<_>>();
+        let audit = EditAuditRecord::for_plan(&plan);
         let ApplyReport { committed_files } =
-            apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker())
-                .map_err(|error| error.to_string())?;
+            match apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker()) {
+                Ok(report) => report,
+                Err(error) => {
+                    let _ = self
+                        .edit_plans
+                        .record_audit_with_policy(audit.failed(error.to_string(), false));
+                    return Err(error.to_string());
+                }
+            };
         for (path, version, content) in open_documents {
-            self.translator
+            if let Err(error) = self
+                .translator
                 .apply_open_document_content(&path, version, content)
                 .await
-                .map_err(|error| error.to_string())?;
+            {
+                let _ = self
+                    .edit_plans
+                    .record_audit_with_policy(audit.failed(error.to_string(), false));
+                return Err(error.to_string());
+            }
         }
+        self.edit_plans
+            .record_audit_with_policy(audit.committed(committed_files.clone()))
+            .map_err(|error| error.to_string())?;
         Ok(AppliedEditPlan {
             plan_id: plan.id().clone(),
             operations: plan.operations().to_vec(),
