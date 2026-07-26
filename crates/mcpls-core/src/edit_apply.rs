@@ -87,15 +87,25 @@ fn apply_plan_internal(
     backup_policy: Option<&BackupPolicy>,
 ) -> Result<ApplyReport, ApplyError> {
     let prepared = PreparedPlan::new(boundary, plan, documents)?;
-    if let Some(policy) = backup_policy
-        && let Err(error) = BackupArchive::create(policy, boundary, plan)
-        && policy.failure_mode() == BackupFailureMode::FailClosed
-    {
-        return Err(ApplyError::Backup(error));
-    }
+    prepare_backup(backup_policy, boundary, plan)?;
     let staged = prepared.stage()?;
     prepared.revalidate(boundary, &staged, documents)?;
     PreparedPlan::commit(&staged, &prepared.operations)
+}
+
+fn prepare_backup(
+    policy: Option<&BackupPolicy>,
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+) -> Result<(), ApplyError> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    match BackupArchive::create(policy, boundary, plan) {
+        Ok(_) => Ok(()),
+        Err(_error) if policy.failure_mode() == BackupFailureMode::FailOpen => Ok(()),
+        Err(error) => Err(ApplyError::Backup(error)),
+    }
 }
 
 /// Consume and apply a plan from its owning project store.
