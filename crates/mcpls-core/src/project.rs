@@ -2789,8 +2789,10 @@ impl ProjectRuntime {
     }
 
     fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
-        matches!(status, ProjectStatus::Ready | ProjectStatus::Degraded)
-            && self.has_active_workspace_roots(roots)
+        matches!(
+            status,
+            ProjectStatus::Starting | ProjectStatus::Ready | ProjectStatus::Degraded
+        ) && self.has_active_workspace_roots(roots)
     }
 
     fn begin_automatic_restart(&mut self) -> Option<AutomaticRestartAttempt> {
@@ -7125,13 +7127,29 @@ while True:
         let actor = spawn_project_actor_with_translator(2, translator);
 
         let first = actor.activate(root.path().to_path_buf()).await.unwrap();
-        assert_eq!(first.status(), ProjectStatus::Ready);
+        assert_eq!(first.status(), ProjectStatus::Starting);
         assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
 
         let second = actor.activate(root.path().to_path_buf()).await.unwrap();
-        assert_eq!(second.status(), ProjectStatus::Ready);
+        assert!(matches!(
+            second.status(),
+            ProjectStatus::Starting | ProjectStatus::Ready
+        ));
         assert_eq!(second.runtime().generation(), first.runtime().generation());
         assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+
+        let state = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() == ProjectStatus::Ready {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.runtime().generation(), first.runtime().generation());
     }
 
     #[tokio::test]

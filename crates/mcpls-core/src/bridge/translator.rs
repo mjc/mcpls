@@ -253,7 +253,6 @@ impl Translator {
     #[must_use]
     pub fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
         !self.lsp_clients.is_empty()
-            && self.expected_languages.is_empty()
             && Self::same_workspace_roots(&self.workspace_roots, roots)
             && self.lsp_clients.keys().all(|language_id| {
                 self.lsp_configs
@@ -476,6 +475,8 @@ impl Translator {
 
         let failures = result.failures;
         let servers = result.servers;
+        self.expected_languages
+            .retain(|language_id| servers.contains_key(language_id));
         let health = if failures.is_empty() {
             ActivationHealth::Ready
         } else {
@@ -492,7 +493,6 @@ impl Translator {
             self.register_server(language_id, server);
         }
         self.reopen_tracked_documents().await?;
-        self.clear_expected_languages();
         Ok(ProjectActivation::new(notification_receivers, health))
     }
 
@@ -1207,6 +1207,7 @@ impl Translator {
     /// Get a cloned LSP client for a file path based on language detection.
     fn get_client_for_file(&self, path: &Path) -> Result<LspClient> {
         let language_id = detect_language(path, &self.extension_map);
+        self.wait_for_language_ready(&language_id)?;
         self.lsp_clients.get(&language_id).cloned().ok_or_else(|| {
             // A configured+applicable language whose server has not registered
             // yet is still initializing (e.g. a large Unity solution loading via
@@ -1344,9 +1345,17 @@ impl Translator {
         .await?;
         let client = server.client().clone();
         let _ = server.take_notification_rx();
-        self.register_client(language_id.clone(), client);
+        self.register_client(language_id.clone(), client.clone());
         self.register_server(language_id.clone(), server);
-        self.register_server_root(language_id, root);
+        self.register_server_root(language_id.clone(), root);
+        if language_id.eq_ignore_ascii_case("rust") {
+            self.expected_languages.insert(language_id.clone());
+            let readiness = client.wait_until_quiescent().await;
+            if readiness.is_ok() {
+                self.expected_languages.remove(&language_id);
+            }
+            readiness?;
+        }
         Ok(())
     }
 
@@ -1940,6 +1949,9 @@ impl Translator {
                 .map_or(Error::NoServerConfigured, |lang| {
                     Error::ServerInitializing(lang.clone())
                 }));
+        }
+        if let Some(language_id) = self.expected_languages.iter().min() {
+            return Err(Error::ServerInitializing(language_id.clone()));
         }
         if limit == 0 {
             return Ok(WorkspaceSymbolResult {
@@ -3189,6 +3201,7 @@ mod tests {
             r#"#!/usr/bin/env python3
 import json
 import sys
+import time
 
 def read_message():
     headers = b""
@@ -3216,6 +3229,13 @@ while True:
         break
     if message.get("method") == "initialize":
         send_message({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}})
+    elif message.get("method") == "initialized":
+        time.sleep(2)
+        send_message({
+            "jsonrpc": "2.0",
+            "method": "experimental/serverStatus",
+            "params": {"health": "ok", "quiescent": True},
+        })
     elif message.get("method") == "shutdown":
         send_message({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
@@ -3237,6 +3257,7 @@ while True:
 
         assert!(result.is_ok());
         assert_eq!(translator.lsp_servers.len(), 1);
+        assert!(translator.is_initializing());
         drop(translator);
 
         let file = root.path().join("src/lib.rs");
@@ -3247,9 +3268,13 @@ while True:
         lazy.set_workspace_roots(vec![root.path().to_path_buf()]);
         lazy.set_lsp_configs(vec![config], Some(3));
 
-        lazy.ensure_client_for_file(&file).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), lazy.ensure_client_for_file(&file))
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(lazy.lsp_servers.len(), 1);
+        assert!(!lazy.is_initializing());
     }
 
     #[test]
@@ -3566,6 +3591,9 @@ while True:
                 },
             }],
         })
+    elif method == "textDocument/documentSymbol":
+        request_log.write_text("requested")
+        send_message({"jsonrpc": "2.0", "id": message["id"], "result": []})
     elif method == "shutdown":
         send_message({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
@@ -3624,6 +3652,52 @@ while True:
             .unwrap();
 
         assert!(result.symbols.is_empty());
+        assert!(!request_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_reports_pending_while_rust_is_loading() {
+        let root = TempDir::new().unwrap();
+        let request_log = root.path().join("loading.log");
+        let server =
+            workspace_symbol_test_server(root.path(), "rust", true, "ignored", &request_log).await;
+        let client = server.client().clone();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.register_client("rust".to_string(), client);
+        translator.register_server("rust".to_string(), server);
+        translator.set_expected_languages(HashSet::from(["rust".to_string()]));
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await;
+
+        assert!(matches!(result, Err(Error::ServerInitializing(language)) if language == "rust"));
+        assert!(!request_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn document_symbols_report_pending_while_rust_is_loading() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("loading.rs");
+        fs::write(&file, "fn loading() {}\n").unwrap();
+        let request_log = root.path().join("loading.log");
+        let server =
+            workspace_symbol_test_server(root.path(), "rust", true, "ignored", &request_log).await;
+        let client = server.client().clone();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.register_client("rust".to_string(), client);
+        translator.register_server("rust".to_string(), server);
+        translator.set_expected_languages(HashSet::from(["rust".to_string()]));
+
+        let result = translator
+            .handle_document_symbols(file.display().to_string())
+            .await;
+
+        assert!(matches!(result, Err(Error::ServerInitializing(language)) if language == "rust"));
         assert!(!request_log.exists());
     }
 

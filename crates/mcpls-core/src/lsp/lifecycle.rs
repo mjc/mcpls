@@ -220,11 +220,10 @@ impl LspServer {
     ///
     /// # Errors
     ///
-    /// Returns an error if rust-analyzer reports an unhealthy state or does
-    /// not become quiescent before the timeout.
-    pub async fn wait_until_quiescent(&self, timeout: Duration) -> Result<()> {
+    /// Returns an error if rust-analyzer reports an unhealthy state.
+    pub async fn wait_until_quiescent(&self) -> Result<()> {
         if self.client.language_id() == "rust" {
-            self.client.wait_until_quiescent(timeout).await?;
+            self.client.wait_until_quiescent().await?;
         }
         Ok(())
     }

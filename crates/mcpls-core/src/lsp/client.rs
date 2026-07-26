@@ -222,9 +222,8 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns a timeout or a server-health error when readiness is not reached.
-    pub async fn wait_until_quiescent(&self, timeout_duration: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout_duration;
+    /// Returns a server-health error when readiness is reached with an error.
+    pub async fn wait_until_quiescent(&self) -> Result<()> {
         loop {
             // Register before reading the status so a concurrent update cannot
             // land between the read and the wait and leave us asleep.
@@ -246,9 +245,7 @@ impl LspClient {
                 }
             }
 
-            tokio::time::timeout_at(deadline, notified)
-                .await
-                .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?;
+            notified.await;
         }
     }
 
