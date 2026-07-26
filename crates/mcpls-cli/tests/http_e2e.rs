@@ -813,12 +813,20 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
             "Ready"
         );
     }
-    let restart_one = second.call_tool("project_restart_lsp", json!({"project_id": "ready"}));
+    let (restart_one, restart_two) = std::thread::scope(|scope| {
+        let first_restart =
+            scope.spawn(|| first.call_tool("project_restart_lsp", json!({"project_id": "ready"})));
+        let second_restart =
+            scope.spawn(|| second.call_tool("project_restart_lsp", json!({"project_id": "ready"})));
+        (
+            first_restart.join().unwrap(),
+            second_restart.join().unwrap(),
+        )
+    });
     assert_eq!(
         restart_one["status"], "Ready",
         "restart response: {restart_one}"
     );
-    let restart_two = first.call_tool("project_restart_lsp", json!({"project_id": "ready"}));
     assert_eq!(
         restart_two["status"], "Ready",
         "restart response: {restart_two}"
