@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::bridge::DocumentTracker;
+use crate::edit_backup::{BackupArchive, BackupError, BackupFailureMode, BackupPolicy};
 use crate::edit_paths::PathSafetyError;
 use crate::edit_paths::{OperationValidationError, ValidatedFileOperation, WorkspaceBoundary};
 use crate::edit_plan::{
@@ -33,7 +34,7 @@ pub fn apply_plan(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
 ) -> Result<ApplyReport, ApplyError> {
-    apply_plan_internal(boundary, plan, None)
+    apply_plan_internal(boundary, plan, None, None)
 }
 
 /// Apply a plan while validating open-document snapshots against the
@@ -49,15 +50,49 @@ pub fn apply_plan_with_documents(
     plan: &EditPlan,
     documents: &DocumentTracker,
 ) -> Result<ApplyReport, ApplyError> {
-    apply_plan_internal(boundary, plan, Some(documents))
+    apply_plan_internal(boundary, plan, Some(documents), None)
+}
+
+/// Apply a plan with an optional bounded backup archive.
+///
+/// # Errors
+///
+/// Returns validation, filesystem, or fail-closed backup errors.
+pub fn apply_plan_with_backup(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    policy: &BackupPolicy,
+) -> Result<ApplyReport, ApplyError> {
+    apply_plan_internal(boundary, plan, None, Some(policy))
+}
+
+/// Apply a plan with open-document validation and a bounded backup archive.
+///
+/// # Errors
+///
+/// Returns validation, filesystem, or fail-closed backup errors.
+pub fn apply_plan_with_documents_and_backup(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    documents: &DocumentTracker,
+    policy: &BackupPolicy,
+) -> Result<ApplyReport, ApplyError> {
+    apply_plan_internal(boundary, plan, Some(documents), Some(policy))
 }
 
 fn apply_plan_internal(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
     documents: Option<&DocumentTracker>,
+    backup_policy: Option<&BackupPolicy>,
 ) -> Result<ApplyReport, ApplyError> {
     let prepared = PreparedPlan::new(boundary, plan, documents)?;
+    if let Some(policy) = backup_policy
+        && let Err(error) = BackupArchive::create(policy, boundary, plan)
+        && policy.failure_mode() == BackupFailureMode::FailClosed
+    {
+        return Err(ApplyError::Backup(error));
+    }
     let staged = prepared.stage()?;
     prepared.revalidate(boundary, &staged, documents)?;
     PreparedPlan::commit(&staged, &prepared.operations)
@@ -323,6 +358,9 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
+    /// A fail-closed backup could not be created before writing.
+    #[error("failed to create edit backup: {0}")]
+    Backup(#[source] BackupError),
 }
 
 #[derive(Debug)]
@@ -710,5 +748,53 @@ mod tests {
         );
         assert!(!record.rollback());
         assert!(record.committed_files().is_empty());
+    }
+
+    #[test]
+    fn backup_failure_mode_controls_whether_writes_continue() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("backup-mode.rs");
+        let backup_path = root.path().join("backup-file");
+        fs::write(&file, "before\n").unwrap();
+        fs::write(&backup_path, "not a directory").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+
+        let fail_closed = BackupPolicy::new(
+            &boundary,
+            &backup_path,
+            1,
+            1024,
+            BackupFailureMode::FailClosed,
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_plan_with_backup(&boundary, &plan, &fail_closed),
+            Err(ApplyError::Backup(_))
+        ));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "before\n");
+
+        let fail_open = BackupPolicy::new(
+            &boundary,
+            &backup_path,
+            1,
+            1024,
+            BackupFailureMode::FailOpen,
+        )
+        .unwrap();
+        apply_plan_with_backup(&boundary, &plan, &fail_open).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
     }
 }
