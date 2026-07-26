@@ -605,10 +605,7 @@ impl EditPlanStore {
     /// Look up a non-expired plan by ID.
     #[must_use]
     pub fn get(&self, id: &PlanId) -> Option<&EditPlan> {
-        self.plans.get(id).filter(|plan| {
-            !plan.is_expired(SystemTime::now())
-                && plan.policy_generation() == self.policy_generation
-        })
+        self.current_plan(id).ok()
     }
 
     /// Look up a plan while enforcing its owning project identity.
@@ -623,18 +620,7 @@ impl EditPlanStore {
         id: &PlanId,
         project_id: &str,
     ) -> Result<&EditPlan, PlanStoreError> {
-        let plan = self
-            .plans
-            .get(id)
-            .filter(|plan| !plan.is_expired(SystemTime::now()))
-            .ok_or_else(|| PlanStoreError::NotFound(id.clone()))?;
-        if plan.policy_generation() != self.policy_generation {
-            return Err(PlanStoreError::PolicyChanged {
-                plan_id: id.clone(),
-                plan_generation: plan.policy_generation(),
-                current_generation: self.policy_generation,
-            });
-        }
+        let plan = self.current_plan(id)?;
         if plan.project_id() != project_id {
             return Err(PlanStoreError::ProjectMismatch {
                 expected: project_id.to_string(),
@@ -713,6 +699,22 @@ impl EditPlanStore {
     /// Invalidate plans admitted under the previous edit policy generation.
     pub const fn invalidate_policy(&mut self) {
         self.policy_generation = self.policy_generation.wrapping_add(1);
+    }
+
+    fn current_plan(&self, id: &PlanId) -> Result<&EditPlan, PlanStoreError> {
+        let plan = self
+            .plans
+            .get(id)
+            .filter(|plan| !plan.is_expired(SystemTime::now()))
+            .ok_or_else(|| PlanStoreError::NotFound(id.clone()))?;
+        if plan.policy_generation() != self.policy_generation {
+            return Err(PlanStoreError::PolicyChanged {
+                plan_id: id.clone(),
+                plan_generation: plan.policy_generation(),
+                current_generation: self.policy_generation,
+            });
+        }
+        Ok(plan)
     }
 }
 
