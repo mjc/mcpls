@@ -292,9 +292,13 @@ impl Translator {
             && self.expected_languages.is_empty()
             && Self::same_workspace_roots(&self.workspace_roots, roots)
             && self.lsp_clients.keys().all(|language_id| {
-                self.lsp_roots
+                self.lsp_configs
                     .get(language_id)
-                    .is_some_and(|registered| Self::same_workspace_roots(registered, roots))
+                    .map(|config| self.server_workspace_roots(config, roots))
+                    .zip(self.lsp_roots.get(language_id))
+                    .is_some_and(|(expected, registered)| {
+                        Self::same_workspace_roots(registered, &expected)
+                    })
             })
     }
 
@@ -454,7 +458,7 @@ impl Translator {
         let mut pending = Vec::new();
         for config in &configs {
             let language_id = &config.language_id;
-            if self.can_reuse_server(language_id, &roots) {
+            if self.can_reuse_server(config, &roots) {
                 continue;
             }
 
@@ -481,10 +485,14 @@ impl Translator {
         let server_configs = pending
             .iter()
             .map(|config| {
+                let server_roots = self.server_workspace_roots(config, &roots);
                 Ok(ServerInitConfig {
                     server_config: config.clone(),
-                    workspace_roots: roots.clone(),
-                    initialization_options: linked_project_initialization_options(config, &roots)?,
+                    workspace_roots: server_roots.clone(),
+                    initialization_options: linked_project_initialization_options(
+                        config,
+                        &server_roots,
+                    )?,
                     notification_tx: None,
                 })
             })
@@ -537,12 +545,32 @@ impl Translator {
                 .all(|root| existing.iter().any(|existing| existing == root))
     }
 
-    fn can_reuse_server(&self, language_id: &str, requested_roots: &[PathBuf]) -> bool {
-        self.lsp_clients.contains_key(language_id)
+    fn can_reuse_server(&self, config: &LspServerConfig, requested_roots: &[PathBuf]) -> bool {
+        self.lsp_clients.contains_key(&config.language_id)
             && self
                 .lsp_roots
-                .get(language_id)
-                .is_some_and(|existing| Self::same_workspace_roots(existing, requested_roots))
+                .get(&config.language_id)
+                .is_some_and(|existing| {
+                    Self::same_workspace_roots(
+                        existing,
+                        &self.server_workspace_roots(config, requested_roots),
+                    )
+                })
+    }
+
+    fn server_workspace_roots(&self, config: &LspServerConfig, roots: &[PathBuf]) -> Vec<PathBuf> {
+        let mut server_roots = roots
+            .iter()
+            .flat_map(|root| {
+                config.heuristics.as_ref().map_or_else(
+                    || vec![root.clone()],
+                    |heuristics| heuristics.matching_roots(root, self.heuristics_max_depth),
+                )
+            })
+            .collect::<Vec<_>>();
+        server_roots.sort();
+        server_roots.dedup();
+        server_roots
     }
 
     async fn reopen_tracked_documents(&self) -> Result<()> {
@@ -1247,9 +1275,18 @@ impl Translator {
     }
 
     fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> PathBuf {
-        // Registered project roots own the daemon's LSP lifecycle. Prefer the
-        // most specific one before manifest heuristics so a nested Cargo.toml
-        // does not replace an already-active workspace server on every request.
+        // Prefer an active language-server root before the broader daemon
+        // project root. A container project can own a nested Cargo package.
+        if let Some(root) = self
+            .lsp_roots
+            .get(&config.language_id)
+            .and_then(|roots| crate::project::longest_matching_root(path, roots))
+        {
+            return root.to_path_buf();
+        }
+
+        // Registered project roots own the daemon's lifecycle when no more
+        // specific active language-server root matches.
         if let Some(root) = self.registered_workspace_root(path) {
             return root;
         }
@@ -3064,6 +3101,22 @@ mod tests {
             ),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn server_workspace_roots_use_nested_manifest_for_container_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let nested = workspace.path().join("pkgs/ai-integrations");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+
+        let translator = Translator::new();
+        let roots = translator.server_workspace_roots(
+            &LspServerConfig::rust_analyzer(),
+            &[workspace.path().to_path_buf()],
+        );
+
+        assert_eq!(roots, vec![nested]);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 //! LSP server configuration types.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -101,15 +101,27 @@ impl ServerHeuristics {
             return true;
         }
 
-        let depth = max_depth.unwrap_or(DEFAULT_HEURISTICS_MAX_DEPTH);
-        self.find_any_marker_recursive(workspace_root, depth)
+        !self.matching_roots(workspace_root, max_depth).is_empty()
     }
 
-    /// Search recursively for any marker file.
-    fn find_any_marker_recursive(&self, workspace_root: &Path, max_depth: usize) -> bool {
+    /// Return workspace roots containing a configured marker.
+    ///
+    /// A container workspace may contain a nested language project without
+    /// having a marker of its own. In that case, return the nested marker's
+    /// parent so the language server receives a real project root.
+    #[must_use]
+    pub(crate) fn matching_roots(
+        &self,
+        workspace_root: &Path,
+        max_depth: Option<usize>,
+    ) -> Vec<PathBuf> {
+        if self.project_markers.is_empty() || self.is_applicable(workspace_root) {
+            return vec![workspace_root.to_path_buf()];
+        }
+
         let mut builder = WalkBuilder::new(workspace_root);
         builder
-            .max_depth(Some(max_depth))
+            .max_depth(max_depth.or(Some(DEFAULT_HEURISTICS_MAX_DEPTH)))
             .hidden(false)
             .git_ignore(true)
             .git_global(false)
@@ -117,7 +129,6 @@ impl ServerHeuristics {
             .follow_links(false)
             .standard_filters(false)
             .filter_entry(|entry| {
-                // Skip excluded directories entirely (prevents descending into them)
                 if entry.file_type().is_some_and(|ft| ft.is_dir())
                     && let Some(name) = entry.file_name().to_str()
                     && EXCLUDED_DIRECTORIES.contains(&name)
@@ -127,18 +138,23 @@ impl ServerHeuristics {
                 true
             });
 
-        for entry in builder.build().flatten() {
-            let path = entry.path();
-
-            // Check if this entry matches any marker
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                && self.project_markers.iter().any(|m| m == file_name)
-            {
-                return true;
-            }
-        }
-
-        false
+        let mut roots = builder
+            .build()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let file_name = path.file_name()?.to_str()?;
+                self.project_markers
+                    .iter()
+                    .any(|marker| marker == file_name)
+                    .then_some(path)
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
     }
 }
 
