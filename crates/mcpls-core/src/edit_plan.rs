@@ -507,6 +507,12 @@ pub enum PlanStoreError {
     /// A plan ID was not found or has expired.
     #[error("edit plan not found: {0}")]
     NotFound(PlanId),
+    /// The plan expired before it was consumed.
+    #[error("edit plan expired: {0}")]
+    Expired(PlanId),
+    /// The plan was evicted by a store quota before it was consumed.
+    #[error("edit plan evicted by store quota: {0}")]
+    Evicted(PlanId),
     /// The plan belongs to a different project.
     #[error("edit plan belongs to project {actual}, not {expected}")]
     ProjectMismatch {
@@ -539,6 +545,9 @@ pub struct EditPlanStore {
     bytes: usize,
     policy_generation: u64,
     policy: EditPolicy,
+    expired_plans: VecDeque<PlanId>,
+    evicted_plans: VecDeque<PlanId>,
+    max_tombstones: usize,
 }
 
 impl EditPlanStore {
@@ -562,6 +571,9 @@ impl EditPlanStore {
             bytes: 0,
             policy_generation: 0,
             policy: EditPolicy::new(EditMode::Write),
+            expired_plans: VecDeque::new(),
+            evicted_plans: VecDeque::new(),
+            max_tombstones: max_plans.max(1).saturating_mul(4).max(16),
         }
     }
 
@@ -598,6 +610,7 @@ impl EditPlanStore {
             };
             if let Some(oldest) = self.plans.remove(&oldest_id) {
                 self.bytes = self.bytes.saturating_sub(oldest.estimated_bytes());
+                remember_plan_id(&mut self.evicted_plans, self.max_tombstones, oldest_id);
             }
         }
         self.bytes = self.bytes.saturating_add(plan.estimated_bytes());
@@ -664,6 +677,7 @@ impl EditPlanStore {
         for id in expired {
             if let Some(plan) = self.plans.remove(&id) {
                 self.bytes = self.bytes.saturating_sub(plan.estimated_bytes());
+                remember_plan_id(&mut self.expired_plans, self.max_tombstones, id);
             }
         }
     }
@@ -708,11 +722,18 @@ impl EditPlanStore {
     }
 
     fn current_plan(&self, id: &PlanId) -> Result<&EditPlan, PlanStoreError> {
-        let plan = self
-            .plans
-            .get(id)
-            .filter(|plan| !plan.is_expired(SystemTime::now()))
-            .ok_or_else(|| PlanStoreError::NotFound(id.clone()))?;
+        let Some(plan) = self.plans.get(id) else {
+            return if self.expired_plans.contains(id) {
+                Err(PlanStoreError::Expired(id.clone()))
+            } else if self.evicted_plans.contains(id) {
+                Err(PlanStoreError::Evicted(id.clone()))
+            } else {
+                Err(PlanStoreError::NotFound(id.clone()))
+            };
+        };
+        if plan.is_expired(SystemTime::now()) {
+            return Err(PlanStoreError::Expired(id.clone()));
+        }
         if plan.policy_generation() != self.policy_generation {
             return Err(PlanStoreError::PolicyChanged {
                 plan_id: id.clone(),
@@ -722,6 +743,16 @@ impl EditPlanStore {
         }
         Ok(plan)
     }
+}
+
+fn remember_plan_id(queue: &mut VecDeque<PlanId>, limit: usize, id: PlanId) {
+    if queue.contains(&id) {
+        return;
+    }
+    if queue.len() >= limit {
+        queue.pop_front();
+    }
+    queue.push_back(id);
 }
 
 fn file_operation_bytes(operation: &FileOperation) -> usize {
@@ -898,6 +929,47 @@ mod tests {
             Err(PlanStoreError::PolicyChanged { plan_id, .. }) if plan_id == id
         ));
         assert!(store.get(&id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn expired_and_evicted_plans_have_specific_failures() -> Result<(), PlanStoreError> {
+        let mut expired = EditPlanStore::new(2, 1024, Duration::ZERO);
+        let expired_plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let expired_id = expired_plan.id().clone();
+        expired.insert(expired_plan)?;
+        assert!(matches!(
+            expired.take_for_project(&expired_id, "project-a"),
+            Err(PlanStoreError::Expired(id)) if id == expired_id
+        ));
+
+        let mut bounded = EditPlanStore::new(1, 1024, Duration::from_secs(60));
+        let first = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let first_id = first.id().clone();
+        bounded.insert(first)?;
+        bounded.insert(EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        ))?;
+        assert!(matches!(
+            bounded.take_for_project(&first_id, "project-a"),
+            Err(PlanStoreError::Evicted(id)) if id == first_id
+        ));
         Ok(())
     }
 
