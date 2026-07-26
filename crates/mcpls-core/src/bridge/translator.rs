@@ -116,42 +116,6 @@ async fn shutdown_servers(servers: HashMap<String, LspServer>) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-fn server_readiness_timeout(
-    configs: &HashMap<String, LspServerConfig>,
-    language_id: &str,
-) -> Duration {
-    configs
-        .get(language_id)
-        .map_or(Duration::from_secs(30), |config| {
-            Duration::from_secs(config.timeout_seconds)
-        })
-}
-
-async fn wait_for_server_readiness(
-    servers: HashMap<String, LspServer>,
-    configs: &HashMap<String, LspServerConfig>,
-) -> Result<HashMap<String, LspServer>> {
-    let mut ready = HashMap::with_capacity(servers.len());
-    for (language_id, server) in servers {
-        if let Err(error) = server
-            .wait_until_quiescent(server_readiness_timeout(configs, &language_id))
-            .await
-        {
-            let mut remaining = ready;
-            remaining.insert(language_id, server);
-            if let Err(shutdown_error) = shutdown_servers(remaining).await {
-                tracing::warn!(
-                    %shutdown_error,
-                    "failed to clean up LSP servers after readiness failure"
-                );
-            }
-            return Err(error);
-        }
-        ready.insert(language_id, server);
-    }
-    Ok(ready)
-}
-
 /// Configuration snapshot used to construct an isolated project translator.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct TranslatorTemplate {
@@ -511,13 +475,7 @@ impl Translator {
         }
 
         let failures = result.failures;
-        let servers = match wait_for_server_readiness(result.servers, &self.lsp_configs).await {
-            Ok(servers) => servers,
-            Err(error) => {
-                self.clear_expected_languages();
-                return Err(error);
-            }
-        };
+        let servers = result.servers;
         let health = if failures.is_empty() {
             ActivationHealth::Ready
         } else {
@@ -1274,7 +1232,7 @@ impl Translator {
                 .is_some_and(|roots| roots.iter().any(|registered| registered == root))
     }
 
-    fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> PathBuf {
+    fn project_root_for_file(&self, path: &Path, config: &LspServerConfig) -> Option<PathBuf> {
         // Prefer an active language-server root before the broader daemon
         // project root. A container project can own a nested Cargo package.
         if let Some(root) = self
@@ -1282,13 +1240,18 @@ impl Translator {
             .get(&config.language_id)
             .and_then(|roots| crate::project::longest_matching_root(path, roots))
         {
-            return root.to_path_buf();
+            return Some(root.to_path_buf());
         }
 
-        // Registered project roots own the daemon's lifecycle when no more
-        // specific active language-server root matches.
+        // Resolve a registered daemon project through the same marker discovery
+        // used by explicit activation. The outer root remains the routing
+        // boundary, while the nested marker root is the LSP process root.
         if let Some(root) = self.registered_workspace_root(path) {
-            return root;
+            return crate::project::longest_matching_root(
+                path,
+                &self.server_workspace_roots(config, std::slice::from_ref(&root)),
+            )
+            .map(Path::to_path_buf);
         }
 
         let start = path.parent().unwrap_or(path);
@@ -1298,12 +1261,13 @@ impl Translator {
         {
             for ancestor in start.ancestors() {
                 if heuristics.is_applicable(ancestor) {
-                    return ancestor.to_path_buf();
+                    return Some(ancestor.to_path_buf());
                 }
             }
+            return None;
         }
 
-        start.to_path_buf()
+        Some(start.to_path_buf())
     }
 
     fn wait_for_language_ready(&self, language_id: &str) -> Result<()> {
@@ -1311,6 +1275,33 @@ impl Translator {
             return Err(Error::ServerInitializing(language_id.to_string()));
         }
         Ok(())
+    }
+
+    fn workspace_symbol_clients(&self) -> Vec<LspClient> {
+        let mut language_ids = self
+            .lsp_servers
+            .iter()
+            .filter(|(_, server)| {
+                server
+                    .capabilities()
+                    .workspace_symbol_provider
+                    .as_ref()
+                    .is_some_and(|provider| match provider {
+                        lsp_types::OneOf::Left(enabled) => *enabled,
+                        lsp_types::OneOf::Right(_) => true,
+                    })
+            })
+            .filter_map(|(language_id, _)| {
+                self.lsp_clients
+                    .contains_key(language_id)
+                    .then_some(language_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        language_ids.sort_unstable();
+        language_ids
+            .into_iter()
+            .filter_map(|language_id| self.lsp_clients.get(language_id).cloned())
+            .collect()
     }
 
     async fn ensure_client_for_file(&mut self, path: &Path) -> Result<()> {
@@ -1330,7 +1321,9 @@ impl Translator {
 
         self.wait_for_language_ready(&language_id)?;
 
-        let root = self.project_root_for_file(path, &config);
+        let Some(root) = self.project_root_for_file(path, &config) else {
+            return Ok(());
+        };
 
         if self.has_lsp_root(&language_id, &root) {
             return Ok(());
@@ -1349,9 +1342,6 @@ impl Translator {
             notification_tx: None,
         })
         .await?;
-        server
-            .wait_until_quiescent(Duration::from_secs(config.timeout_seconds))
-            .await?;
         let client = server.client().clone();
         let _ = server.take_notification_rx();
         self.register_client(language_id.clone(), client);
@@ -1939,51 +1929,59 @@ impl Translator {
             )));
         }
 
-        // Workspace search requires at least one LSP client. If none are
+        // Workspace search requires at least one active LSP client. If none are
         // registered yet but a configured server is still initializing, tell the
         // caller to wait and retry rather than implying nothing is configured.
-        let client = self.lsp_clients.values().next().cloned().ok_or_else(|| {
-            self.expected_languages
+        if self.lsp_clients.is_empty() {
+            return Err(self
+                .expected_languages
                 .iter()
                 .next()
                 .map_or(Error::NoServerConfigured, |lang| {
                     Error::ServerInitializing(lang.clone())
-                })
-        })?;
-        self.wait_for_language_ready(client.language_id())?;
-
-        let params = LspWorkspaceSymbolParams {
-            query,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let timeout_duration = Duration::from_secs(30);
-        let response: Option<Vec<lsp_types::SymbolInformation>> = client
-            .request("workspace/symbol", params, timeout_duration)
-            .await?;
-
-        let mut symbols: Vec<WorkspaceSymbol> = response
-            .unwrap_or_default()
-            .into_iter()
-            .map(|sym| WorkspaceSymbol {
-                name: sym.name,
-                kind: format!("{:?}", sym.kind),
-                location: Location {
-                    uri: sym.location.uri.to_string(),
-                    range: normalize_range(sym.location.range),
-                },
-                container_name: sym.container_name,
-            })
-            .collect();
-
-        // Apply kind filter if specified
-        if let Some(kind) = kind_filter {
-            symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
+                }));
+        }
+        if limit == 0 {
+            return Ok(WorkspaceSymbolResult {
+                symbols: Vec::new(),
+            });
         }
 
-        // Limit results
-        symbols.truncate(limit as usize);
+        let timeout_duration = Duration::from_secs(30);
+        let mut symbols = Vec::new();
+        for client in self.workspace_symbol_clients() {
+            let params = LspWorkspaceSymbolParams {
+                query: query.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            let response: Option<Vec<lsp_types::SymbolInformation>> = client
+                .request("workspace/symbol", params, timeout_duration)
+                .await?;
+            symbols.extend(
+                response
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|sym| WorkspaceSymbol {
+                        name: sym.name,
+                        kind: format!("{:?}", sym.kind),
+                        location: Location {
+                            uri: sym.location.uri.to_string(),
+                            range: normalize_range(sym.location.range),
+                        },
+                        container_name: sym.container_name,
+                    })
+                    .filter(|symbol| {
+                        kind_filter
+                            .as_ref()
+                            .is_none_or(|kind| symbol.kind.eq_ignore_ascii_case(kind))
+                    })
+                    .take((limit as usize).saturating_sub(symbols.len())),
+            );
+            if symbols.len() == limit as usize {
+                break;
+            }
+        }
 
         Ok(WorkspaceSymbolResult { symbols })
     }
@@ -3176,7 +3174,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_activation_enforces_rust_readiness_timeout() {
+    async fn handshaken_rust_server_does_not_wait_for_quiescence() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = TempDir::new().unwrap();
@@ -3233,13 +3231,25 @@ while True:
         config.timeout_seconds = 1;
         config.heuristics = None;
         let mut translator = Translator::new();
-        translator.set_lsp_configs(vec![config], Some(3));
+        translator.set_lsp_configs(vec![config.clone()], Some(3));
 
         let result = translator.activate_project(root.path().to_path_buf()).await;
 
-        assert!(matches!(result, Err(Error::Timeout(1))));
-        assert!(translator.lsp_servers.is_empty());
-        assert!(translator.lsp_clients.is_empty());
+        assert!(result.is_ok());
+        assert_eq!(translator.lsp_servers.len(), 1);
+        drop(translator);
+
+        let file = root.path().join("src/lib.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "pub fn fixture() {}\n").unwrap();
+        let mut lazy = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        lazy.set_workspace_roots(vec![root.path().to_path_buf()]);
+        lazy.set_lsp_configs(vec![config], Some(3));
+
+        lazy.ensure_client_for_file(&file).await.unwrap();
+
+        assert_eq!(lazy.lsp_servers.len(), 1);
     }
 
     #[test]
@@ -3277,7 +3287,39 @@ while True:
 
         assert_eq!(
             translator.project_root_for_file(&file, &LspServerConfig::rust_analyzer()),
-            workspace.path()
+            Some(workspace.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn project_root_for_file_uses_nested_manifest_in_container_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let nested = workspace.path().join("pkgs/ai-integrations");
+        fs::create_dir_all(nested.join("src")).unwrap();
+        fs::write(nested.join("Cargo.toml"), "[package]\nname=\"nested\"\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![workspace.path().to_path_buf()]);
+        let file = nested.join("src/lib.rs");
+
+        assert_eq!(
+            translator.project_root_for_file(&file, &LspServerConfig::rust_analyzer()),
+            Some(nested)
+        );
+    }
+
+    #[test]
+    fn project_root_for_file_skips_marker_free_container_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("src/lib.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![workspace.path().to_path_buf()]);
+
+        assert_eq!(
+            translator.project_root_for_file(&file, &LspServerConfig::rust_analyzer()),
+            None
         );
     }
 
@@ -3451,6 +3493,235 @@ while True:
             .handle_workspace_symbol("test".to_string(), None, 100)
             .await;
         assert!(matches!(result, Err(Error::NoServerConfigured)));
+    }
+
+    #[cfg(unix)]
+    async fn workspace_symbol_test_server(
+        root: &Path,
+        language_id: &str,
+        supports_workspace_symbols: bool,
+        symbol_name: &str,
+        request_log: &Path,
+    ) -> LspServer {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = root.join(format!("{language_id}-workspace-symbol-lsp.py"));
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json
+from pathlib import Path
+import sys
+
+supports = sys.argv[1] == "true"
+symbol_name = sys.argv[2]
+request_log = Path(sys.argv[3])
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send_message(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send_message({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"capabilities": {"workspaceSymbolProvider": supports}},
+        })
+    elif method == "workspace/symbol":
+        request_log.write_text("requested")
+        send_message({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": [{
+                "name": symbol_name,
+                "kind": 12,
+                "location": {
+                    "uri": "file:///tmp/test.rs",
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1},
+                    },
+                },
+            }],
+        })
+    elif method == "shutdown":
+        send_message({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let config = LspServerConfig {
+            language_id: language_id.to_string(),
+            command: script.display().to_string(),
+            args: vec![
+                supports_workspace_symbols.to_string(),
+                symbol_name.to_string(),
+                request_log.display().to_string(),
+            ],
+            env: HashMap::new(),
+            file_patterns: Vec::new(),
+            initialization_options: None,
+            timeout_seconds: 5,
+            heuristics: None,
+        };
+        LspServer::spawn(ServerInitConfig {
+            server_config: config,
+            workspace_roots: vec![root.to_path_buf()],
+            initialization_options: None,
+            notification_tx: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_skips_server_without_capability() {
+        let root = TempDir::new().unwrap();
+        let request_log = root.path().join("unsupported.log");
+        let server = workspace_symbol_test_server(
+            root.path(),
+            "unsupported",
+            false,
+            "ignored",
+            &request_log,
+        )
+        .await;
+        let client = server.client().clone();
+        let mut translator = Translator::new();
+        translator.register_client("unsupported".to_string(), client);
+        translator.register_server("unsupported".to_string(), server);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await
+            .unwrap();
+
+        assert!(result.symbols.is_empty());
+        assert!(!request_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_queries_capable_server() {
+        let root = TempDir::new().unwrap();
+        let request_log = root.path().join("capable.log");
+        let server =
+            workspace_symbol_test_server(root.path(), "capable", true, "found", &request_log).await;
+        let client = server.client().clone();
+        let mut translator = Translator::new();
+        translator.register_client("capable".to_string(), client);
+        translator.register_server("capable".to_string(), server);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "found");
+        assert!(request_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_queries_only_capable_servers() {
+        let root = TempDir::new().unwrap();
+        let unsupported_log = root.path().join("unsupported.log");
+        let capable_log = root.path().join("capable.log");
+        let unsupported = workspace_symbol_test_server(
+            root.path(),
+            "aaa-unsupported",
+            false,
+            "ignored",
+            &unsupported_log,
+        )
+        .await;
+        let capable =
+            workspace_symbol_test_server(root.path(), "zzz-capable", true, "found", &capable_log)
+                .await;
+        let mut translator = Translator::new();
+        translator.register_client("aaa-unsupported".to_string(), unsupported.client().clone());
+        translator.register_server("aaa-unsupported".to_string(), unsupported);
+        translator.register_client("zzz-capable".to_string(), capable.client().clone());
+        translator.register_server("zzz-capable".to_string(), capable);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "found");
+        assert!(!unsupported_log.exists());
+        assert!(capable_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_aggregates_in_language_order() {
+        let root = TempDir::new().unwrap();
+        let zzz = workspace_symbol_test_server(
+            root.path(),
+            "zzz-capable",
+            true,
+            "second",
+            &root.path().join("zzz.log"),
+        )
+        .await;
+        let aaa = workspace_symbol_test_server(
+            root.path(),
+            "aaa-capable",
+            true,
+            "first",
+            &root.path().join("aaa.log"),
+        )
+        .await;
+        let mut translator = Translator::new();
+        translator.register_client("zzz-capable".to_string(), zzz.client().clone());
+        translator.register_server("zzz-capable".to_string(), zzz);
+        translator.register_client("aaa-capable".to_string(), aaa.client().clone());
+        translator.register_server("aaa-capable".to_string(), aaa);
+
+        let result = translator
+            .handle_workspace_symbol("test".to_string(), None, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
     }
 
     #[tokio::test]
