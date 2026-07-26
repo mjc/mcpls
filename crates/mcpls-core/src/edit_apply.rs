@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::bridge::DocumentTracker;
+use crate::edit_backup::{BackupArchive, BackupError, BackupFailureMode, BackupPolicy};
 use crate::edit_paths::PathSafetyError;
 use crate::edit_paths::{OperationValidationError, ValidatedFileOperation, WorkspaceBoundary};
 use crate::edit_plan::{
-    EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
+    EditAuditRecord, EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
     SnapshotValidationError,
 };
 
@@ -33,7 +34,7 @@ pub fn apply_plan(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
 ) -> Result<ApplyReport, ApplyError> {
-    apply_plan_internal(boundary, plan, None)
+    apply_plan_internal(boundary, plan, None, None)
 }
 
 /// Apply a plan while validating open-document snapshots against the
@@ -49,18 +50,62 @@ pub fn apply_plan_with_documents(
     plan: &EditPlan,
     documents: &DocumentTracker,
 ) -> Result<ApplyReport, ApplyError> {
-    apply_plan_internal(boundary, plan, Some(documents))
+    apply_plan_internal(boundary, plan, Some(documents), None)
+}
+
+/// Apply a plan with an optional bounded backup archive.
+///
+/// # Errors
+///
+/// Returns validation, filesystem, or fail-closed backup errors.
+pub fn apply_plan_with_backup(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    policy: &BackupPolicy,
+) -> Result<ApplyReport, ApplyError> {
+    apply_plan_internal(boundary, plan, None, Some(policy))
+}
+
+/// Apply a plan with open-document validation and a bounded backup archive.
+///
+/// # Errors
+///
+/// Returns validation, filesystem, or fail-closed backup errors.
+pub fn apply_plan_with_documents_and_backup(
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+    documents: &DocumentTracker,
+    policy: &BackupPolicy,
+) -> Result<ApplyReport, ApplyError> {
+    apply_plan_internal(boundary, plan, Some(documents), Some(policy))
 }
 
 fn apply_plan_internal(
     boundary: &WorkspaceBoundary,
     plan: &EditPlan,
     documents: Option<&DocumentTracker>,
+    backup_policy: Option<&BackupPolicy>,
 ) -> Result<ApplyReport, ApplyError> {
     let prepared = PreparedPlan::new(boundary, plan, documents)?;
+    prepare_backup(backup_policy, boundary, plan)?;
     let staged = prepared.stage()?;
     prepared.revalidate(boundary, &staged, documents)?;
     PreparedPlan::commit(&staged, &prepared.operations)
+}
+
+fn prepare_backup(
+    policy: Option<&BackupPolicy>,
+    boundary: &WorkspaceBoundary,
+    plan: &EditPlan,
+) -> Result<(), ApplyError> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    match BackupArchive::create(policy, boundary, plan) {
+        Ok(_) => Ok(()),
+        Err(_error) if policy.failure_mode() == BackupFailureMode::FailOpen => Ok(()),
+        Err(error) => Err(ApplyError::Backup(error)),
+    }
 }
 
 /// Consume and apply a plan from its owning project store.
@@ -76,8 +121,36 @@ pub fn apply_stored_plan(
     project_id: &str,
     plan_id: &PlanId,
 ) -> Result<ApplyReport, ApplyError> {
+    apply_stored_plan_with_context(store, boundary, project_id, plan_id, None, None)
+}
+
+/// Consume and apply a stored plan while retaining optional caller context in
+/// its audit record.
+///
+/// # Errors
+///
+/// Returns a plan lookup, application, or fail-closed audit error.
+pub fn apply_stored_plan_with_context(
+    store: &mut EditPlanStore,
+    boundary: &WorkspaceBoundary,
+    project_id: &str,
+    plan_id: &PlanId,
+    session_id: Option<String>,
+    principal: Option<String>,
+) -> Result<ApplyReport, ApplyError> {
     let plan = store.take_for_project(plan_id, project_id)?;
-    apply_plan(boundary, &plan)
+    let audit = EditAuditRecord::for_plan_with_context(&plan, session_id, principal);
+    let result = apply_plan(boundary, &plan);
+    let audit = match &result {
+        Ok(report) => audit.committed(report.committed_files.clone()),
+        Err(error) => audit.failed(error.to_string(), false),
+    };
+    let audit_result = store.record_audit_with_policy(audit);
+    match (result, audit_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Ok(_), Err(error)) => Err(ApplyError::Audit(error)),
+        (Err(error), _) => Err(error),
+    }
 }
 
 struct PreparedPlan<'a> {
@@ -316,6 +389,12 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
+    /// A fail-closed backup could not be created before writing.
+    #[error("failed to create edit backup: {0}")]
+    Backup(#[source] BackupError),
+    /// A fail-closed audit sink rejected a completed edit record.
+    #[error("failed to record edit audit: {0}")]
+    Audit(#[source] PlanStoreError),
 }
 
 #[derive(Debug)]
@@ -406,7 +485,9 @@ mod tests {
     use super::*;
     use crate::bridge::{DocumentTracker, ResourceLimits};
     use crate::edit_paths::FileOperation;
-    use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
+    use crate::edit_plan::{
+        AuditFailureMode, AuditLogPolicy, EditAuditOutcome, EditPlan, FileSnapshot, SnapshotSource,
+    };
 
     #[test]
     fn applies_all_disk_snapshots_after_revalidating_preconditions() {
@@ -627,5 +708,204 @@ mod tests {
             apply_stored_plan(&mut store, &boundary, "project", &plan_id),
             Err(ApplyError::Store(PlanStoreError::NotFound(_)))
         ));
+    }
+
+    #[test]
+    fn stored_application_records_audit_outcome() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("audited.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file,
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace text".to_string()],
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        let report = apply_stored_plan(&mut store, &boundary, "project", &plan_id).unwrap();
+
+        let records: Vec<_> = store.audit_records().collect();
+        assert_eq!(records.len(), 1);
+        let record = records[0];
+        assert_eq!(record.project_id(), "project");
+        assert_eq!(record.plan_id(), plan_id.as_str());
+        assert_eq!(record.operations(), ["replace text"]);
+        assert_eq!(record.precondition_hashes().len(), 1);
+        assert_eq!(record.versions(), [None]);
+        assert_eq!(record.committed_files(), report.committed_files.as_slice());
+        assert_eq!(record.outcome(), &EditAuditOutcome::Committed);
+        assert!(!record.rollback());
+    }
+
+    #[test]
+    fn stored_application_records_failed_audit_outcome() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("stale.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        fs::write(&file, "changed\n").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        let error = apply_stored_plan(&mut store, &boundary, "project", &plan_id).unwrap_err();
+
+        assert!(matches!(error, ApplyError::Stale(_)));
+        let record = store.audit_records().next().unwrap();
+        assert_eq!(
+            record.outcome(),
+            &EditAuditOutcome::Failed {
+                error: error.to_string()
+            }
+        );
+        assert!(!record.rollback());
+        assert!(record.committed_files().is_empty());
+    }
+
+    #[test]
+    fn stored_application_persists_context_and_reports_closed_sink_failure() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("context.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        let audit_path = root.path().join("audit.jsonl");
+        store.set_audit_log(
+            AuditLogPolicy::new(&audit_path, 4_096, AuditFailureMode::FailClosed).unwrap(),
+        );
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        apply_stored_plan_with_context(
+            &mut store,
+            &boundary,
+            "project",
+            &plan_id,
+            Some("session-1".to_string()),
+            Some("principal-1".to_string()),
+        )
+        .unwrap();
+
+        let record = store.audit_records().next().unwrap();
+        assert_eq!(record.session_id(), Some("session-1"));
+        assert_eq!(record.principal(), Some("principal-1"));
+        assert!(
+            fs::read_to_string(audit_path)
+                .unwrap()
+                .contains("session-1")
+        );
+
+        store.set_audit_log(
+            AuditLogPolicy::new(root.path(), 4_096, AuditFailureMode::FailClosed).unwrap(),
+        );
+        let failed_plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "after\n",
+                "final\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let failed_id = failed_plan.id().clone();
+        store.insert(failed_plan).unwrap();
+        let error = apply_stored_plan_with_context(
+            &mut store, &boundary, "project", &failed_id, None, None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ApplyError::Audit(PlanStoreError::Audit { .. })
+        ));
+        assert_eq!(fs::read_to_string(file).unwrap(), "final\n");
+    }
+
+    #[test]
+    fn backup_failure_mode_controls_whether_writes_continue() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("backup-mode.rs");
+        let backup_path = root.path().join("backup-file");
+        fs::write(&file, "before\n").unwrap();
+        fs::write(&backup_path, "not a directory").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+
+        let fail_closed = BackupPolicy::new(
+            &boundary,
+            &backup_path,
+            1,
+            1024,
+            BackupFailureMode::FailClosed,
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_plan_with_backup(&boundary, &plan, &fail_closed),
+            Err(ApplyError::Backup(_))
+        ));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "before\n");
+
+        let fail_open = BackupPolicy::new(
+            &boundary,
+            &backup_path,
+            1,
+            1024,
+            BackupFailureMode::FailOpen,
+        )
+        .unwrap();
+        apply_plan_with_backup(&boundary, &plan, &fail_open).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
     }
 }

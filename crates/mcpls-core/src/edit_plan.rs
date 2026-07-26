@@ -1,15 +1,19 @@
 //! Preview artifacts and bounded storage for workspace edit plans.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::edit_paths::FileOperation;
+use crate::edit_policy::{EditMode, EditPolicy};
 
 /// Shared edit safety limits used by preview and project-local plan storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +24,10 @@ pub struct EditLimits {
     pub max_edits: usize,
     /// Maximum combined plan bytes retained by one project store.
     pub max_bytes: usize,
+    /// Maximum combined original and planned bytes for one file.
+    pub max_file_bytes: usize,
+    /// Maximum create, rename, and delete operations in one preview.
+    pub max_resource_operations: usize,
     /// Lifetime of a stored plan.
     pub plan_ttl: Duration,
 }
@@ -30,6 +38,8 @@ impl EditLimits {
         max_files: 64,
         max_edits: 4_096,
         max_bytes: 16 * 1024 * 1024,
+        max_file_bytes: 8 * 1024 * 1024,
+        max_resource_operations: 256,
         plan_ttl: Duration::from_secs(15 * 60),
     };
 }
@@ -228,6 +238,7 @@ pub struct EditPlan {
     file_operations: Vec<FileOperation>,
     unified_diff: String,
     safe_to_apply: bool,
+    policy_generation: u64,
     created_at: SystemTime,
     expires_at: SystemTime,
     estimated_bytes: usize,
@@ -268,6 +279,7 @@ impl EditPlan {
             file_operations: Vec::new(),
             unified_diff,
             safe_to_apply,
+            policy_generation: 0,
             created_at,
             expires_at,
             estimated_bytes,
@@ -337,6 +349,12 @@ impl EditPlan {
         self.safe_to_apply
     }
 
+    /// Return the policy generation that admitted this plan to a store.
+    #[must_use]
+    pub const fn policy_generation(&self) -> u64 {
+        self.policy_generation
+    }
+
     /// Return the plan creation timestamp.
     #[must_use]
     pub const fn created_at(&self) -> SystemTime {
@@ -356,6 +374,216 @@ impl EditPlan {
     }
 }
 
+/// Outcome recorded when a stored edit plan is applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditAuditOutcome {
+    /// Every planned operation committed successfully.
+    Committed,
+    /// Application failed before a complete commit.
+    Failed {
+        /// Redacted, human-readable failure summary.
+        error: String,
+    },
+}
+
+/// Bounded audit record for one plan application attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditAuditRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    principal: Option<String>,
+    timestamp_ms: u64,
+    project_id: String,
+    plan_id: String,
+    operations: Vec<String>,
+    precondition_hashes: Vec<String>,
+    versions: Vec<Option<i32>>,
+    committed_files: Vec<PathBuf>,
+    outcome: EditAuditOutcome,
+    rollback: bool,
+}
+
+impl EditAuditRecord {
+    /// Create an audit record containing plan metadata without file contents.
+    #[must_use]
+    pub fn for_plan(plan: &EditPlan) -> Self {
+        Self::for_plan_with_context(plan, None, None)
+    }
+
+    /// Create an audit record with optional caller context and no file contents.
+    #[must_use]
+    pub fn for_plan_with_context(
+        plan: &EditPlan,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            principal,
+            timestamp_ms: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            project_id: plan.project_id().to_owned(),
+            plan_id: plan.id().as_str().to_owned(),
+            operations: plan.operations().to_vec(),
+            precondition_hashes: plan
+                .files()
+                .iter()
+                .map(|file| file.content_hash().to_owned())
+                .collect(),
+            versions: plan.files().iter().map(FileSnapshot::version).collect(),
+            committed_files: Vec::new(),
+            outcome: EditAuditOutcome::Failed {
+                error: "application pending".to_owned(),
+            },
+            rollback: false,
+        }
+    }
+
+    /// Return the caller session when the transport supplied one.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Return the authenticated or configured principal when available.
+    #[must_use]
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
+    }
+
+    /// Return a completed success record with committed file paths.
+    #[must_use]
+    pub fn committed(mut self, files: Vec<PathBuf>) -> Self {
+        self.committed_files = files;
+        self.outcome = EditAuditOutcome::Committed;
+        self
+    }
+
+    /// Return a completed failure record.
+    #[must_use]
+    pub fn failed(mut self, error: impl Into<String>, rollback: bool) -> Self {
+        self.outcome = EditAuditOutcome::Failed {
+            error: error.into(),
+        };
+        self.rollback = rollback;
+        self
+    }
+
+    /// Return the project that owned the plan.
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Return the plan identifier.
+    #[must_use]
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    /// Return the recorded operation descriptions.
+    #[must_use]
+    pub fn operations(&self) -> &[String] {
+        &self.operations
+    }
+
+    /// Return precondition hashes without exposing source contents.
+    #[must_use]
+    pub fn precondition_hashes(&self) -> &[String] {
+        &self.precondition_hashes
+    }
+
+    /// Return the optimistic document versions captured by the plan.
+    #[must_use]
+    pub fn versions(&self) -> &[Option<i32>] {
+        &self.versions
+    }
+
+    /// Return the files committed by a successful application.
+    #[must_use]
+    pub fn committed_files(&self) -> &[PathBuf] {
+        &self.committed_files
+    }
+
+    /// Return the application outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> &EditAuditOutcome {
+        &self.outcome
+    }
+
+    /// Return whether the failed application rolled back staged files.
+    #[must_use]
+    pub const fn rollback(&self) -> bool {
+        self.rollback
+    }
+}
+
+/// Whether an audit sink failure blocks an otherwise successful edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFailureMode {
+    /// Keep the bounded in-memory record and allow the edit to continue.
+    #[default]
+    FailOpen,
+    /// Return an error after a successful edit when the durable record fails.
+    FailClosed,
+}
+
+/// Configuration for a bounded JSONL audit sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogPolicy {
+    path: PathBuf,
+    max_bytes: usize,
+    failure_mode: AuditFailureMode,
+}
+
+impl AuditLogPolicy {
+    /// Construct a bounded audit sink policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditLogError::InvalidMaxBytes`] when the sink limit is zero.
+    pub fn new(
+        path: impl Into<PathBuf>,
+        max_bytes: usize,
+        failure_mode: AuditFailureMode,
+    ) -> Result<Self, AuditLogError> {
+        if max_bytes == 0 {
+            return Err(AuditLogError::InvalidMaxBytes);
+        }
+        Ok(Self {
+            path: path.into(),
+            max_bytes,
+            failure_mode,
+        })
+    }
+
+    /// Return the JSONL destination path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the configured sink failure behavior.
+    #[must_use]
+    pub const fn failure_mode(&self) -> AuditFailureMode {
+        self.failure_mode
+    }
+}
+
+/// Invalid audit sink configuration.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AuditLogError {
+    /// The sink must have room for at least one byte.
+    #[error("audit log max bytes must be greater than zero")]
+    InvalidMaxBytes,
+}
+
 /// Errors returned by bounded plan storage and project-scoped lookup.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlanStoreError {
@@ -370,6 +598,12 @@ pub enum PlanStoreError {
     /// A plan ID was not found or has expired.
     #[error("edit plan not found: {0}")]
     NotFound(PlanId),
+    /// The plan expired before it was consumed.
+    #[error("edit plan expired: {0}")]
+    Expired(PlanId),
+    /// The plan was evicted by a store quota before it was consumed.
+    #[error("edit plan evicted by store quota: {0}")]
+    Evicted(PlanId),
     /// The plan belongs to a different project.
     #[error("edit plan belongs to project {actual}, not {expected}")]
     ProjectMismatch {
@@ -378,16 +612,40 @@ pub enum PlanStoreError {
         /// Project recorded on the plan.
         actual: String,
     },
+    /// The plan was created before the current edit policy generation.
+    #[error("edit plan invalidated by a policy change: {plan_id}")]
+    PolicyChanged {
+        /// Invalidated plan identifier.
+        plan_id: PlanId,
+        /// Generation captured by the plan.
+        plan_generation: u64,
+        /// Current store generation.
+        current_generation: u64,
+    },
+    /// A configured durable audit sink could not accept a record.
+    #[error("failed to write audit log {path}: {error}")]
+    Audit {
+        /// Configured audit destination.
+        path: PathBuf,
+        /// Redacted write failure summary.
+        error: String,
+    },
 }
 
 /// Bounded, project-local in-memory plan storage.
 #[derive(Debug)]
 pub struct EditPlanStore {
     plans: HashMap<PlanId, EditPlan>,
+    audit_records: VecDeque<EditAuditRecord>,
+    max_audit_records: usize,
     max_plans: usize,
     max_bytes: usize,
     ttl: Duration,
     bytes: usize,
+    policy_generation: u64,
+    policy: EditPolicy,
+    tombstones: PlanTombstones,
+    audit_log: Option<AuditLogPolicy>,
 }
 
 impl EditPlanStore {
@@ -403,10 +661,16 @@ impl EditPlanStore {
     pub fn new(max_plans: usize, max_bytes: usize, ttl: Duration) -> Self {
         Self {
             plans: HashMap::new(),
+            audit_records: VecDeque::new(),
+            max_audit_records: max_plans.max(1).saturating_mul(8).max(16),
             max_plans: max_plans.max(1),
             max_bytes: max_bytes.max(1),
             ttl,
             bytes: 0,
+            policy_generation: 0,
+            policy: EditPolicy::new(EditMode::Write),
+            tombstones: PlanTombstones::new(max_plans),
+            audit_log: None,
         }
     }
 
@@ -426,6 +690,7 @@ impl EditPlanStore {
         let now = SystemTime::now();
         self.purge_expired(now);
         plan.expires_at = now.checked_add(self.ttl).unwrap_or(now);
+        plan.policy_generation = self.policy_generation;
         if let Some(previous) = self.plans.remove(plan.id()) {
             self.bytes = self.bytes.saturating_sub(previous.estimated_bytes());
         }
@@ -442,6 +707,7 @@ impl EditPlanStore {
             };
             if let Some(oldest) = self.plans.remove(&oldest_id) {
                 self.bytes = self.bytes.saturating_sub(oldest.estimated_bytes());
+                self.tombstones.remember_evicted(oldest_id);
             }
         }
         self.bytes = self.bytes.saturating_add(plan.estimated_bytes());
@@ -452,9 +718,7 @@ impl EditPlanStore {
     /// Look up a non-expired plan by ID.
     #[must_use]
     pub fn get(&self, id: &PlanId) -> Option<&EditPlan> {
-        self.plans
-            .get(id)
-            .filter(|plan| !plan.is_expired(SystemTime::now()))
+        self.current_plan(id).ok()
     }
 
     /// Look up a plan while enforcing its owning project identity.
@@ -469,9 +733,7 @@ impl EditPlanStore {
         id: &PlanId,
         project_id: &str,
     ) -> Result<&EditPlan, PlanStoreError> {
-        let plan = self
-            .get(id)
-            .ok_or_else(|| PlanStoreError::NotFound(id.clone()))?;
+        let plan = self.current_plan(id)?;
         if plan.project_id() != project_id {
             return Err(PlanStoreError::ProjectMismatch {
                 expected: project_id.to_string(),
@@ -512,6 +774,7 @@ impl EditPlanStore {
         for id in expired {
             if let Some(plan) = self.plans.remove(&id) {
                 self.bytes = self.bytes.saturating_sub(plan.estimated_bytes());
+                self.tombstones.remember_expired(id);
             }
         }
     }
@@ -533,6 +796,153 @@ impl EditPlanStore {
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Append one bounded audit record, evicting the oldest record if needed.
+    pub fn record_audit(&mut self, record: EditAuditRecord) {
+        if self.audit_records.len() >= self.max_audit_records {
+            self.audit_records.pop_front();
+        }
+        self.audit_records.push_back(record);
+    }
+
+    /// Configure a durable JSONL sink for future audit records.
+    pub fn set_audit_log(&mut self, policy: AuditLogPolicy) {
+        self.audit_log = Some(policy);
+    }
+
+    /// Append an audit record to the configured sink and bounded memory store.
+    ///
+    /// With [`AuditFailureMode::FailOpen`], sink errors are ignored after the
+    /// in-memory record is retained. With [`AuditFailureMode::FailClosed`], a
+    /// sink error is returned and the record is not retained in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanStoreError::Audit`] when a fail-closed sink rejects the
+    /// serialized record.
+    pub fn record_audit_with_policy(
+        &mut self,
+        record: EditAuditRecord,
+    ) -> Result<(), PlanStoreError> {
+        let Some(policy) = self.audit_log.clone() else {
+            self.record_audit(record);
+            return Ok(());
+        };
+        match append_audit_record(&policy, &record) {
+            Ok(()) => {
+                self.record_audit(record);
+                Ok(())
+            }
+            Err(_error) if policy.failure_mode() == AuditFailureMode::FailOpen => {
+                self.record_audit(record);
+                Ok(())
+            }
+            Err(error) => Err(PlanStoreError::Audit {
+                path: policy.path().to_path_buf(),
+                error,
+            }),
+        }
+    }
+
+    /// Return audit records from oldest to newest.
+    pub fn audit_records(&self) -> impl Iterator<Item = &EditAuditRecord> {
+        self.audit_records.iter()
+    }
+
+    /// Replace the edit policy, invalidating plans if it changed.
+    pub fn update_policy(&mut self, policy: EditPolicy) {
+        if self.policy != policy {
+            self.policy_generation = self.policy_generation.wrapping_add(1);
+            self.policy = policy;
+        }
+    }
+
+    fn current_plan(&self, id: &PlanId) -> Result<&EditPlan, PlanStoreError> {
+        let Some(plan) = self.plans.get(id) else {
+            return Err(self
+                .tombstones
+                .error_for(id)
+                .unwrap_or_else(|| PlanStoreError::NotFound(id.clone())));
+        };
+        if plan.is_expired(SystemTime::now()) {
+            return Err(PlanStoreError::Expired(id.clone()));
+        }
+        if plan.policy_generation() != self.policy_generation {
+            return Err(PlanStoreError::PolicyChanged {
+                plan_id: id.clone(),
+                plan_generation: plan.policy_generation(),
+                current_generation: self.policy_generation,
+            });
+        }
+        Ok(plan)
+    }
+}
+
+fn append_audit_record(policy: &AuditLogPolicy, record: &EditAuditRecord) -> Result<(), String> {
+    let mut line = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    line.push(b'\n');
+    let existing = std::fs::metadata(policy.path()).map_or(0, |metadata| metadata.len());
+    let total = existing
+        .checked_add(u64::try_from(line.len()).map_err(|_| "audit record is too large".to_owned())?)
+        .ok_or_else(|| "audit log size overflow".to_owned())?;
+    if total > u64::try_from(policy.max_bytes).unwrap_or(u64::MAX) {
+        return Err(format!("audit log exceeds {} byte limit", policy.max_bytes));
+    }
+    if let Some(parent) = policy.path().parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(policy.path())
+        .map_err(|error| error.to_string())?;
+    file.write_all(&line).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+struct PlanTombstones {
+    expired: VecDeque<PlanId>,
+    evicted: VecDeque<PlanId>,
+    limit: usize,
+}
+
+impl PlanTombstones {
+    fn new(max_plans: usize) -> Self {
+        Self {
+            expired: VecDeque::new(),
+            evicted: VecDeque::new(),
+            limit: max_plans.max(1).saturating_mul(4).max(16),
+        }
+    }
+
+    fn remember_expired(&mut self, id: PlanId) {
+        remember_plan_id(&mut self.expired, self.limit, id);
+    }
+
+    fn remember_evicted(&mut self, id: PlanId) {
+        remember_plan_id(&mut self.evicted, self.limit, id);
+    }
+
+    fn error_for(&self, id: &PlanId) -> Option<PlanStoreError> {
+        if self.expired.contains(id) {
+            Some(PlanStoreError::Expired(id.clone()))
+        } else if self.evicted.contains(id) {
+            Some(PlanStoreError::Evicted(id.clone()))
+        } else {
+            None
+        }
+    }
+}
+
+fn remember_plan_id(queue: &mut VecDeque<PlanId>, limit: usize, id: PlanId) {
+    if queue.contains(&id) {
+        return;
+    }
+    if queue.len() >= limit {
+        queue.pop_front();
+    }
+    queue.push_back(id);
 }
 
 fn file_operation_bytes(operation: &FileOperation) -> usize {
@@ -578,9 +988,13 @@ fn unified_diff(snapshot: &FileSnapshot) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -687,6 +1101,137 @@ mod tests {
             Err(PlanStoreError::TooLarge { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn policy_changes_invalidate_outstanding_plans() -> Result<(), PlanStoreError> {
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let id = plan.id().clone();
+        store.insert(plan)?;
+
+        store.update_policy(EditPolicy::new(EditMode::Refactor));
+
+        assert!(matches!(
+            store.take_for_project(&id, "project-a"),
+            Err(PlanStoreError::PolicyChanged { plan_id, .. }) if plan_id == id
+        ));
+        assert!(store.get(&id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn expired_and_evicted_plans_have_specific_failures() -> Result<(), PlanStoreError> {
+        let mut expired = EditPlanStore::new(2, 1024, Duration::ZERO);
+        let expired_plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let expired_id = expired_plan.id().clone();
+        expired.insert(expired_plan)?;
+        assert!(matches!(
+            expired.take_for_project(&expired_id, "project-a"),
+            Err(PlanStoreError::Expired(id)) if id == expired_id
+        ));
+
+        let mut bounded = EditPlanStore::new(1, 1024, Duration::from_secs(60));
+        let first = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let first_id = first.id().clone();
+        bounded.insert(first)?;
+        bounded.insert(EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        ))?;
+        assert!(matches!(
+            bounded.take_for_project(&first_id, "project-a"),
+            Err(PlanStoreError::Evicted(id)) if id == first_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn durable_audit_records_keep_context_without_source_content() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("audit.jsonl");
+        let policy = AuditLogPolicy::new(&path, 4_096, AuditFailureMode::FailClosed).unwrap();
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            vec![FileSnapshot::from_contents(
+                PathBuf::from("src/lib.rs"),
+                SnapshotSource::Disk,
+                None,
+                "secret source\n",
+                "updated\n",
+            )],
+            vec!["replace text".to_string()],
+            true,
+            Duration::from_secs(60),
+        );
+        let record = EditAuditRecord::for_plan_with_context(
+            &plan,
+            Some("session-a".to_string()),
+            Some("principal-a".to_string()),
+        )
+        .committed(vec![PathBuf::from("src/lib.rs")]);
+        let mut store = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        store.set_audit_log(policy);
+
+        store.record_audit_with_policy(record).unwrap();
+
+        let line = fs::read_to_string(path).unwrap();
+        assert!(line.contains("\"session_id\":\"session-a\""));
+        assert!(line.contains("\"principal\":\"principal-a\""));
+        assert!(line.contains("\"precondition_hashes\""));
+        assert!(!line.contains("secret source"));
+        assert_eq!(store.audit_records().count(), 1);
+    }
+
+    #[test]
+    fn audit_sink_failure_mode_controls_memory_fallback() {
+        let root = TempDir::new().unwrap();
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let record = EditAuditRecord::for_plan(&plan);
+
+        let mut fail_closed = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        fail_closed.set_audit_log(
+            AuditLogPolicy::new(root.path(), 4_096, AuditFailureMode::FailClosed).unwrap(),
+        );
+        assert!(matches!(
+            fail_closed.record_audit_with_policy(record.clone()),
+            Err(PlanStoreError::Audit { .. })
+        ));
+        assert_eq!(fail_closed.audit_records().count(), 0);
+
+        let mut fail_open = EditPlanStore::new(2, 1_024, Duration::from_secs(60));
+        fail_open.set_audit_log(
+            AuditLogPolicy::new(root.path(), 4_096, AuditFailureMode::FailOpen).unwrap(),
+        );
+        fail_open.record_audit_with_policy(record).unwrap();
+        assert_eq!(fail_open.audit_records().count(), 1);
     }
 
     #[test]

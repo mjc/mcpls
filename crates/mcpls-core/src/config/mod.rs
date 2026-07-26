@@ -991,6 +991,42 @@ mod tests {
     }
 
     #[test]
+    fn edit_safety_policy_round_trips_through_toml() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+                [daemon.edit_safety.audit_log]
+                path = ".mcpls/audit.jsonl"
+                max_bytes = 8192
+                failure_mode = "fail_closed"
+
+                [daemon.edit_safety.backup]
+                root = ".mcpls/backups"
+                max_archives = 3
+                max_bytes = 65536
+                failure_mode = "fail_open"
+            "#,
+        )
+        .unwrap();
+
+        let safety = config.daemon.edit_safety.unwrap();
+        let audit = safety.audit_log.unwrap();
+        assert_eq!(audit.path, PathBuf::from(".mcpls/audit.jsonl"));
+        assert_eq!(audit.max_bytes, 8192);
+        assert_eq!(
+            audit.failure_mode,
+            crate::edit_plan::AuditFailureMode::FailClosed
+        );
+        let backup = safety.backup.unwrap();
+        assert_eq!(backup.root, PathBuf::from(".mcpls/backups"));
+        assert_eq!(backup.max_archives, 3);
+        assert_eq!(backup.max_bytes, 65536);
+        assert_eq!(
+            backup.failure_mode,
+            crate::edit_backup::BackupFailureMode::FailOpen
+        );
+    }
+
+    #[test]
     fn daemon_default_keeps_shutdown_timeout_when_section_is_omitted() {
         let config: ServerConfig = toml::from_str("").unwrap();
 

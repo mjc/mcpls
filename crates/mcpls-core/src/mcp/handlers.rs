@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
 
@@ -117,6 +118,11 @@ impl BridgeContext {
             subscriptions,
             project_config_ignored,
         }
+    }
+
+    /// Return this MCP session's stable audit identifier.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Remember a plan returned by a preview in this session.

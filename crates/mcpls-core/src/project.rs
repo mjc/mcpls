@@ -20,10 +20,13 @@ use crate::bridge::{
     ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult, SignatureHelpResult,
     Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
-use crate::config::ProjectConfig;
-use crate::edit_apply::{ApplyReport, apply_plan_with_documents};
+use crate::config::{EditSafetyConfig, ProjectConfig};
+use crate::edit_apply::{
+    ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
+};
+use crate::edit_backup::BackupPolicy;
 use crate::edit_paths::WorkspaceBoundary;
-use crate::edit_plan::{EditPlan, EditPlanStore, PlanId};
+use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
@@ -467,6 +470,14 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectIdentityError> {
         })
 }
 
+fn resolve_edit_safety_path(boundary: &WorkspaceBoundary, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        boundary.root().join(path)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProjectCompatibilityKey([u8; 32]);
 
@@ -559,6 +570,11 @@ fn hash_rust_server_config(
     hash_project_environment(hasher, project_environment);
     let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
     hash_compatibility_field(hasher, &initialization_options);
+    if let Some(edit_safety) = template.edit_safety() {
+        let edit_safety = serde_json::to_vec(edit_safety).ok()?;
+        hash_compatibility_field(hasher, b"edit-safety-policy-v1");
+        hash_compatibility_field(hasher, &edit_safety);
+    }
     hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
     if let Some(heuristics) = &config.heuristics {
         hash_compatibility_strings(hasher, &heuristics.project_markers);
@@ -1389,6 +1405,8 @@ enum ProjectRequest {
         plan_id: PlanId,
         project_id: String,
         root: PathBuf,
+        session_id: Option<String>,
+        principal: Option<String>,
         reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
     },
     PublishEvent {
@@ -2439,12 +2457,32 @@ impl ProjectHandle {
         project_id: String,
         root: PathBuf,
     ) -> Result<AppliedEditPlan, ProjectActorError> {
+        self.apply_edit_plan_with_context(plan_id, project_id, root, None, None)
+            .await
+    }
+
+    /// Consume and apply one project-owned workspace edit preview with audit context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the plan is not owned by the
+    /// project, or filesystem validation/application fails.
+    pub async fn apply_edit_plan_with_context(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+        root: PathBuf,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Result<AppliedEditPlan, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::ApplyEditPlan {
                 plan_id,
                 project_id,
                 root,
+                session_id,
+                principal,
                 reply,
             })
             .await
@@ -2620,6 +2658,7 @@ impl ProjectHandle {
 struct ProjectRuntime {
     translator: Translator,
     edit_plans: EditPlanStore,
+    edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -2719,9 +2758,14 @@ impl CodeActionStore {
 
 impl ProjectRuntime {
     fn new(translator: Translator) -> Self {
+        Self::with_edit_safety(translator, None)
+    }
+
+    fn with_edit_safety(translator: Translator, edit_safety: Option<EditSafetyConfig>) -> Self {
         Self {
             translator,
             edit_plans: EditPlanStore::for_project(),
+            edit_safety,
             code_actions: CodeActionStore::new(),
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -2794,17 +2838,59 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn apply_edit_plan(
+    fn configure_edit_safety(
+        &mut self,
+        boundary: &WorkspaceBoundary,
+    ) -> Result<Option<BackupPolicy>, String> {
+        let Some(safety) = self.edit_safety.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(audit) = &safety.audit_log {
+            let path = resolve_edit_safety_path(boundary, &audit.path);
+            boundary
+                .validate_target(&path)
+                .map_err(|error| format!("invalid audit log path {}: {error}", path.display()))?;
+            let policy = AuditLogPolicy::new(&path, audit.max_bytes, audit.failure_mode)
+                .map_err(|error| error.to_string())?;
+            self.edit_plans.set_audit_log(policy);
+        }
+        safety
+            .backup
+            .as_ref()
+            .map(|backup| {
+                BackupPolicy::new(
+                    boundary,
+                    &backup.root,
+                    backup.max_archives,
+                    backup.max_bytes,
+                    backup.failure_mode,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    fn record_edit_failure(&mut self, audit: EditAuditRecord, error: String) -> String {
+        let _ = self
+            .edit_plans
+            .record_audit_with_policy(audit.failed(error.clone(), false));
+        error
+    }
+
+    async fn apply_edit_plan_with_context(
         &mut self,
         plan_id: &PlanId,
         project_id: &str,
         root: &Path,
+        session_id: Option<String>,
+        principal: Option<String>,
     ) -> Result<AppliedEditPlan, String> {
+        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let backup_policy = self.configure_edit_safety(&boundary)?;
         let plan = self
             .edit_plans
             .take_for_project(plan_id, project_id)
             .map_err(|error| error.to_string())?;
-        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
         let open_documents = plan
             .open_document_snapshots()
             .map(|snapshot| {
@@ -2815,15 +2901,34 @@ impl ProjectRuntime {
                 )
             })
             .collect::<Vec<_>>();
-        let ApplyReport { committed_files } =
-            apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker())
-                .map_err(|error| error.to_string())?;
+        let audit = EditAuditRecord::for_plan_with_context(&plan, session_id, principal);
+        let apply_result = match backup_policy.as_ref() {
+            Some(policy) => apply_plan_with_documents_and_backup(
+                &boundary,
+                &plan,
+                self.translator.document_tracker(),
+                policy,
+            ),
+            None => apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker()),
+        };
+        let ApplyReport { committed_files } = match apply_result {
+            Ok(report) => report,
+            Err(error) => {
+                return Err(self.record_edit_failure(audit, error.to_string()));
+            }
+        };
         for (path, version, content) in open_documents {
-            self.translator
+            if let Err(error) = self
+                .translator
                 .apply_open_document_content(&path, version, content)
                 .await
-                .map_err(|error| error.to_string())?;
+            {
+                return Err(self.record_edit_failure(audit, error.to_string()));
+            }
         }
+        self.edit_plans
+            .record_audit_with_policy(audit.committed(committed_files.clone()))
+            .map_err(|error| error.to_string())?;
         Ok(AppliedEditPlan {
             plan_id: plan.id().clone(),
             operations: plan.operations().to_vec(),
@@ -3383,9 +3488,10 @@ pub fn spawn_project_actor_for_root_with_template(
     root: &CanonicalRoot,
     template: &TranslatorTemplate,
 ) -> ProjectHandle {
-    spawn_project_actor_with_translator(
+    spawn_project_actor_with_translator_and_safety(
         capacity,
         template.translator_for_root(root.as_path().to_path_buf()),
+        template.edit_safety().cloned(),
     )
 }
 
@@ -3394,6 +3500,14 @@ pub fn spawn_project_actor_for_root_with_template(
 pub fn spawn_project_actor_with_translator(
     capacity: usize,
     translator: Translator,
+) -> ProjectHandle {
+    spawn_project_actor_with_translator_and_safety(capacity, translator, None)
+}
+
+fn spawn_project_actor_with_translator_and_safety(
+    capacity: usize,
+    translator: Translator,
+    edit_safety: Option<EditSafetyConfig>,
 ) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.downgrade();
@@ -3407,7 +3521,10 @@ pub fn spawn_project_actor_with_translator(
         event_tx,
         event_history: std::sync::Arc::clone(&event_history),
     };
-    let runtime = ProjectRuntime::new(translator);
+    let runtime = match edit_safety {
+        None => ProjectRuntime::new(translator),
+        Some(safety) => ProjectRuntime::with_edit_safety(translator, Some(safety)),
+    };
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
@@ -3959,9 +4076,13 @@ async fn handle_project_request(
             plan_id,
             project_id,
             root,
+            session_id,
+            principal,
             reply,
         } => {
-            let result = runtime.apply_edit_plan(&plan_id, &project_id, &root).await;
+            let result = runtime
+                .apply_edit_plan_with_context(&plan_id, &project_id, &root, session_id, principal)
+                .await;
             if let Ok(applied) = &result {
                 channels.publish_applied_edit(applied);
             }
@@ -5447,13 +5568,32 @@ impl ProjectRegistry {
         id: &ProjectId,
         plan_id: PlanId,
     ) -> Result<AppliedEditPlan, ProjectRegistryError> {
+        self.apply_edit_plan_with_context(id, plan_id, None, None)
+            .await
+    }
+
+    /// Consume and apply a project-owned edit plan while recording audit context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, the plan is not
+    /// owned by it, or filesystem validation/application fails.
+    pub async fn apply_edit_plan_with_context(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Result<AppliedEditPlan, ProjectRegistryError> {
         let (identity, actor, mutation) = self.entry(id).await?;
         let _mutation = mutation.lock().await;
         actor
-            .apply_edit_plan(
+            .apply_edit_plan_with_context(
                 plan_id,
                 id.as_str().to_string(),
                 identity.root().as_path().to_path_buf(),
+                session_id,
+                principal,
             )
             .await
             .map_err(ProjectRegistryError::from)
@@ -5892,6 +6032,44 @@ mod tests {
                 .await,
             rust_project_compatibility_key(root.path(), Some(&second.configuration_template()))
                 .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_compatibility_key_changes_with_edit_safety_policy() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+        let first = translator.configuration_template();
+        let second = first.clone().with_project_config(&ProjectConfig {
+            edit_safety: Some(EditSafetyConfig {
+                audit_log: Some(crate::config::AuditLogConfig {
+                    path: PathBuf::from("audit.jsonl"),
+                    max_bytes: 4_096,
+                    failure_mode: crate::edit_plan::AuditFailureMode::FailClosed,
+                }),
+                backup: None,
+            }),
+            ..ProjectConfig::default()
+        });
+
+        assert_ne!(
+            rust_project_compatibility_key(root.path(), Some(&first)).await,
+            rust_project_compatibility_key(root.path(), Some(&second)).await
         );
     }
 
@@ -7182,6 +7360,77 @@ while True:
     }
 
     #[tokio::test]
+    async fn project_runtime_applies_configured_audit_and_backup_policies() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("configured.rs");
+        fs::write(&file, "before\n").unwrap();
+        let safety = EditSafetyConfig {
+            audit_log: Some(crate::config::AuditLogConfig {
+                path: PathBuf::from(".mcpls/audit.jsonl"),
+                max_bytes: 4_096,
+                failure_mode: crate::edit_plan::AuditFailureMode::FailClosed,
+            }),
+            backup: Some(crate::config::BackupConfig {
+                root: PathBuf::from(".mcpls/backups"),
+                max_archives: 2,
+                max_bytes: 16_384,
+                failure_mode: crate::edit_backup::BackupFailureMode::FailClosed,
+            }),
+        };
+        let mut runtime = ProjectRuntime::with_edit_safety(Translator::new(), Some(safety));
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let configured_backup = runtime.configure_edit_safety(&boundary).unwrap().unwrap();
+        assert_eq!(
+            configured_backup.root(),
+            root.path().join(".mcpls/backups").as_path()
+        );
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                file.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        runtime.store_edit_plan(plan).unwrap();
+
+        runtime
+            .apply_edit_plan_with_context(
+                &plan_id,
+                "project",
+                root.path(),
+                Some("session-1".to_string()),
+                Some("principal-1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
+        let audit = runtime.edit_plans.audit_records().next().unwrap();
+        assert_eq!(audit.session_id(), Some("session-1"));
+        assert_eq!(audit.principal(), Some("principal-1"));
+        let audit_path = root.path().join(".mcpls/audit.jsonl");
+        assert!(
+            fs::read_to_string(audit_path)
+                .unwrap()
+                .contains("Committed")
+        );
+        assert!(
+            root.path()
+                .join(".mcpls/backups")
+                .join(plan_id.as_str())
+                .join("manifest.json")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
     async fn registry_keeps_one_logical_project_for_linked_git_worktrees() {
         let repository = TempDir::new().unwrap();
         let git_dir = repository.path().join(".git");
@@ -7678,6 +7927,7 @@ while True:
             heuristics_max_depth: Some(3),
             redaction_patterns: None,
             persist_environment: false,
+            edit_safety: None,
         };
 
         registry
@@ -7804,6 +8054,7 @@ while True:
                     heuristics_max_depth: Some(3),
                     redaction_patterns: None,
                     persist_environment: false,
+                    edit_safety: None,
                 }),
             )
             .await
