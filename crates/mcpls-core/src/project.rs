@@ -570,6 +570,11 @@ fn hash_rust_server_config(
     hash_project_environment(hasher, project_environment);
     let initialization_options = serde_json::to_vec(&config.initialization_options).ok()?;
     hash_compatibility_field(hasher, &initialization_options);
+    if let Some(edit_safety) = template.edit_safety() {
+        let edit_safety = serde_json::to_vec(edit_safety).ok()?;
+        hash_compatibility_field(hasher, b"edit-safety-policy-v1");
+        hash_compatibility_field(hasher, &edit_safety);
+    }
     hash_compatibility_field(hasher, &config.timeout_seconds.to_le_bytes());
     if let Some(heuristics) = &config.heuristics {
         hash_compatibility_strings(hasher, &heuristics.project_markers);
@@ -5980,6 +5985,44 @@ mod tests {
                 .await,
             rust_project_compatibility_key(root.path(), Some(&second.configuration_template()))
                 .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_compatibility_key_changes_with_edit_safety_policy() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+        let first = translator.configuration_template();
+        let second = first.clone().with_project_config(&ProjectConfig {
+            edit_safety: Some(EditSafetyConfig {
+                audit_log: Some(crate::config::AuditLogConfig {
+                    path: PathBuf::from("audit.jsonl"),
+                    max_bytes: 4_096,
+                    failure_mode: crate::edit_plan::AuditFailureMode::FailClosed,
+                }),
+                backup: None,
+            }),
+            ..ProjectConfig::default()
+        });
+
+        assert_ne!(
+            rust_project_compatibility_key(root.path(), Some(&first)).await,
+            rust_project_compatibility_key(root.path(), Some(&second)).await
         );
     }
 
