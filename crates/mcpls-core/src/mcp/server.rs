@@ -697,7 +697,9 @@ impl McplsServer {
     }
 
     /// Remove a project and shut down its actor.
-    #[tool(description = "Remove a registered project and stop its actor.")]
+    #[tool(
+        description = "Permanently forget a registered project and stop its actor. Do not use for session cleanup or activation recovery."
+    )]
     async fn project_remove(
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,

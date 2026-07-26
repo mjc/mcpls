@@ -3312,6 +3312,7 @@ impl ProjectRuntime {
         generation: u64,
         notification: LspNotification,
     ) -> Option<ProjectEvent> {
+        let completes_initial_load = notification.completes_initial_load();
         match notification {
             LspNotification::PublishDiagnostics(params) => {
                 let event = ProjectEvent::DiagnosticsUpdated {
@@ -3338,13 +3339,13 @@ impl ProjectRuntime {
                     .store_message_with_generation(generation, params.typ.into(), params.message);
                 None
             }
-            LspNotification::ServerStatus(status) => {
-                if status.quiescent {
+            LspNotification::ServerStatus(_) | LspNotification::Progress { .. } => {
+                if completes_initial_load {
                     self.translator.clear_expected_languages();
                 }
                 None
             }
-            LspNotification::Progress { .. } | LspNotification::Other { .. } => None,
+            LspNotification::Other { .. } => None,
         }
     }
 
@@ -7005,7 +7006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_actor_becomes_ready_when_server_status_reaches_quiescence() {
+    async fn project_actor_becomes_ready_when_initial_rust_indexing_finishes() {
         let mut translator = Translator::new();
         translator.set_expected_languages(HashSet::from(["rust".to_string()]));
         let actor = spawn_project_actor_with_translator(2, translator);
@@ -7018,7 +7019,26 @@ mod tests {
                     "experimental/serverStatus",
                     Some(serde_json::json!({
                         "health": "ok",
-                        "quiescent": true
+                        "quiescent": false
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.query().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                notification: LspNotification::parse(
+                    "$/progress",
+                    Some(serde_json::json!({
+                        "token": "rustAnalyzer/Indexing",
+                        "value": {"kind": "end"}
                     })),
                 ),
             })

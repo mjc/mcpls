@@ -1458,17 +1458,19 @@ impl Translator {
         })
         .await?;
         let client = server.client().clone();
-        let _ = server.take_notification_rx();
+        let mut notifications = server.take_notification_rx();
         self.register_client(language_id.clone(), client.clone());
         self.register_server(language_id.clone(), server);
         self.register_server_root(language_id.clone(), root);
         if language_id.eq_ignore_ascii_case("rust") {
             self.expected_languages.insert(language_id.clone());
-            let readiness = client.wait_until_quiescent().await;
-            if readiness.is_ok() {
-                self.expected_languages.remove(&language_id);
+            while let Some(notification) = notifications.recv().await {
+                if notification.completes_initial_load() {
+                    self.expected_languages.remove(&language_id);
+                    return Ok(());
+                }
             }
-            readiness?;
+            return Err(Error::ServerTerminated);
         }
         Ok(())
     }
@@ -3401,8 +3403,16 @@ while True:
         time.sleep(2)
         send_message({
             "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {
+                "token": "rustAnalyzer/Indexing",
+                "value": {"kind": "end"},
+            },
+        })
+        send_message({
+            "jsonrpc": "2.0",
             "method": "experimental/serverStatus",
-            "params": {"health": "ok", "quiescent": True},
+            "params": {"health": "ok", "quiescent": False},
         })
     elif message.get("method") == "shutdown":
         send_message({"jsonrpc": "2.0", "id": message["id"], "result": None})
