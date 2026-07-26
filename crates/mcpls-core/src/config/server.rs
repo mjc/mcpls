@@ -92,15 +92,6 @@ impl ServerHeuristics {
     /// `true` if any marker is found, `false` otherwise.
     #[must_use]
     pub fn is_applicable_recursive(&self, workspace_root: &Path, max_depth: Option<usize>) -> bool {
-        if self.project_markers.is_empty() {
-            return true;
-        }
-
-        // First check the root level (fast path)
-        if self.is_applicable(workspace_root) {
-            return true;
-        }
-
         !self.matching_roots(workspace_root, max_depth).is_empty()
     }
 
