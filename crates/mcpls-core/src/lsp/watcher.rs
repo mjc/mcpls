@@ -492,11 +492,6 @@ fn watch_specs(
             Value::String(pattern) => {
                 let path = Path::new(&pattern);
                 if path.is_absolute() && !has_glob_meta(&pattern) {
-                    if !is_within_workspace(workspace_roots, path) {
-                        return Err(invalid_params(
-                            "absolute watched-file path is outside the workspace",
-                        ));
-                    }
                     specs.push(WatchSpec::exact(path.to_path_buf(), watcher.kind)?);
                 } else if path.is_absolute() {
                     let Some((root, relative)) = workspace_roots
@@ -571,16 +566,6 @@ fn relative_base_uri(value: &Value) -> Option<&str> {
     value
         .as_str()
         .or_else(|| value.as_object()?.get("uri")?.as_str())
-}
-
-fn is_within_workspace(workspace_roots: &[PathBuf], path: &Path) -> bool {
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    workspace_roots.iter().any(|workspace_root| {
-        let canonical_workspace = workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.clone());
-        canonical_path.starts_with(canonical_workspace)
-    })
 }
 
 fn snapshot(specs: &[WatchSpec]) -> Result<HashMap<PathBuf, bool>, JsonRpcError> {
@@ -1116,24 +1101,30 @@ mod tests {
     }
 
     #[test]
-    fn absolute_file_and_directory_patterns_must_stay_inside_workspace() {
+    fn registration_accepts_rust_analyzer_user_config_outside_workspace() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
+        let config_dir = outside.path().join("rust-analyzer");
+        fs::create_dir(&config_dir).unwrap();
 
-        for path in [
-            outside.path().join("Cargo.toml"),
-            outside.path().to_path_buf(),
-        ] {
-            let result = watch_specs(
-                &[workspace.path().to_path_buf()],
-                vec![RawWatcher {
-                    glob_pattern: json!(path.to_string_lossy()),
+        let specs = watch_specs(
+            &[workspace.path().to_path_buf()],
+            vec![
+                RawWatcher {
+                    glob_pattern: json!("**/*.rs"),
                     kind: all_watch_kinds(),
-                }],
-            );
+                },
+                RawWatcher {
+                    glob_pattern: json!(config_dir.to_string_lossy()),
+                    kind: all_watch_kinds(),
+                },
+            ],
+        )
+        .unwrap();
 
-            assert!(result.is_err());
-        }
+        assert_eq!(specs.len(), 2);
+        assert!(specs[0].matches(&workspace.path().join("src/lib.rs"), false));
+        assert!(specs[1].matches(&config_dir, true));
     }
 
     #[test]
