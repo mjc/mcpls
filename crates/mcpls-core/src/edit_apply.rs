@@ -78,16 +78,13 @@ pub fn apply_stored_plan(
 ) -> Result<ApplyReport, ApplyError> {
     let plan = store.take_for_project(plan_id, project_id)?;
     let audit = EditAuditRecord::for_plan(&plan);
-    match apply_plan(boundary, &plan) {
-        Ok(report) => {
-            store.record_audit(audit.committed(report.committed_files.clone()));
-            Ok(report)
-        }
-        Err(error) => {
-            store.record_audit(audit.failed(error.to_string(), false));
-            Err(error)
-        }
-    }
+    let result = apply_plan(boundary, &plan);
+    let audit = match &result {
+        Ok(report) => audit.committed(report.committed_files.clone()),
+        Err(error) => audit.failed(error.to_string(), false),
+    };
+    store.record_audit(audit);
+    result
 }
 
 struct PreparedPlan<'a> {
