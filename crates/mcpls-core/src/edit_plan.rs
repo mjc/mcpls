@@ -545,9 +545,7 @@ pub struct EditPlanStore {
     bytes: usize,
     policy_generation: u64,
     policy: EditPolicy,
-    expired_plans: VecDeque<PlanId>,
-    evicted_plans: VecDeque<PlanId>,
-    max_tombstones: usize,
+    tombstones: PlanTombstones,
 }
 
 impl EditPlanStore {
@@ -571,9 +569,7 @@ impl EditPlanStore {
             bytes: 0,
             policy_generation: 0,
             policy: EditPolicy::new(EditMode::Write),
-            expired_plans: VecDeque::new(),
-            evicted_plans: VecDeque::new(),
-            max_tombstones: max_plans.max(1).saturating_mul(4).max(16),
+            tombstones: PlanTombstones::new(max_plans),
         }
     }
 
@@ -610,7 +606,7 @@ impl EditPlanStore {
             };
             if let Some(oldest) = self.plans.remove(&oldest_id) {
                 self.bytes = self.bytes.saturating_sub(oldest.estimated_bytes());
-                remember_plan_id(&mut self.evicted_plans, self.max_tombstones, oldest_id);
+                self.tombstones.remember_evicted(oldest_id);
             }
         }
         self.bytes = self.bytes.saturating_add(plan.estimated_bytes());
@@ -677,7 +673,7 @@ impl EditPlanStore {
         for id in expired {
             if let Some(plan) = self.plans.remove(&id) {
                 self.bytes = self.bytes.saturating_sub(plan.estimated_bytes());
-                remember_plan_id(&mut self.expired_plans, self.max_tombstones, id);
+                self.tombstones.remember_expired(id);
             }
         }
     }
@@ -723,13 +719,10 @@ impl EditPlanStore {
 
     fn current_plan(&self, id: &PlanId) -> Result<&EditPlan, PlanStoreError> {
         let Some(plan) = self.plans.get(id) else {
-            return if self.expired_plans.contains(id) {
-                Err(PlanStoreError::Expired(id.clone()))
-            } else if self.evicted_plans.contains(id) {
-                Err(PlanStoreError::Evicted(id.clone()))
-            } else {
-                Err(PlanStoreError::NotFound(id.clone()))
-            };
+            return Err(self
+                .tombstones
+                .error_for(id)
+                .unwrap_or_else(|| PlanStoreError::NotFound(id.clone())));
         };
         if plan.is_expired(SystemTime::now()) {
             return Err(PlanStoreError::Expired(id.clone()));
@@ -742,6 +735,41 @@ impl EditPlanStore {
             });
         }
         Ok(plan)
+    }
+}
+
+#[derive(Debug)]
+struct PlanTombstones {
+    expired: VecDeque<PlanId>,
+    evicted: VecDeque<PlanId>,
+    limit: usize,
+}
+
+impl PlanTombstones {
+    fn new(max_plans: usize) -> Self {
+        Self {
+            expired: VecDeque::new(),
+            evicted: VecDeque::new(),
+            limit: max_plans.max(1).saturating_mul(4).max(16),
+        }
+    }
+
+    fn remember_expired(&mut self, id: PlanId) {
+        remember_plan_id(&mut self.expired, self.limit, id);
+    }
+
+    fn remember_evicted(&mut self, id: PlanId) {
+        remember_plan_id(&mut self.evicted, self.limit, id);
+    }
+
+    fn error_for(&self, id: &PlanId) -> Option<PlanStoreError> {
+        if self.expired.contains(id) {
+            Some(PlanStoreError::Expired(id.clone()))
+        } else if self.evicted.contains(id) {
+            Some(PlanStoreError::Evicted(id.clone()))
+        } else {
+            None
+        }
     }
 }
 
