@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::edit_paths::FileOperation;
+use crate::edit_policy::{EditMode, EditPolicy};
 
 /// Shared edit safety limits used by preview and project-local plan storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,6 +538,7 @@ pub struct EditPlanStore {
     ttl: Duration,
     bytes: usize,
     policy_generation: u64,
+    policy: EditPolicy,
 }
 
 impl EditPlanStore {
@@ -559,6 +561,7 @@ impl EditPlanStore {
             ttl,
             bytes: 0,
             policy_generation: 0,
+            policy: EditPolicy::new(EditMode::Write),
         }
     }
 
@@ -696,9 +699,12 @@ impl EditPlanStore {
         self.audit_records.iter()
     }
 
-    /// Invalidate plans admitted under the previous edit policy generation.
-    pub const fn invalidate_policy(&mut self) {
-        self.policy_generation = self.policy_generation.wrapping_add(1);
+    /// Replace the edit policy, invalidating plans if it changed.
+    pub fn update_policy(&mut self, policy: EditPolicy) {
+        if self.policy != policy {
+            self.policy_generation = self.policy_generation.wrapping_add(1);
+            self.policy = policy;
+        }
     }
 
     fn current_plan(&self, id: &PlanId) -> Result<&EditPlan, PlanStoreError> {
@@ -885,7 +891,7 @@ mod tests {
         let id = plan.id().clone();
         store.insert(plan)?;
 
-        store.invalidate_policy();
+        store.update_policy(EditPolicy::new(EditMode::Refactor));
 
         assert!(matches!(
             store.take_for_project(&id, "project-a"),
