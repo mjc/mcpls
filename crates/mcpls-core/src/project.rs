@@ -2843,6 +2843,13 @@ impl ProjectRuntime {
             .transpose()
     }
 
+    fn record_edit_failure(&mut self, audit: EditAuditRecord, error: String) -> String {
+        let _ = self
+            .edit_plans
+            .record_audit_with_policy(audit.failed(error.clone(), false));
+        error
+    }
+
     async fn apply_edit_plan(
         &mut self,
         plan_id: &PlanId,
@@ -2878,10 +2885,7 @@ impl ProjectRuntime {
         let ApplyReport { committed_files } = match apply_result {
             Ok(report) => report,
             Err(error) => {
-                let _ = self
-                    .edit_plans
-                    .record_audit_with_policy(audit.failed(error.to_string(), false));
-                return Err(error.to_string());
+                return Err(self.record_edit_failure(audit, error.to_string()));
             }
         };
         for (path, version, content) in open_documents {
@@ -2890,10 +2894,7 @@ impl ProjectRuntime {
                 .apply_open_document_content(&path, version, content)
                 .await
             {
-                let _ = self
-                    .edit_plans
-                    .record_audit_with_policy(audit.failed(error.to_string(), false));
-                return Err(error.to_string());
+                return Err(self.record_edit_failure(audit, error.to_string()));
             }
         }
         self.edit_plans
