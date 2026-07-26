@@ -23,6 +23,10 @@ pub struct PreviewLimits {
     pub max_edits: usize,
     /// Maximum combined original and planned content bytes.
     pub max_bytes: usize,
+    /// Maximum combined original and planned bytes for one file.
+    pub max_file_bytes: usize,
+    /// Maximum create, rename, and delete operations.
+    pub max_resource_operations: usize,
 }
 
 impl Default for PreviewLimits {
@@ -31,6 +35,8 @@ impl Default for PreviewLimits {
             max_files: EditLimits::PROJECT.max_files,
             max_edits: EditLimits::PROJECT.max_edits,
             max_bytes: EditLimits::PROJECT.max_bytes,
+            max_file_bytes: EditLimits::PROJECT.max_file_bytes,
+            max_resource_operations: EditLimits::PROJECT.max_resource_operations,
         }
     }
 }
@@ -142,6 +148,7 @@ struct PreviewBuilder<'a> {
     conflicts: Vec<String>,
     unsupported: Vec<String>,
     edit_count: usize,
+    resource_operation_count: usize,
 }
 
 impl<'a> PreviewBuilder<'a> {
@@ -164,6 +171,7 @@ impl<'a> PreviewBuilder<'a> {
             conflicts: Vec::new(),
             unsupported: Vec::new(),
             edit_count: 0,
+            resource_operation_count: 0,
         }
     }
 
@@ -191,6 +199,18 @@ impl<'a> PreviewBuilder<'a> {
                 kind: "byte",
                 actual: total_bytes,
                 limit: self.limits.max_bytes,
+            });
+        }
+        if let Some((_, file_bytes)) = self
+            .files
+            .iter()
+            .map(|(path, file)| (path, file.original.len().saturating_add(file.planned.len())))
+            .find(|(_, bytes)| *bytes > self.limits.max_file_bytes)
+        {
+            return Err(PreviewError::Limit {
+                kind: "file byte",
+                actual: file_bytes,
+                limit: self.limits.max_file_bytes,
             });
         }
         if self.operations.is_empty() {
@@ -243,6 +263,7 @@ impl<'a> PreviewBuilder<'a> {
                 edits,
             } => self.handle_text(&uri.to_string(), version, &edits),
             EditOperation::Create { uri, options, .. } => {
+                self.count_resource_operation()?;
                 let path = self
                     .boundary
                     .validate_target(path_for_uri(&uri.to_string())?)?;
@@ -274,6 +295,7 @@ impl<'a> PreviewBuilder<'a> {
                 options,
                 ..
             } => {
+                self.count_resource_operation()?;
                 let from = self
                     .boundary
                     .validate_existing(path_for_uri(&old_uri.to_string())?)?;
@@ -307,6 +329,7 @@ impl<'a> PreviewBuilder<'a> {
                 Ok(())
             }
             EditOperation::Delete { uri, options, .. } => {
+                self.count_resource_operation()?;
                 let path = self
                     .boundary
                     .validate_existing(path_for_uri(&uri.to_string())?)?;
@@ -333,6 +356,18 @@ impl<'a> PreviewBuilder<'a> {
                 Ok(())
             }
         }
+    }
+
+    const fn count_resource_operation(&mut self) -> Result<(), PreviewError> {
+        self.resource_operation_count = self.resource_operation_count.saturating_add(1);
+        if self.resource_operation_count > self.limits.max_resource_operations {
+            return Err(PreviewError::Limit {
+                kind: "resource operation",
+                actual: self.resource_operation_count,
+                limit: self.limits.max_resource_operations,
+            });
+        }
+        Ok(())
     }
 
     fn handle_text(
@@ -425,6 +460,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::path_to_uri;
+    use crate::workspace_edit::NormalizedTextEdit;
 
     #[test]
     fn previews_disk_text_edit_without_writing() {
@@ -459,5 +495,87 @@ mod tests {
         assert!(artifact.plan.safe_to_apply());
         assert!(artifact.plan.unified_diff().contains("+after"));
         assert_eq!(fs::read_to_string(file).unwrap(), "before\n");
+    }
+
+    #[test]
+    fn rejects_resource_operation_limit() {
+        let root = TempDir::new().unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let path = root.path().join("created.rs");
+        let edit = NormalizedWorkspaceEdit {
+            operations: vec![EditOperation::Create {
+                uri: path_to_uri(&path),
+                options: None,
+                annotation_id: None,
+            }],
+            change_annotations: None,
+        };
+        let limits = PreviewLimits {
+            max_resource_operations: 0,
+            ..PreviewLimits::default()
+        };
+
+        let result = preview_normalized(
+            &boundary,
+            "project",
+            edit,
+            PositionEncoding::Utf8,
+            &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+            limits,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PreviewError::Limit {
+                kind: "resource operation",
+                actual: 1,
+                limit: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_per_file_byte_limit() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("large.rs");
+        fs::write(&file, "before\n").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let edit = NormalizedWorkspaceEdit {
+            operations: vec![EditOperation::Text {
+                uri: path_to_uri(&file),
+                version: None,
+                edits: vec![NormalizedTextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 6),
+                    ),
+                    new_text: "after".to_string(),
+                    annotation_id: None,
+                }],
+            }],
+            change_annotations: None,
+        };
+        let limits = PreviewLimits {
+            max_file_bytes: 10,
+            ..PreviewLimits::default()
+        };
+
+        let result = preview_normalized(
+            &boundary,
+            "project",
+            edit,
+            PositionEncoding::Utf8,
+            &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+            limits,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PreviewError::Limit {
+                kind: "file byte",
+                actual: 13,
+                limit: 10,
+            })
+        ));
     }
 }

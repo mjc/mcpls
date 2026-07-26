@@ -21,6 +21,10 @@ pub struct EditLimits {
     pub max_edits: usize,
     /// Maximum combined plan bytes retained by one project store.
     pub max_bytes: usize,
+    /// Maximum combined original and planned bytes for one file.
+    pub max_file_bytes: usize,
+    /// Maximum create, rename, and delete operations in one preview.
+    pub max_resource_operations: usize,
     /// Lifetime of a stored plan.
     pub plan_ttl: Duration,
 }
@@ -31,6 +35,8 @@ impl EditLimits {
         max_files: 64,
         max_edits: 4_096,
         max_bytes: 16 * 1024 * 1024,
+        max_file_bytes: 8 * 1024 * 1024,
+        max_resource_operations: 256,
         plan_ttl: Duration::from_secs(15 * 60),
     };
 }
