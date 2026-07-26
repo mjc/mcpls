@@ -452,7 +452,7 @@ impl Translator {
                 Ok(ServerInitConfig {
                     server_config: config.clone(),
                     workspace_roots: server_roots.clone(),
-                    initialization_options: linked_project_initialization_options(
+                    initialization_options: rust_analyzer_initialization_options(
                         config,
                         &server_roots,
                     )?,
@@ -657,17 +657,33 @@ impl Translator {
     // Future implementation will use LspServer instead of LspClient directly
 }
 
-/// Add rust-analyzer's explicit linked-project manifests for a shared actor.
+const RUST_ANALYZER_EXCLUDED_DIRECTORIES: &[&str] = &[
+    ".direnv",
+    ".git",
+    ".next",
+    ".nuxt",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+    "target",
+];
+
+/// Add rust-analyzer's file exclusions and shared linked-project manifests.
 ///
 /// The registry only joins projects after a fail-closed compatibility check,
 /// so a multi-root actor can safely give rust-analyzer every member manifest.
 /// Existing initialization options are preserved and an existing array is
 /// extended without duplicates.
-fn linked_project_initialization_options(
+fn rust_analyzer_initialization_options(
     config: &LspServerConfig,
     roots: &[PathBuf],
 ) -> Result<Option<serde_json::Value>> {
-    if roots.len() < 2 || !config.language_id.eq_ignore_ascii_case("rust") {
+    if !config.language_id.eq_ignore_ascii_case("rust") {
         return Ok(config.initialization_options.clone());
     }
 
@@ -676,22 +692,95 @@ fn linked_project_initialization_options(
         Some(serde_json::Value::Object(options)) => options,
         Some(_) => {
             return Err(Error::InvalidConfig(
-                "rust linked-project initialization_options must be a JSON object".to_string(),
+                "rust-analyzer initialization_options must be a JSON object".to_string(),
             ));
         }
     };
 
-    let mut linked_projects = take_linked_projects(&mut options)?;
-    for manifest in cargo_manifest_values(roots)? {
-        if !linked_projects.contains(&manifest) {
-            linked_projects.push(manifest);
+    merge_rust_analyzer_file_exclusions(&mut options, roots)?;
+
+    if roots.len() >= 2 {
+        let mut linked_projects = take_linked_projects(&mut options)?;
+        for manifest in cargo_manifest_values(roots)? {
+            if !linked_projects.contains(&manifest) {
+                linked_projects.push(manifest);
+            }
+        }
+        options.insert(
+            "linkedProjects".to_string(),
+            serde_json::Value::Array(linked_projects),
+        );
+    }
+
+    Ok(Some(serde_json::Value::Object(options)))
+}
+
+fn merge_rust_analyzer_file_exclusions(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+    roots: &[PathBuf],
+) -> Result<()> {
+    let files = options
+        .entry("files".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "rust-analyzer initialization_options.files must be a JSON object".to_string(),
+            )
+        })?;
+    let excludes = files
+        .entry("exclude".to_string())
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            Error::InvalidConfig(
+                "rust-analyzer initialization_options.files.exclude must be a JSON array"
+                    .to_string(),
+            )
+        })?;
+
+    for path in rust_analyzer_excluded_paths(roots) {
+        let value = serde_json::Value::String(path);
+        if !excludes.contains(&value) {
+            excludes.push(value);
         }
     }
-    options.insert(
-        "linkedProjects".to_string(),
-        serde_json::Value::Array(linked_projects),
-    );
-    Ok(Some(serde_json::Value::Object(options)))
+    Ok(())
+}
+
+fn rust_analyzer_excluded_paths(roots: &[PathBuf]) -> Vec<String> {
+    let mut excluded = Vec::new();
+    for root in roots {
+        let mut pending = vec![root.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let path = entry.path();
+                if RUST_ANALYZER_EXCLUDED_DIRECTORIES
+                    .contains(&entry.file_name().to_string_lossy().as_ref())
+                {
+                    if let Ok(relative) = path.strip_prefix(root) {
+                        let relative = relative.to_string_lossy().into_owned();
+                        if !excluded.contains(&relative) {
+                            excluded.push(relative);
+                        }
+                    }
+                } else {
+                    pending.push(path);
+                }
+            }
+        }
+    }
+    excluded.sort();
+    excluded
 }
 
 fn take_linked_projects(
@@ -1339,7 +1428,10 @@ impl Translator {
         let mut server = LspServer::spawn(ServerInitConfig {
             server_config: config.clone(),
             workspace_roots: vec![root.clone()],
-            initialization_options: config.initialization_options.clone(),
+            initialization_options: rust_analyzer_initialization_options(
+                &config,
+                std::slice::from_ref(&root),
+            )?,
             notification_tx: None,
         })
         .await?;
@@ -3036,18 +3128,21 @@ mod tests {
     }
 
     #[test]
-    fn linked_project_options_include_all_cargo_manifests() {
+    fn rust_analyzer_options_include_exclusions_and_all_cargo_manifests() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         fs::write(first.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::create_dir_all(first.path().join(".direnv/flake-inputs")).unwrap();
+        fs::create_dir_all(first.path().join("web/node_modules/package")).unwrap();
         fs::write(
             second.path().join("Cargo.toml"),
             "[workspace]\nmembers=[]\n",
         )
         .unwrap();
+        fs::create_dir_all(second.path().join("target/debug")).unwrap();
         let config = LspServerConfig::rust_analyzer();
 
-        let options = linked_project_initialization_options(
+        let options = rust_analyzer_initialization_options(
             &config,
             &[first.path().to_path_buf(), second.path().to_path_buf()],
         )
@@ -3056,6 +3151,9 @@ mod tests {
         assert_eq!(
             options,
             Some(serde_json::json!({
+                "files": {
+                    "exclude": [".direnv", "target", "web/node_modules"]
+                },
                 "linkedProjects": [
                     first.path().join("Cargo.toml"),
                     second.path().join("Cargo.toml")
@@ -3065,10 +3163,29 @@ mod tests {
     }
 
     #[test]
-    fn linked_project_options_merge_existing_settings_without_duplicates() {
+    fn rust_analyzer_options_exclude_generated_directories_for_one_root() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("target/debug")).unwrap();
+        fs::create_dir_all(root.path().join("src/nested/node_modules/package")).unwrap();
+        let config = LspServerConfig::rust_analyzer();
+
+        let options = rust_analyzer_initialization_options(&config, &[root.path().to_path_buf()])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            options["files"]["exclude"],
+            serde_json::json!(["src/nested/node_modules", "target"])
+        );
+        assert!(options.get("linkedProjects").is_none());
+    }
+
+    #[test]
+    fn rust_analyzer_options_merge_existing_settings_without_duplicates() {
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         fs::write(first.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        fs::create_dir(first.path().join("target")).unwrap();
         fs::write(
             second.path().join("Cargo.toml"),
             "[workspace]\nmembers=[]\n",
@@ -3077,10 +3194,11 @@ mod tests {
         let mut config = LspServerConfig::rust_analyzer();
         config.initialization_options = Some(serde_json::json!({
             "cargo": {"buildScripts": {"enable": true}},
+            "files": {"exclude": ["custom", "target"]},
             "linkedProjects": [first.path().join("Cargo.toml")]
         }));
 
-        let options = linked_project_initialization_options(
+        let options = rust_analyzer_initialization_options(
             &config,
             &[first.path().to_path_buf(), second.path().to_path_buf()],
         )
@@ -3088,15 +3206,19 @@ mod tests {
         .unwrap();
         assert_eq!(options["cargo"]["buildScripts"]["enable"], true);
         assert_eq!(options["linkedProjects"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            options["files"]["exclude"],
+            serde_json::json!(["custom", "target"])
+        );
     }
 
     #[test]
-    fn linked_project_options_fail_closed_for_invalid_inputs() {
+    fn rust_analyzer_options_fail_closed_for_invalid_inputs() {
         let root = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
         let config = LspServerConfig::rust_analyzer();
-        let missing_manifest = linked_project_initialization_options(
+        let missing_manifest = rust_analyzer_initialization_options(
             &config,
             &[root.path().to_path_buf(), second.path().to_path_buf()],
         );
@@ -3105,12 +3227,24 @@ mod tests {
         let mut invalid = LspServerConfig::rust_analyzer();
         invalid.initialization_options = Some(serde_json::json!({"linkedProjects": "nope"}));
         assert!(matches!(
-            linked_project_initialization_options(
+            rust_analyzer_initialization_options(
                 &invalid,
                 &[root.path().to_path_buf(), root.path().to_path_buf()]
             ),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn non_rust_initialization_options_are_unchanged() {
+        let mut config = LspServerConfig::rust_analyzer();
+        config.language_id = "nix".to_string();
+        config.initialization_options = Some(serde_json::json!({"custom": true}));
+
+        let options =
+            rust_analyzer_initialization_options(&config, &[PathBuf::from("/workspace")]).unwrap();
+
+        assert_eq!(options, config.initialization_options);
     }
 
     #[test]
