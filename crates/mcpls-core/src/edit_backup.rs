@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::edit_paths::WorkspaceBoundary;
+use crate::edit_paths::{FileOperation, WorkspaceBoundary};
 use crate::edit_plan::EditPlan;
 
 /// Whether a backup failure blocks a write.
@@ -124,6 +124,10 @@ pub enum BackupError {
     /// A backup file changed or was truncated.
     #[error("backup contents are corrupt: {0}")]
     Corrupt(PathBuf),
+    /// A resource operation targets a directory or special file that this
+    /// bounded file archive cannot restore safely.
+    #[error("backup does not support resource path: {0}")]
+    Unsupported(PathBuf),
 }
 
 impl BackupError {
@@ -151,12 +155,18 @@ struct BackupManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackupEntry {
     target: PathBuf,
-    file_name: String,
-    bytes: usize,
+    file_name: Option<String>,
+    kind: BackupEntryKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum BackupEntryKind {
+    File { bytes: usize },
+    Absent,
 }
 
 impl BackupArchive {
-    /// Capture the original contents of every disk snapshot in a plan.
+    /// Capture original file snapshots and resource-operation preimages.
     ///
     /// # Errors
     ///
@@ -187,9 +197,36 @@ impl BackupArchive {
             })?;
             entries.push(BackupEntry {
                 target,
-                file_name,
-                bytes: bytes.len(),
+                file_name: Some(file_name),
+                kind: BackupEntryKind::File { bytes: bytes.len() },
             });
+        }
+        let mut next_file = entries.len();
+        for operation in plan.file_operations() {
+            match operation {
+                FileOperation::Create { path, .. } => {
+                    let target = boundary
+                        .validate_target(path)
+                        .map_err(|_| BackupError::outside(boundary, path.clone()))?;
+                    entries.push(capture_target(&directory, &mut next_file, target)?);
+                }
+                FileOperation::Rename { from, to, .. } => {
+                    let from = boundary
+                        .validate_existing(from)
+                        .map_err(|_| BackupError::outside(boundary, from.clone()))?;
+                    entries.push(capture_existing(&directory, &mut next_file, from)?);
+                    let to = boundary
+                        .validate_target(to)
+                        .map_err(|_| BackupError::outside(boundary, to.clone()))?;
+                    entries.push(capture_target(&directory, &mut next_file, to)?);
+                }
+                FileOperation::Delete { path, .. } => {
+                    let target = boundary
+                        .validate_existing(path)
+                        .map_err(|_| BackupError::outside(boundary, path.clone()))?;
+                    entries.push(capture_existing(&directory, &mut next_file, target)?);
+                }
+            }
         }
         let manifest = BackupManifest {
             plan_id: plan.id().as_str().to_owned(),
@@ -220,26 +257,90 @@ impl BackupArchive {
             return Err(BackupError::Missing(self.directory.clone()));
         }
         let mut restored = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
+        for entry in self.entries.iter().rev() {
             let target = boundary
                 .validate_target(&entry.target)
                 .map_err(|_| BackupError::outside(boundary, entry.target.clone()))?;
-            let source = self.directory.join(&entry.file_name);
-            let contents = fs::read(&source).map_err(|source_error| BackupError::Io {
-                path: source.clone(),
-                source: source_error,
-            })?;
-            if contents.len() != entry.bytes {
-                return Err(BackupError::Corrupt(source));
+            match (&entry.kind, &entry.file_name) {
+                (BackupEntryKind::Absent, None) => {
+                    if target.exists() {
+                        if target.is_dir() {
+                            fs::remove_dir_all(&target).map_err(|source| BackupError::Io {
+                                path: target.clone(),
+                                source,
+                            })?;
+                        } else {
+                            fs::remove_file(&target).map_err(|source| BackupError::Io {
+                                path: target.clone(),
+                                source,
+                            })?;
+                        }
+                    }
+                }
+                (BackupEntryKind::File { bytes }, Some(file_name)) => {
+                    let source = self.directory.join(file_name);
+                    let contents = fs::read(&source).map_err(|source_error| BackupError::Io {
+                        path: source.clone(),
+                        source: source_error,
+                    })?;
+                    if contents.len() != *bytes {
+                        return Err(BackupError::Corrupt(source));
+                    }
+                    fs::write(&target, contents).map_err(|source| BackupError::Io {
+                        path: target.clone(),
+                        source,
+                    })?;
+                }
+                _ => return Err(BackupError::Corrupt(entry.target.clone())),
             }
-            fs::write(&target, contents).map_err(|source| BackupError::Io {
-                path: target.clone(),
-                source,
-            })?;
             restored.push(target);
         }
         Ok(restored)
     }
+}
+
+fn capture_target(
+    directory: &Path,
+    next_file: &mut usize,
+    target: PathBuf,
+) -> Result<BackupEntry, BackupError> {
+    if target.exists() {
+        capture_existing(directory, next_file, target)
+    } else {
+        Ok(BackupEntry {
+            target,
+            file_name: None,
+            kind: BackupEntryKind::Absent,
+        })
+    }
+}
+
+fn capture_existing(
+    directory: &Path,
+    next_file: &mut usize,
+    target: PathBuf,
+) -> Result<BackupEntry, BackupError> {
+    if !target.is_file() {
+        return Err(BackupError::Unsupported(target));
+    }
+    let contents = fs::read(&target).map_err(|source| BackupError::Io {
+        path: target.clone(),
+        source,
+    })?;
+    let file_name = format!("{next_file}.bak");
+    *next_file = next_file.saturating_add(1);
+    let path = directory.join(&file_name);
+    fs::write(&path, &contents).map_err(|source| BackupError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(BackupEntry {
+        target,
+        file_name: Some(file_name),
+        kind: BackupEntryKind::File {
+            bytes: contents.len(),
+        },
+    })
 }
 
 fn ensure_root(policy: &BackupPolicy, boundary: &WorkspaceBoundary) -> Result<(), BackupError> {
@@ -319,7 +420,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::edit_paths::WorkspaceBoundary;
+    use crate::edit_paths::{FileOperation, WorkspaceBoundary};
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
 
     #[test]
@@ -391,5 +492,50 @@ mod tests {
         BackupArchive::create(&policy, &boundary, &second_plan).unwrap();
         let archives = fs::read_dir(&backup_root).unwrap().count();
         assert_eq!(archives, 1);
+    }
+
+    #[test]
+    fn backup_archives_restore_resource_operations() {
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("old.rs");
+        let renamed = root.path().join("renamed.rs");
+        let created = root.path().join("created.rs");
+        fs::write(&old, "old\n").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        )
+        .with_file_operations(vec![
+            FileOperation::Rename {
+                from: old.clone(),
+                to: renamed.clone(),
+                overwrite: false,
+            },
+            FileOperation::Create {
+                path: created.clone(),
+                overwrite: false,
+            },
+        ]);
+        let policy = BackupPolicy::new(
+            &boundary,
+            root.path().join("backups"),
+            2,
+            4_096,
+            BackupFailureMode::FailClosed,
+        )
+        .unwrap();
+        let archive = BackupArchive::create(&policy, &boundary, &plan).unwrap();
+
+        fs::rename(&old, &renamed).unwrap();
+        fs::write(&created, []).unwrap();
+        archive.restore(&boundary).unwrap();
+
+        assert_eq!(fs::read_to_string(&old).unwrap(), "old\n");
+        assert!(!renamed.exists());
+        assert!(!created.exists());
     }
 }
