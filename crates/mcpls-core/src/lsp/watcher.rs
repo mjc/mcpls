@@ -9,7 +9,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 use super::types::JsonRpcError;
@@ -73,7 +73,7 @@ struct WatchSpec {
 #[derive(Debug)]
 enum WatchMatcher {
     Glob(Gitignore),
-    Exact { path: PathBuf, recursive: bool },
+    Exact(PathBuf),
 }
 
 impl WatchSpec {
@@ -93,35 +93,25 @@ impl WatchSpec {
     }
 
     fn exact(path: PathBuf, kind: u8) -> Result<Self, JsonRpcError> {
-        let recursive = path.is_dir() || path.extension().is_none();
-        let root = if path.is_dir() {
-            path.clone()
-        } else {
-            path.parent()
-                .ok_or_else(|| invalid_params("absolute watched path has no parent"))?
-                .to_path_buf()
-        };
+        let root = path
+            .parent()
+            .ok_or_else(|| invalid_params("absolute watched path has no parent"))?
+            .to_path_buf();
         Ok(Self {
             root,
-            matcher: WatchMatcher::Exact { path, recursive },
+            matcher: WatchMatcher::Exact(path),
             kind,
         })
     }
 
-    fn matches(&self, path: &Path, is_dir: bool) -> bool {
+    fn matches(&self, path: &Path, _is_dir: bool) -> bool {
         match &self.matcher {
-            WatchMatcher::Glob(matcher) => {
-                !is_dir
-                    && path.strip_prefix(&self.root).is_ok_and(|relative| {
-                        matcher
-                            .matched_path_or_any_parents(relative, false)
-                            .is_ignore()
-                    })
-            }
-            WatchMatcher::Exact {
-                path: exact,
-                recursive,
-            } => path == exact || (*recursive && path.starts_with(exact)),
+            WatchMatcher::Glob(matcher) => path.strip_prefix(&self.root).is_ok_and(|relative| {
+                matcher
+                    .matched_path_or_any_parents(relative, false)
+                    .is_ignore()
+            }),
+            WatchMatcher::Exact(exact) => path == exact,
         }
     }
 }
@@ -141,12 +131,15 @@ struct WatchedEntry {
 #[derive(Debug)]
 struct WatchTask {
     stop_tx: std_mpsc::Sender<()>,
-    _thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for WatchTask {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -277,6 +270,11 @@ fn watch_specs(
             Value::String(pattern) => {
                 let path = Path::new(&pattern);
                 if path.is_absolute() && !has_glob_meta(&pattern) {
+                    if !is_within_workspace(workspace_roots, path) {
+                        return Err(invalid_params(
+                            "absolute watched-file path is outside the workspace",
+                        ));
+                    }
                     specs.push(WatchSpec::exact(path.to_path_buf(), watcher.kind)?);
                 } else if path.is_absolute() {
                     let Some((root, relative)) = workspace_roots
@@ -353,6 +351,16 @@ fn relative_base_uri(value: &Value) -> Option<&str> {
         .or_else(|| value.as_object()?.get("uri")?.as_str())
 }
 
+fn is_within_workspace(workspace_roots: &[PathBuf], path: &Path) -> bool {
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    workspace_roots.iter().any(|workspace_root| {
+        let canonical_workspace = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.clone());
+        canonical_path.starts_with(canonical_workspace)
+    })
+}
+
 fn spawn_watch_task(
     registration_id: String,
     generation: u64,
@@ -368,7 +376,7 @@ fn spawn_watch_task(
         .map_err(|error| internal_error(format!("failed to spawn watched-file poller: {error}")))?;
     Ok(WatchTask {
         stop_tx,
-        _thread: watcher_thread,
+        thread: Some(watcher_thread),
     })
 }
 
@@ -392,18 +400,24 @@ fn watch_loop(
         }
         let current = scan(specs);
         let changes = diff(&previous, &current);
-        if !changes.is_empty()
-            && event_tx
-                .blocking_send(WatchedFileEvent {
-                    registration_id: registration_id.to_string(),
-                    generation,
-                    params: json!({ "changes": changes }),
-                })
-                .is_err()
-        {
-            break;
+        if changes.is_empty() {
+            previous = current;
+        } else {
+            match event_tx.try_send(WatchedFileEvent {
+                registration_id: registration_id.to_string(),
+                generation,
+                params: json!({ "changes": changes }),
+            }) {
+                Ok(()) => previous = current,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        registration_id,
+                        "watched-file channel full; coalescing changes"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
         }
-        previous = current;
     }
     debug!(registration_id, "watched-file poller stopped");
 }
@@ -412,16 +426,8 @@ fn scan(specs: &[WatchSpec]) -> HashMap<PathBuf, WatchedEntry> {
     let mut entries = HashMap::new();
     let mut grouped: HashMap<&Path, Vec<&WatchSpec>> = HashMap::new();
     for spec in specs {
-        if matches!(
-            &spec.matcher,
-            WatchMatcher::Exact {
-                recursive: false,
-                ..
-            }
-        ) {
-            if let WatchMatcher::Exact { path, .. } = &spec.matcher
-                && let Ok(metadata) = path.metadata()
-            {
+        if let WatchMatcher::Exact(path) = &spec.matcher {
+            if let Ok(metadata) = path.metadata() {
                 entries.insert(
                     path.clone(),
                     WatchedEntry {
@@ -623,7 +629,15 @@ mod tests {
     }
 
     #[test]
-    fn absolute_file_and_directory_patterns_are_scanned() {
+    fn glob_patterns_match_directories() {
+        let temp = TempDir::new().unwrap();
+        let spec = WatchSpec::glob(temp.path().to_path_buf(), "**", all_watch_kinds()).unwrap();
+
+        assert!(spec.matches(&temp.path().join("created-directory"), true));
+    }
+
+    #[test]
+    fn absolute_patterns_match_only_the_requested_path() {
         let temp = TempDir::new().unwrap();
         let manifest = temp.path().join("Cargo.toml");
         let config_dir = temp.path().join("rust-analyzer");
@@ -647,7 +661,28 @@ mod tests {
 
         assert!(snapshot.contains_key(&manifest));
         assert!(snapshot.contains_key(&config_dir));
-        assert!(snapshot.contains_key(&config));
+        assert!(!snapshot.contains_key(&config));
+    }
+
+    #[test]
+    fn absolute_file_and_directory_patterns_must_stay_inside_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        for path in [
+            outside.path().join("Cargo.toml"),
+            outside.path().to_path_buf(),
+        ] {
+            let result = watch_specs(
+                &[workspace.path().to_path_buf()],
+                vec![RawWatcher {
+                    glob_pattern: json!(path.to_string_lossy()),
+                    kind: all_watch_kinds(),
+                }],
+            );
+
+            assert!(result.is_err());
+        }
     }
 
     #[tokio::test]
