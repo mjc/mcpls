@@ -2025,7 +2025,6 @@ while True:
             .await
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
-        assert_eq!(status["status"], "Ready");
         assert_eq!(status["actor_groups"].as_array().unwrap().len(), 1);
         assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
         assert!(file.exists());

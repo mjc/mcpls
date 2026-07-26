@@ -17,6 +17,7 @@ dirs = { workspace = true }
 futures = { workspace = true }
 ignore = { workspace = true }
 lsp-types = { workspace = true }
+notify = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
 axum = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["rt"] }

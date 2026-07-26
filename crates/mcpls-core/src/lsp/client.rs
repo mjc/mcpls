@@ -18,7 +18,7 @@ use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
 };
-use crate::lsp::watcher::{WatchRegistry, WatchedFileEvent};
+use crate::lsp::watcher::{WATCH_EVENT_CHANNEL_CAPACITY, WatchRegistry, WatchSignal};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -377,15 +377,16 @@ impl LspClient {
         workspace_roots: Vec<std::path::PathBuf>,
     ) -> Result<()> {
         debug!("Message loop started");
-        let (watched_file_tx, mut watched_file_rx) = mpsc::channel(16);
-        let mut watch_registry = WatchRegistry::new(workspace_roots, watched_file_tx);
+        let (watch_signal_tx, mut watch_signal_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
+        let mut watch_registry = WatchRegistry::new(workspace_roots, watch_signal_tx)
+            .map_err(|error| Error::Transport(error.message))?;
         let result = Self::message_loop_inner(
             &mut transport,
             &mut command_rx,
             &pending_requests,
             notification_tx.as_ref(),
             &mut watch_registry,
-            &mut watched_file_rx,
+            &mut watch_signal_rx,
         )
         .await;
         if let Err(ref e) = result {
@@ -411,7 +412,7 @@ impl LspClient {
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         watch_registry: &mut WatchRegistry,
-        watched_file_rx: &mut mpsc::Receiver<WatchedFileEvent>,
+        watch_signal_rx: &mut mpsc::Receiver<WatchSignal>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -445,13 +446,18 @@ impl LspClient {
                     }
                 }
 
-                Some(event) = watched_file_rx.recv() => {
-                    if watch_registry.accepts(&event) {
-                        transport.send(&serde_json::json!({
-                            "jsonrpc": JSONRPC_VERSION,
-                            "method": "workspace/didChangeWatchedFiles",
-                            "params": event.params,
-                        })).await?;
+                Some(signal) = watch_signal_rx.recv() => {
+                    for event in watch_registry
+                        .handle_signal(signal)
+                        .map_err(|error| Error::Transport(error.message))?
+                    {
+                        if watch_registry.accepts(&event) {
+                            transport.send(&serde_json::json!({
+                                "jsonrpc": JSONRPC_VERSION,
+                                "method": "workspace/didChangeWatchedFiles",
+                                "params": event.params,
+                            })).await?;
+                        }
                     }
                 }
 
@@ -675,8 +681,8 @@ mod tests {
             method: "client/registerCapability".to_string(),
             params: Some(serde_json::json!({ "registrations": [] })),
         };
-        let (event_tx, _event_rx) = mpsc::channel(1);
-        let mut registry = WatchRegistry::new(Vec::new(), event_tx);
+        let (signal_tx, _signal_rx) = mpsc::channel(1);
+        let mut registry = WatchRegistry::new(Vec::new(), signal_tx).unwrap();
 
         let response = LspClient::server_request_response_with_watchers(request, &mut registry);
 
