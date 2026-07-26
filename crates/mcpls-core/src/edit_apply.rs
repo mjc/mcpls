@@ -9,7 +9,7 @@ use crate::bridge::DocumentTracker;
 use crate::edit_paths::PathSafetyError;
 use crate::edit_paths::{OperationValidationError, ValidatedFileOperation, WorkspaceBoundary};
 use crate::edit_plan::{
-    EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
+    EditAuditRecord, EditPlan, EditPlanStore, FileSnapshot, PlanId, PlanStoreError, SnapshotSource,
     SnapshotValidationError,
 };
 
@@ -77,7 +77,17 @@ pub fn apply_stored_plan(
     plan_id: &PlanId,
 ) -> Result<ApplyReport, ApplyError> {
     let plan = store.take_for_project(plan_id, project_id)?;
-    apply_plan(boundary, &plan)
+    let audit = EditAuditRecord::for_plan(&plan);
+    match apply_plan(boundary, &plan) {
+        Ok(report) => {
+            store.record_audit(audit.committed(report.committed_files.clone()));
+            Ok(report)
+        }
+        Err(error) => {
+            store.record_audit(audit.failed(error.to_string(), false));
+            Err(error)
+        }
+    }
 }
 
 struct PreparedPlan<'a> {
@@ -406,7 +416,7 @@ mod tests {
     use super::*;
     use crate::bridge::{DocumentTracker, ResourceLimits};
     use crate::edit_paths::FileOperation;
-    use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
+    use crate::edit_plan::{EditAuditOutcome, EditPlan, FileSnapshot, SnapshotSource};
 
     #[test]
     fn applies_all_disk_snapshots_after_revalidating_preconditions() {
@@ -627,5 +637,81 @@ mod tests {
             apply_stored_plan(&mut store, &boundary, "project", &plan_id),
             Err(ApplyError::Store(PlanStoreError::NotFound(_)))
         ));
+    }
+
+    #[test]
+    fn stored_application_records_audit_outcome() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("audited.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file,
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace text".to_string()],
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        let report = apply_stored_plan(&mut store, &boundary, "project", &plan_id).unwrap();
+
+        let records: Vec<_> = store.audit_records().collect();
+        assert_eq!(records.len(), 1);
+        let record = records[0];
+        assert_eq!(record.project_id(), "project");
+        assert_eq!(record.plan_id(), plan_id.as_str());
+        assert_eq!(record.operations(), ["replace text"]);
+        assert_eq!(record.precondition_hashes().len(), 1);
+        assert_eq!(record.versions(), [None]);
+        assert_eq!(record.committed_files(), report.committed_files.as_slice());
+        assert_eq!(record.outcome(), &EditAuditOutcome::Committed);
+        assert!(!record.rollback());
+    }
+
+    #[test]
+    fn stored_application_records_failed_audit_outcome() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("stale.rs");
+        fs::write(&file, "before\n").unwrap();
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![FileSnapshot::from_contents(
+                file.clone(),
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        store.insert(plan).unwrap();
+        fs::write(&file, "changed\n").unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+        let error = apply_stored_plan(&mut store, &boundary, "project", &plan_id).unwrap_err();
+
+        assert!(matches!(error, ApplyError::Stale(_)));
+        let record = store.audit_records().next().unwrap();
+        assert_eq!(
+            record.outcome(),
+            &EditAuditOutcome::Failed {
+                error: error.to_string()
+            }
+        );
+        assert!(!record.rollback());
+        assert!(record.committed_files().is_empty());
     }
 }

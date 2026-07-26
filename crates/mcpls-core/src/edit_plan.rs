@@ -1,11 +1,12 @@
 //! Preview artifacts and bounded storage for workspace edit plans.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -356,6 +357,127 @@ impl EditPlan {
     }
 }
 
+/// Outcome recorded when a stored edit plan is applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditAuditOutcome {
+    /// Every planned operation committed successfully.
+    Committed,
+    /// Application failed before a complete commit.
+    Failed {
+        /// Redacted, human-readable failure summary.
+        error: String,
+    },
+}
+
+/// Bounded audit record for one plan application attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditAuditRecord {
+    timestamp_ms: u64,
+    project_id: String,
+    plan_id: String,
+    operations: Vec<String>,
+    precondition_hashes: Vec<String>,
+    versions: Vec<Option<i32>>,
+    committed_files: Vec<PathBuf>,
+    outcome: EditAuditOutcome,
+    rollback: bool,
+}
+
+impl EditAuditRecord {
+    /// Create an audit record containing plan metadata without file contents.
+    #[must_use]
+    pub fn for_plan(plan: &EditPlan) -> Self {
+        Self {
+            timestamp_ms: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            project_id: plan.project_id().to_owned(),
+            plan_id: plan.id().as_str().to_owned(),
+            operations: plan.operations().to_vec(),
+            precondition_hashes: plan
+                .files()
+                .iter()
+                .map(|file| file.content_hash().to_owned())
+                .collect(),
+            versions: plan.files().iter().map(FileSnapshot::version).collect(),
+            committed_files: Vec::new(),
+            outcome: EditAuditOutcome::Failed {
+                error: "application pending".to_owned(),
+            },
+            rollback: false,
+        }
+    }
+
+    /// Return a completed success record with committed file paths.
+    #[must_use]
+    pub fn committed(mut self, files: Vec<PathBuf>) -> Self {
+        self.committed_files = files;
+        self.outcome = EditAuditOutcome::Committed;
+        self
+    }
+
+    /// Return a completed failure record.
+    #[must_use]
+    pub fn failed(mut self, error: impl Into<String>, rollback: bool) -> Self {
+        self.outcome = EditAuditOutcome::Failed {
+            error: error.into(),
+        };
+        self.rollback = rollback;
+        self
+    }
+
+    /// Return the project that owned the plan.
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Return the plan identifier.
+    #[must_use]
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    /// Return the recorded operation descriptions.
+    #[must_use]
+    pub fn operations(&self) -> &[String] {
+        &self.operations
+    }
+
+    /// Return precondition hashes without exposing source contents.
+    #[must_use]
+    pub fn precondition_hashes(&self) -> &[String] {
+        &self.precondition_hashes
+    }
+
+    /// Return the optimistic document versions captured by the plan.
+    #[must_use]
+    pub fn versions(&self) -> &[Option<i32>] {
+        &self.versions
+    }
+
+    /// Return the files committed by a successful application.
+    #[must_use]
+    pub fn committed_files(&self) -> &[PathBuf] {
+        &self.committed_files
+    }
+
+    /// Return the application outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> &EditAuditOutcome {
+        &self.outcome
+    }
+
+    /// Return whether the failed application rolled back staged files.
+    #[must_use]
+    pub const fn rollback(&self) -> bool {
+        self.rollback
+    }
+}
+
 /// Errors returned by bounded plan storage and project-scoped lookup.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlanStoreError {
@@ -384,6 +506,8 @@ pub enum PlanStoreError {
 #[derive(Debug)]
 pub struct EditPlanStore {
     plans: HashMap<PlanId, EditPlan>,
+    audit_records: VecDeque<EditAuditRecord>,
+    max_audit_records: usize,
     max_plans: usize,
     max_bytes: usize,
     ttl: Duration,
@@ -403,6 +527,8 @@ impl EditPlanStore {
     pub fn new(max_plans: usize, max_bytes: usize, ttl: Duration) -> Self {
         Self {
             plans: HashMap::new(),
+            audit_records: VecDeque::new(),
+            max_audit_records: max_plans.max(1).saturating_mul(8).max(16),
             max_plans: max_plans.max(1),
             max_bytes: max_bytes.max(1),
             ttl,
@@ -532,6 +658,19 @@ impl EditPlanStore {
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Append one bounded audit record, evicting the oldest record if needed.
+    pub fn record_audit(&mut self, record: EditAuditRecord) {
+        if self.audit_records.len() >= self.max_audit_records {
+            self.audit_records.pop_front();
+        }
+        self.audit_records.push_back(record);
+    }
+
+    /// Return audit records from oldest to newest.
+    pub fn audit_records(&self) -> impl Iterator<Item = &EditAuditRecord> {
+        self.audit_records.iter()
     }
 }
 
