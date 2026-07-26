@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, error, trace, warn};
@@ -17,8 +17,8 @@ use crate::error::{Error, Result};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
-    ServerStatusParams,
 };
+use crate::lsp::watcher::{WATCH_EVENT_CHANNEL_CAPACITY, WatchRegistry, WatchSignal};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -95,11 +95,6 @@ pub struct LspClient {
 
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
-
-    /// Latest server status notification, when the server provides one.
-    server_status: Arc<Mutex<Option<ServerStatusParams>>>,
-    /// Wakes waiters when a server status notification arrives.
-    server_status_notify: Arc<Notify>,
 }
 
 impl Clone for LspClient {
@@ -115,8 +110,6 @@ impl Clone for LspClient {
             command_tx: self.command_tx.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
             receiver_task: None,
-            server_status: Arc::clone(&self.server_status),
-            server_status_notify: Arc::clone(&self.server_status_notify),
         }
     }
 }
@@ -166,8 +159,6 @@ impl LspClient {
             command_tx,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             receiver_task: None,
-            server_status: Arc::new(Mutex::new(None)),
-            server_status_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -187,8 +178,7 @@ impl LspClient {
             command_rx,
             Arc::clone(&pending_requests),
             None,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Notify::new()),
+            Vec::new(),
         ));
 
         Self {
@@ -198,8 +188,6 @@ impl LspClient {
             command_tx,
             pending_requests,
             receiver_task: Some(receiver_task),
-            server_status: Arc::new(Mutex::new(None)),
-            server_status_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -211,22 +199,19 @@ impl LspClient {
         config: LspServerConfig,
         transport: LspTransport,
         notification_tx: mpsc::Sender<LspNotification>,
+        workspace_roots: Vec<std::path::PathBuf>,
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
         let (command_tx, command_rx) = mpsc::channel(100);
-        let server_status = Arc::new(Mutex::new(None));
-        let server_status_notify = Arc::new(Notify::new());
-
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
             Arc::clone(&pending_requests),
             Some(notification_tx),
-            Arc::clone(&server_status),
-            Arc::clone(&server_status_notify),
+            workspace_roots,
         ));
 
         Self {
@@ -236,8 +221,6 @@ impl LspClient {
             command_tx,
             pending_requests,
             receiver_task: Some(receiver_task),
-            server_status,
-            server_status_notify,
         }
     }
 
@@ -520,17 +503,19 @@ impl LspClient {
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_tx: Option<mpsc::Sender<LspNotification>>,
-        server_status: Arc<Mutex<Option<ServerStatusParams>>>,
-        server_status_notify: Arc<Notify>,
+        workspace_roots: Vec<std::path::PathBuf>,
     ) -> Result<()> {
         debug!("Message loop started");
+        let (watch_signal_tx, mut watch_signal_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
+        let mut watch_registry = WatchRegistry::new(workspace_roots, watch_signal_tx)
+            .map_err(|error| Error::Transport(error.message))?;
         let result = Self::message_loop_inner(
             &mut transport,
             &mut command_rx,
             &pending_requests,
             notification_tx.as_ref(),
-            &server_status,
-            &server_status_notify,
+            &mut watch_registry,
+            &mut watch_signal_rx,
         )
         .await;
         if let Err(ref e) = result {
@@ -558,8 +543,8 @@ impl LspClient {
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
-        server_status: &Arc<Mutex<Option<ServerStatusParams>>>,
-        server_status_notify: &Arc<Notify>,
+        watch_registry: &mut WatchRegistry,
+        watch_signal_rx: &mut mpsc::Receiver<WatchSignal>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -589,6 +574,25 @@ impl LspClient {
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
                             break;
+                        }
+                    }
+                }
+
+                Some(signal) = watch_signal_rx.recv() => {
+                    let events = match watch_registry.handle_signal(signal) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            warn!("Watched-file runtime degraded: {}", error.message);
+                            continue;
+                        }
+                    };
+                    for event in events {
+                        if watch_registry.accepts(&event) {
+                            transport.send(&serde_json::json!({
+                                "jsonrpc": JSONRPC_VERSION,
+                                "method": "workspace/didChangeWatchedFiles",
+                                "params": event.params,
+                            })).await?;
                         }
                     }
                 }
@@ -642,7 +646,10 @@ impl LspClient {
                                 "Received server request: {} (id={:?})",
                                 request.method, request.id
                             );
-                            let response = Self::server_request_response(request);
+                            let response = Self::server_request_response_with_watchers(
+                                request,
+                                watch_registry,
+                            );
                             let value = serde_json::to_value(&response)?;
                             transport.send(&value).await?;
                         }
@@ -652,13 +659,16 @@ impl LspClient {
                             // Parse notification into typed variant
                             let typed = LspNotification::parse(&notification.method, notification.params);
 
-                            if let LspNotification::ServerStatus(status) = &typed {
-                                *server_status.lock().await = Some(status.clone());
-                                server_status_notify.notify_waiters();
-                            }
-
                             // Forward to notification handler if sender is available
                             if let Some(tx) = notification_tx {
+                                // Progress reports are noisy and currently have no
+                                // consumer. Preserve only the initial-indexing
+                                // completion signal, and never drop readiness/status.
+                                let readiness = typed.completes_initial_load();
+                                if matches!(typed, LspNotification::Progress { .. }) && !readiness {
+                                    continue;
+                                }
+
                                 // Log diagnostics count since it's useful for debugging
                                 if let LspNotification::PublishDiagnostics(ref params) = typed {
                                     debug!(
@@ -670,8 +680,13 @@ impl LspClient {
                                     trace!("Forwarding notification: {:?}", typed);
                                 }
 
-                                // Send the notification with backpressure handling
-                                if tx.try_send(typed).is_err() {
+                                if readiness
+                                    || matches!(&typed, LspNotification::ServerStatus(_))
+                                {
+                                    if tx.send(typed).await.is_err() {
+                                        warn!("Notification channel closed, dropping readiness notification");
+                                    }
+                                } else if tx.try_send(typed).is_err() {
                                     warn!("Notification channel full or closed, dropping notification");
                                 }
                             }
@@ -684,8 +699,34 @@ impl LspClient {
         Ok(())
     }
 
+    #[cfg(test)]
     fn server_request_response(request: JsonRpcRequest) -> JsonRpcResponse {
         match Self::server_request_result(&request.method, request.params.as_ref()) {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    fn server_request_response_with_watchers(
+        request: JsonRpcRequest,
+        watch_registry: &mut WatchRegistry,
+    ) -> JsonRpcResponse {
+        let result = match request.method.as_str() {
+            "client/registerCapability" => watch_registry.register(request.params.as_ref()),
+            "client/unregisterCapability" => watch_registry.unregister(request.params.as_ref()),
+            _ => Self::server_request_result(&request.method, request.params.as_ref()),
+        };
+        match result {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
@@ -706,9 +747,7 @@ impl LspClient {
         params: Option<&Value>,
     ) -> std::result::Result<Value, JsonRpcError> {
         match method {
-            "client/registerCapability"
-            | "client/unregisterCapability"
-            | "workspace/workspaceFolders"
+            "workspace/workspaceFolders"
             | "workspace/diagnostic/refresh"
             | "workspace/semanticTokens/refresh"
             | "workspace/inlayHint/refresh"
@@ -844,8 +883,10 @@ mod tests {
             method: "client/registerCapability".to_string(),
             params: Some(serde_json::json!({ "registrations": [] })),
         };
+        let (signal_tx, _signal_rx) = mpsc::channel(1);
+        let mut registry = WatchRegistry::new(Vec::new(), signal_tx).unwrap();
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response_with_watchers(request, &mut registry);
 
         assert_eq!(response.id, RequestId::String("ts1".to_string()));
         assert_eq!(response.result, Some(Value::Null));

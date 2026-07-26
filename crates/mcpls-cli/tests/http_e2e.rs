@@ -692,12 +692,17 @@ fn streamable_http_sessions_share_state_and_restore_projects_after_restart() {
     }
 
     let activated = first.call_tool("project_activate", json!({"project_id": "project-a"}));
-    assert_eq!(activated["status"], "Ready");
+    assert!(matches!(
+        activated["status"].as_str(),
+        Some("Starting" | "Ready")
+    ));
+    wait_project_ready(&mut first, "project-a");
     let restarted = second.call_tool("project_restart_lsp", json!({"project_id": "project-a"}));
-    assert_eq!(
-        restarted["status"], "Ready",
+    assert!(
+        matches!(restarted["status"].as_str(), Some("Starting" | "Ready")),
         "restart response: {restarted}"
     );
+    wait_project_ready(&mut second, "project-a");
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "2"
@@ -801,7 +806,11 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
     );
 
     let ready = second.call_tool("project_activate", json!({"project_id": "ready"}));
-    assert_eq!(ready["status"], "Ready");
+    assert!(matches!(
+        ready["status"].as_str(),
+        Some("Starting" | "Ready")
+    ));
+    wait_project_ready(&mut second, "ready");
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "2"
@@ -823,14 +832,15 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
             second_restart.join().unwrap(),
         )
     });
-    assert_eq!(
-        restart_one["status"], "Ready",
+    assert!(
+        matches!(restart_one["status"].as_str(), Some("Starting" | "Ready")),
         "restart response: {restart_one}"
     );
-    assert_eq!(
-        restart_two["status"], "Ready",
+    assert!(
+        matches!(restart_two["status"].as_str(), Some("Starting" | "Ready")),
         "restart response: {restart_two}"
     );
+    wait_project_ready(&mut first, "ready");
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "4"

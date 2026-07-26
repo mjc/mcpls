@@ -103,7 +103,7 @@ Create a configuration file in your platform's config directory (e.g., `~/.confi
 
 ```toml
 [workspace]
-roots = []  # Auto-detect from current directory
+roots = []  # Detect a containing Git checkout or project manifest
 
 # Rust - rust-analyzer (built-in)
 [[lsp_servers]]

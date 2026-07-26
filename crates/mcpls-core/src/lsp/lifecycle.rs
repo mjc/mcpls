@@ -268,23 +268,6 @@ impl LspServer {
         std::mem::replace(&mut self.notification_rx, dummy)
     }
 
-    /// Wait for rust-analyzer to finish loading the workspace.
-    ///
-    /// rust-analyzer reports this through its experimental server-status
-    /// notification. Other language servers are considered ready once their
-    /// initialize request has completed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if rust-analyzer reports an unhealthy state or does
-    /// not become quiescent before the timeout.
-    pub async fn wait_until_quiescent(&self, timeout: Duration) -> Result<()> {
-        if self.client.language_id() == "rust" {
-            self.client.wait_until_quiescent(timeout).await?;
-        }
-        Ok(())
-    }
-
     /// Spawn and initialize LSP server.
     ///
     /// This performs the complete initialization sequence:
@@ -351,6 +334,7 @@ impl LspServer {
             config.server_config.clone(),
             transport,
             notification_tx,
+            config.workspace_roots.clone(),
         );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
@@ -482,6 +466,12 @@ impl LspServer {
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
                     workspace_folders: Some(true),
+                    did_change_watched_files: Some(
+                        lsp_types::DidChangeWatchedFilesClientCapabilities {
+                            dynamic_registration: Some(true),
+                            relative_pattern_support: Some(true),
+                        },
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()

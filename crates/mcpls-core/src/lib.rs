@@ -323,49 +323,83 @@ pub(crate) fn register_servers(
     }
 }
 
-/// Resolve workspace roots from config or current directory.
+const PROJECT_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "CMakeLists.txt",
+    "Gemfile",
+    "Package.swift",
+    "build.gradle",
+    "composer.json",
+    "dune-project",
+    "flake.nix",
+    "go.mod",
+    "meson.build",
+    "mix.exs",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+    "settings.gradle",
+];
+
+/// Resolve explicitly configured roots or detect the project containing the current directory.
 ///
-/// If no workspace roots are provided in the configuration, this function
-/// will use the current working directory, canonicalized for security.
+/// Detection walks ancestors only. Git checkout roots take precedence over
+/// manifest-only roots so nested package manifests do not split one checkout.
 ///
 /// # Returns
 ///
-/// A vector of workspace root paths. If config roots are provided, they are
-/// returned as-is. Otherwise, returns the canonicalized current directory,
-/// falling back to relative "." if canonicalization fails.
+/// Explicit roots are returned as-is. With no explicit roots, returns the
+/// detected project root or an empty vector when the current directory is not
+/// inside a recognizable project.
 fn resolve_workspace_roots(config_roots: &[PathBuf]) -> Vec<PathBuf> {
-    if config_roots.is_empty() {
-        match std::env::current_dir() {
-            Ok(cwd) => {
-                // current_dir() always returns an absolute path
-                match cwd.canonicalize() {
-                    Ok(canonical) => {
-                        info!(
-                            "Using current directory as workspace root: {}",
-                            canonical.display()
-                        );
-                        vec![canonical]
-                    }
-                    Err(e) => {
-                        // Canonicalization can fail if directory was deleted or permissions changed
-                        // but cwd itself is still absolute
-                        warn!(
-                            "Failed to canonicalize current directory: {e}, using non-canonical path"
-                        );
-                        vec![cwd]
-                    }
-                }
-            }
-            Err(e) => {
-                // This is extremely rare - only happens if cwd was deleted or unlinked
-                // In this case, we have no choice but to use a relative path
-                warn!("Failed to get current directory: {e}, using fallback");
-                vec![PathBuf::from(".")]
-            }
-        }
-    } else {
-        config_roots.to_vec()
+    if !config_roots.is_empty() {
+        return config_roots.to_vec();
     }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        warn!("Failed to get current directory; no default workspace project will be registered");
+        return Vec::new();
+    };
+    resolve_workspace_roots_from(config_roots, &cwd)
+}
+
+fn resolve_workspace_roots_from(config_roots: &[PathBuf], start: &Path) -> Vec<PathBuf> {
+    if !config_roots.is_empty() {
+        return config_roots.to_vec();
+    }
+
+    let Ok(start) = start.canonicalize() else {
+        warn!(
+            "Failed to canonicalize current directory {}; no default workspace project will be registered",
+            start.display()
+        );
+        return Vec::new();
+    };
+
+    let root = start
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").try_exists().unwrap_or(false))
+        .or_else(|| {
+            start.ancestors().find(|ancestor| {
+                PROJECT_MANIFESTS
+                    .iter()
+                    .any(|manifest| ancestor.join(manifest).is_file())
+            })
+        });
+
+    root.map_or_else(
+        || {
+            info!(
+                "No project root detected from {}; no default workspace project will be registered",
+                start.display()
+            );
+            Vec::new()
+        },
+        |root| {
+            info!("Detected workspace root: {}", root.display());
+            vec![root.to_path_buf()]
+        },
+    )
 }
 
 /// Canonicalize each workspace root, falling back to the original path for
@@ -993,11 +1027,80 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_workspace_roots_empty_returns_cwd() {
-        let roots = resolve_workspace_roots(&[]);
-        assert!(
-            !roots.is_empty(),
-            "Should return at least one workspace root"
+    fn detects_linked_worktree_from_nested_directory() {
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: /tmp/example\n").unwrap();
+        let nested = worktree.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+
+        let roots = resolve_workspace_roots_from(&[], &nested);
+
+        assert_eq!(roots, [worktree.path().canonicalize().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn default_registration_resolves_linked_worktree_identity() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        let nested = worktree.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+
+        let roots = resolve_workspace_roots_from(&[], &nested);
+        let registry = project::ProjectRegistry::new(2);
+        assert_eq!(
+            register_default_workspace_projects(&registry, &roots).await,
+            1
+        );
+
+        let projects = registry.list().await;
+        assert_eq!(projects[0].root().as_path(), worktree.path());
+        assert_eq!(
+            projects[0].repository_identity().unwrap().common_dir(),
+            git_dir.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn detects_manifest_workspace_without_git() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let nested = workspace.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+
+        let roots = resolve_workspace_roots_from(&[], &nested);
+
+        assert_eq!(roots, [workspace.path().canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn empty_config_without_project_marker_registers_nothing() {
+        let directory = TempDir::new().unwrap();
+
+        assert!(resolve_workspace_roots_from(&[], directory.path()).is_empty());
+    }
+
+    #[test]
+    fn configured_roots_win_over_detected_workspace() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        let configured = [PathBuf::from("/configured/root")];
+
+        assert_eq!(
+            resolve_workspace_roots_from(&configured, workspace.path()),
+            configured
         );
     }
 

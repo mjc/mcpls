@@ -310,8 +310,11 @@ For Rust projects only (uses built-in defaults):
 
 ```toml
 [workspace]
-roots = []  # Auto-detect from current directory
+roots = []  # Detect a containing Git checkout or project manifest
 ```
+
+If MCPLS starts outside a project, it registers no default project. HTTP
+clients can register projects explicitly with `project_add`.
 
 ### Multi-Language Configuration
 
