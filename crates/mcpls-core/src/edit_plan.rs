@@ -235,6 +235,7 @@ pub struct EditPlan {
     file_operations: Vec<FileOperation>,
     unified_diff: String,
     safe_to_apply: bool,
+    policy_generation: u64,
     created_at: SystemTime,
     expires_at: SystemTime,
     estimated_bytes: usize,
@@ -275,6 +276,7 @@ impl EditPlan {
             file_operations: Vec::new(),
             unified_diff,
             safe_to_apply,
+            policy_generation: 0,
             created_at,
             expires_at,
             estimated_bytes,
@@ -342,6 +344,12 @@ impl EditPlan {
     #[must_use]
     pub const fn safe_to_apply(&self) -> bool {
         self.safe_to_apply
+    }
+
+    /// Return the policy generation that admitted this plan to a store.
+    #[must_use]
+    pub const fn policy_generation(&self) -> u64 {
+        self.policy_generation
     }
 
     /// Return the plan creation timestamp.
@@ -506,6 +514,16 @@ pub enum PlanStoreError {
         /// Project recorded on the plan.
         actual: String,
     },
+    /// The plan was created before the current edit policy generation.
+    #[error("edit plan invalidated by a policy change: {plan_id}")]
+    PolicyChanged {
+        /// Invalidated plan identifier.
+        plan_id: PlanId,
+        /// Generation captured by the plan.
+        plan_generation: u64,
+        /// Current store generation.
+        current_generation: u64,
+    },
 }
 
 /// Bounded, project-local in-memory plan storage.
@@ -518,6 +536,7 @@ pub struct EditPlanStore {
     max_bytes: usize,
     ttl: Duration,
     bytes: usize,
+    policy_generation: u64,
 }
 
 impl EditPlanStore {
@@ -539,6 +558,7 @@ impl EditPlanStore {
             max_bytes: max_bytes.max(1),
             ttl,
             bytes: 0,
+            policy_generation: 0,
         }
     }
 
@@ -558,6 +578,7 @@ impl EditPlanStore {
         let now = SystemTime::now();
         self.purge_expired(now);
         plan.expires_at = now.checked_add(self.ttl).unwrap_or(now);
+        plan.policy_generation = self.policy_generation;
         if let Some(previous) = self.plans.remove(plan.id()) {
             self.bytes = self.bytes.saturating_sub(previous.estimated_bytes());
         }
@@ -584,9 +605,10 @@ impl EditPlanStore {
     /// Look up a non-expired plan by ID.
     #[must_use]
     pub fn get(&self, id: &PlanId) -> Option<&EditPlan> {
-        self.plans
-            .get(id)
-            .filter(|plan| !plan.is_expired(SystemTime::now()))
+        self.plans.get(id).filter(|plan| {
+            !plan.is_expired(SystemTime::now())
+                && plan.policy_generation() == self.policy_generation
+        })
     }
 
     /// Look up a plan while enforcing its owning project identity.
@@ -602,8 +624,17 @@ impl EditPlanStore {
         project_id: &str,
     ) -> Result<&EditPlan, PlanStoreError> {
         let plan = self
+            .plans
             .get(id)
+            .filter(|plan| !plan.is_expired(SystemTime::now()))
             .ok_or_else(|| PlanStoreError::NotFound(id.clone()))?;
+        if plan.policy_generation() != self.policy_generation {
+            return Err(PlanStoreError::PolicyChanged {
+                plan_id: id.clone(),
+                plan_generation: plan.policy_generation(),
+                current_generation: self.policy_generation,
+            });
+        }
         if plan.project_id() != project_id {
             return Err(PlanStoreError::ProjectMismatch {
                 expected: project_id.to_string(),
@@ -677,6 +708,11 @@ impl EditPlanStore {
     /// Return audit records from oldest to newest.
     pub fn audit_records(&self) -> impl Iterator<Item = &EditAuditRecord> {
         self.audit_records.iter()
+    }
+
+    /// Invalidate plans admitted under the previous edit policy generation.
+    pub const fn invalidate_policy(&mut self) {
+        self.policy_generation = self.policy_generation.wrapping_add(1);
     }
 }
 
@@ -831,6 +867,29 @@ mod tests {
             bounded.insert(large),
             Err(PlanStoreError::TooLarge { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn policy_changes_invalidate_outstanding_plans() -> Result<(), PlanStoreError> {
+        let mut store = EditPlanStore::new(2, 1024, Duration::from_secs(60));
+        let plan = EditPlan::new(
+            "project-a".to_string(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        );
+        let id = plan.id().clone();
+        store.insert(plan)?;
+
+        store.invalidate_policy();
+
+        assert!(matches!(
+            store.take_for_project(&id, "project-a"),
+            Err(PlanStoreError::PolicyChanged { plan_id, .. }) if plan_id == id
+        ));
+        assert!(store.get(&id).is_none());
         Ok(())
     }
 
