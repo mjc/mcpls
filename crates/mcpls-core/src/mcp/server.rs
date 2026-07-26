@@ -453,7 +453,12 @@ impl McplsServer {
         let result = self
             .context
             .project_registry
-            .apply_edit_plan(id, plan_id)
+            .apply_edit_plan_with_context(
+                id,
+                plan_id,
+                Some(self.context.session_id().to_owned()),
+                None,
+            )
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         encode_json(&applied_edit_plan_json(&result, id.as_str()))

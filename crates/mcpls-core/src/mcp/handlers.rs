@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::bridge::ResourceSubscriptions;
 use crate::edit_plan::PlanId;
@@ -22,6 +23,8 @@ use crate::transport::{self, SessionManagerHandle, TransportSnapshot};
 /// live inside project actors; the MCP peer handle is not stored here because
 /// resource-update notifications are sent by the transport layer.
 pub struct HandlerContext {
+    /// Stable identifier for this MCP session, used in mutation audit records.
+    session_id: String,
     /// Set of resource URIs the MCP client has subscribed to.
     pub subscriptions: Arc<ResourceSubscriptions>,
     /// Shared registry for project lifecycle operations.
@@ -78,6 +81,7 @@ impl HandlerContext {
     ) -> Self {
         let event_sink = Arc::new(SessionEventSink::new(Arc::clone(&subscriptions)));
         Self {
+            session_id: Uuid::new_v4().to_string(),
             subscriptions,
             project_registry,
             event_sink,
@@ -86,6 +90,11 @@ impl HandlerContext {
             started_at: Instant::now(),
             owned_plan_ids: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Return this MCP session's stable audit identifier.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Remember a plan returned by a preview in this session.

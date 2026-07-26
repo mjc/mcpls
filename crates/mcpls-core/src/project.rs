@@ -1405,6 +1405,8 @@ enum ProjectRequest {
         plan_id: PlanId,
         project_id: String,
         root: PathBuf,
+        session_id: Option<String>,
+        principal: Option<String>,
         reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
     },
     PublishEvent {
@@ -2455,12 +2457,32 @@ impl ProjectHandle {
         project_id: String,
         root: PathBuf,
     ) -> Result<AppliedEditPlan, ProjectActorError> {
+        self.apply_edit_plan_with_context(plan_id, project_id, root, None, None)
+            .await
+    }
+
+    /// Consume and apply one project-owned workspace edit preview with audit context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the plan is not owned by the
+    /// project, or filesystem validation/application fails.
+    pub async fn apply_edit_plan_with_context(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+        root: PathBuf,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Result<AppliedEditPlan, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::ApplyEditPlan {
                 plan_id,
                 project_id,
                 root,
+                session_id,
+                principal,
                 reply,
             })
             .await
@@ -2855,11 +2877,13 @@ impl ProjectRuntime {
         error
     }
 
-    async fn apply_edit_plan(
+    async fn apply_edit_plan_with_context(
         &mut self,
         plan_id: &PlanId,
         project_id: &str,
         root: &Path,
+        session_id: Option<String>,
+        principal: Option<String>,
     ) -> Result<AppliedEditPlan, String> {
         let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
         let backup_policy = self.configure_edit_safety(&boundary)?;
@@ -2877,7 +2901,7 @@ impl ProjectRuntime {
                 )
             })
             .collect::<Vec<_>>();
-        let audit = EditAuditRecord::for_plan(&plan);
+        let audit = EditAuditRecord::for_plan_with_context(&plan, session_id, principal);
         let apply_result = match backup_policy.as_ref() {
             Some(policy) => apply_plan_with_documents_and_backup(
                 &boundary,
@@ -4052,9 +4076,13 @@ async fn handle_project_request(
             plan_id,
             project_id,
             root,
+            session_id,
+            principal,
             reply,
         } => {
-            let result = runtime.apply_edit_plan(&plan_id, &project_id, &root).await;
+            let result = runtime
+                .apply_edit_plan_with_context(&plan_id, &project_id, &root, session_id, principal)
+                .await;
             if let Ok(applied) = &result {
                 channels.publish_applied_edit(applied);
             }
@@ -5540,13 +5568,32 @@ impl ProjectRegistry {
         id: &ProjectId,
         plan_id: PlanId,
     ) -> Result<AppliedEditPlan, ProjectRegistryError> {
+        self.apply_edit_plan_with_context(id, plan_id, None, None)
+            .await
+    }
+
+    /// Consume and apply a project-owned edit plan while recording audit context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, the plan is not
+    /// owned by it, or filesystem validation/application fails.
+    pub async fn apply_edit_plan_with_context(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Result<AppliedEditPlan, ProjectRegistryError> {
         let (identity, actor, mutation) = self.entry(id).await?;
         let _mutation = mutation.lock().await;
         actor
-            .apply_edit_plan(
+            .apply_edit_plan_with_context(
                 plan_id,
                 id.as_str().to_string(),
                 identity.root().as_path().to_path_buf(),
+                session_id,
+                principal,
             )
             .await
             .map_err(ProjectRegistryError::from)
@@ -7354,11 +7401,20 @@ while True:
         runtime.store_edit_plan(plan).unwrap();
 
         runtime
-            .apply_edit_plan(&plan_id, "project", root.path())
+            .apply_edit_plan_with_context(
+                &plan_id,
+                "project",
+                root.path(),
+                Some("session-1".to_string()),
+                Some("principal-1".to_string()),
+            )
             .await
             .unwrap();
 
         assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
+        let audit = runtime.edit_plans.audit_records().next().unwrap();
+        assert_eq!(audit.session_id(), Some("session-1"));
+        assert_eq!(audit.principal(), Some("principal-1"));
         let audit_path = root.path().join(".mcpls/audit.jsonl");
         assert!(
             fs::read_to_string(audit_path)
