@@ -19,6 +19,7 @@ use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
     ServerStatusParams,
 };
+use crate::lsp::watcher::{WatchRegistry, WatchedFileEvent};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -150,6 +151,7 @@ impl LspClient {
             None,
             Arc::new(Mutex::new(None)),
             Arc::new(Notify::new()),
+            Vec::new(),
         ));
 
         Self {
@@ -171,6 +173,7 @@ impl LspClient {
         config: LspServerConfig,
         transport: LspTransport,
         notification_tx: mpsc::Sender<LspNotification>,
+        workspace_roots: Vec<std::path::PathBuf>,
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
@@ -187,6 +190,7 @@ impl LspClient {
             Some(notification_tx),
             Arc::clone(&server_status),
             Arc::clone(&server_status_notify),
+            workspace_roots,
         ));
 
         Self {
@@ -427,8 +431,11 @@ impl LspClient {
         notification_tx: Option<mpsc::Sender<LspNotification>>,
         server_status: Arc<Mutex<Option<ServerStatusParams>>>,
         server_status_notify: Arc<Notify>,
+        workspace_roots: Vec<std::path::PathBuf>,
     ) -> Result<()> {
         debug!("Message loop started");
+        let (watched_file_tx, mut watched_file_rx) = mpsc::channel(16);
+        let mut watch_registry = WatchRegistry::new(workspace_roots, watched_file_tx);
         let result = Self::message_loop_inner(
             &mut transport,
             &mut command_rx,
@@ -436,6 +443,8 @@ impl LspClient {
             notification_tx.as_ref(),
             &server_status,
             &server_status_notify,
+            &mut watch_registry,
+            &mut watched_file_rx,
         )
         .await;
         if let Err(ref e) = result {
@@ -454,7 +463,7 @@ impl LspClient {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
@@ -462,6 +471,8 @@ impl LspClient {
         notification_tx: Option<&mpsc::Sender<LspNotification>>,
         server_status: &Arc<Mutex<Option<ServerStatusParams>>>,
         server_status_notify: &Arc<Notify>,
+        watch_registry: &mut WatchRegistry,
+        watched_file_rx: &mut mpsc::Receiver<WatchedFileEvent>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -492,6 +503,16 @@ impl LspClient {
                             debug!("Client shutdown requested");
                             break;
                         }
+                    }
+                }
+
+                Some(event) = watched_file_rx.recv() => {
+                    if watch_registry.accepts(&event) {
+                        transport.send(&serde_json::json!({
+                            "jsonrpc": JSONRPC_VERSION,
+                            "method": "workspace/didChangeWatchedFiles",
+                            "params": event.params,
+                        })).await?;
                     }
                 }
 
@@ -539,7 +560,10 @@ impl LspClient {
                                 "Received server request: {} (id={:?})",
                                 request.method, request.id
                             );
-                            let response = Self::server_request_response(request);
+                            let response = Self::server_request_response_with_watchers(
+                                request,
+                                watch_registry,
+                            );
                             let value = serde_json::to_value(&response)?;
                             transport.send(&value).await?;
                         }
@@ -581,8 +605,34 @@ impl LspClient {
         Ok(())
     }
 
+    #[cfg(test)]
     fn server_request_response(request: JsonRpcRequest) -> JsonRpcResponse {
         match Self::server_request_result(&request.method, request.params.as_ref()) {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    fn server_request_response_with_watchers(
+        request: JsonRpcRequest,
+        watch_registry: &mut WatchRegistry,
+    ) -> JsonRpcResponse {
+        let result = match request.method.as_str() {
+            "client/registerCapability" => watch_registry.register(request.params.as_ref()),
+            "client/unregisterCapability" => watch_registry.unregister(request.params.as_ref()),
+            _ => Self::server_request_result(&request.method, request.params.as_ref()),
+        };
+        match result {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: request.id,
@@ -603,9 +653,7 @@ impl LspClient {
         params: Option<&Value>,
     ) -> std::result::Result<Value, JsonRpcError> {
         match method {
-            "client/registerCapability"
-            | "client/unregisterCapability"
-            | "workspace/workspaceFolders"
+            "workspace/workspaceFolders"
             | "workspace/diagnostic/refresh"
             | "workspace/semanticTokens/refresh"
             | "workspace/inlayHint/refresh"
@@ -673,15 +721,17 @@ mod tests {
     }
 
     #[test]
-    fn test_register_capability_request_is_acknowledged() {
+    fn test_register_capability_request_updates_watcher_registry() {
         let request = JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: RequestId::String("ts1".to_string()),
             method: "client/registerCapability".to_string(),
             params: Some(serde_json::json!({ "registrations": [] })),
         };
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let mut registry = WatchRegistry::new(Vec::new(), event_tx);
 
-        let response = LspClient::server_request_response(request);
+        let response = LspClient::server_request_response_with_watchers(request, &mut registry);
 
         assert_eq!(response.id, RequestId::String("ts1".to_string()));
         assert_eq!(response.result, Some(Value::Null));

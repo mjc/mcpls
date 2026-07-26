@@ -301,6 +301,7 @@ impl LspServer {
             config.server_config.clone(),
             transport,
             notification_tx,
+            config.workspace_roots.clone(),
         );
 
         let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
@@ -419,6 +420,12 @@ impl LspServer {
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
                     workspace_folders: Some(true),
+                    did_change_watched_files: Some(
+                        lsp_types::DidChangeWatchedFilesClientCapabilities {
+                            dynamic_registration: Some(true),
+                            relative_pattern_support: Some(true),
+                        },
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()
