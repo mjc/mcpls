@@ -201,18 +201,7 @@ impl<'a> PreviewBuilder<'a> {
                 limit: self.limits.max_bytes,
             });
         }
-        if let Some((_, file_bytes)) = self
-            .files
-            .iter()
-            .map(|(path, file)| (path, file.original.len().saturating_add(file.planned.len())))
-            .find(|(_, bytes)| *bytes > self.limits.max_file_bytes)
-        {
-            return Err(PreviewError::Limit {
-                kind: "file byte",
-                actual: file_bytes,
-                limit: self.limits.max_file_bytes,
-            });
-        }
+        self.check_file_limits()?;
         if self.operations.is_empty() {
             self.conflicts
                 .push("workspace edit contains no operations".to_string());
@@ -366,6 +355,20 @@ impl<'a> PreviewBuilder<'a> {
                 actual: self.resource_operation_count,
                 limit: self.limits.max_resource_operations,
             });
+        }
+        Ok(())
+    }
+
+    fn check_file_limits(&self) -> Result<(), PreviewError> {
+        for file in self.files.values() {
+            let file_bytes = file.original.len().saturating_add(file.planned.len());
+            if file_bytes > self.limits.max_file_bytes {
+                return Err(PreviewError::Limit {
+                    kind: "file byte",
+                    actual: file_bytes,
+                    limit: self.limits.max_file_bytes,
+                });
+            }
         }
         Ok(())
     }
