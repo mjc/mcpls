@@ -170,14 +170,14 @@ impl WorkspaceBoundary {
             return self.validate_existing(supplied);
         }
 
-        let name = supplied
-            .file_name()
-            .ok_or_else(|| PathSafetyError::MissingParent(supplied.clone()))?;
-        let parent = Self::nearest_existing_parent(&supplied)?;
+        let (parent, missing_components) = Self::nearest_existing_parent(&supplied)?;
         let canonical_parent = fs::canonicalize(&parent)
             .map_err(|_| PathSafetyError::MissingParent(parent.clone()))?;
         let canonical_parent = self.validate_canonical_parent(canonical_parent)?;
-        Ok(canonical_parent.join(name))
+        Ok(missing_components
+            .iter()
+            .rev()
+            .fold(canonical_parent, |path, component| path.join(component)))
     }
 
     /// Validate all paths and preconditions for one file operation.
@@ -257,9 +257,15 @@ impl WorkspaceBoundary {
         }
     }
 
-    fn nearest_existing_parent(path: &Path) -> Result<PathBuf, PathSafetyError> {
+    fn nearest_existing_parent(path: &Path) -> Result<(PathBuf, Vec<PathBuf>), PathSafetyError> {
         let mut current = path.to_path_buf();
+        let mut missing_components = Vec::new();
         while !current.exists() {
+            let name = current
+                .file_name()
+                .map(PathBuf::from)
+                .ok_or_else(|| PathSafetyError::MissingParent(path.to_path_buf()))?;
+            missing_components.push(name);
             let Some(parent) = current.parent() else {
                 return Err(PathSafetyError::MissingParent(path.to_path_buf()));
             };
@@ -268,7 +274,7 @@ impl WorkspaceBoundary {
             }
             current = parent.to_path_buf();
         }
-        Ok(current)
+        Ok((current, missing_components))
     }
 
     fn validate_canonical(&self, canonical: PathBuf) -> Result<PathBuf, PathSafetyError> {
@@ -377,6 +383,15 @@ mod tests {
             Ok(ValidatedFileOperation::Rename { from, to, .. })
                 if from == source && to == existing
         ));
+    }
+
+    #[test]
+    fn preserves_nested_missing_target_components() {
+        let root = TempDir::new().unwrap();
+        let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+        let target = root.path().join("nested").join("new.txt");
+
+        assert_eq!(boundary.validate_target(&target).unwrap(), target);
     }
 
     #[test]

@@ -159,17 +159,20 @@ pub struct TranslatorTemplate {
     lsp_configs: Vec<LspServerConfig>,
     redaction_patterns: Vec<String>,
     heuristics_max_depth: Option<usize>,
+    edit_safety: Option<crate::config::EditSafetyConfig>,
 }
 
 impl TranslatorTemplate {
     /// Build the daemon template directly from its declarative configuration.
     #[must_use]
     pub(crate) fn from_server_config(config: &crate::config::ServerConfig) -> Self {
-        Self::from_configuration(
+        let mut template = Self::from_configuration(
             config.build_effective_extension_map(),
             config.lsp_servers.clone(),
             Some(config.workspace.heuristics_max_depth),
-        )
+        );
+        template.edit_safety.clone_from(&config.daemon.edit_safety);
+        template
     }
 
     /// Build an immutable project configuration without creating a live
@@ -185,6 +188,7 @@ impl TranslatorTemplate {
             lsp_configs,
             redaction_patterns: Vec::new(),
             heuristics_max_depth,
+            edit_safety: None,
         }
     }
 
@@ -210,7 +214,14 @@ impl TranslatorTemplate {
         if let Some(patterns) = &config.redaction_patterns {
             self.redaction_patterns.clone_from(patterns);
         }
+        if let Some(edit_safety) = &config.edit_safety {
+            self.edit_safety = Some(edit_safety.clone());
+        }
         self
+    }
+
+    pub(crate) const fn edit_safety(&self) -> Option<&crate::config::EditSafetyConfig> {
+        self.edit_safety.as_ref()
     }
 
     pub(crate) fn same_configuration(&self, other: &Self) -> bool {

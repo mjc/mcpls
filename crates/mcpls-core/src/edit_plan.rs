@@ -524,9 +524,11 @@ impl EditAuditRecord {
 }
 
 /// Whether an audit sink failure blocks an otherwise successful edit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuditFailureMode {
     /// Keep the bounded in-memory record and allow the edit to continue.
+    #[default]
     FailOpen,
     /// Return an error after a successful edit when the durable record fails.
     FailClosed,
@@ -885,6 +887,9 @@ fn append_audit_record(policy: &AuditLogPolicy, record: &EditAuditRecord) -> Res
         .ok_or_else(|| "audit log size overflow".to_owned())?;
     if total > u64::try_from(policy.max_bytes).unwrap_or(u64::MAX) {
         return Err(format!("audit log exceeds {} byte limit", policy.max_bytes));
+    }
+    if let Some(parent) = policy.path().parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let mut file = OpenOptions::new()
         .create(true)

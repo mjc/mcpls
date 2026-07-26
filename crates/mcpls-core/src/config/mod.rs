@@ -12,6 +12,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 pub use server::{DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, ServerHeuristics};
 
+use crate::edit_backup::BackupFailureMode;
+use crate::edit_plan::AuditFailureMode;
 use crate::error::{Error, Result};
 
 /// Maps file extensions to LSP language identifiers.
@@ -70,6 +72,10 @@ pub struct ProjectConfig {
     /// safe to store on disk.
     #[serde(default)]
     pub persist_environment: bool,
+
+    /// Project-specific edit-safety policies replacing daemon defaults.
+    #[serde(default)]
+    pub edit_safety: Option<EditSafetyConfig>,
 }
 
 impl ProjectConfig {
@@ -79,6 +85,10 @@ impl ProjectConfig {
         self.lsp_servers.is_none()
             && self.heuristics_max_depth.is_none()
             && self.redaction_patterns.is_none()
+            && match self.edit_safety.as_ref() {
+                None => true,
+                Some(config) => config.is_empty(),
+            }
             && !self.persist_environment
     }
 
@@ -106,6 +116,69 @@ fn default_daemon_config() -> DaemonConfig {
     DaemonConfig::default()
 }
 
+/// Durable audit-log configuration for edit applications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLogConfig {
+    /// JSONL path, resolved relative to the project root when not absolute.
+    pub path: PathBuf,
+    /// Maximum bytes retained in the append-only file.
+    #[serde(default = "default_audit_max_bytes")]
+    pub max_bytes: usize,
+    /// Whether a sink failure blocks a successful edit.
+    #[serde(default)]
+    pub failure_mode: AuditFailureMode,
+}
+
+/// Optional bounded backup configuration for edit applications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupConfig {
+    /// Archive directory, resolved relative to the project root when not absolute.
+    pub root: PathBuf,
+    /// Maximum number of retained plan archives.
+    #[serde(default = "default_backup_max_archives")]
+    pub max_archives: usize,
+    /// Maximum combined bytes retained by the archive directory.
+    #[serde(default = "default_backup_max_bytes")]
+    pub max_bytes: usize,
+    /// Whether a backup failure blocks the edit.
+    #[serde(default)]
+    pub failure_mode: BackupFailureMode,
+}
+
+/// Optional edit-safety policies inherited by projects from the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditSafetyConfig {
+    /// Durable audit sink configuration.
+    #[serde(default)]
+    pub audit_log: Option<AuditLogConfig>,
+    /// Bounded backup archive configuration.
+    #[serde(default)]
+    pub backup: Option<BackupConfig>,
+}
+
+impl EditSafetyConfig {
+    /// Return whether no edit-safety override is configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.audit_log.is_none() && self.backup.is_none()
+    }
+}
+
+const fn default_audit_max_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+const fn default_backup_max_archives() -> usize {
+    16
+}
+
+const fn default_backup_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 /// Configuration for daemon-owned runtime state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +190,10 @@ pub struct DaemonConfig {
     /// Maximum time to wait for each project actor during daemon shutdown.
     #[serde(default = "default_shutdown_timeout_seconds")]
     pub shutdown_timeout_seconds: u64,
+
+    /// Optional edit-safety defaults inherited by registered projects.
+    #[serde(default)]
+    pub edit_safety: Option<EditSafetyConfig>,
 }
 
 impl Default for DaemonConfig {
@@ -124,6 +201,7 @@ impl Default for DaemonConfig {
         Self {
             state_file: None,
             shutdown_timeout_seconds: default_shutdown_timeout_seconds(),
+            edit_safety: None,
         }
     }
 }
@@ -599,6 +677,42 @@ mod tests {
         assert_eq!(config.daemon.shutdown_timeout_seconds, 7);
         let encoded = toml::to_string(&config).unwrap();
         assert!(encoded.contains("state_file"));
+    }
+
+    #[test]
+    fn edit_safety_policy_round_trips_through_toml() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+                [daemon.edit_safety.audit_log]
+                path = ".mcpls/audit.jsonl"
+                max_bytes = 8192
+                failure_mode = "fail_closed"
+
+                [daemon.edit_safety.backup]
+                root = ".mcpls/backups"
+                max_archives = 3
+                max_bytes = 65536
+                failure_mode = "fail_open"
+            "#,
+        )
+        .unwrap();
+
+        let safety = config.daemon.edit_safety.unwrap();
+        let audit = safety.audit_log.unwrap();
+        assert_eq!(audit.path, PathBuf::from(".mcpls/audit.jsonl"));
+        assert_eq!(audit.max_bytes, 8192);
+        assert_eq!(
+            audit.failure_mode,
+            crate::edit_plan::AuditFailureMode::FailClosed
+        );
+        let backup = safety.backup.unwrap();
+        assert_eq!(backup.root, PathBuf::from(".mcpls/backups"));
+        assert_eq!(backup.max_archives, 3);
+        assert_eq!(backup.max_bytes, 65536);
+        assert_eq!(
+            backup.failure_mode,
+            crate::edit_backup::BackupFailureMode::FailOpen
+        );
     }
 
     #[test]

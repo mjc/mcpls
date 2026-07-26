@@ -10,11 +10,13 @@ use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::EditPlan;
 
 /// Whether a backup failure blocks a write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BackupFailureMode {
     /// Continue the requested edit when the optional backup cannot be made.
     FailOpen,
     /// Reject the requested edit when the backup cannot be made.
+    #[default]
     FailClosed,
 }
 
