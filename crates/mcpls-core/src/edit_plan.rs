@@ -822,18 +822,17 @@ impl EditPlanStore {
         &mut self,
         record: EditAuditRecord,
     ) -> Result<(), PlanStoreError> {
-        let Some(policy) = self.audit_log.as_ref() else {
+        let Some(policy) = self.audit_log.clone() else {
             self.record_audit(record);
             return Ok(());
         };
-        match append_audit_record(policy, &record) {
+        match append_audit_record(&policy, &record) {
             Ok(()) => {
                 self.record_audit(record);
                 Ok(())
             }
-            Err(error) if policy.failure_mode() == AuditFailureMode::FailOpen => {
+            Err(_error) if policy.failure_mode() == AuditFailureMode::FailOpen => {
                 self.record_audit(record);
-                let _ = error;
                 Ok(())
             }
             Err(error) => Err(PlanStoreError::Audit {
