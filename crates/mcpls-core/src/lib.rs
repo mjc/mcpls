@@ -364,6 +364,41 @@ mod tests {
         assert_eq!(roots, [worktree.path().canonicalize().unwrap()]);
     }
 
+    #[tokio::test]
+    async fn default_registration_resolves_linked_worktree_identity() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        let nested = worktree.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+
+        let roots = resolve_workspace_roots_from(&[], &nested);
+        let registry = project::ProjectRegistry::new(2);
+        assert_eq!(
+            register_default_workspace_projects(&registry, &roots).await,
+            1
+        );
+
+        let projects = registry.list().await;
+        assert_eq!(projects[0].root().as_path(), worktree.path());
+        assert_eq!(
+            projects[0].repository_identity().unwrap().common_dir(),
+            git_dir.canonicalize().unwrap()
+        );
+    }
+
     #[test]
     fn detects_manifest_workspace_without_git() {
         let workspace = TempDir::new().unwrap();
