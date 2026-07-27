@@ -335,15 +335,6 @@ impl McplsServer {
         encode_json(&project_state_json(identity, state, &actor_groups))
     }
 
-    async fn actor_for_project(&self, value: String) -> Result<ProjectHandle, McpError> {
-        let project_id = parse_project_id(value)?;
-        self.context
-            .project_registry
-            .actor_for_project(&project_id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))
-    }
-
     async fn attach_subscription(
         &self,
         project_id: ProjectId,
@@ -1113,7 +1104,18 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
-        let actor = self.actor_for_project(project_id).await?;
+        let id = parse_project_id(project_id)?;
+        self.context
+            .project_registry
+            .activate(&id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
             .workspace_symbol(query, kind_filter, limit)
             .await
@@ -1882,7 +1884,10 @@ while True:
     method = message.get("method")
     if method == "initialize":
         send({"jsonrpc": "2.0", "id": message["id"], "result": {
-            "capabilities": {"positionEncoding": "utf-8"}
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "workspaceSymbolProvider": True
+            }
         }})
         send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
               "params": {"health": "ok", "quiescent": True}})
@@ -1892,6 +1897,18 @@ while True:
             while not release.exists():
                 time.sleep(0.001)
         send({"jsonrpc": "2.0", "id": message["id"], "result": []})
+    elif method == "workspace/symbol":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{
+            "name": "fixture_symbol",
+            "kind": 12,
+            "location": {
+                "uri": "file://" + str(pathlib.Path.cwd() / "src/main.rs"),
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 7}
+                }
+            }
+        }]})
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
@@ -2028,6 +2045,39 @@ while True:
         assert_eq!(status["actor_groups"].as_array().unwrap().len(), 1);
         assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
         assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_search_lazily_activates_the_requested_project() {
+        let root = TempDir::new().unwrap();
+        write_rust_fixture(root.path());
+        let counter = root.path().join("spawn-count");
+        let config = write_concurrency_lsp(root.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("dormant").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let result = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: "dormant".to_string(),
+                query: "fixture".to_string(),
+                kind_filter: None,
+                limit: 20,
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
     }
 
     #[cfg(unix)]
