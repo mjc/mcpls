@@ -37,9 +37,14 @@ cargo.features = "all"
 ### `workspace.roots`
 
 **Type**: Array of strings
-**Default**: `[]` (auto-detect from current directory)
+**Default**: `[]` (detect the containing project)
 
 Workspace root directories for LSP servers.
+
+When empty, MCPLS walks upward from its current directory. It uses the nearest
+Git checkout root (including linked worktrees), or the nearest recognized
+project manifest when no Git checkout contains the directory. If neither
+exists, MCPLS starts without a default project; add one with `project_add`.
 
 ```toml
 [workspace]

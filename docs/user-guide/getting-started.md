@@ -99,7 +99,7 @@ Create `~/.config/mcpls/mcpls.toml`:
 
 ```toml
 [workspace]
-roots = []  # Auto-detect from current directory
+roots = []  # Detect a containing Git checkout or project manifest
 
 # Rust - rust-analyzer (built-in)
 [[lsp_servers]]
