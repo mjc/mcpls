@@ -695,6 +695,20 @@ fn desired_watch_directories(
     Ok(directories)
 }
 
+#[cfg(feature = "bench")]
+pub fn benchmark_desired_watch_directory_count(
+    root: &Path,
+    pattern: &str,
+) -> Result<usize, JsonRpcError> {
+    let registration = RegisteredWatch {
+        generation: 0,
+        specs: vec![WatchSpec::glob(root.to_path_buf(), pattern, WATCH_CREATE)?],
+        known_paths: HashMap::new(),
+    };
+    let registrations = HashMap::from([("benchmark".to_string(), registration)]);
+    desired_watch_directories(&[root.to_path_buf()], &registrations).map(|paths| paths.len())
+}
+
 fn configured_walk(root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder

@@ -9,7 +9,7 @@ mod encoding;
 mod notifications;
 pub mod resources;
 mod state;
-mod translator;
+pub(crate) mod translator;
 
 pub use encoding::{EncodingConverter, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
 pub use notifications::{

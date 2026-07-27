@@ -35,6 +35,9 @@
 //! }
 //! ```
 
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench_support;
 pub mod bridge;
 pub mod config;
 pub mod edit_apply;

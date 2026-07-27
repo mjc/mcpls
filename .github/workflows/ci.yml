@@ -235,6 +235,55 @@ jobs:
       - name: Run e2e tests
         run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --run-ignored ignored-only -E 'kind(test) and test(e2e)'
 
+  benchmark:
+    name: Benchmark regressions (Gungraun)
+    needs: [detect-changes, fmt, clippy]
+    if: needs.detect-changes.outputs.run-full-ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - name: Record base benchmark
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          BENCHMARK_HOME="$RUNNER_TEMP/mcpls-gungraun"
+          rm -rf "$BENCHMARK_HOME"
+          git checkout --detach "$BASE_SHA"
+          if [[ -f flake.nix && -f crates/mcpls-core/benches/core_hot_paths.rs ]]; then
+            GUNGRAUN_HOME="$BENCHMARK_HOME" nix develop --command cargo bench -p mcpls-core --features bench --bench core_hot_paths -- --save-baseline=base
+          fi
+          git checkout --detach "$HEAD_SHA"
+      - name: Check benchmark regressions
+        run: |
+          GUNGRAUN_HOME="$RUNNER_TEMP/mcpls-gungraun" \
+            nix develop --command cargo bench -p mcpls-core --features bench --bench core_hot_paths -- --baseline=base
+      - name: Check rust-analyzer memory budget
+        run: |
+          nix develop --command python3 benchmarks/rust_analyzer_memory.py \
+            --profile lean \
+            --root "$PWD" \
+            --max-before-mib 450 \
+            --max-query-delta-mib 1100 \
+            --max-query-ms 15000 \
+            --output target/benchmarks/rust-analyzer-memory.json
+      - name: Upload rust-analyzer benchmark
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-analyzer-memory
+          path: |
+            target/benchmarks/rust-analyzer-memory.json
+            target/benchmarks/rust-analyzer-stderr.log
+          if-no-files-found: ignore
+
   msrv:
     name: MSRV check (1.88)
     needs: detect-changes
