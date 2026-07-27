@@ -447,10 +447,14 @@ impl LspClient {
                 }
 
                 Some(signal) = watch_signal_rx.recv() => {
-                    for event in watch_registry
-                        .handle_signal(signal)
-                        .map_err(|error| Error::Transport(error.message))?
-                    {
+                    let events = match watch_registry.handle_signal(signal) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            warn!("Watched-file runtime degraded: {}", error.message);
+                            continue;
+                        }
+                    };
+                    for event in events {
                         if watch_registry.accepts(&event) {
                             transport.send(&serde_json::json!({
                                 "jsonrpc": JSONRPC_VERSION,

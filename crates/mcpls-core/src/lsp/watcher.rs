@@ -419,7 +419,7 @@ impl WatchRegistry {
     }
 
     fn refresh_watches(&mut self) -> Result<(), JsonRpcError> {
-        let desired = desired_watch_directories(&self.roots, &self.registrations)?;
+        let mut desired = desired_watch_directories(&self.roots, &self.registrations)?;
         if desired.len() > MAX_WATCHED_DIRECTORIES {
             return Err(internal_error(format!(
                 "watched-file runtime requires {} directories, exceeding the limit of {MAX_WATCHED_DIRECTORIES}",
@@ -439,6 +439,10 @@ impl WatchRegistry {
         let mut installed: Vec<PathBuf> = Vec::new();
         for directory in &added {
             if let Err(error) = self.watcher.watch(directory, RecursiveMode::NonRecursive) {
+                if watch_target_vanished(directory, &error) {
+                    desired.remove(directory);
+                    continue;
+                }
                 for installed_directory in installed {
                     let _ = self.watcher.unwatch(&installed_directory);
                 }
@@ -477,6 +481,10 @@ impl WatchRegistry {
         self.watched_directories = desired;
         Ok(())
     }
+}
+
+fn watch_target_vanished(directory: &Path, error: &notify::Error) -> bool {
+    matches!(error.kind, ErrorKind::PathNotFound) || !directory.is_dir()
 }
 
 fn watch_specs(
@@ -1280,6 +1288,19 @@ mod tests {
         registry.overflowed.store(true, Ordering::Release);
         let created = changes(registry.handle_signal(other_event()).unwrap());
         assert!(created.iter().any(|change| change["type"] == 1));
+    }
+
+    #[test]
+    fn vanished_watch_targets_are_transient() {
+        let temp = TempDir::new().unwrap();
+        let vanished = temp.path().join("vanished");
+        let path_not_found = notify::Error::path_not_found().add_path(vanished.clone());
+
+        assert!(watch_target_vanished(&vanished, &path_not_found));
+
+        fs::create_dir(&vanished).unwrap();
+        let other = notify::Error::generic("inotify failed");
+        assert!(!watch_target_vanished(&vanished, &other));
     }
 
     #[test]
