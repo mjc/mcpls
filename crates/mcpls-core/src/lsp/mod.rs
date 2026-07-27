@@ -7,7 +7,7 @@ mod client;
 mod lifecycle;
 mod transport;
 pub(crate) mod types;
-mod watcher;
+pub(crate) mod watcher;
 
 pub use client::LspClient;
 pub use lifecycle::{LspServer, ServerInitConfig, ServerInitResult, ServerState};

@@ -716,6 +716,14 @@ fn rust_analyzer_initialization_options(
     Ok(Some(serde_json::Value::Object(options)))
 }
 
+#[cfg(feature = "bench")]
+pub fn benchmark_rust_analyzer_initialization_options(
+    roots: &[PathBuf],
+) -> Result<serde_json::Value> {
+    rust_analyzer_initialization_options(&LspServerConfig::rust_analyzer(), roots)?
+        .ok_or_else(|| Error::InvalidConfig("rust benchmark options were absent".to_string()))
+}
+
 fn set_default_rust_analyzer_symbol_search(
     options: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
