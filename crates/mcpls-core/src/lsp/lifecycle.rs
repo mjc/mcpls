@@ -515,7 +515,7 @@ impl LspServer {
     ///
     /// # Behavior
     ///
-    /// - Attempts to spawn each server sequentially
+    /// - Attempts to spawn all servers concurrently
     /// - Logs success (info) and failure (error) for each server
     /// - Accumulates successful servers and failures
     /// - Never panics or returns early - attempts all servers
@@ -556,12 +556,15 @@ impl LspServer {
     /// ```
     pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
         let mut result = ServerInitResult::new();
-
-        for config in configs {
+        let attempts = configs.iter().cloned().map(|config| async move {
             let language_id = config.server_config.language_id.clone();
             let command = config.server_config.command.clone();
+            let outcome = Self::spawn(config).await;
+            (language_id, command, outcome)
+        });
 
-            match Self::spawn(config.clone()).await {
+        for (language_id, command, outcome) in futures::future::join_all(attempts).await {
+            match outcome {
                 Ok(server) => {
                     info!(
                         "Successfully spawned LSP server: {} ({})",
@@ -680,6 +683,79 @@ pub fn resolve_command(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn write_coordinated_lsp(directory: &tempfile::TempDir) -> PathBuf {
+        let source = directory.path().join("coordinated-lsp.rs");
+        let command = directory.path().join("coordinated-lsp");
+        std::fs::write(
+            &source,
+            r#"
+use std::{env, fs, io::{self, Read, Write}, thread, time::Duration};
+
+fn read_message() -> Option<String> {
+    let mut headers = Vec::new();
+    let mut byte = [0; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        io::stdin().read_exact(&mut byte).ok()?;
+        headers.push(byte[0]);
+    }
+    let headers = String::from_utf8(headers).ok()?;
+    let length = headers.lines().find_map(|line| {
+        line.strip_prefix("Content-Length:")?.trim().parse::<usize>().ok()
+    })?;
+    let mut body = vec![0; length];
+    io::stdin().read_exact(&mut body).ok()?;
+    String::from_utf8(body).ok()
+}
+
+fn request_id(body: &str) -> Option<&str> {
+    let value = body[body.find("\"id\"")?..].split_once(':')?.1.trim_start();
+    let end = value.find(|character: char| !character.is_ascii_digit()).unwrap_or(value.len());
+    Some(&value[..end])
+}
+
+fn send(body: &str) {
+    print!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+    io::stdout().flush().unwrap();
+}
+
+fn main() {
+    while let Some(message) = read_message() {
+        if message.contains("\"method\":\"initialize\"") {
+            if let Some(path) = env::var_os("MCPLS_SIGNAL_FILE") {
+                fs::write(path, "ready").unwrap();
+            }
+            if let Some(path) = env::var_os("MCPLS_WAIT_FILE") {
+                while !std::path::Path::new(&path).exists() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let id = request_id(&message).unwrap();
+            send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"positionEncoding\":\"utf-8\"}}}}}}"));
+        } else if message.contains("\"method\":\"shutdown\"") {
+            let id = request_id(&message).unwrap();
+            send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":null}}"));
+        } else if message.contains("\"method\":\"exit\"") {
+            break;
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let status = std::process::Command::new("rustc")
+            .args([
+                "--edition=2021",
+                source.to_str().unwrap(),
+                "-o",
+                command.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to compile coordinated mock LSP");
+        command
+    }
 
     #[test]
     fn test_server_state_ready() {
@@ -1206,6 +1282,50 @@ mod tests {
         assert!(!result.partial_success());
         assert_eq!(result.server_count(), 0);
         assert_eq!(result.failure_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_batch_initializes_servers_concurrently() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = write_coordinated_lsp(&directory);
+        let signal = directory.path().join("initialization-signal");
+        let server = |language_id: &str, env| ServerInitConfig {
+            server_config: LspServerConfig {
+                language_id: language_id.to_string(),
+                command: command.display().to_string(),
+                args: vec![],
+                env,
+                file_patterns: vec![],
+                initialization_options: None,
+                timeout_seconds: 1,
+                heuristics: None,
+            },
+            workspace_roots: vec![directory.path().to_path_buf()],
+            initialization_options: None,
+            notification_tx: None,
+        };
+        let configs = [
+            server(
+                "waiter",
+                HashMap::from([("MCPLS_WAIT_FILE".to_string(), signal.display().to_string())]),
+            ),
+            server(
+                "signaler",
+                HashMap::from([(
+                    "MCPLS_SIGNAL_FILE".to_string(),
+                    signal.display().to_string(),
+                )]),
+            ),
+        ];
+
+        let result = LspServer::spawn_batch(&configs).await;
+
+        assert_eq!(result.failure_count(), 0);
+        assert_eq!(result.server_count(), 2);
+        for server in result.servers.into_values() {
+            server.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
