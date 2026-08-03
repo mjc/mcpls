@@ -461,6 +461,9 @@ impl Translator {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // Preserve the searchable roots even when every LSP fails to start;
+        // workspace-symbol lookup can still use its AST fallback.
+        self.set_workspace_roots(roots.clone());
         let result = LspServer::spawn_batch(&server_configs).await;
 
         if result.all_failed() {

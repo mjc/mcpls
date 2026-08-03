@@ -1105,11 +1105,13 @@ impl McplsServer {
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
         let id = parse_project_id(project_id)?;
-        self.context
-            .project_registry
-            .activate(&id)
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if let Err(error) = self.context.project_registry.activate(&id).await {
+            tracing::warn!(
+                project_id = %id,
+                error = %error,
+                "workspace symbol activation failed; trying degraded lookup"
+            );
+        }
         let actor = self
             .context
             .project_registry
@@ -2298,6 +2300,44 @@ while True:
             added["configured_language_servers"],
             serde_json::json!(["rust"])
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_falls_back_when_project_activation_fails() {
+        let root = TempDir::new().unwrap();
+        let source = write_rust_fixture(root.path());
+        std::fs::write(&source, "fn fixture_symbol() {}\n").unwrap();
+        let server = create_test_server();
+
+        server
+            .project_add(Parameters(ProjectAddParams {
+                project_id: "activation-fallback".to_string(),
+                root: root.path().display().to_string(),
+                config: Some(serde_json::json!({
+                    "lsp_servers": [{
+                        "language_id": "rust",
+                        "command": "/definitely/missing/rust-analyzer",
+                        "file_patterns": ["**/*.rs"],
+                        "heuristics": {"project_markers": ["Cargo.toml"]}
+                    }]
+                })),
+            }))
+            .await
+            .unwrap();
+
+        let result = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: "activation-fallback".to_string(),
+                query: "fixture_symbol".to_string(),
+                kind_filter: None,
+                limit: 20,
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
     }
 
     #[tokio::test]

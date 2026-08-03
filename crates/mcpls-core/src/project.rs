@@ -1481,7 +1481,8 @@ impl ProjectRequest {
             Self::Completions { reply, .. } => reject!(reply),
             Self::DocumentSymbols { reply, .. } => reject!(reply),
             Self::FormatDocument { reply, .. } => reject!(reply),
-            Self::WorkspaceSymbol { reply, .. } => reject!(reply),
+            // Workspace-symbol lookup has an in-process AST fallback, so it
+            // remains available even after all configured LSPs fail.
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reject!(reply)
             }
