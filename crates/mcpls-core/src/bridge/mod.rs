@@ -3,6 +3,7 @@
 //! This module handles the bidirectional conversion between
 //! MCP tool calls and LSP requests/responses.
 
+mod ast_grep;
 mod encoding;
 mod notifications;
 pub mod resources;

@@ -18,6 +18,7 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::Duration};
 
+use super::ast_grep;
 use super::notifications::RedactionPolicy;
 use super::state::{ResourceLimits, detect_language, path_to_uri};
 use super::{DocumentTracker, NotificationCache};
@@ -2006,80 +2007,63 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails or no server is configured.
+    /// Returns an error if the parameters are invalid or no server is configured.
     pub async fn handle_workspace_symbol(
         &mut self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
-        const MAX_QUERY_LENGTH: usize = 1000;
-        const VALID_SYMBOL_KINDS: &[&str] = &[
-            "File",
-            "Module",
-            "Namespace",
-            "Package",
-            "Class",
-            "Method",
-            "Property",
-            "Field",
-            "Constructor",
-            "Enum",
-            "Interface",
-            "Function",
-            "Variable",
-            "Constant",
-            "String",
-            "Number",
-            "Boolean",
-            "Array",
-            "Object",
-            "Key",
-            "Null",
-            "EnumMember",
-            "Struct",
-            "Event",
-            "Operator",
-            "TypeParameter",
-        ];
+        validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
 
-        // Validate query length
-        if query.len() > MAX_QUERY_LENGTH {
-            return Err(Error::InvalidToolParams(format!(
-                "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
-                query.len()
-            )));
-        }
-
-        // Validate kind filter
-        if let Some(ref kind) = kind_filter
-            && !VALID_SYMBOL_KINDS
-                .iter()
-                .any(|k| k.eq_ignore_ascii_case(kind))
-        {
-            return Err(Error::InvalidToolParams(format!(
-                "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
-            )));
-        }
-
-        // Workspace search requires at least one active LSP client. If none are
-        // registered yet but a configured server is still initializing, tell the
-        // caller to wait and retry rather than implying nothing is configured.
-        if self.lsp_clients.is_empty() {
-            return Err(self
-                .expected_languages
-                .iter()
-                .next()
-                .map_or(Error::NoServerConfigured, |lang| {
-                    Error::ServerInitializing(lang.clone())
-                }));
-        }
-        if let Some(language_id) = self.expected_languages.iter().min() {
-            return Err(Error::ServerInitializing(language_id.clone()));
-        }
         if limit == 0 {
             return Ok(WorkspaceSymbolResult {
                 symbols: Vec::new(),
+            });
+        }
+
+        let mut fallback_languages = self
+            .lsp_configs
+            .keys()
+            .chain(self.extension_map.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        fallback_languages.sort_unstable();
+        fallback_languages.dedup();
+
+        // No active capable LSP is a normal degraded mode. Use the configured
+        // AST parser instead of claiming that a textual fallback is semantic.
+        if self.lsp_clients.is_empty() {
+            if self.workspace_roots.is_empty() || fallback_languages.is_empty() {
+                return Err(self
+                    .expected_languages
+                    .iter()
+                    .next()
+                    .map_or(Error::NoServerConfigured, |lang| {
+                        Error::ServerInitializing(lang.clone())
+                    }));
+            }
+            return Ok(WorkspaceSymbolResult {
+                symbols: self
+                    .ast_grep_workspace_symbols(
+                        &fallback_languages,
+                        &query,
+                        kind_filter.as_deref(),
+                        limit as usize,
+                    )
+                    .await,
+            });
+        }
+        if !self.expected_languages.is_empty() || self.workspace_symbol_clients().is_empty() {
+            return Ok(WorkspaceSymbolResult {
+                symbols: self
+                    .ast_grep_workspace_symbols(
+                        &fallback_languages,
+                        &query,
+                        kind_filter.as_deref(),
+                        limit as usize,
+                    )
+                    .await,
             });
         }
 
@@ -2091,9 +2075,24 @@ impl Translator {
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
             };
-            let response: Option<Vec<lsp_types::SymbolInformation>> = client
+            let response: Option<Vec<lsp_types::SymbolInformation>> = match client
                 .request("workspace/symbol", params, timeout_duration)
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    return Ok(WorkspaceSymbolResult {
+                        symbols: self
+                            .ast_grep_workspace_symbols(
+                                &fallback_languages,
+                                &query,
+                                kind_filter.as_deref(),
+                                limit as usize,
+                            )
+                            .await,
+                    });
+                }
+            };
             symbols.extend(
                 response
                     .unwrap_or_default()
@@ -2120,6 +2119,43 @@ impl Translator {
         }
 
         Ok(WorkspaceSymbolResult { symbols })
+    }
+
+    async fn ast_grep_workspace_symbols(
+        &self,
+        languages: &[String],
+        query: &str,
+        kind_filter: Option<&str>,
+        limit: usize,
+    ) -> Vec<WorkspaceSymbol> {
+        ast_grep::search(&self.workspace_roots, languages, query, limit)
+            .await
+            .into_iter()
+            .filter_map(|symbol| {
+                let kind = ast_grep_symbol_kind(&symbol.kind)?;
+                kind_filter
+                    .is_none_or(|filter| kind.eq_ignore_ascii_case(filter))
+                    .then_some(WorkspaceSymbol {
+                        name: symbol.name,
+                        kind: kind.to_string(),
+                        location: Location {
+                            uri: path_to_uri(&symbol.path).to_string(),
+                            range: Range {
+                                start: Position2D {
+                                    line: symbol.start_line + 1,
+                                    character: symbol.start_character + 1,
+                                },
+                                end: Position2D {
+                                    line: symbol.end_line + 1,
+                                    character: symbol.end_character + 1,
+                                },
+                            },
+                        },
+                        container_name: None,
+                    })
+            })
+            .take(limit)
+            .collect()
     }
 
     /// Handle code actions request.
@@ -2998,6 +3034,72 @@ const fn normalize_range(range: lsp_types::Range) -> Range {
     }
 }
 
+fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
+    const MAX_QUERY_LENGTH: usize = 1000;
+    const VALID_SYMBOL_KINDS: &[&str] = &[
+        "File",
+        "Module",
+        "Namespace",
+        "Package",
+        "Class",
+        "Method",
+        "Property",
+        "Field",
+        "Constructor",
+        "Enum",
+        "Interface",
+        "Function",
+        "Variable",
+        "Constant",
+        "String",
+        "Number",
+        "Boolean",
+        "Array",
+        "Object",
+        "Key",
+        "Null",
+        "EnumMember",
+        "Struct",
+        "Event",
+        "Operator",
+        "TypeParameter",
+    ];
+
+    if query.len() > MAX_QUERY_LENGTH {
+        return Err(Error::InvalidToolParams(format!(
+            "Query too long: {} chars (max {MAX_QUERY_LENGTH})",
+            query.len()
+        )));
+    }
+    if let Some(kind) = kind_filter
+        && !VALID_SYMBOL_KINDS
+            .iter()
+            .any(|valid_kind| valid_kind.eq_ignore_ascii_case(kind))
+    {
+        return Err(Error::InvalidToolParams(format!(
+            "Invalid kind_filter: '{kind}'. Valid values: {VALID_SYMBOL_KINDS:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn ast_grep_symbol_kind(symbol_type: &str) -> Option<&'static str> {
+    match symbol_type.to_ascii_lowercase().as_str() {
+        "class" => Some("Class"),
+        "constant" | "const" => Some("Constant"),
+        "enum" => Some("Enum"),
+        "field" => Some("Field"),
+        "function" => Some("Function"),
+        "interface" | "trait" => Some("Interface"),
+        "method" => Some("Method"),
+        "module" | "namespace" => Some("Module"),
+        "struct" | "union" => Some("Struct"),
+        "type" | "typealias" => Some("TypeParameter"),
+        "variable" => Some("Variable"),
+        _ => None,
+    }
+}
+
 /// Convert LSP document symbol to MCP symbol.
 fn convert_document_symbol(symbol: DocumentSymbol) -> Symbol {
     Symbol {
@@ -3843,23 +3945,60 @@ while True:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn workspace_symbol_reports_pending_while_rust_is_loading() {
+    async fn workspace_symbol_falls_back_while_rust_is_loading() {
         let root = TempDir::new().unwrap();
+        fs::write(root.path().join("loading.rs"), "fn fallback_loading() {}\n").unwrap();
         let request_log = root.path().join("loading.log");
         let server =
             workspace_symbol_test_server(root.path(), "rust", true, "ignored", &request_log).await;
         let client = server.client().clone();
         let mut translator = Translator::new()
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![LspServerConfig::rust_analyzer()], None);
         translator.register_client("rust".to_string(), client);
         translator.register_server("rust".to_string(), server);
         translator.set_expected_languages(HashSet::from(["rust".to_string()]));
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol("fallback_loading".to_string(), None, 100)
             .await;
 
-        assert!(matches!(result, Err(Error::ServerInitializing(language)) if language == "rust"));
+        let result = result.unwrap();
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "fallback_loading");
+        assert_eq!(result.symbols[0].kind, "Function");
+        assert!(!request_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_falls_back_when_provider_is_unsupported() {
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("fallback.rs"), "struct AstFallback;\n").unwrap();
+        let request_log = root.path().join("unsupported-fallback.log");
+        let server = workspace_symbol_test_server(
+            root.path(),
+            "unsupported-fallback",
+            false,
+            "ignored",
+            &request_log,
+        )
+        .await;
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![LspServerConfig::rust_analyzer()], None);
+        translator.register_client("unsupported-fallback".to_string(), server.client().clone());
+        translator.register_server("unsupported-fallback".to_string(), server);
+
+        let result = translator
+            .handle_workspace_symbol("AstFallback".to_string(), None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "AstFallback");
+        assert_eq!(result.symbols[0].kind, "Struct");
         assert!(!request_log.exists());
     }
 

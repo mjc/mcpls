@@ -12,6 +12,8 @@ categories = ["development-tools"]
 
 [dependencies]
 async-trait = { workspace = true }
+ast-grep-core = { workspace = true }
+ast-grep-language = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
