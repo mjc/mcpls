@@ -718,6 +718,14 @@ fn configured_walk(root: &Path) -> WalkBuilder {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true);
+    // `ignore` only discovers a root `.gitignore` automatically when the
+    // workspace is a Git repository. LSP workspaces can be plain directories,
+    // so explicitly load the root rules as well.
+    let root_ignore = root.join(".gitignore");
+    if root_ignore.is_file() {
+        builder.current_dir(root);
+        let _ = builder.add_ignore(root_ignore);
+    }
     builder.filter_entry(|entry| entry.file_name() != ".git");
     builder
 }
@@ -743,11 +751,15 @@ fn visible_path(path: &Path, is_dir: bool, specs: &[WatchSpec]) -> Result<bool, 
         if !matches!(spec.matcher, WatchMatcher::Glob(_)) || !path.starts_with(&spec.root) {
             continue;
         }
-        if !path.exists() {
-            if missing_path_is_visible(&spec.root, path, is_dir)? {
-                return Ok(true);
-            }
+        // `filter_entry` can be used to narrow a walk, but it also overrides
+        // the walker's normal ignore pruning for matching parent directories.
+        // Check repository ignore files first so generated trees such as
+        // `target/` cannot turn every build artifact into an LSP change event.
+        if !missing_path_is_visible(&spec.root, path, is_dir)? {
             continue;
+        }
+        if !path.exists() {
+            return Ok(true);
         }
         let target = path.to_path_buf();
         let mut builder = WalkBuilder::new(&spec.root);
@@ -1007,12 +1019,17 @@ mod tests {
     #[test]
     fn ignored_paths_are_not_visible_to_native_events() {
         let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join(".git")).unwrap();
-        fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(temp.path().join(".gitignore"), "ignored.rs\n/target/\n").unwrap();
         let ignored = temp.path().join("ignored.rs");
         fs::write(&ignored, "").unwrap();
+        fs::create_dir_all(temp.path().join("target/debug/build")).unwrap();
+        let ignored_generated = temp.path().join("target/debug/build/generated.rs");
+        fs::write(&ignored_generated, "").unwrap();
 
+        let initial = snapshot(&[rust_spec(temp.path())]).unwrap();
+        assert!(!initial.contains_key(&ignored_generated));
         assert!(!visible_path(&ignored, false, &[rust_spec(temp.path())]).unwrap());
+        assert!(!visible_path(&ignored_generated, false, &[rust_spec(temp.path())]).unwrap());
         fs::remove_file(&ignored).unwrap();
         assert!(!missing_path_is_visible(temp.path(), &ignored, false).unwrap());
         assert!(

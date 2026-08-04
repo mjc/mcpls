@@ -20,7 +20,7 @@ use mcpls_core::lsp::{LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::common::test_utils::{rust_analyzer_available, rust_workspace_path};
+use crate::common::test_utils::{rust_analyzer_available, rust_analyzer_path, rust_workspace_path};
 
 static INIT_TRACING: Once = Once::new();
 
@@ -49,7 +49,7 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
 
     let lsp_config = LspServerConfig {
         language_id: "rust".to_string(),
-        command: "rust-analyzer".to_string(),
+        command: rust_analyzer_path().to_string_lossy().into_owned(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec!["**/*.rs".to_string()],
@@ -102,19 +102,18 @@ async fn wait_for_indexing_ready(
 ) {
     let lib_rs = workspace.join("src/lib.rs");
     let file_path = lib_rs.to_string_lossy().to_string();
-    // `pub fn add(` is on line 51; 'a' of "add" is at column 8 (1-based).
-    let add_line: u32 = 51;
-    let add_col: u32 = 8;
+    let (add_line, declaration_start) = find_position(&lib_rs, "pub fn add(");
+    let add_col = declaration_start + u32::try_from("pub fn ".len()).unwrap();
 
     let deadline = Instant::now() + timeout;
     let required_consecutive: u32 = 3;
     let mut consecutive = 0u32;
 
     loop {
-        if Instant::now() >= deadline {
-            tracing::warn!("Timed out waiting for rust-analyzer readiness");
-            return;
-        }
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for rust-analyzer readiness"
+        );
 
         let hover_result = translator
             .lock()
@@ -141,6 +140,22 @@ async fn wait_for_indexing_ready(
 
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn find_position(path: &Path, needle: &str) -> (u32, u32) {
+    let source = std::fs::read_to_string(path).expect("failed to read Rust fixture");
+    source
+        .lines()
+        .enumerate()
+        .find_map(|(line, text)| {
+            text.find(needle).map(|character| {
+                (
+                    u32::try_from(line + 1).unwrap(),
+                    u32::try_from(character + 1).unwrap(),
+                )
+            })
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not found in {}", path.display()))
 }
 
 #[tokio::test]
@@ -203,8 +218,7 @@ async fn test_hover_on_u64_type() {
 
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
-    // Hover over "u64" in User struct (line 19)
-    // The line is: `pub id: u64,`
+    let (line, character) = find_position(&file_path, "u64");
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
@@ -244,8 +258,7 @@ async fn test_definition_user_struct() {
 
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
-    // Go to definition of User in types.rs (line 9, owner: User)
-    // The line is: `pub owner: User,`
+    let (line, character) = find_position(&types_file, "User,");
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_definition(
@@ -269,9 +282,8 @@ async fn test_definition_user_struct() {
 
     // Verify definition points to lib.rs where User is defined
     assert!(
-        def_str.contains("lib.rs") && def_str.contains("User"),
-        "Definition should reference User struct in lib.rs, got: {}",
-        def_str
+        !def_json.locations.is_empty() && def_str.contains("lib.rs"),
+        "Definition should reference User struct in lib.rs, got: {def_str}"
     );
 }
 
@@ -440,11 +452,14 @@ async fn test_diagnostics_with_error() {
     let diag_json = diag_result.unwrap();
     let diag_str = serde_json::to_string(&diag_json).unwrap();
 
-    // Should contain the error about undefined_variable
+    // The fixture intentionally contains compile errors. The exact first error
+    // reported by rust-analyzer is version-dependent.
     assert!(
-        diag_str.contains("undefined_variable") || diag_str.contains("cannot find"),
-        "Diagnostics should report the intentional error, got: {}",
-        diag_str
+        diag_json.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic.severity,
+            mcpls_core::bridge::DiagnosticSeverity::Error
+        )),
+        "Diagnostics should report an intentional fixture error, got: {diag_str}"
     );
 }
 

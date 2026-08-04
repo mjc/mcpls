@@ -1495,7 +1495,8 @@ impl ProjectRequest {
             Self::Completions { reply, .. } => reject!(reply),
             Self::DocumentSymbols { reply, .. } => reject!(reply),
             Self::FormatDocument { reply, .. } => reject!(reply),
-            Self::WorkspaceSymbol { reply, .. } => reject!(reply),
+            // Workspace-symbol lookup has an in-process AST fallback, so it
+            // remains available even after all configured LSPs fail.
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reject!(reply)
             }
@@ -9011,7 +9012,23 @@ while True:
             .unwrap();
 
         let state = registry.activate(&project_id).await.unwrap();
-        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert!(matches!(
+            state.status(),
+            ProjectStatus::Starting | ProjectStatus::Ready
+        ));
+        let ready = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if registry.status(&project_id).await.unwrap().status() == ProjectStatus::Ready {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            ready.is_ok(),
+            "linked-worktree project did not become ready"
+        );
         assert_eq!(state.workspace_roots().len(), 2);
         assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
         assert_eq!(fs::read_to_string(counter).unwrap(), "1");

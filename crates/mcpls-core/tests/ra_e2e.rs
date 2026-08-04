@@ -508,7 +508,7 @@ fn sc_rename_symbol(client: &mut McpClient, workspace: &Path) -> Result<(), Stri
 /// Tool 6: `get_completions` — completions after `ad` inside `caller`.
 fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
-    // Inside caller body: `    add(1, 2)` — col 6 is after 'a','d' (prefix "ad").
+    // Inside caller body: `    add(1, 2)` — column 7 is after 'a','d' (prefix "ad").
     let caller_line = find_line(&lib, "pub fn caller(");
     let body_line = caller_line + 1;
 
@@ -521,7 +521,7 @@ fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), St
                 &json!({
                     "file_path": lib.to_string_lossy(),
                     "line": body_line,
-                    "character": 6,
+                    "character": 7,
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
@@ -1890,7 +1890,11 @@ fn format_and_restart(client: &mut McpClient, fixture: &MultiProjectFixture) {
         &json!({"project_id": "second"}),
     )
     .unwrap();
-    assert_eq!(restarted["status"], "Ready");
+    assert!(matches!(
+        restarted["status"].as_str(),
+        Some("Starting" | "Ready")
+    ));
+    wait_until_ready(client, &fixture.second_lib);
     let hover = call_json(
         client,
         "get_hover",

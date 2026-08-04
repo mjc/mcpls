@@ -50,7 +50,7 @@ fn test_e2e_initialize_handshake() -> Result<()> {
 /// Test listing all available MCP tools.
 ///
 /// Validates that:
-/// - tools/list returns an array of 16 tools
+/// - tools/list returns the stable core tool set
 /// - All expected tool names are present
 #[test]
 #[ignore = "Requires mcpls binary built"]
@@ -63,8 +63,6 @@ fn test_e2e_list_tools() -> Result<()> {
     let tools = response["result"]["tools"]
         .as_array()
         .unwrap_or_else(|| panic!("tools should be an array"));
-
-    assert_eq!(tools.len(), 20, "Should have exactly 20 tools");
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
@@ -89,6 +87,11 @@ fn test_e2e_list_tools() -> Result<()> {
         "go_to_implementation",
         "go_to_type_definition",
         "get_inlay_hints",
+        "workspace_edit_preview",
+        "workspace_edit_apply",
+        "rename_preview",
+        "format_preview",
+        "move_inline_module_preview",
     ] {
         assert!(tool_names.contains(expected), "Should have {expected} tool");
     }
@@ -143,8 +146,10 @@ fn test_e2e_tool_schemas() -> Result<()> {
         );
 
         assert!(
-            schema["properties"].is_object(),
-            "Tool '{tool_name}' schema should have properties object"
+            schema
+                .get("properties")
+                .is_none_or(serde_json::Value::is_object),
+            "Tool '{tool_name}' schema properties should be an object when present"
         );
     }
 

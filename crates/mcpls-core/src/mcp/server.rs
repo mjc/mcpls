@@ -1267,6 +1267,22 @@ while True:
     }
 
     #[cfg(unix)]
+    async fn wait_for_project_ready(registry: &ProjectRegistry, project_id: &ProjectId) {
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if registry.status(project_id).await.unwrap().status()
+                    == crate::project::ProjectStatus::Ready
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "project did not become ready");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn http_sessions_share_one_project_actor_and_lsp_process() {
         let root = TempDir::new().unwrap();
@@ -1319,6 +1335,17 @@ while True:
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
+        server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: "dormant".to_string(),
+                query: "fixture".to_string(),
+                kind_filter: None,
+                limit: 20,
+            }))
+            .await
+            .unwrap();
+        let project_id = ProjectId::new("dormant").unwrap();
+        wait_for_project_ready(&server.context.project_registry, &project_id).await;
         let result = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "dormant".to_string(),
@@ -1380,6 +1407,8 @@ while True:
         );
         first_activation.unwrap();
         second_activation.unwrap();
+        wait_for_project_ready(&server.context.project_registry, &first_id).await;
+        wait_for_project_ready(&server.context.project_registry, &second_id).await;
 
         let blocked_server = server.for_session();
         let first_file = first_root.path().join("src/main.rs");
@@ -1388,9 +1417,16 @@ while True:
                 .get_document_symbols(document_symbols_params(&first_file))
                 .await
         });
-        while !entered.exists() {
-            tokio::task::yield_now().await;
-        }
+        let entered_gate = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !entered.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            entered_gate.is_ok(),
+            "blocked request did not reach the language server"
+        );
 
         let second_file = second_root.path().join("src/main.rs");
         let second_result = tokio::time::timeout(

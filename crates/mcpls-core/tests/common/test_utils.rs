@@ -1,14 +1,21 @@
 use std::path::PathBuf;
 
+/// Returns the configured rust-analyzer binary.
+#[must_use]
+pub fn rust_analyzer_path() -> PathBuf {
+    std::env::var_os("MCPLS_RUST_ANALYZER")
+        .map_or_else(|| PathBuf::from("rust-analyzer"), PathBuf::from)
+}
+
 /// Checks if rust-analyzer is available in the system.
 ///
 /// Returns true if rust-analyzer can be executed.
 #[must_use]
 pub fn rust_analyzer_available() -> bool {
-    std::process::Command::new("rust-analyzer")
+    std::process::Command::new(rust_analyzer_path())
         .arg("--version")
         .output()
-        .is_ok()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Returns the path to the Rust workspace test fixture.

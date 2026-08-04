@@ -235,6 +235,10 @@ impl LspClient {
         *self.state.lock().await
     }
 
+    pub(crate) async fn set_ready(&self) {
+        *self.state.lock().await = super::ServerState::Ready;
+    }
+
     /// The timeout applied to a single LSP request attempt, derived from
     /// [`LspServerConfig::request_timeout_seconds`].
     ///
@@ -378,11 +382,15 @@ impl LspClient {
             let outcome = match timeout(timeout_duration, response_rx).await {
                 Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
                 Err(_elapsed) => {
-                    // The response may still arrive after this point (the
-                    // server is just slow, not dead), but nothing will ever
-                    // read it again -- drop the now-orphaned entry instead of
-                    // leaking it in `pending_requests` forever.
+                    // Remove the pending sender before returning so a timed-out
+                    // request cannot leak even when the outbound command queue
+                    // is saturated. Cancellation stays detached so queue
+                    // pressure cannot extend the caller's request deadline.
                     self.pending_requests.lock().await.remove(&id);
+                    let command_tx = self.command_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = command_tx.send(ClientCommand::CancelRequest { id }).await;
+                    });
                     return Err(Error::Timeout(timeout_duration.as_secs()));
                 }
             };
@@ -440,7 +448,11 @@ impl LspClient {
     /// superseded by a respawned replacement for the same server -- so
     /// callers still waiting on it unblock immediately.
     pub(crate) async fn fail_pending_requests(&self) {
-        let mut pending = self.pending_requests.lock().await;
+        Self::fail_pending_map(&self.pending_requests).await;
+    }
+
+    async fn fail_pending_map(pending_requests: &Arc<Mutex<PendingRequests>>) {
+        let mut pending = pending_requests.lock().await;
         for (_, sender) in pending.drain() {
             let _ = sender.send(Err(Error::ServerTerminated));
         }
@@ -523,7 +535,7 @@ impl LspClient {
         } else {
             debug!("Message loop exiting normally");
         }
-        Self::fail_pending_requests(&pending_requests).await;
+        Self::fail_pending_map(&pending_requests).await;
         result
     }
 
@@ -538,6 +550,7 @@ impl LspClient {
         crate::util::truncate_str(message, MAX_ERROR_MESSAGE_LOG_BYTES)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
@@ -1288,6 +1301,39 @@ mod tests {
             let mut buf = vec![0u8; content_length.unwrap()];
             reader.read_exact(&mut buf).await.unwrap();
             serde_json::from_slice(&buf).unwrap()
+        }
+
+        #[tokio::test]
+        #[allow(clippy::expect_used)]
+        async fn timed_out_request_returns_promptly_and_cancels_server_work() {
+            let (client, mut server) = fake_lsp_client();
+            let request_client = client.clone();
+            let request_task = tokio::spawn(async move {
+                request_client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_millis(20),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let request_id = request["id"].clone();
+            let result = tokio::time::timeout(Duration::from_millis(200), request_task)
+                .await
+                .expect("request must return at its own deadline")
+                .unwrap();
+            assert!(matches!(result, Err(Error::Timeout(0))));
+
+            let cancellation =
+                tokio::time::timeout(Duration::from_secs(1), read_framed_message(&mut reader))
+                    .await
+                    .expect("timed-out request must send $/cancelRequest");
+            assert_eq!(cancellation["method"], "$/cancelRequest");
+            assert_eq!(cancellation["params"]["id"], request_id);
+            assert!(client.pending_requests.lock().await.is_empty());
         }
 
         /// Writes a framed JSON-RPC `ServerCancelled` (-32802) error response.
