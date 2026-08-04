@@ -52,6 +52,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod project;
 pub mod project_persistence;
+pub mod rust_refactor;
 pub mod transport;
 mod util;
 

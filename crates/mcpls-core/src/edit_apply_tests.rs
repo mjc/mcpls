@@ -177,6 +177,38 @@ fn applies_validated_resource_operations() {
 }
 
 #[test]
+fn applies_text_to_a_created_file_as_one_plan() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("created.rs");
+    let plan = EditPlan::new(
+        "project".to_string(),
+        vec![FileSnapshot::from_contents(
+            file.clone(),
+            SnapshotSource::Disk,
+            None,
+            "",
+            "created content\n",
+        )],
+        vec![
+            format!("create {}", file.display()),
+            format!("text {}", file.display()),
+        ],
+        true,
+        Duration::from_secs(60),
+    )
+    .with_file_operations(vec![FileOperation::Create {
+        path: file.clone(),
+        overwrite: false,
+    }]);
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+    let report = apply_plan(&boundary, &plan).unwrap();
+
+    assert_eq!(report.committed_files, vec![file.clone()]);
+    assert_eq!(fs::read_to_string(file).unwrap(), "created content\n");
+}
+
+#[test]
 fn rename_without_overwrite_rechecks_destination_at_commit() {
     let root = TempDir::new().unwrap();
     let old = root.path().join("old.rs");

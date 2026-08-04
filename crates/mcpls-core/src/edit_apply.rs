@@ -172,14 +172,14 @@ impl<'a> PreparedPlan<'a> {
             return Err(ApplyError::Expired);
         }
 
-        let snapshots: Vec<_> = plan
-            .files()
-            .iter()
-            .map(|snapshot| validate_snapshot(boundary, snapshot, documents))
-            .collect::<Result<_, _>>()?;
         let operations = boundary
             .validate_operations(plan.file_operations())
             .map_err(ApplyError::Operation)?;
+        let snapshots: Vec<_> = plan
+            .files()
+            .iter()
+            .map(|snapshot| validate_snapshot(boundary, snapshot, documents, &operations))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             plan,
             snapshots,
@@ -215,7 +215,7 @@ impl<'a> PreparedPlan<'a> {
         // Revalidate after staging and immediately before the first
         // destructive operation. This rejects a stale plan as one unit.
         for snapshot in &self.snapshots {
-            if let Err(error) = validate_snapshot(boundary, snapshot, documents) {
+            if let Err(error) = validate_snapshot(boundary, snapshot, documents, &self.operations) {
                 cleanup_staged(staged);
                 return Err(error);
             }
@@ -234,7 +234,9 @@ impl<'a> PreparedPlan<'a> {
         let mut committed_files = commit_staged_files(staged)?;
         for operation in operations {
             let path = apply_resource_operation(operation, &committed_files)?;
-            committed_files.push(path);
+            if !committed_files.contains(&path) {
+                committed_files.push(path);
+            }
         }
 
         Ok(ApplyReport { committed_files })
@@ -263,6 +265,9 @@ fn apply_resource_operation(
 ) -> Result<PathBuf, ApplyError> {
     match operation {
         ValidatedFileOperation::Create { path, overwrite } => {
+            if committed_files.iter().any(|committed| committed == path) {
+                return Ok(path.clone());
+            }
             let result = if *overwrite {
                 fs::write(path, [])
             } else {
@@ -407,7 +412,13 @@ fn validate_snapshot<'a>(
     boundary: &WorkspaceBoundary,
     snapshot: &'a FileSnapshot,
     documents: Option<&DocumentTracker>,
+    operations: &[ValidatedFileOperation],
 ) -> Result<&'a FileSnapshot, ApplyError> {
+    if operations.iter().any(|operation| {
+        matches!(operation, ValidatedFileOperation::Create { path, .. } if path == snapshot.path())
+    }) {
+        return Ok(snapshot);
+    }
     let canonical = boundary
         .validate_existing(snapshot.path())
         .map_err(|source| ApplyError::Path {

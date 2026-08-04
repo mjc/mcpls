@@ -146,6 +146,21 @@ pub struct FormatPreviewParams {
     pub position_encoding: Option<String>,
 }
 
+/// Parameters for previewing a Rust inline-module move.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for moving one inline Rust module to its own file.")]
+pub struct MoveInlineModulePreviewParams {
+    /// Registered project that owns the source file.
+    pub project_id: String,
+    /// Absolute path to the Rust source containing the inline module.
+    pub file_path: String,
+    /// Inline module name to move.
+    pub module_name: String,
+    /// Optional negotiated LSP position encoding.
+    #[serde(default)]
+    pub position_encoding: Option<String>,
+}
+
 const fn default_tab_size() -> u32 {
     4
 }

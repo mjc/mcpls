@@ -43,6 +43,49 @@ fn previews_disk_text_edit_without_writing() {
 }
 
 #[test]
+fn previews_text_edit_after_ordered_create() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("created.rs");
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let edit = NormalizedWorkspaceEdit {
+        operations: vec![
+            EditOperation::Create {
+                uri: path_to_uri(&file),
+                options: None,
+                annotation_id: None,
+            },
+            EditOperation::Text {
+                uri: path_to_uri(&file),
+                version: None,
+                edits: vec![NormalizedTextEdit {
+                    range: lsp_types::Range::default(),
+                    new_text: "created content\n".to_string(),
+                    annotation_id: None,
+                }],
+            },
+        ],
+        change_annotations: None,
+    };
+
+    let artifact = preview_normalized(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits::default(),
+    )
+    .unwrap();
+
+    assert!(artifact.plan.safe_to_apply());
+    assert_eq!(artifact.plan.files()[0].original_content(), "");
+    assert_eq!(
+        artifact.plan.files()[0].planned_content(),
+        "created content\n"
+    );
+}
+
+#[test]
 fn rejects_resource_operation_limit() {
     let root = TempDir::new().unwrap();
     let boundary = WorkspaceBoundary::new(root.path()).unwrap();

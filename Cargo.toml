@@ -17,6 +17,8 @@ categories = ["development-tools", "command-line-utilities"]
 [workspace.dependencies]
 # Sorted alphabetically
 anyhow = "1.0"
+ast-grep-core = "0.45.0"
+ast-grep-language = "0.45.0"
 assert_cmd = "2.2"
 async-trait = "0.1"
 axum = "0.8"

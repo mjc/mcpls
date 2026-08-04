@@ -1,6 +1,6 @@
 //! Read-only planning for LSP `WorkspaceEdit` values.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -143,6 +143,7 @@ struct PreviewBuilder<'a> {
     documents: &'a DocumentTracker,
     limits: PreviewLimits,
     files: BTreeMap<PathBuf, PlannedFile>,
+    created_paths: BTreeSet<PathBuf>,
     file_operations: Vec<FileOperation>,
     operations: Vec<String>,
     conflicts: Vec<String>,
@@ -166,6 +167,7 @@ impl<'a> PreviewBuilder<'a> {
             documents,
             limits,
             files: BTreeMap::new(),
+            created_paths: BTreeSet::new(),
             file_operations: Vec::new(),
             operations: Vec::new(),
             conflicts: Vec::new(),
@@ -206,11 +208,14 @@ impl<'a> PreviewBuilder<'a> {
             self.conflicts
                 .push("workspace edit contains no operations".to_string());
         }
-        if !self.files.is_empty() && !self.file_operations.is_empty() {
-            self.conflicts.push(
-                "text and resource operations in one plan are not yet transactionally ordered"
-                    .to_string(),
-            );
+        if !self.files.is_empty()
+            && self
+                .file_operations
+                .iter()
+                .any(|operation| !matches!(operation, FileOperation::Create { .. }))
+        {
+            self.conflicts
+                .push("text edits can only be combined with ordered create operations".to_string());
         }
 
         let snapshots = self
@@ -244,6 +249,7 @@ impl<'a> PreviewBuilder<'a> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_operation(&mut self, operation: EditOperation) -> Result<(), PreviewError> {
         match operation {
             EditOperation::Text {
@@ -266,6 +272,7 @@ impl<'a> PreviewBuilder<'a> {
                 }])?;
                 let operation = format!("create {}", path.display());
                 self.operations.push(operation);
+                self.created_paths.insert(path.clone());
                 self.file_operations
                     .push(FileOperation::Create { path, overwrite });
                 if options
@@ -387,10 +394,24 @@ impl<'a> PreviewBuilder<'a> {
                 limit: self.limits.max_edits,
             });
         }
-        let path = self.boundary.validate_existing(path_for_uri(uri)?)?;
+        let requested_path = path_for_uri(uri)?;
+        let path = if self.created_paths.contains(&requested_path) {
+            self.boundary.validate_target(&requested_path)?
+        } else {
+            self.boundary.validate_existing(requested_path)?
+        };
         if !self.files.contains_key(&path) {
-            self.files
-                .insert(path.clone(), initial_file(&path, self.documents)?);
+            let file = if self.created_paths.contains(&path) {
+                PlannedFile {
+                    source: SnapshotSource::Disk,
+                    version: None,
+                    original: String::new(),
+                    planned: String::new(),
+                }
+            } else {
+                initial_file(&path, self.documents)?
+            };
+            self.files.insert(path.clone(), file);
         }
         let entry = self
             .files
