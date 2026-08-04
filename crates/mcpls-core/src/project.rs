@@ -18,7 +18,8 @@ use crate::bridge::{
     FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, LocationsResult,
     LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult,
     RenameResult, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
-    SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    SignatureHelpResult, StructuralMatch, StructuralSearchResult, Translator, TranslatorTemplate,
+    WorkspaceSymbolResult, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig};
 use crate::edit_apply::{
@@ -28,11 +29,12 @@ use crate::edit_backup::BackupPolicy;
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{
-    PreviewArtifact, PreviewLimits, VerificationStatus, preview_workspace_edit,
+    EditProducer, PreviewArtifact, PreviewLimits, VerificationStatus, preview_workspace_edit,
 };
 use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use crate::rust_refactor::{logical_module_name, move_inline_module_preview_with_source};
+use crate::workspace_edit::{EditOperation, normalize};
 use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
@@ -1228,6 +1230,60 @@ impl AppliedEditPlan {
     }
 }
 
+/// Explicit syntax accepted by the structural preview tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuralDialect {
+    /// rust-analyzer's `experimental/ssr` rule syntax.
+    RustAnalyzerSsr,
+    /// ast-grep's pattern and replacement-template syntax.
+    AstGrep,
+}
+
+impl StructuralDialect {
+    /// Return the stable MCP wire value.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RustAnalyzerSsr => "rust_analyzer_ssr",
+            Self::AstGrep => "ast_grep",
+        }
+    }
+
+    /// Return the implementation selected by this explicit dialect.
+    #[must_use]
+    pub(crate) const fn engine(self) -> &'static str {
+        match self {
+            Self::RustAnalyzerSsr => "rust_analyzer",
+            Self::AstGrep => "ast_grep",
+        }
+    }
+}
+
+/// Actor-owned inputs for one structural search or replacement preview.
+#[derive(Debug, Clone)]
+pub(crate) struct StructuralReplaceRequest {
+    pub(crate) file_path: String,
+    pub(crate) dialect: StructuralDialect,
+    pub(crate) query: String,
+    pub(crate) replacement: Option<String>,
+    pub(crate) language_id: Option<String>,
+    pub(crate) parse_only: bool,
+    pub(crate) encoding: PositionEncoding,
+}
+
+/// Write-free result of a structural search or replacement request.
+#[derive(Debug, Clone)]
+pub(crate) struct StructuralPreview {
+    /// Stored plan when a replacement matched and was previewed.
+    pub(crate) artifact: Option<PreviewArtifact>,
+    /// Explicit parser/replacement syntax selected by the caller.
+    pub(crate) dialect: StructuralDialect,
+    /// Matched source ranges before replacement.
+    pub(crate) matches: Vec<StructuralMatch>,
+    /// Whether only parser validation was requested.
+    pub(crate) parse_only: bool,
+}
+
 enum ProjectRequest {
     Query {
         reply: oneshot::Sender<ProjectState>,
@@ -1434,6 +1490,12 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<PreviewArtifact, String>>,
     },
+    StructuralReplacePreview {
+        project_id: String,
+        request: StructuralReplaceRequest,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<StructuralPreview, String>>,
+    },
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
@@ -1543,6 +1605,7 @@ impl ProjectRequest {
             Self::CodeActionPreview { reply, .. }
             | Self::PreviewEdit { reply, .. }
             | Self::MoveInlineModulePreview { reply, .. } => reply.is_closed(),
+            Self::StructuralReplacePreview { reply, .. } => reply.is_closed(),
             Self::PrepareCallHierarchy { reply, .. } => reply.is_closed(),
             Self::IncomingCalls { reply, .. } => reply.is_closed(),
             Self::OutgoingCalls { reply, .. } => reply.is_closed(),
@@ -2468,6 +2531,29 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Search or preview one explicitly selected structural replacement dialect.
+    pub(crate) async fn structural_replace_preview(
+        &self,
+        project_id: String,
+        request: StructuralReplaceRequest,
+        root: PathBuf,
+    ) -> Result<StructuralPreview, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::StructuralReplacePreview {
+                project_id,
+                request,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Consume one project-owned workspace edit preview.
     ///
     /// # Errors
@@ -2740,6 +2826,44 @@ const fn position_in_mcp_range(line: u32, character: u32, range: &crate::bridge:
     after_start && before_end
 }
 
+fn structural_matches_from_workspace_edit(
+    edit: &WorkspaceEdit,
+) -> Result<Vec<StructuralMatch>, String> {
+    let normalized = normalize(edit.clone()).expect("workspace edit normalization is infallible");
+    let mut matches = Vec::new();
+    for operation in normalized.operations {
+        let EditOperation::Text { uri, edits, .. } = operation else {
+            return Err("rust-analyzer SSR returned an unsupported resource operation".to_string());
+        };
+        let path = uri_to_path(&uri)
+            .ok_or_else(|| "rust-analyzer SSR returned a non-file URI".to_string())?;
+        if matches.len().saturating_add(edits.len()) > PreviewLimits::default().max_edits {
+            return Err("rust-analyzer SSR exceeded the structural match limit".to_string());
+        }
+        matches.extend(edits.into_iter().map(|edit| StructuralMatch {
+            path: path.clone(),
+            range: edit.range,
+        }));
+    }
+    matches.sort_by(|left, right| {
+        left.path.cmp(&right.path).then_with(|| {
+            (
+                left.range.start.line,
+                left.range.start.character,
+                left.range.end.line,
+                left.range.end.character,
+            )
+                .cmp(&(
+                    right.range.start.line,
+                    right.range.start.character,
+                    right.range.end.line,
+                    right.range.end.character,
+                ))
+        })
+    });
+    Ok(matches)
+}
+
 #[derive(Debug, Default)]
 struct AutomaticRestartPolicy {
     attempts: usize,
@@ -2903,6 +3027,89 @@ impl ProjectRuntime {
         Ok(artifact)
     }
 
+    async fn structural_replace_preview(
+        &mut self,
+        project_id: &str,
+        request: StructuralReplaceRequest,
+        root: &Path,
+    ) -> Result<StructuralPreview, String> {
+        let StructuralReplaceRequest {
+            file_path,
+            dialect,
+            query,
+            replacement,
+            language_id,
+            parse_only,
+            encoding,
+        } = request;
+        self.translator
+            .validate_path(Path::new(&file_path))
+            .map_err(|error| error.to_string())?;
+        let (edit, matches, verification, producer) = match dialect {
+            StructuralDialect::RustAnalyzerSsr => {
+                if replacement.is_some() || language_id.is_some() {
+                    return Err(
+                        "rust_analyzer_ssr accepts the complete rust-analyzer rule in query; replacement and language_id must be omitted"
+                            .to_string(),
+                    );
+                }
+                let edit = self
+                    .translator
+                    .request_rust_analyzer_ssr(file_path.clone(), query, parse_only)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let matches = if parse_only {
+                    Vec::new()
+                } else {
+                    structural_matches_from_workspace_edit(&edit)?
+                };
+                (
+                    (!parse_only && !matches.is_empty()).then_some(edit),
+                    matches,
+                    VerificationStatus::SemanticVerified,
+                    EditProducer::RustAnalyzer,
+                )
+            }
+            StructuralDialect::AstGrep => {
+                let language = language_id.ok_or_else(|| {
+                    "ast_grep requires an explicit language_id; syntax is never inferred or translated"
+                        .to_string()
+                })?;
+                let StructuralSearchResult { edit, matches } = self
+                    .translator
+                    .structural_ast_grep_search(
+                        root.to_path_buf(),
+                        language,
+                        query,
+                        replacement,
+                        encoding,
+                        parse_only,
+                    )
+                    .await?;
+                (
+                    edit.filter(|_| !matches.is_empty()),
+                    matches,
+                    VerificationStatus::StructuralUnverified,
+                    EditProducer::StructuralAstGrep,
+                )
+            }
+        };
+        let artifact = edit
+            .map(|edit| {
+                let mut artifact = self.preview_edit(project_id, edit, encoding, root)?;
+                artifact.verification = Some(verification);
+                artifact.producer = Some(producer);
+                Ok::<_, String>(artifact)
+            })
+            .transpose()?;
+        Ok(StructuralPreview {
+            artifact,
+            dialect,
+            matches,
+            parse_only,
+        })
+    }
+
     async fn verify_inline_module_before_preview(
         &mut self,
         source_path: &Path,
@@ -2974,7 +3181,7 @@ impl ProjectRuntime {
         let (verification, verified_position) = self
             .verify_inline_module_before_preview(&source_path, module_name, module_position)
             .await?;
-        let edit = move_inline_module_preview_with_source(
+        let structural_edit = move_inline_module_preview_with_source(
             &source_path,
             module_name,
             encoding,
@@ -2982,8 +3189,24 @@ impl ProjectRuntime {
             module_position,
         )
         .map_err(|error| error.to_string())?;
+        let native_edit = if verification == VerificationStatus::SemanticVerified {
+            match verified_position {
+                Some(position) => {
+                    self.native_inline_module_move_edit(&source_path, position)
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (edit, producer) = native_edit
+            .map_or((structural_edit, EditProducer::StructuralAstGrep), |edit| {
+                (edit, EditProducer::RustAnalyzer)
+            });
         let mut artifact = self.preview_edit(project_id, edit, encoding, root)?;
         artifact.verification = Some(verification);
+        artifact.producer = Some(producer);
         if let Some(destination_path) = artifact
             .plan
             .files()
@@ -3012,6 +3235,42 @@ impl ProjectRuntime {
             );
         }
         Ok(artifact)
+    }
+
+    async fn native_inline_module_move_edit(
+        &mut self,
+        source_path: &Path,
+        position: lsp_types::Position,
+    ) -> Option<WorkspaceEdit> {
+        let line = position.line.saturating_add(1);
+        let character = position.character.saturating_add(1);
+        let actions = self
+            .translator
+            .request_code_actions(
+                source_path.display().to_string(),
+                line,
+                character,
+                line,
+                character,
+                Some("refactor.extract".to_string()),
+            )
+            .await
+            .ok()?;
+        let mut action = take_code_action_by_assist_id(actions, "move_module_to_file")?;
+        if action.disabled.is_some() || action.command.is_some() {
+            return None;
+        }
+        if action.edit.is_none() {
+            action = self
+                .translator
+                .resolve_code_action(&source_path.display().to_string(), action)
+                .await
+                .ok()?;
+        }
+        if action.disabled.is_some() || action.command.is_some() {
+            return None;
+        }
+        action.edit
     }
 
     fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
@@ -3636,6 +3895,30 @@ impl ProjectRuntime {
             .map(PathBuf::from)
             .collect()
     }
+}
+
+fn code_action_has_assist_id(action: &lsp_types::CodeAction, expected: &str) -> bool {
+    action
+        .data
+        .as_ref()
+        .and_then(|data| data.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| id.strip_prefix(expected))
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(':'))
+}
+
+fn take_code_action_by_assist_id(
+    actions: Vec<lsp_types::CodeActionOrCommand>,
+    expected: &str,
+) -> Option<lsp_types::CodeAction> {
+    actions.into_iter().find_map(|action| match action {
+        lsp_types::CodeActionOrCommand::CodeAction(action)
+            if code_action_has_assist_id(&action, expected) =>
+        {
+            Some(action)
+        }
+        _ => None,
+    })
 }
 
 fn diagnostics_are_error_free(result: &DiagnosticsResult) -> bool {
@@ -4333,6 +4616,21 @@ async fn handle_project_request(
                     )
                     .await,
             );
+        }
+        ProjectRequest::StructuralReplacePreview {
+            project_id,
+            request,
+            root,
+            mut reply,
+        } => {
+            let operation = runtime.structural_replace_preview(&project_id, request, &root);
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => {
+                    let _ = reply.send(result);
+                }
+                () = reply.closed() => {}
+            }
         }
         ProjectRequest::TakeEditPlan {
             plan_id,
@@ -5923,6 +6221,33 @@ impl ProjectRegistry {
                 encoding,
                 identity.root().as_path().to_path_buf(),
             )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Search or preview an explicitly selected structural replacement dialect.
+    pub(crate) async fn structural_replace_preview(
+        &self,
+        id: &ProjectId,
+        request: StructuralReplaceRequest,
+    ) -> Result<StructuralPreview, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let path = canonicalize(Path::new(&request.file_path))?;
+        let roots = identity
+            .roots()
+            .iter()
+            .map(CanonicalRoot::as_path)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        let root = longest_matching_root(&path, &roots)
+            .ok_or_else(|| ProjectIdentityError::ProjectPathMismatch {
+                id: id.clone(),
+                path: path.clone(),
+            })?
+            .to_path_buf();
+        let _mutation = mutation.lock().await;
+        actor
+            .structural_replace_preview(id.as_str().to_string(), request, root)
             .await
             .map_err(ProjectRegistryError::from)
     }
@@ -7725,6 +8050,7 @@ while True:
             artifact.verification,
             Some(VerificationStatus::StructuralUnverified)
         );
+        assert_eq!(artifact.producer, Some(EditProducer::StructuralAstGrep));
         let destination = root.path().join("feature.rs");
         assert!(
             artifact
@@ -7760,6 +8086,45 @@ while True:
             "// dirty\n#[path = \"feature.rs\"] pub mod feature;\n"
         );
         assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
+    }
+
+    #[test]
+    fn identifies_rust_analyzer_assists_by_stable_data_id() {
+        let matching = lsp_types::CodeAction {
+            title: "localized or changed title".to_string(),
+            data: Some(serde_json::json!({
+                "id": "move_module_to_file:RefactorExtract:2:"
+            })),
+            ..lsp_types::CodeAction::default()
+        };
+        let similarly_named = lsp_types::CodeAction {
+            title: "Extract module to file".to_string(),
+            data: Some(serde_json::json!({
+                "id": "move_module_to_file_elsewhere:RefactorExtract:2:"
+            })),
+            ..lsp_types::CodeAction::default()
+        };
+
+        assert!(code_action_has_assist_id(&matching, "move_module_to_file"));
+        assert!(!code_action_has_assist_id(
+            &similarly_named,
+            "move_module_to_file"
+        ));
+        assert!(
+            take_code_action_by_assist_id(
+                vec![lsp_types::CodeActionOrCommand::CodeAction(similarly_named)],
+                "move_module_to_file",
+            )
+            .is_none()
+        );
+        assert_eq!(
+            take_code_action_by_assist_id(
+                vec![lsp_types::CodeActionOrCommand::CodeAction(matching)],
+                "move_module_to_file",
+            )
+            .map(|action| action.title),
+            Some("localized or changed title".to_string())
+        );
     }
 
     #[tokio::test]

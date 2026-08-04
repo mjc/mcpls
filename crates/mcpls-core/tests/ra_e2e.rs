@@ -1406,7 +1406,148 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
-/// Tool 25: `move_inline_module_preview` + `workspace_edit_apply` — move a
+/// rust-analyzer SSR syntax validation and write-free replacement preview.
+fn sc_structural_replace_preview(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    let rule = "add($a, $b) ==>> add($b, $a)";
+    let parsed = call_json(
+        client,
+        "structural_replace_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": lib_rs,
+            "dialect": "rust_analyzer_ssr",
+            "query": rule,
+            "parse_only": true,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if parsed["engine"] != "rust_analyzer"
+        || parsed["parse_only"] != true
+        || parsed.get("plan_id").is_some()
+    {
+        return Err(format!("unexpected SSR parse-only response: {parsed}"));
+    }
+
+    let preview = call_json(
+        client,
+        "structural_replace_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": lib_rs,
+            "dialect": "rust_analyzer_ssr",
+            "query": rule,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if preview["producer"] != "rust_analyzer"
+        || preview["verification"] != "semantic_verified"
+        || preview["match_count"]
+            .as_u64()
+            .is_none_or(|count| count < 2)
+        || preview["plan_id"].as_str().is_none()
+        || !preview["unified_diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("add(2, 1)"))
+    {
+        return Err(format!("unexpected SSR replacement preview: {preview}"));
+    }
+    Ok(())
+}
+
+/// Tool 25: native rust-analyzer module rename through workspace-edit preview.
+fn sc_native_module_rename_preview(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    let module_line = find_line(&lib_rs, "pub mod functions;");
+    let preview = call_json(
+        client,
+        "rename_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": lib_rs,
+            "line": module_line,
+            "character": 9,
+            "new_name": "functions_renamed_probe",
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    let source = workspace.join("src/functions.rs");
+    let destination = workspace.join("src/functions_renamed_probe.rs");
+    if !preview["operations"].as_array().is_some_and(|operations| {
+        operations.iter().any(|operation| {
+            operation.as_str().is_some_and(|value| {
+                value.contains(source.to_string_lossy().as_ref())
+                    && value.contains(destination.to_string_lossy().as_ref())
+            })
+        })
+    }) {
+        return Err(format!(
+            "native module rename preview omitted its RenameFile operation: {preview}"
+        ));
+    }
+    Ok(())
+}
+
+/// Tool 26: native rust-analyzer module extraction through code-action preview.
+fn sc_native_module_move_code_action_preview(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    let module_line = find_line(&lib_rs, "pub mod move_target {");
+    let listed = call_json(
+        client,
+        "code_action_list",
+        &json!({
+            "project_id": "default",
+            "file_path": lib_rs,
+            "start_line": module_line,
+            "start_character": 9,
+            "end_line": module_line,
+            "end_character": 9,
+            "kind_filter": "refactor.extract",
+        }),
+    )?;
+    let action = listed["actions"]
+        .as_array()
+        .and_then(|actions| {
+            actions
+                .iter()
+                .find(|action| action["title"] == "Extract module to file")
+        })
+        .ok_or_else(|| format!("rust-analyzer omitted native module move action: {listed}"))?;
+    let action_id = action["action_id"]
+        .as_str()
+        .ok_or_else(|| format!("native module move omitted action_id: {action}"))?;
+    let preview = call_json(
+        client,
+        "code_action_preview",
+        &json!({
+            "project_id": "default",
+            "action_id": action_id,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    let destination = workspace.join("src/move_target.rs");
+    if !preview["affected_files"].as_array().is_some_and(|files| {
+        files
+            .iter()
+            .any(|file| file.as_str() == Some(destination.to_string_lossy().as_ref()))
+    }) || !preview["operations"].as_array().is_some_and(|operations| {
+        operations.iter().any(|operation| {
+            operation
+                .as_str()
+                .is_some_and(|value| value.starts_with("create "))
+        })
+    }) {
+        return Err(format!(
+            "native module move preview omitted its CreateFile operation: {preview}"
+        ));
+    }
+    Ok(())
+}
+
+/// Tool 27: `move_inline_module_preview` + `workspace_edit_apply` — move a
 /// real top-level module through the actor-owned semantic edit path.
 fn sc_move_inline_module_semantic_edit(
     client: &mut McpClient,
@@ -1430,6 +1571,12 @@ fn sc_move_inline_module_semantic_edit(
         return Err(format!(
             "real rust-analyzer did not semantically verify the move: {}",
             preview["verification"]
+        ));
+    }
+    if preview["producer"] != "rust_analyzer" {
+        return Err(format!(
+            "semantic move did not select rust-analyzer's native edit: {}",
+            preview["producer"]
         ));
     }
     let plan_id = preview["plan_id"]
@@ -1508,6 +1655,12 @@ fn sc_move_inline_module_raw_and_unicode(
             return Err(format!(
                 "rust-analyzer did not verify {module_name}: {}",
                 preview["verification"]
+            ));
+        }
+        if preview["producer"] != "rust_analyzer" {
+            return Err(format!(
+                "rust-analyzer did not produce the {module_name} move: {}",
+                preview["producer"]
             ));
         }
         let plan_id = preview["plan_id"]
@@ -1598,6 +1751,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_cached_diagnostics),
         sub_case!(sc_get_server_logs),
         sub_case!(sc_get_server_messages),
+        sub_case!(sc_structural_replace_preview),
         sub_case!(sc_get_signature_help),
         sub_case!(sc_go_to_implementation),
         sub_case!(sc_go_to_type_definition),

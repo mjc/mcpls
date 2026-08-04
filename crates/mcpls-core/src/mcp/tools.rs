@@ -167,6 +167,32 @@ pub struct MoveInlineModulePreviewParams {
     pub position_encoding: Option<String>,
 }
 
+/// Parameters for structural search and replacement preview.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for explicit-dialect structural search and replacement.")]
+pub struct StructuralReplacePreviewParams {
+    /// Registered project that owns the context file and resulting plan.
+    pub project_id: String,
+    /// Absolute context file used for project containment and rust-analyzer selection.
+    pub file_path: String,
+    /// Exact syntax dialect: `rust_analyzer_ssr` or `ast_grep`.
+    pub dialect: String,
+    /// Exact query in the selected dialect; MCPLS never translates it.
+    pub query: String,
+    /// ast-grep replacement template. Omit for search-only requests.
+    #[serde(default)]
+    pub replacement: Option<String>,
+    /// Explicit ast-grep language ID. Required only for the `ast_grep` dialect.
+    #[serde(default)]
+    pub language_id: Option<String>,
+    /// Validate dialect syntax without searching or constructing a plan.
+    #[serde(default)]
+    pub parse_only: bool,
+    /// Position encoding for ast-grep ranges and workspace-edit planning.
+    #[serde(default)]
+    pub position_encoding: Option<String>,
+}
+
 const fn default_tab_size() -> u32 {
     4
 }

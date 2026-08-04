@@ -1,23 +1,31 @@
 //! In-process AST-grep fallback for workspace symbol lookup.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ast_grep_core::Node;
+use ast_grep_core::replacer::TemplateFix;
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc};
+use ast_grep_core::{Node, Pattern};
 use ast_grep_language::{Language, SupportLang};
 use ignore::WalkBuilder;
 
 use super::encoding::{EncodingConverter, PositionEncoding};
+use super::state::path_to_uri;
 
 const MAX_SCANNED_FILES: usize = 4_096;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SCAN_DURATION: Duration = Duration::from_secs(10);
+const MAX_MATCHES: usize = 4_096;
+const MAX_AFFECTED_FILES: usize = 64;
+const MAX_PLANNED_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PLANNED_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_QUERY_BYTES: usize = 64 * 1024;
+const MAX_REPLACEMENT_BYTES: usize = 64 * 1024;
 const GENERATED_DIRECTORIES: &[&str] = &[
     ".direnv",
     "build",
@@ -36,6 +44,256 @@ pub struct Symbol {
     pub(crate) start_character: u32,
     pub(crate) end_line: u32,
     pub(crate) end_character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralMatch {
+    pub path: PathBuf,
+    pub range: lsp_types::Range,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuralSearchResult {
+    pub edit: Option<lsp_types::WorkspaceEdit>,
+    pub matches: Vec<StructuralMatch>,
+}
+
+/// Search or replace an explicit ast-grep pattern without touching the filesystem.
+pub async fn structural_search(
+    root: PathBuf,
+    language: String,
+    query: String,
+    replacement: Option<String>,
+    encoding: PositionEncoding,
+    source_overrides: HashMap<PathBuf, String>,
+    parse_only: bool,
+) -> Result<StructuralSearchResult, String> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let cancellation_guard = CancellationGuard(cancelled);
+    let result = tokio::task::spawn_blocking(move || {
+        structural_search_sync(
+            &root,
+            &language,
+            &query,
+            replacement.as_deref(),
+            encoding,
+            &source_overrides,
+            parse_only,
+            &worker_cancelled,
+        )
+    })
+    .await
+    .map_err(|error| format!("ast-grep worker failed: {error}"))?;
+    drop(cancellation_guard);
+    result
+}
+
+#[allow(
+    clippy::mutable_key_type,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn structural_search_sync(
+    root: &std::path::Path,
+    language: &str,
+    query: &str,
+    replacement: Option<&str>,
+    encoding: PositionEncoding,
+    source_overrides: &HashMap<PathBuf, String>,
+    parse_only: bool,
+    cancelled: &AtomicBool,
+) -> Result<StructuralSearchResult, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("ast-grep search cancelled".to_string());
+    }
+    if query.len() > MAX_QUERY_BYTES {
+        return Err("ast-grep query exceeded byte limit".to_string());
+    }
+    if replacement.is_some_and(|replacement| replacement.len() > MAX_REPLACEMENT_BYTES) {
+        return Err("ast-grep replacement exceeded template byte limit".to_string());
+    }
+    let language = ast_grep_language(language)
+        .ok_or_else(|| format!("unsupported ast-grep language: {language}"))?;
+    let pattern = Pattern::try_new(query, language)
+        .map_err(|error| format!("invalid ast-grep pattern: {error}"))?;
+    if pattern.has_error() {
+        return Err("invalid ast-grep pattern: pattern contains a parse error".to_string());
+    }
+    let replacer = replacement
+        .map(|replacement| TemplateFix::try_new(replacement, &language))
+        .transpose()
+        .map_err(|error| format!("invalid ast-grep replacement: {error}"))?;
+    if let Some(replacer) = &replacer {
+        let defined = pattern.defined_vars();
+        let mut undefined = replacer
+            .used_vars()
+            .into_iter()
+            .filter(|name| !defined.contains(name))
+            .collect::<Vec<_>>();
+        undefined.sort_unstable();
+        if !undefined.is_empty() {
+            return Err(format!(
+                "ast-grep replacement uses undefined metavariables: {}",
+                undefined.join(", ")
+            ));
+        }
+    }
+    if parse_only {
+        return Ok(StructuralSearchResult {
+            edit: None,
+            matches: Vec::new(),
+        });
+    }
+
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!("failed to canonicalize ast-grep root: {error}"))?;
+    let started = Instant::now();
+    let mut paths = BTreeSet::new();
+    for entry in WalkBuilder::new(&root)
+        .standard_filters(true)
+        .filter_entry(|entry| !is_generated_path(entry.path()))
+        .build()
+        .flatten()
+    {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("ast-grep search cancelled".to_string());
+        }
+        if started.elapsed() >= MAX_SCAN_DURATION {
+            return Err("ast-grep search exceeded duration limit".to_string());
+        }
+        if paths.len() >= MAX_SCANNED_FILES {
+            return Err("ast-grep search exceeded file limit".to_string());
+        }
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let Ok(path) = fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if SupportLang::from_path(&path) == Some(language) {
+            paths.insert(path);
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut changes = HashMap::new();
+    let mut affected_files = 0usize;
+    let mut total_bytes = 0u64;
+    let mut planned_total_bytes = 0usize;
+    for path in paths {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("ast-grep search cancelled".to_string());
+        }
+        if started.elapsed() >= MAX_SCAN_DURATION {
+            return Err("ast-grep search exceeded duration limit".to_string());
+        }
+        let source = source_overrides.get(&path).cloned().map_or_else(
+            || fs::read_to_string(&path).map_err(|error| error.to_string()),
+            Ok,
+        )?;
+        let source_bytes = u64::try_from(source.len())
+            .map_err(|_| "ast-grep source size does not fit u64".to_string())?;
+        if source_bytes > MAX_FILE_BYTES {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(source_bytes);
+        if total_bytes > MAX_TOTAL_BYTES {
+            return Err("ast-grep search exceeded byte limit".to_string());
+        }
+
+        let tree = language.ast_grep(&source);
+        let ranges = tree
+            .root()
+            .find_all(&pattern)
+            .map(|matched| matched.range())
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            continue;
+        }
+        if matches.len().saturating_add(ranges.len()) > MAX_MATCHES {
+            return Err("ast-grep search exceeded match limit".to_string());
+        }
+        affected_files += 1;
+        if affected_files > MAX_AFFECTED_FILES {
+            return Err("ast-grep search exceeded affected-file limit".to_string());
+        }
+
+        let mut previous_end = 0usize;
+        for range in &ranges {
+            if range.start < previous_end || range.end > source.len() {
+                return Err("ast-grep produced overlapping or invalid matches".to_string());
+            }
+            let Some(start) = byte_offset_to_position(&source, range.start, encoding) else {
+                return Err("ast-grep match start is not a valid text position".to_string());
+            };
+            let Some(end_position) = byte_offset_to_position(&source, range.end, encoding) else {
+                return Err("ast-grep match end is not a valid text position".to_string());
+            };
+            matches.push(StructuralMatch {
+                path: path.clone(),
+                range: lsp_types::Range {
+                    start,
+                    end: end_position,
+                },
+            });
+            previous_end = range.end;
+        }
+
+        let Some(replacer) = &replacer else {
+            continue;
+        };
+        if replacement.is_some_and(|replacement| {
+            replacement.len().saturating_mul(ranges.len()) > MAX_PLANNED_FILE_BYTES
+        }) {
+            return Err("ast-grep replacement exceeded expansion byte limit".to_string());
+        }
+        let replacement_edits = tree.root().replace_all(&pattern, replacer);
+        if replacement_edits.len() != ranges.len() {
+            return Err("ast-grep replacement produced ambiguous matches".to_string());
+        }
+        let mut planned = source.clone();
+        for edit in replacement_edits.into_iter().rev() {
+            let end = edit.position + edit.deleted_length;
+            if !planned.is_char_boundary(edit.position) || !planned.is_char_boundary(end) {
+                return Err("ast-grep replacement is not on a UTF-8 boundary".to_string());
+            }
+            let inserted = String::from_utf8(edit.inserted_text)
+                .map_err(|_| "ast-grep replacement is not valid UTF-8".to_string())?;
+            planned.replace_range(edit.position..end, &inserted);
+        }
+        if planned.len() > MAX_PLANNED_FILE_BYTES {
+            return Err("ast-grep replacement exceeded per-file byte limit".to_string());
+        }
+        planned_total_bytes = planned_total_bytes.saturating_add(source.len() + planned.len());
+        if planned_total_bytes > MAX_PLANNED_TOTAL_BYTES {
+            return Err("ast-grep replacement exceeded total byte limit".to_string());
+        }
+        let end = byte_offset_to_position(&source, source.len(), encoding)
+            .ok_or_else(|| "ast-grep source end is not a valid text position".to_string())?;
+        changes.insert(
+            path_to_uri(&path),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end,
+                },
+                new_text: planned,
+            }],
+        );
+    }
+
+    Ok(StructuralSearchResult {
+        edit: replacer.map(|_| lsp_types::WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        matches,
+    })
 }
 
 /// Search configured workspace roots with ast-grep's Rust library.
@@ -222,6 +480,15 @@ fn search_sync(
 /// default keeps Unicode coordinates deterministic rather than relying on the
 /// parser's point-column convention.
 fn byte_offset_to_fallback_position(source: &str, offset: usize) -> Option<(u32, u32)> {
+    let position = byte_offset_to_position(source, offset, PositionEncoding::Utf8)?;
+    Some((position.line, position.character))
+}
+
+fn byte_offset_to_position(
+    source: &str,
+    offset: usize,
+    encoding: PositionEncoding,
+) -> Option<lsp_types::Position> {
     if offset > source.len() || !source.is_char_boundary(offset) {
         return None;
     }
@@ -230,10 +497,13 @@ fn byte_offset_to_fallback_position(source: &str, offset: usize) -> Option<(u32,
         .filter(|byte| *byte == b'\n')
         .count();
     let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
-    let character = EncodingConverter::new(PositionEncoding::Utf8)
+    let character = EncodingConverter::new(encoding)
         .byte_offset_to_character(&source[line_start..offset], offset - line_start)
         .ok()?;
-    Some((u32::try_from(line).ok()?, character))
+    Some(lsp_types::Position::new(
+        u32::try_from(line).ok()?,
+        character,
+    ))
 }
 
 fn is_generated_path(path: &std::path::Path) -> bool {
@@ -327,8 +597,10 @@ fn ast_grep_language(language: &str) -> Option<SupportLang> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::mutable_key_type)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn maps_supported_language_ids() {
@@ -484,6 +756,226 @@ mod tests {
         );
 
         assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn structural_search_reports_matches_without_building_an_edit() {
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("failed to create temporary directory");
+        };
+        assert!(
+            fs::write(
+                temp.path().join("search.rs"),
+                "fn main() { foo(\"😀\"); foo(2); }\n"
+            )
+            .is_ok()
+        );
+
+        let result = structural_search_sync(
+            temp.path(),
+            "rust",
+            "foo($A)",
+            None,
+            PositionEncoding::Utf16,
+            &HashMap::new(),
+            false,
+            &AtomicBool::new(false),
+        )
+        .expect("structural search should succeed");
+
+        assert!(result.edit.is_none());
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].range.start.line, 0);
+        assert_eq!(result.matches[0].range.start.character, 12);
+    }
+
+    #[test]
+    fn structural_replacement_uses_dirty_source_and_builds_full_file_edit() {
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("failed to create temporary directory");
+        };
+        let path = temp.path().join("dirty.rs");
+        assert!(fs::write(&path, "fn main() { foo(1); }\n").is_ok());
+        let path = fs::canonicalize(path).expect("test path should canonicalize");
+        let overrides = HashMap::from([(path.clone(), "fn main() { foo(2); }\n".to_string())]);
+
+        let result = structural_search_sync(
+            temp.path(),
+            "rust",
+            "foo($A)",
+            Some("bar($A)"),
+            PositionEncoding::Utf8,
+            &overrides,
+            false,
+            &AtomicBool::new(false),
+        )
+        .expect("structural replacement should succeed");
+
+        assert_eq!(result.matches.len(), 1);
+        let changes = result
+            .edit
+            .and_then(|edit| edit.changes)
+            .expect("replacement should produce changes");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[&path_to_uri(&path)][0].new_text,
+            "fn main() { bar(2); }\n"
+        );
+    }
+
+    #[test]
+    fn structural_parse_only_validates_replacement_variables() {
+        let result = structural_search_sync(
+            Path::new("."),
+            "rust",
+            "foo($A)",
+            Some("bar($B)"),
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            true,
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            result
+                .expect_err("undefined replacement variable should fail")
+                .contains("undefined metavariables: B")
+        );
+    }
+
+    #[test]
+    fn structural_parse_only_rejects_pattern_parse_errors() {
+        let result = structural_search_sync(
+            Path::new("."),
+            "rust",
+            "fn {",
+            None,
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            true,
+            &AtomicBool::new(false),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancelled_structural_search_stops_before_traversal() {
+        let result = structural_search_sync(
+            Path::new("."),
+            "rust",
+            "foo($A)",
+            None,
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            false,
+            &AtomicBool::new(true),
+        );
+
+        assert_eq!(
+            result.expect_err("cancelled search should fail"),
+            "ast-grep search cancelled"
+        );
+    }
+
+    #[test]
+    fn structural_search_fails_closed_on_overlapping_matches() {
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("failed to create temporary directory");
+        };
+        assert!(fs::write(temp.path().join("overlap.rs"), "fn main() { foo(1); }\n").is_ok());
+
+        let result = structural_search_sync(
+            temp.path(),
+            "rust",
+            "$A",
+            None,
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            result
+                .expect_err("overlapping matches should fail")
+                .contains("overlapping")
+        );
+    }
+
+    #[test]
+    fn structural_search_skips_generated_directories() {
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("failed to create temporary directory");
+        };
+        let target = temp.path().join("target");
+        assert!(fs::create_dir(&target).is_ok());
+        assert!(fs::write(target.join("generated.rs"), "fn main() { foo(1); }\n").is_ok());
+
+        let result = structural_search_sync(
+            temp.path(),
+            "rust",
+            "foo($A)",
+            None,
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            false,
+            &AtomicBool::new(false),
+        )
+        .expect("structural search should succeed");
+
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn structural_replacement_supports_non_rust_languages() {
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("failed to create temporary directory");
+        };
+        let path = temp.path().join("source.ts");
+        assert!(fs::write(&path, "const value = foo(1);\n").is_ok());
+        let path = fs::canonicalize(path).expect("test path should canonicalize");
+
+        let result = structural_search_sync(
+            temp.path(),
+            "typescript",
+            "foo($A)",
+            Some("bar($A)"),
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            false,
+            &AtomicBool::new(false),
+        )
+        .expect("TypeScript replacement should succeed");
+
+        assert_eq!(result.matches.len(), 1);
+        let planned = result
+            .edit
+            .and_then(|edit| edit.changes)
+            .and_then(|changes| changes.get(&path_to_uri(&path)).cloned())
+            .and_then(|edits| edits.into_iter().next())
+            .map(|edit| edit.new_text);
+        assert_eq!(planned.as_deref(), Some("const value = bar(1);\n"));
+    }
+
+    #[test]
+    fn structural_parse_only_enforces_query_byte_limit() {
+        let query = "x".repeat(MAX_QUERY_BYTES + 1);
+        let result = structural_search_sync(
+            Path::new("."),
+            "rust",
+            &query,
+            None,
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            true,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(
+            result.expect_err("oversized query should fail"),
+            "ast-grep query exceeded byte limit"
+        );
     }
 
     #[test]
