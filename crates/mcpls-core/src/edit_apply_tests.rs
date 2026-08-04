@@ -182,11 +182,8 @@ fn applies_text_to_a_created_file_as_one_plan() {
     let file = root.path().join("created.rs");
     let plan = EditPlan::new(
         "project".to_string(),
-        vec![FileSnapshot::from_contents(
+        vec![FileSnapshot::from_created_contents(
             file.clone(),
-            SnapshotSource::Disk,
-            None,
-            "",
             "created content\n",
         )],
         vec![
@@ -206,6 +203,77 @@ fn applies_text_to_a_created_file_as_one_plan() {
 
     assert_eq!(report.committed_files, vec![file.clone()]);
     assert_eq!(fs::read_to_string(file).unwrap(), "created content\n");
+}
+
+#[test]
+fn rejects_stale_preimage_for_overwrite_create_with_text() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("existing.rs");
+    fs::write(&file, "before\n").unwrap();
+    let plan = EditPlan::new(
+        "project".to_string(),
+        vec![FileSnapshot::from_contents(
+            file.clone(),
+            SnapshotSource::Disk,
+            None,
+            "before\n",
+            "replacement\n",
+        )],
+        vec![
+            format!("create {}", file.display()),
+            format!("text {}", file.display()),
+        ],
+        true,
+        Duration::from_secs(60),
+    )
+    .with_file_operations(vec![FileOperation::Create {
+        path: file.clone(),
+        overwrite: true,
+    }]);
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    fs::write(&file, "changed after preview\n").unwrap();
+
+    assert!(matches!(
+        apply_plan(&boundary, &plan),
+        Err(ApplyError::Stale(_))
+    ));
+    assert_eq!(fs::read_to_string(file).unwrap(), "changed after preview\n");
+}
+
+#[test]
+fn rejects_a_new_destination_that_appears_after_preview() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("created.rs");
+    let plan = EditPlan::new(
+        "project".to_string(),
+        vec![FileSnapshot::from_created_contents(
+            file.clone(),
+            "created content\n",
+        )],
+        vec![
+            format!("create {}", file.display()),
+            format!("text {}", file.display()),
+        ],
+        true,
+        Duration::from_secs(60),
+    )
+    .with_file_operations(vec![FileOperation::Create {
+        path: file.clone(),
+        overwrite: false,
+    }]);
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    fs::write(&file, "appeared after preview\n").unwrap();
+
+    assert!(matches!(
+        apply_plan(&boundary, &plan),
+        Err(ApplyError::Operation(
+            OperationValidationError::DestinationExists(path)
+        )) if path == file
+    ));
+    assert_eq!(
+        fs::read_to_string(file).unwrap(),
+        "appeared after preview\n"
+    );
 }
 
 #[test]

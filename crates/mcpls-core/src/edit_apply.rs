@@ -414,9 +414,28 @@ fn validate_snapshot<'a>(
     documents: Option<&DocumentTracker>,
     operations: &[ValidatedFileOperation],
 ) -> Result<&'a FileSnapshot, ApplyError> {
-    if operations.iter().any(|operation| {
-        matches!(operation, ValidatedFileOperation::Create { path, .. } if path == snapshot.path())
-    }) {
+    if snapshot.was_created() {
+        let canonical = boundary
+            .validate_target(snapshot.path())
+            .map_err(|source| ApplyError::Path {
+                path: snapshot.path().clone(),
+                source,
+            })?;
+        if canonical != *snapshot.path() {
+            return Err(ApplyError::TopologyChanged {
+                expected: snapshot.path().clone(),
+                actual: canonical,
+            });
+        }
+        if snapshot.path().exists()
+            || operations.iter().any(|operation| {
+                matches!(operation, ValidatedFileOperation::Create { path, .. } if path == snapshot.path() && path.exists())
+            })
+        {
+            return Err(ApplyError::Operation(
+                OperationValidationError::DestinationExists(snapshot.path().clone()),
+            ));
+        }
         return Ok(snapshot);
     }
     let canonical = boundary

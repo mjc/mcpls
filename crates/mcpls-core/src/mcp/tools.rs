@@ -156,6 +156,12 @@ pub struct MoveInlineModulePreviewParams {
     pub file_path: String,
     /// Inline module name to move.
     pub module_name: String,
+    /// Optional zero-based LSP line containing the selected module declaration.
+    #[serde(default)]
+    pub module_line: Option<u32>,
+    /// Optional zero-based LSP character within the selected module declaration.
+    #[serde(default)]
+    pub module_character: Option<u32>,
     /// Optional negotiated LSP position encoding.
     #[serde(default)]
     pub position_encoding: Option<String>,

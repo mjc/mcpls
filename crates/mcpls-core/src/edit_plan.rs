@@ -114,6 +114,7 @@ pub struct FileSnapshot {
     path: PathBuf,
     source: SnapshotSource,
     version: Option<i32>,
+    created: bool,
     content_hash: String,
     original_content: String,
     planned_content: String,
@@ -157,10 +158,20 @@ impl FileSnapshot {
             path,
             source,
             version,
+            created: false,
             content_hash,
             original_content,
             planned_content,
         }
+    }
+
+    /// Capture the empty pre-image of a file that must be created by the plan.
+    #[must_use]
+    pub fn from_created_contents(path: PathBuf, planned_content: impl Into<String>) -> Self {
+        let mut snapshot =
+            Self::from_contents(path, SnapshotSource::Disk, None, "", planned_content);
+        snapshot.created = true;
+        snapshot
     }
 
     /// Return the canonical path captured by this snapshot.
@@ -179,6 +190,12 @@ impl FileSnapshot {
     #[must_use]
     pub const fn version(&self) -> Option<i32> {
         self.version
+    }
+
+    /// Return whether the path was absent when this snapshot was captured.
+    #[must_use]
+    pub const fn was_created(&self) -> bool {
+        self.created
     }
 
     /// Return the SHA-256 hash of the exact pre-edit content.

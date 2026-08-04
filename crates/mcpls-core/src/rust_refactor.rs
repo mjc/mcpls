@@ -47,6 +47,18 @@ pub fn move_inline_module_preview(
     module_name: &str,
     encoding: PositionEncoding,
 ) -> Result<WorkspaceEdit, RustRefactorError> {
+    move_inline_module_preview_with_source(source_path, module_name, encoding, None, None)
+}
+
+/// Build an inline-module move from actor-owned source text when a document is open.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn move_inline_module_preview_with_source(
+    source_path: &Path,
+    module_name: &str,
+    encoding: PositionEncoding,
+    source_override: Option<&str>,
+    module_position: Option<Position>,
+) -> Result<WorkspaceEdit, RustRefactorError> {
     if source_path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
         return Err(RustRefactorError::Invalid(
             "inline module moves require a Rust source file".to_string(),
@@ -62,34 +74,51 @@ pub fn move_inline_module_preview(
             .is_some_and(|character| character.is_ascii_digit())
     {
         return Err(RustRefactorError::Invalid(format!(
-            "invalid Rust module name: {module_name}"
+            "unsupported Rust module name: {module_name}; this refactor currently accepts only ASCII Rust identifiers"
         )));
     }
 
-    let source = fs::read_to_string(source_path).map_err(|source| RustRefactorError::Read {
-        path: source_path.to_path_buf(),
-        source,
-    })?;
-    let tree = SupportLang::Rust.ast_grep(&source);
-    let module = tree
+    let disk_source;
+    let source = if let Some(source) = source_override {
+        source
+    } else {
+        disk_source =
+            fs::read_to_string(source_path).map_err(|source| RustRefactorError::Read {
+                path: source_path.to_path_buf(),
+                source,
+            })?;
+        &disk_source
+    };
+    let tree = SupportLang::Rust.ast_grep(source);
+    let position_offset = module_position
+        .map(|position| position_to_byte_offset(source, position, encoding))
+        .transpose()?;
+    let matching_modules = tree
         .root()
         .dfs()
-        .find(|node| {
+        .filter(|node| {
             node.kind() == "mod_item"
-                && node
-                    .field("name")
-                    .is_some_and(|name| name.text() == module_name)
+                && node.field("name").is_some_and(|name| {
+                    name.text() == module_name
+                        && position_offset.is_none_or(|offset| {
+                            let range = node.range();
+                            range.start <= offset && offset < range.end
+                        })
+                })
         })
-        .ok_or_else(|| {
-            RustRefactorError::Invalid(format!("inline Rust module not found: {module_name}"))
-        })?;
+        .collect::<Vec<_>>();
+    if matching_modules.len() > 1 {
+        return Err(RustRefactorError::Invalid(format!(
+            "module name is ambiguous in Rust source: {module_name}"
+        )));
+    }
+    let module = matching_modules.into_iter().next().ok_or_else(|| {
+        RustRefactorError::Invalid(format!("inline Rust module not found: {module_name}"))
+    })?;
 
-    if module
-        .parent()
-        .is_some_and(|parent| parent.kind() == "mod_item")
-    {
+    if has_mod_ancestor(&module) {
         return Err(RustRefactorError::Invalid(
-            "nested inline module moves are not supported yet".to_string(),
+            "nested inline module moves are not supported; select a top-level module".to_string(),
         ));
     }
     let Some(body) = module.field("body") else {
@@ -121,9 +150,18 @@ pub fn move_inline_module_preview(
         format!("{replacement_prefix}{module_name};")
     };
     let content = source[body_range.start + 1..body_range.end - 1].to_string();
+    if ["include!", "include_str!", "include_bytes!", "#[path"]
+        .iter()
+        .any(|needle| content.contains(needle))
+    {
+        return Err(RustRefactorError::Invalid(
+            "inline module contains file-relative include or path syntax; move it manually"
+                .to_string(),
+        ));
+    }
     let range = lsp_types::Range {
-        start: byte_to_position(&source, module_range.start, encoding)?,
-        end: byte_to_position(&source, module_range.end, encoding)?,
+        start: byte_to_position(source, module_range.start, encoding)?,
+        end: byte_to_position(source, module_range.end, encoding)?,
     };
 
     Ok(WorkspaceEdit {
@@ -162,6 +200,19 @@ pub fn move_inline_module_preview(
     })
 }
 
+fn has_mod_ancestor(
+    node: &ast_grep_core::Node<'_, ast_grep_core::tree_sitter::StrDoc<SupportLang>>,
+) -> bool {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if candidate.kind() == "mod_item" {
+            return true;
+        }
+        parent = candidate.parent();
+    }
+    false
+}
+
 struct ModuleDestination {
     path: PathBuf,
     requires_path_attribute: bool,
@@ -175,18 +226,15 @@ fn module_file_path(
         RustRefactorError::Invalid("Rust source has no parent directory".to_string())
     })?;
     let stem = source_path.file_stem().and_then(|stem| stem.to_str());
-    let directory = match stem {
-        Some("lib" | "main" | "mod") => parent.to_path_buf(),
-        Some(stem) => parent.join(stem),
-        None => {
-            return Err(RustRefactorError::Invalid(
-                "Rust source has no valid file stem".to_string(),
-            ));
-        }
+    let Some(stem) = stem else {
+        return Err(RustRefactorError::Invalid(
+            "Rust source has no valid file stem".to_string(),
+        ));
     };
-    if directory.is_dir() {
+    let module_directory = parent.join(stem);
+    if module_directory.is_dir() {
         Ok(ModuleDestination {
-            path: directory.join(format!("{module_name}.rs")),
+            path: module_directory.join(format!("{module_name}.rs")),
             requires_path_attribute: false,
         })
     } else {
@@ -232,6 +280,32 @@ fn byte_to_position(
     })
 }
 
+fn position_to_byte_offset(
+    source: &str,
+    position: Position,
+    encoding: PositionEncoding,
+) -> Result<usize, RustRefactorError> {
+    let line = usize::try_from(position.line)
+        .map_err(|_| RustRefactorError::Invalid("module position line is too large".to_string()))?;
+    let line_start = source
+        .split_inclusive('\n')
+        .take(line)
+        .map(str::len)
+        .sum::<usize>();
+    let line_text = source
+        .split_inclusive('\n')
+        .nth(line)
+        .ok_or_else(|| {
+            RustRefactorError::Invalid("module position line is out of bounds".to_string())
+        })?
+        .strip_suffix('\n')
+        .unwrap_or_else(|| source.split_inclusive('\n').nth(line).unwrap_or_default());
+    let character_offset = EncodingConverter::new(encoding)
+        .character_to_byte_offset(line_text, position.character)
+        .map_err(RustRefactorError::Invalid)?;
+    Ok(line_start + character_offset)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -270,7 +344,10 @@ mod tests {
         let OneOf::Left(text_edit) = &edit.edits[0] else {
             panic!("expected plain text edit");
         };
-        assert_eq!(text_edit.new_text, "pub mod feature;");
+        assert_eq!(
+            text_edit.new_text,
+            "#[path = \"feature.rs\"] pub mod feature;"
+        );
     }
 
     #[test]
@@ -282,6 +359,98 @@ mod tests {
         let error = move_inline_module_preview(&source_path, "feature", PositionEncoding::Utf8)
             .unwrap_err();
         assert!(error.to_string().contains("already out-of-line"));
+    }
+
+    #[test]
+    fn rejects_nested_inline_module_even_when_the_parent_is_a_declaration_list() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(&source_path, "mod outer { mod child { fn run() {} } }\n").unwrap();
+
+        let error =
+            move_inline_module_preview(&source_path, "child", PositionEncoding::Utf8).unwrap_err();
+        assert!(error.to_string().contains("nested inline module"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_top_level_module_names() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(
+            &source_path,
+            "#[cfg(unix)] mod feature {}\n#[cfg(windows)] mod feature {}\n",
+        )
+        .unwrap();
+
+        let error = move_inline_module_preview(&source_path, "feature", PositionEncoding::Utf8)
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn explicit_module_position_selects_one_of_duplicate_names() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(
+            &source_path,
+            "#[cfg(unix)] mod feature { fn unix() {} }\n#[cfg(windows)] mod feature { fn windows() {} }\n",
+        )
+        .unwrap();
+
+        let edit = move_inline_module_preview_with_source(
+            &source_path,
+            "feature",
+            PositionEncoding::Utf8,
+            None,
+            Some(Position {
+                line: 1,
+                character: 16,
+            }),
+        )
+        .unwrap();
+        let DocumentChanges::Operations(operations) = edit.document_changes.unwrap() else {
+            panic!("expected ordered resource and text operations");
+        };
+        let DocumentChangeOperation::Edit(created) = &operations[1] else {
+            panic!("expected destination file content edit");
+        };
+        let OneOf::Left(content_edit) = &created.edits[0] else {
+            panic!("expected plain destination text edit");
+        };
+        assert!(content_edit.new_text.contains("windows"));
+    }
+
+    #[test]
+    fn uses_open_document_source_override_for_module_ranges_and_content() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(&source_path, "pub mod feature { fn disk() {} }\n").unwrap();
+
+        let edit = move_inline_module_preview_with_source(
+            &source_path,
+            "feature",
+            PositionEncoding::Utf8,
+            Some("// dirty\npub mod feature { fn open() {} }\n"),
+            None,
+        )
+        .unwrap();
+        let DocumentChanges::Operations(operations) = edit.document_changes.unwrap() else {
+            panic!("expected ordered resource and text operations");
+        };
+        let DocumentChangeOperation::Edit(created) = &operations[1] else {
+            panic!("expected destination file content edit");
+        };
+        let OneOf::Left(content_edit) = &created.edits[0] else {
+            panic!("expected plain destination text edit");
+        };
+        assert!(content_edit.new_text.contains("open"));
+        let DocumentChangeOperation::Edit(source_edit) = &operations[2] else {
+            panic!("expected source text edit");
+        };
+        let OneOf::Left(text_edit) = &source_edit.edits[0] else {
+            panic!("expected plain text edit");
+        };
+        assert_eq!(text_edit.range.start.line, 1);
     }
 
     #[test]
@@ -327,7 +496,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&source_path).unwrap(),
-            "pub mod feature;\n"
+            "#[path = \"feature.rs\"] pub mod feature;\n"
         );
         assert_eq!(
             fs::read_to_string(root.path().join("feature.rs")).unwrap(),

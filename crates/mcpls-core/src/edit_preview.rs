@@ -91,6 +91,7 @@ pub enum PreviewError {
 struct PlannedFile {
     source: SnapshotSource,
     version: Option<i32>,
+    created: bool,
     original: String,
     planned: String,
 }
@@ -144,6 +145,8 @@ struct PreviewBuilder<'a> {
     limits: PreviewLimits,
     files: BTreeMap<PathBuf, PlannedFile>,
     created_paths: BTreeSet<PathBuf>,
+    create_overwrites: BTreeMap<PathBuf, bool>,
+    saw_text_edits: bool,
     file_operations: Vec<FileOperation>,
     operations: Vec<String>,
     conflicts: Vec<String>,
@@ -168,6 +171,8 @@ impl<'a> PreviewBuilder<'a> {
             limits,
             files: BTreeMap::new(),
             created_paths: BTreeSet::new(),
+            create_overwrites: BTreeMap::new(),
+            saw_text_edits: false,
             file_operations: Vec::new(),
             operations: Vec::new(),
             conflicts: Vec::new(),
@@ -222,13 +227,17 @@ impl<'a> PreviewBuilder<'a> {
             .files
             .into_iter()
             .map(|(path, file)| {
-                FileSnapshot::from_contents(
-                    path,
-                    file.source,
-                    file.version,
-                    file.original,
-                    file.planned,
-                )
+                if file.created {
+                    FileSnapshot::from_created_contents(path, file.planned)
+                } else {
+                    FileSnapshot::from_contents(
+                        path,
+                        file.source,
+                        file.version,
+                        file.original,
+                        file.planned,
+                    )
+                }
             })
             .collect::<Vec<_>>();
         let safe_to_apply = self.conflicts.is_empty() && self.unsupported.is_empty();
@@ -270,9 +279,20 @@ impl<'a> PreviewBuilder<'a> {
                     path: path.clone(),
                     overwrite,
                 }])?;
+                if self.saw_text_edits {
+                    self.conflicts.push(format!(
+                        "create {} follows text edits and cannot be transactionally ordered",
+                        path.display()
+                    ));
+                }
+                if self.created_paths.contains(&path) {
+                    self.conflicts
+                        .push(format!("duplicate create operation: {}", path.display()));
+                }
                 let operation = format!("create {}", path.display());
                 self.operations.push(operation);
                 self.created_paths.insert(path.clone());
+                self.create_overwrites.insert(path.clone(), overwrite);
                 self.file_operations
                     .push(FileOperation::Create { path, overwrite });
                 if options
@@ -386,6 +406,7 @@ impl<'a> PreviewBuilder<'a> {
         version: Option<i32>,
         edits: &[crate::workspace_edit::NormalizedTextEdit],
     ) -> Result<(), PreviewError> {
+        self.saw_text_edits = true;
         self.edit_count = self.edit_count.saturating_add(edits.len());
         if self.edit_count > self.limits.max_edits {
             return Err(PreviewError::Limit {
@@ -402,11 +423,18 @@ impl<'a> PreviewBuilder<'a> {
         };
         if !self.files.contains_key(&path) {
             let file = if self.created_paths.contains(&path) {
-                PlannedFile {
-                    source: SnapshotSource::Disk,
-                    version: None,
-                    original: String::new(),
-                    planned: String::new(),
+                if self.create_overwrites.get(&path).copied().unwrap_or(false) {
+                    let mut file = initial_file(&path, self.documents)?;
+                    file.planned.clear();
+                    file
+                } else {
+                    PlannedFile {
+                        source: SnapshotSource::Disk,
+                        version: None,
+                        created: true,
+                        original: String::new(),
+                        planned: String::new(),
+                    }
                 }
             } else {
                 initial_file(&path, self.documents)?
@@ -459,6 +487,7 @@ fn initial_file(path: &PathBuf, documents: &DocumentTracker) -> Result<PlannedFi
         return Ok(PlannedFile {
             source: SnapshotSource::OpenDocument,
             version: Some(document.version),
+            created: false,
             original: document.content.clone(),
             planned: document.content.clone(),
         });
@@ -470,6 +499,7 @@ fn initial_file(path: &PathBuf, documents: &DocumentTracker) -> Result<PlannedFi
     Ok(PlannedFile {
         source: SnapshotSource::Disk,
         version: None,
+        created: false,
         planned: original.clone(),
         original,
     })

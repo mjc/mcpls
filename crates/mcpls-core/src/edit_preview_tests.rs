@@ -86,6 +86,102 @@ fn previews_text_edit_after_ordered_create() {
 }
 
 #[test]
+fn rejects_text_before_create_in_the_same_transaction() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("existing.rs");
+    fs::write(&file, "before\n").unwrap();
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let edit = NormalizedWorkspaceEdit {
+        operations: vec![
+            EditOperation::Text {
+                uri: path_to_uri(&file),
+                version: None,
+                edits: vec![NormalizedTextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 6),
+                    ),
+                    new_text: "edited".to_string(),
+                    annotation_id: None,
+                }],
+            },
+            EditOperation::Create {
+                uri: path_to_uri(&file),
+                options: Some(lsp_types::CreateFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: Some(false),
+                }),
+                annotation_id: None,
+            },
+        ],
+        change_annotations: None,
+    };
+
+    let artifact = preview_normalized(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits::default(),
+    )
+    .unwrap();
+
+    assert!(!artifact.plan.safe_to_apply());
+    assert!(
+        artifact
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("follows text edits"))
+    );
+}
+
+#[test]
+fn create_overwrite_then_text_retains_existing_preimage() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("existing.rs");
+    fs::write(&file, "before\n").unwrap();
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let edit = NormalizedWorkspaceEdit {
+        operations: vec![
+            EditOperation::Create {
+                uri: path_to_uri(&file),
+                options: Some(lsp_types::CreateFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: Some(false),
+                }),
+                annotation_id: None,
+            },
+            EditOperation::Text {
+                uri: path_to_uri(&file),
+                version: None,
+                edits: vec![NormalizedTextEdit {
+                    range: lsp_types::Range::default(),
+                    new_text: "replacement\n".to_string(),
+                    annotation_id: None,
+                }],
+            },
+        ],
+        change_annotations: None,
+    };
+
+    let artifact = preview_normalized(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits::default(),
+    )
+    .unwrap();
+
+    assert!(artifact.plan.safe_to_apply());
+    assert_eq!(artifact.plan.files()[0].original_content(), "before\n");
+    assert!(!artifact.plan.files()[0].was_created());
+    assert_eq!(artifact.plan.files()[0].planned_content(), "replacement\n");
+}
+
+#[test]
 fn rejects_resource_operation_limit() {
     let root = TempDir::new().unwrap();
     let boundary = WorkspaceBoundary::new(root.path()).unwrap();

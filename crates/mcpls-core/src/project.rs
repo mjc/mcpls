@@ -30,6 +30,7 @@ use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore,
 use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
 use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
+use crate::rust_refactor::move_inline_module_preview_with_source;
 use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
@@ -1420,6 +1421,15 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<PreviewArtifact, String>>,
     },
+    MoveInlineModulePreview {
+        project_id: String,
+        file_path: String,
+        module_name: String,
+        module_position: Option<lsp_types::Position>,
+        encoding: PositionEncoding,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<PreviewArtifact, String>>,
+    },
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
@@ -1525,9 +1535,9 @@ impl ProjectRequest {
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reply.is_closed()
             }
-            Self::CodeActionPreview { reply, .. } | Self::PreviewEdit { reply, .. } => {
-                reply.is_closed()
-            }
+            Self::CodeActionPreview { reply, .. }
+            | Self::PreviewEdit { reply, .. }
+            | Self::MoveInlineModulePreview { reply, .. } => reply.is_closed(),
             Self::PrepareCallHierarchy { reply, .. } => reply.is_closed(),
             Self::IncomingCalls { reply, .. } => reply.is_closed(),
             Self::OutgoingCalls { reply, .. } => reply.is_closed(),
@@ -2419,6 +2429,40 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Build and store an inline Rust module move from actor-owned document state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, the request is cancelled, or
+    /// the project-owned refactor/preview rejects the operation.
+    pub async fn move_inline_module_preview(
+        &self,
+        project_id: String,
+        file_path: String,
+        module_name: String,
+        module_position: Option<lsp_types::Position>,
+        encoding: PositionEncoding,
+        root: PathBuf,
+    ) -> Result<PreviewArtifact, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::MoveInlineModulePreview {
+                project_id,
+                file_path,
+                module_name,
+                module_position,
+                encoding,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Consume one project-owned workspace edit preview.
     ///
     /// # Errors
@@ -2832,6 +2876,35 @@ impl ProjectRuntime {
             .insert(artifact.plan.clone())
             .map_err(|error| error.to_string())?;
         Ok(artifact)
+    }
+
+    fn move_inline_module_preview(
+        &mut self,
+        project_id: &str,
+        file_path: &str,
+        module_name: &str,
+        module_position: Option<lsp_types::Position>,
+        encoding: PositionEncoding,
+        root: &Path,
+    ) -> Result<PreviewArtifact, String> {
+        let source_path = self
+            .translator
+            .validate_path(Path::new(file_path))
+            .map_err(|error| error.to_string())?;
+        let source_override = self
+            .translator
+            .document_tracker()
+            .get(&source_path)
+            .map(|document| document.content.as_str());
+        let edit = move_inline_module_preview_with_source(
+            &source_path,
+            module_name,
+            encoding,
+            source_override,
+            module_position,
+        )
+        .map_err(|error| error.to_string())?;
+        self.preview_edit(project_id, edit, encoding, root)
     }
 
     fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
@@ -4067,6 +4140,24 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.preview_edit(&project_id, edit, encoding, &root));
+        }
+        ProjectRequest::MoveInlineModulePreview {
+            project_id,
+            file_path,
+            module_name,
+            module_position,
+            encoding,
+            root,
+            reply,
+        } => {
+            let _ = reply.send(runtime.move_inline_module_preview(
+                &project_id,
+                &file_path,
+                &module_name,
+                module_position,
+                encoding,
+                &root,
+            ));
         }
         ProjectRequest::TakeEditPlan {
             plan_id,
@@ -5621,6 +5712,39 @@ impl ProjectRegistry {
             .preview_edit(
                 id.as_str().to_string(),
                 edit,
+                encoding,
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    /// Preview an inline Rust module move using the actor's current document state.
+    ///
+    /// The source path validation, dirty-document lookup, AST extraction, and
+    /// generic edit preview are serialized behind the same project mutation gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project is not registered, the source path is
+    /// outside the project, the module cannot be extracted safely, or the edit
+    /// preview fails its normal workspace checks.
+    pub async fn preview_inline_module_move(
+        &self,
+        id: &ProjectId,
+        file_path: String,
+        module_name: String,
+        module_position: Option<lsp_types::Position>,
+        encoding: PositionEncoding,
+    ) -> Result<PreviewArtifact, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .move_inline_module_preview(
+                id.as_str().to_string(),
+                file_path,
+                module_name,
+                module_position,
                 encoding,
                 identity.root().as_path().to_path_buf(),
             )
