@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +8,13 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::*;
+
+fn numbered_lines(prefix: &str, count: usize) -> String {
+    (0..count).fold(String::new(), |mut output, line| {
+        writeln!(output, "{prefix} {line}").unwrap();
+        output
+    })
+}
 
 #[test]
 fn captures_snapshot_hash_diff_and_project_identity() {
@@ -31,6 +39,130 @@ fn captures_snapshot_hash_diff_and_project_identity() {
     assert!(plan.unified_diff().contains("-fn old() {}"));
     assert!(plan.unified_diff().contains("+fn new() {}"));
     assert!(plan.safe_to_apply());
+}
+
+#[test]
+fn renders_contextual_diff_hunks_instead_of_whole_files() {
+    let original = numbered_lines("line", 200);
+    let planned = original
+        .replace("line 20\n", "changed 20\n")
+        .replace("line 180\n", "changed 180\n");
+    let snapshot = FileSnapshot::from_contents(
+        PathBuf::from("src/large.rs"),
+        SnapshotSource::Disk,
+        None,
+        original,
+        planned,
+    );
+    let plan = EditPlan::new(
+        "project-a".to_string(),
+        vec![snapshot],
+        vec!["text edit".to_string()],
+        true,
+        Duration::from_secs(60),
+    );
+
+    assert!(plan.unified_diff().contains("-line 20"));
+    assert!(plan.unified_diff().contains("+changed 20"));
+    assert!(plan.unified_diff().contains("-line 180"));
+    assert!(plan.unified_diff().contains("+changed 180"));
+    assert_eq!(
+        plan.unified_diff()
+            .lines()
+            .filter(|line| line.starts_with("@@"))
+            .count(),
+        2
+    );
+    assert!(!plan.unified_diff().contains(" line 0\n"));
+    assert!(!plan.unified_diff().contains(" line 199\n"));
+    assert!(!plan.diff_truncated());
+    assert_eq!(plan.diff_files()[0].additions(), 2);
+    assert_eq!(plan.diff_files()[0].deletions(), 2);
+}
+
+#[test]
+fn preserves_unicode_and_crlf_in_contextual_diffs() {
+    let snapshot = FileSnapshot::from_contents(
+        PathBuf::from("src/unicode.rs"),
+        SnapshotSource::Disk,
+        None,
+        "alpha\r\nold crab 🦀\r\nomega\r\n",
+        "alpha\r\nnew crab 🦀\r\nomega\r\n",
+    );
+    let plan = EditPlan::new(
+        "project-a".to_string(),
+        vec![snapshot],
+        vec!["text edit".to_string()],
+        true,
+        Duration::from_secs(60),
+    );
+
+    assert!(plan.unified_diff().contains("-old crab 🦀\r\n"));
+    assert!(plan.unified_diff().contains("+new crab 🦀\r\n"));
+    assert_eq!(plan.diff_files()[0].additions(), 1);
+    assert_eq!(plan.diff_files()[0].deletions(), 1);
+}
+
+#[test]
+fn renders_created_and_deleted_file_contents() {
+    let plan = EditPlan::new(
+        "project-a".to_string(),
+        vec![
+            FileSnapshot::from_created_contents(PathBuf::from("src/created.rs"), "created\n"),
+            FileSnapshot::from_contents(
+                PathBuf::from("src/deleted.rs"),
+                SnapshotSource::Disk,
+                None,
+                "deleted\n",
+                "",
+            ),
+        ],
+        vec![
+            "create src/created.rs".to_string(),
+            "delete src/deleted.rs".to_string(),
+        ],
+        true,
+        Duration::from_secs(60),
+    );
+
+    assert!(plan.unified_diff().contains("+created"));
+    assert!(plan.unified_diff().contains("-deleted"));
+    assert_eq!(plan.diff_files()[0].additions(), 1);
+    assert_eq!(plan.diff_files()[1].deletions(), 1);
+}
+
+#[test]
+fn bounds_rendered_diff_without_discarding_complete_line_counts() {
+    let original = numbered_lines("old line", 20_000);
+    let planned = numbered_lines("new line", 20_000);
+    let snapshot = FileSnapshot::from_contents(
+        PathBuf::from("src/huge.rs"),
+        SnapshotSource::Disk,
+        None,
+        original,
+        planned,
+    );
+    let plan = EditPlan::new(
+        "project-a".to_string(),
+        vec![snapshot],
+        vec!["text edit".to_string()],
+        true,
+        Duration::from_secs(60),
+    );
+
+    assert!(plan.diff_truncated());
+    assert!(plan.unified_diff().len() <= MAX_RENDERED_DIFF_BYTES);
+    assert_eq!(plan.diff_files()[0].additions(), 20_000);
+    assert_eq!(plan.diff_files()[0].deletions(), 20_000);
+}
+
+#[test]
+fn truncation_preserves_utf8_and_an_explicit_marker_at_the_byte_boundary() {
+    let mut rendered = "a".repeat(MAX_RENDERED_DIFF_BYTES - 1);
+
+    assert!(append_bounded_diff(&mut rendered, "🦀"));
+    assert!(rendered.len() <= MAX_RENDERED_DIFF_BYTES);
+    assert!(rendered.ends_with(DIFF_TRUNCATION_MARKER));
 }
 
 #[test]

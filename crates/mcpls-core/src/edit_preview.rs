@@ -54,6 +54,28 @@ pub struct PreviewArtifact {
     pub unsupported: Vec<String>,
     /// Optional semantic verification outcome for a specialized refactor.
     pub verification: Option<VerificationStatus>,
+    /// Optional implementation that produced a specialized edit.
+    pub producer: Option<EditProducer>,
+}
+
+/// Producer selected for a specialized edit preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditProducer {
+    /// Workspace edit returned by the active language server.
+    RustAnalyzer,
+    /// MCPLS's in-process structural Rust refactor.
+    StructuralAstGrep,
+}
+
+impl EditProducer {
+    /// Return the stable wire value used by MCP responses.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RustAnalyzer => "rust_analyzer",
+            Self::StructuralAstGrep => "structural_ast_grep",
+        }
+    }
 }
 
 /// Semantic confidence attached to a specialized edit preview or application.
@@ -281,6 +303,7 @@ impl<'a> PreviewBuilder<'a> {
             conflicts: self.conflicts,
             unsupported: self.unsupported,
             verification: None,
+            producer: None,
         })
     }
 

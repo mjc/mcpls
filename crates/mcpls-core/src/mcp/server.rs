@@ -979,6 +979,8 @@ impl ServerHandler for McplsServer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use crate::bridge::resources::parse_uri;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
@@ -1000,6 +1002,43 @@ mod tests {
             subscriptions,
             project_config_ignored,
         )
+    }
+
+    #[test]
+    fn truncated_preview_keeps_complete_metadata() {
+        let original = numbered_lines("old line", 20_000);
+        let planned = numbered_lines("new line", 20_000);
+        let artifact = PreviewArtifact {
+            plan: EditPlan::new(
+                "project".to_string(),
+                vec![FileSnapshot::from_contents(
+                    PathBuf::from("src/huge.rs"),
+                    SnapshotSource::Disk,
+                    None,
+                    original,
+                    planned,
+                )],
+                vec!["text src/huge.rs".to_string()],
+                false,
+                std::time::Duration::from_secs(60),
+            ),
+            affected_files: vec![PathBuf::from("src/huge.rs")],
+            conflicts: vec!["conflict".to_string()],
+            unsupported: vec!["unsupported".to_string()],
+            verification: None,
+            producer: None,
+        };
+
+        let value = preview_artifact_json(&artifact, "project");
+
+        assert_eq!(value["diff_truncated"], true);
+        assert_eq!(value["diff_files"][0]["additions"], 20_000);
+        assert_eq!(value["diff_files"][0]["deletions"], 20_000);
+        assert_eq!(value["operations"][0], "text src/huge.rs");
+        assert_eq!(value["conflicts"][0], "conflict");
+        assert_eq!(value["unsupported"][0], "unsupported");
+        assert_eq!(value["preconditions"].as_array().unwrap().len(), 1);
+        assert_eq!(value["safe_to_apply"], false);
     }
 
     #[tokio::test]

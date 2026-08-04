@@ -128,6 +128,18 @@ pub struct ServerInitConfig {
     pub notification_tx: Option<mpsc::Sender<LspNotification>>,
 }
 
+fn mcpls_workspace_edit_capabilities() -> lsp_types::WorkspaceEditClientCapabilities {
+    lsp_types::WorkspaceEditClientCapabilities {
+        document_changes: Some(true),
+        resource_operations: Some(vec![
+            lsp_types::ResourceOperationKind::Create,
+            lsp_types::ResourceOperationKind::Rename,
+            lsp_types::ResourceOperationKind::Delete,
+        ]),
+        ..Default::default()
+    }
+}
+
 /// Result of attempting to spawn multiple LSP servers.
 ///
 /// This type enables graceful degradation by collecting both
@@ -456,7 +468,7 @@ impl LspServer {
                                     lsp_types::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                                 ]
                                 .iter()
-                                .map(|k| k.as_str().to_string())
+                                .map(|kind| kind.as_str().to_string())
                                 .collect(),
                             },
                         }),
@@ -465,6 +477,7 @@ impl LspServer {
                     ..Default::default()
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
+                    workspace_edit: Some(mcpls_workspace_edit_capabilities()),
                     workspace_folders: Some(true),
                     did_change_watched_files: Some(
                         lsp_types::DidChangeWatchedFilesClientCapabilities {
@@ -862,6 +875,21 @@ impl LspServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_capabilities_advertise_supported_workspace_edit_operations() {
+        let workspace_edit = mcpls_workspace_edit_capabilities();
+
+        assert_eq!(workspace_edit.document_changes, Some(true));
+        assert_eq!(
+            workspace_edit.resource_operations,
+            Some(vec![
+                lsp_types::ResourceOperationKind::Create,
+                lsp_types::ResourceOperationKind::Rename,
+                lsp_types::ResourceOperationKind::Delete,
+            ])
+        );
+    }
 
     #[cfg(unix)]
     fn write_coordinated_lsp(directory: &tempfile::TempDir) -> PathBuf {

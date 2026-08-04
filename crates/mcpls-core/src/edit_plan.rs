@@ -6,10 +6,11 @@ use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
 
 use crate::edit_paths::FileOperation;
@@ -245,6 +246,38 @@ impl FileSnapshot {
     }
 }
 
+const MAX_RENDERED_DIFF_BYTES: usize = 64 * 1024;
+const MAX_DIFF_COMPUTE_TIME: Duration = Duration::from_millis(500);
+const DIFF_TRUNCATION_MARKER: &str = "\n... diff truncated ...\n";
+
+/// Complete line-change counts for one previewed file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiffSummary {
+    path: PathBuf,
+    additions: usize,
+    deletions: usize,
+}
+
+impl FileDiffSummary {
+    /// Return the changed file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the number of inserted lines.
+    #[must_use]
+    pub const fn additions(&self) -> usize {
+        self.additions
+    }
+
+    /// Return the number of deleted lines.
+    #[must_use]
+    pub const fn deletions(&self) -> usize {
+        self.deletions
+    }
+}
+
 /// Immutable preview artifact bound to one project identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditPlan {
@@ -254,6 +287,8 @@ pub struct EditPlan {
     operations: Vec<String>,
     file_operations: Vec<FileOperation>,
     unified_diff: String,
+    diff_files: Vec<FileDiffSummary>,
+    diff_truncated: bool,
     safe_to_apply: bool,
     policy_generation: u64,
     created_at: SystemTime,
@@ -271,12 +306,7 @@ impl EditPlan {
         safe_to_apply: bool,
         ttl: Duration,
     ) -> Self {
-        let unified_diff = files
-            .iter()
-            .map(unified_diff)
-            .filter(|diff| !diff.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (unified_diff, diff_files, diff_truncated) = render_unified_diff(&files);
         let created_at = SystemTime::now();
         let expires_at = created_at
             .checked_add(ttl)
@@ -295,6 +325,8 @@ impl EditPlan {
             operations,
             file_operations: Vec::new(),
             unified_diff,
+            diff_files,
+            diff_truncated,
             safe_to_apply,
             policy_generation: 0,
             created_at,
@@ -358,6 +390,18 @@ impl EditPlan {
     #[must_use]
     pub fn unified_diff(&self) -> &str {
         &self.unified_diff
+    }
+
+    /// Return complete per-file line counts, even when rendered diff text was truncated.
+    #[must_use]
+    pub fn diff_files(&self) -> &[FileDiffSummary] {
+        &self.diff_files
+    }
+
+    /// Return whether the rendered diff text reached its response-size bound.
+    #[must_use]
+    pub const fn diff_truncated(&self) -> bool {
+        self.diff_truncated
     }
 
     /// Return whether all preconditions currently allow application.
@@ -982,26 +1026,84 @@ fn hash_content(content: &str) -> String {
     hash
 }
 
-fn unified_diff(snapshot: &FileSnapshot) -> String {
-    if snapshot.original_content == snapshot.planned_content {
-        return String::new();
+fn render_unified_diff(files: &[FileSnapshot]) -> (String, Vec<FileDiffSummary>, bool) {
+    let mut rendered = String::new();
+    let mut summaries = Vec::new();
+    let mut truncated = false;
+    let deadline = Instant::now() + MAX_DIFF_COMPUTE_TIME;
+
+    for snapshot in files {
+        if snapshot.original_content == snapshot.planned_content {
+            continue;
+        }
+        let mut config = TextDiff::configure();
+        config.deadline(deadline);
+        let diff = config.diff_lines(&snapshot.original_content, &snapshot.planned_content);
+        let mut additions = 0;
+        let mut deletions = 0;
+        for change in diff.iter_all_changes() {
+            match change.tag() {
+                ChangeTag::Insert => additions += 1,
+                ChangeTag::Delete => deletions += 1,
+                ChangeTag::Equal => {}
+            }
+        }
+        summaries.push(FileDiffSummary {
+            path: snapshot.path.clone(),
+            additions,
+            deletions,
+        });
+
+        if truncated {
+            continue;
+        }
+        let path = snapshot.path.to_string_lossy();
+        let file_diff = diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&path, &path)
+            .to_string();
+        truncated = append_bounded_diff(&mut rendered, &file_diff);
     }
-    let mut diff = format!(
-        "--- {}\n+++ {}\n@@\n",
-        snapshot.path.display(),
-        snapshot.path.display()
-    );
-    for line in snapshot.original_content.lines() {
-        diff.push('-');
-        diff.push_str(line);
-        diff.push('\n');
+
+    (rendered, summaries, truncated)
+}
+
+fn append_bounded_diff(rendered: &mut String, file_diff: &str) -> bool {
+    let separator_len = usize::from(!rendered.is_empty());
+    if rendered
+        .len()
+        .saturating_add(separator_len)
+        .saturating_add(file_diff.len())
+        <= MAX_RENDERED_DIFF_BYTES
+    {
+        if separator_len != 0 {
+            rendered.push('\n');
+        }
+        rendered.push_str(file_diff);
+        return false;
     }
-    for line in snapshot.planned_content.lines() {
-        diff.push('+');
-        diff.push_str(line);
-        diff.push('\n');
+
+    if separator_len != 0 {
+        rendered.push('\n');
     }
-    diff
+    let text_limit = MAX_RENDERED_DIFF_BYTES - DIFF_TRUNCATION_MARKER.len();
+    let available = text_limit.saturating_sub(rendered.len());
+    let mut end = available.min(file_diff.len());
+    while !file_diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    rendered.push_str(&file_diff[..end]);
+
+    if rendered.len() > text_limit {
+        let mut end = text_limit;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        rendered.truncate(end);
+    }
+    rendered.push_str(DIFF_TRUNCATION_MARKER);
+    true
 }
 
 #[cfg(test)]
