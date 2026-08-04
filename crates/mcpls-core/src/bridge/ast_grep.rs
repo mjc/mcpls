@@ -3,6 +3,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ast_grep_core::Node;
@@ -56,11 +58,31 @@ pub async fn search(
     let languages = languages.to_vec();
     let query = query.to_string();
     let kind_filter = kind_filter.map(str::to_owned);
-    tokio::task::spawn_blocking(move || {
-        search_sync(&roots, &languages, &query, kind_filter.as_deref(), limit)
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let cancellation_guard = CancellationGuard(cancelled);
+    let result = tokio::task::spawn_blocking(move || {
+        search_sync(
+            &roots,
+            &languages,
+            &query,
+            kind_filter.as_deref(),
+            limit,
+            &worker_cancelled,
+        )
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    drop(cancellation_guard);
+    result
+}
+
+struct CancellationGuard(Arc<AtomicBool>);
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -70,7 +92,11 @@ fn search_sync(
     query: &str,
     kind_filter: Option<&str>,
     limit: usize,
+    cancelled: &AtomicBool,
 ) -> Vec<Symbol> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let languages = languages
         .iter()
         .filter_map(|language| ast_grep_language(language))
@@ -89,7 +115,10 @@ fn search_sync(
             .build()
             .flatten()
         {
-            if started.elapsed() >= MAX_SCAN_DURATION || paths.len() >= MAX_SCANNED_FILES {
+            if cancelled.load(Ordering::Relaxed)
+                || started.elapsed() >= MAX_SCAN_DURATION
+                || paths.len() >= MAX_SCANNED_FILES
+            {
                 break;
             }
             if !entry
@@ -109,7 +138,10 @@ fn search_sync(
             }
             paths.insert(path);
         }
-        if started.elapsed() >= MAX_SCAN_DURATION || paths.len() >= MAX_SCANNED_FILES {
+        if cancelled.load(Ordering::Relaxed)
+            || started.elapsed() >= MAX_SCAN_DURATION
+            || paths.len() >= MAX_SCANNED_FILES
+        {
             break;
         }
     }
@@ -117,7 +149,7 @@ fn search_sync(
     let mut symbols = Vec::new();
     let mut total_bytes: u64 = 0;
     for path in paths {
-        if started.elapsed() >= MAX_SCAN_DURATION {
+        if cancelled.load(Ordering::Relaxed) || started.elapsed() >= MAX_SCAN_DURATION {
             break;
         }
         let Ok(metadata) = fs::metadata(&path) else {
@@ -142,6 +174,9 @@ fn search_sync(
 
         let tree = language.ast_grep(&source);
         for node in tree.root().dfs() {
+            if cancelled.load(Ordering::Relaxed) || started.elapsed() >= MAX_SCAN_DURATION {
+                return symbols;
+            }
             let Some(kind) = symbol_kind(&node) else {
                 continue;
             };
@@ -320,6 +355,7 @@ mod tests {
             "fallback",
             None,
             10,
+            &AtomicBool::new(false),
         );
 
         assert_eq!(symbols.len(), 2);
@@ -346,6 +382,7 @@ mod tests {
             "run",
             Some("struct"),
             1,
+            &AtomicBool::new(false),
         );
 
         assert_eq!(symbols.len(), 1);
@@ -373,6 +410,7 @@ mod tests {
             "run",
             None,
             10,
+            &AtomicBool::new(false),
         );
         assert!(
             symbols
@@ -386,6 +424,7 @@ mod tests {
             "running",
             None,
             10,
+            &AtomicBool::new(false),
         );
         assert!(
             symbols
@@ -413,6 +452,7 @@ mod tests {
             "run",
             None,
             10,
+            &AtomicBool::new(false),
         );
 
         assert_eq!(symbols.len(), 1);
@@ -424,5 +464,65 @@ mod tests {
             panic!("test source must contain the searched function");
         };
         assert_eq!(symbols[0].start_character, expected_start);
+    }
+
+    #[test]
+    fn cancelled_scan_returns_without_traversing() {
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("failed to create temporary directory");
+        };
+        assert!(fs::write(temp.path().join("cancelled.rs"), "fn cancelled() {}\n").is_ok());
+        let cancelled = AtomicBool::new(true);
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["rust".to_string()],
+            "cancelled",
+            None,
+            10,
+            &cancelled,
+        );
+
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn no_match_scan_stops_at_file_budget() {
+        let Ok(first_root) = tempfile::tempdir() else {
+            panic!("failed to create first temporary directory");
+        };
+        let Ok(second_root) = tempfile::tempdir() else {
+            panic!("failed to create second temporary directory");
+        };
+        for index in 0..MAX_SCANNED_FILES {
+            assert!(
+                fs::write(
+                    first_root.path().join(format!("{index:04}.rs")),
+                    "fn no_match() {}\n"
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            fs::write(
+                second_root.path().join("match.rs"),
+                "fn budget_match() {}\n"
+            )
+            .is_ok()
+        );
+
+        let symbols = search_sync(
+            &[
+                first_root.path().to_path_buf(),
+                second_root.path().to_path_buf(),
+            ],
+            &["rust".to_string()],
+            "budget_match",
+            None,
+            10,
+            &AtomicBool::new(false),
+        );
+
+        assert!(symbols.is_empty());
     }
 }

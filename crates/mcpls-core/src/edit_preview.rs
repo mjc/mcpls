@@ -52,6 +52,31 @@ pub struct PreviewArtifact {
     pub conflicts: Vec<String>,
     /// Valid but not-yet-applicable operations.
     pub unsupported: Vec<String>,
+    /// Optional semantic verification outcome for a specialized refactor.
+    pub verification: Option<VerificationStatus>,
+}
+
+/// Semantic confidence attached to a specialized edit preview or application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    /// No analyzer/compiler proof was available.
+    StructuralUnverified,
+    /// The project analyzer accepted the selected identity and post-apply checks passed.
+    SemanticVerified,
+    /// The edit committed, but post-apply semantic checks did not complete successfully.
+    SemanticPostcheckFailed,
+}
+
+impl VerificationStatus {
+    /// Return the stable wire value used by MCP responses.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuralUnverified => "structural_unverified",
+            Self::SemanticVerified => "semantic_verified",
+            Self::SemanticPostcheckFailed => "semantic_postcheck_failed",
+        }
+    }
 }
 
 /// Errors that prevent a workspace edit from being previewed.
@@ -255,6 +280,7 @@ impl<'a> PreviewBuilder<'a> {
             affected_files,
             conflicts: self.conflicts,
             unsupported: self.unsupported,
+            verification: None,
         })
     }
 

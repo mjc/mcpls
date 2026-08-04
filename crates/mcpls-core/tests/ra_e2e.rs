@@ -91,6 +91,8 @@ fn stage_workspace() -> TempDir {
     let lib_path = tmp.path().join("src/lib.rs");
     let mut lib_content = fs::read_to_string(&lib_path).expect("failed to read lib.rs");
     lib_content.push_str("\npub mod broken;\n");
+    lib_content
+        .push_str("\npub mod move_target {\n    pub fn answer() -> u32 {\n        42\n    }\n}\n");
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
 
     // Copy bad_format.rs into src/ — NOT added to lib.rs (no mod declaration).
@@ -1404,6 +1406,131 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Ok(())
 }
 
+/// Tool 25: `move_inline_module_preview` + `workspace_edit_apply` — move a
+/// real top-level module through the actor-owned semantic edit path.
+fn sc_move_inline_module_semantic_edit(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    let module_line = find_line(&lib_rs, "pub mod move_target {");
+    let preview = call_json(
+        client,
+        "move_inline_module_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": lib_rs,
+            "module_name": "move_target",
+            "module_line": module_line - 1,
+            "module_character": 8,
+        }),
+    )?;
+
+    if preview["verification"] != "semantic_verified" {
+        return Err(format!(
+            "real rust-analyzer did not semantically verify the move: {}",
+            preview["verification"]
+        ));
+    }
+    let plan_id = preview["plan_id"]
+        .as_str()
+        .ok_or_else(|| format!("move preview omitted plan_id: {preview}"))?;
+    let destination = workspace.join("src/move_target.rs");
+    if !preview["affected_files"].as_array().is_some_and(|files| {
+        files
+            .iter()
+            .any(|file| file.as_str() == Some(destination.to_string_lossy().as_ref()))
+    }) {
+        return Err(format!(
+            "move preview did not target {}: {preview}",
+            destination.display()
+        ));
+    }
+
+    let applied = call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    if applied["verification"] != "semantic_verified" {
+        return Err(format!(
+            "semantic move postcheck failed: {}",
+            applied["verification"]
+        ));
+    }
+    let moved_source = fs::read_to_string(&lib_rs)
+        .map_err(|error| format!("failed to read moved source: {error}"))?;
+    let moved_destination = fs::read_to_string(&destination)
+        .map_err(|error| format!("failed to read moved destination: {error}"))?;
+    if moved_source.contains("pub mod move_target {")
+        || !moved_destination.contains("pub fn answer() -> u32")
+    {
+        return Err(format!(
+            "filesystem result did not preserve the module move: source={moved_source:?}, destination={moved_destination:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Tool 26: live rust-analyzer identity checks for raw and Unicode modules.
+fn sc_move_inline_module_raw_and_unicode(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    for (module_name, declaration, destination_name, body_marker) in [
+        (
+            "r#type",
+            "pub mod r#type {",
+            "type.rs",
+            "pub fn raw_answer() -> u32",
+        ),
+        (
+            "café",
+            "pub mod café {",
+            "café.rs",
+            "pub fn unicode_answer() -> u32",
+        ),
+    ] {
+        let module_line = find_line(&lib_rs, declaration);
+        let preview = call_json(
+            client,
+            "move_inline_module_preview",
+            &json!({
+                "project_id": "default",
+                "file_path": lib_rs,
+                "module_name": module_name,
+                "module_line": module_line - 1,
+                "module_character": 8,
+            }),
+        )?;
+        if preview["verification"] != "semantic_verified" {
+            return Err(format!(
+                "rust-analyzer did not verify {module_name}: {}",
+                preview["verification"]
+            ));
+        }
+        let plan_id = preview["plan_id"]
+            .as_str()
+            .ok_or_else(|| format!("preview omitted plan_id for {module_name}: {preview}"))?;
+        call_json(
+            client,
+            "workspace_edit_apply",
+            &json!({"project_id": "default", "plan_id": plan_id}),
+        )?;
+        let destination = workspace.join("src").join(destination_name);
+        let content = fs::read_to_string(&destination)
+            .map_err(|error| format!("failed to read {}: {error}", destination.display()))?;
+        if !content.contains(body_marker) {
+            return Err(format!(
+                "moved {module_name} body missing from {}",
+                destination.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Suite driver
 // ---------------------------------------------------------------------------
@@ -1535,6 +1662,39 @@ fn ra_e2e_suite() {
     }
 
     println!("[ra_e2e] all {} sub-cases passed", results.len());
+}
+
+#[test]
+#[ignore = "Requires rust-analyzer in PATH; set MCPLS_SKIP_RA=1 to skip or MCPLS_RUST_ANALYZER=<path> to override"]
+fn ra_unicode_module_move_e2e() {
+    let ra_path = match resolve_rust_analyzer() {
+        Resolution::Found(path) => path,
+        Resolution::Skipped(reason) => {
+            println!("[ra_unicode_e2e] suite skipped: {reason}");
+            return;
+        }
+        Resolution::Missing => panic!("[ra_unicode_e2e] rust-analyzer not found"),
+    };
+    let workspace_tmp = stage_workspace();
+    let lib_rs = workspace_tmp.path().join("src/lib.rs");
+    let mut lib_content = fs::read_to_string(&lib_rs).expect("failed to read lib.rs");
+    lib_content.push_str(
+        "\npub mod r#type {\n    pub fn raw_answer() -> u32 {\n        7\n    }\n}\n\npub mod café {\n    pub fn unicode_answer() -> u32 {\n        8\n    }\n}\n",
+    );
+    fs::write(&lib_rs, lib_content).expect("failed to append raw and Unicode modules");
+    let workspace = workspace_tmp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_tmp.path().to_owned());
+    let config_path = workspace.join("mcpls-unicode-e2e.toml");
+    write_config(&ra_path, &workspace, &config_path);
+    let config_str = config_path.to_string_lossy().into_owned();
+    let mut client =
+        McpClient::spawn_with_args(&["--config", &config_str]).expect("failed to spawn mcpls");
+    client.initialize().expect("MCP initialize failed");
+    wait_until_ready(&mut client, &workspace.join("src/lib.rs"));
+    sc_move_inline_module_raw_and_unicode(&mut client, &workspace)
+        .expect("Unicode move e2e failed");
 }
 
 fn call_json(client: &mut McpClient, name: &str, arguments: &Value) -> Result<Value, String> {

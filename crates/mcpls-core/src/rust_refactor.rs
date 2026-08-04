@@ -64,17 +64,9 @@ pub(crate) fn move_inline_module_preview_with_source(
             "inline module moves require a Rust source file".to_string(),
         ));
     }
-    if module_name.is_empty()
-        || !module_name
-            .chars()
-            .all(|character| character == '_' || character.is_ascii_alphanumeric())
-        || module_name
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_digit())
-    {
+    if !supported_module_name(module_name) {
         return Err(RustRefactorError::Invalid(format!(
-            "unsupported Rust module name: {module_name}; this refactor currently accepts only ASCII Rust identifiers"
+            "invalid Rust module name: {module_name}"
         )));
     }
 
@@ -99,7 +91,7 @@ pub(crate) fn move_inline_module_preview_with_source(
         .filter(|node| {
             node.kind() == "mod_item"
                 && node.field("name").is_some_and(|name| {
-                    name.text() == module_name
+                    logical_module_name(name.text().as_ref()) == logical_module_name(module_name)
                         && position_offset.is_none_or(|offset| {
                             let range = node.range();
                             range.start <= offset && offset < range.end
@@ -131,6 +123,8 @@ pub(crate) fn move_inline_module_preview_with_source(
             "module has no name: {module_name}"
         )));
     };
+    let module_identifier = name.text();
+    let module_file_name = logical_module_name(module_identifier.as_ref());
     let body_range = body.range();
     let name_range = name.range();
     let module_range = module.range();
@@ -140,14 +134,14 @@ pub(crate) fn move_inline_module_preview_with_source(
         ));
     }
 
-    let destination = module_file_path(source_path, module_name)?;
+    let destination = module_file_path(source_path, module_file_name)?;
     let source_uri = file_uri(source_path)?;
     let destination_uri = file_uri(&destination.path)?;
     let replacement_prefix = &source[module_range.start..name_range.start];
     let replacement = if destination.requires_path_attribute {
-        format!("#[path = \"{module_name}.rs\"] {replacement_prefix}{module_name};")
+        format!("#[path = \"{module_file_name}.rs\"] {replacement_prefix}{module_identifier};")
     } else {
-        format!("{replacement_prefix}{module_name};")
+        format!("{replacement_prefix}{module_identifier};")
     };
     let content = source[body_range.start + 1..body_range.end - 1].to_string();
     if ["include!", "include_str!", "include_bytes!", "#[path"]
@@ -198,6 +192,20 @@ pub(crate) fn move_inline_module_preview_with_source(
         ])),
         change_annotations: None,
     })
+}
+
+pub(crate) fn logical_module_name(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+fn supported_module_name(name: &str) -> bool {
+    let logical = logical_module_name(name);
+    let mut characters = logical.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic())
+        && characters.all(|character| character == '_' || character.is_alphanumeric())
 }
 
 fn has_mod_ancestor(
@@ -362,6 +370,116 @@ mod tests {
     }
 
     #[test]
+    fn supports_raw_and_unicode_module_names() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(
+            &source_path,
+            "mod r#type { fn raw() {} }\nmod café { fn unicode() {} }\n",
+        )
+        .unwrap();
+
+        let raw =
+            move_inline_module_preview(&source_path, "r#type", PositionEncoding::Utf8).unwrap();
+        let unicode =
+            move_inline_module_preview(&source_path, "café", PositionEncoding::Utf8).unwrap();
+        let DocumentChanges::Operations(raw_operations) = raw.document_changes.unwrap() else {
+            panic!("expected ordered resource and text operations");
+        };
+        let DocumentChangeOperation::Edit(raw_source_edit) = &raw_operations[2] else {
+            panic!("expected source text edit");
+        };
+        let OneOf::Left(raw_text_edit) = &raw_source_edit.edits[0] else {
+            panic!("expected plain text edit");
+        };
+        assert!(raw_text_edit.new_text.contains("mod r#type;"));
+        let DocumentChanges::Operations(unicode_operations) = unicode.document_changes.unwrap()
+        else {
+            panic!("expected ordered resource and text operations");
+        };
+        let DocumentChangeOperation::Edit(unicode_source_edit) = &unicode_operations[2] else {
+            panic!("expected source text edit");
+        };
+        let OneOf::Left(unicode_text_edit) = &unicode_source_edit.edits[0] else {
+            panic!("expected plain text edit");
+        };
+        assert!(unicode_text_edit.new_text.contains("mod café;"));
+    }
+
+    #[test]
+    fn encodes_module_ranges_in_utf8_utf16_and_utf32() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        let source = "fn pre() {} /* 😀 */ mod feature {}\n";
+        fs::write(&source_path, source).unwrap();
+        let module_byte_offset = source.find("mod feature").unwrap();
+        for encoding in [
+            PositionEncoding::Utf8,
+            PositionEncoding::Utf16,
+            PositionEncoding::Utf32,
+        ] {
+            let character = EncodingConverter::new(encoding)
+                .byte_offset_to_character(source, module_byte_offset)
+                .unwrap();
+            let edit = move_inline_module_preview_with_source(
+                &source_path,
+                "feature",
+                encoding,
+                Some(source),
+                Some(Position { line: 0, character }),
+            )
+            .unwrap();
+            let DocumentChanges::Operations(operations) = edit.document_changes.unwrap() else {
+                panic!("expected ordered resource and text operations");
+            };
+            let DocumentChangeOperation::Edit(source_edit) = &operations[2] else {
+                panic!("expected source text edit");
+            };
+            let OneOf::Left(text_edit) = &source_edit.edits[0] else {
+                panic!("expected plain text edit");
+            };
+            assert_eq!(text_edit.range.start.character, character);
+        }
+    }
+
+    #[test]
+    fn rejects_file_relative_constructs_inside_the_moved_body() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(
+            &source_path,
+            "mod feature { include!(\"generated.rs\"); }\n",
+        )
+        .unwrap();
+
+        let error = move_inline_module_preview(&source_path, "feature", PositionEncoding::Utf8)
+            .unwrap_err();
+        assert!(error.to_string().contains("file-relative include or path"));
+    }
+
+    #[test]
+    fn uses_an_explicit_path_for_a_non_root_lib_named_file() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let source_path = nested.join("lib.rs");
+        fs::write(&source_path, "mod feature {}\n").unwrap();
+
+        let edit =
+            move_inline_module_preview(&source_path, "feature", PositionEncoding::Utf8).unwrap();
+        let DocumentChanges::Operations(operations) = edit.document_changes.unwrap() else {
+            panic!("expected ordered resource and text operations");
+        };
+        let DocumentChangeOperation::Edit(source_edit) = &operations[2] else {
+            panic!("expected source text edit");
+        };
+        let OneOf::Left(text_edit) = &source_edit.edits[0] else {
+            panic!("expected plain text edit");
+        };
+        assert!(text_edit.new_text.starts_with("#[path = \"feature.rs\"]"));
+    }
+
+    #[test]
     fn rejects_nested_inline_module_even_when_the_parent_is_a_declaration_list() {
         let root = tempfile::tempdir().unwrap();
         let source_path = root.path().join("lib.rs");
@@ -451,6 +569,66 @@ mod tests {
             panic!("expected plain text edit");
         };
         assert_eq!(text_edit.range.start.line, 1);
+    }
+
+    #[test]
+    fn preserves_attributes_comments_and_line_endings() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        fs::write(
+            &source_path,
+            "#[cfg(feature = \"feature\")]\r\npub(crate) mod feature {\r\n    #![allow(dead_code)]\r\n    // keep this comment\r\n    pub fn run() {}\r\n}\r\n",
+        )
+        .unwrap();
+
+        let edit =
+            move_inline_module_preview(&source_path, "feature", PositionEncoding::Utf8).unwrap();
+        let DocumentChanges::Operations(operations) = edit.document_changes.unwrap() else {
+            panic!("expected ordered resource and text operations");
+        };
+        let DocumentChangeOperation::Edit(created) = &operations[1] else {
+            panic!("expected destination file content edit");
+        };
+        let OneOf::Left(content_edit) = &created.edits[0] else {
+            panic!("expected plain destination text edit");
+        };
+        assert!(
+            content_edit
+                .new_text
+                .contains("\r\n    #![allow(dead_code)]")
+        );
+        assert!(content_edit.new_text.contains("// keep this comment"));
+        let DocumentChangeOperation::Edit(source_edit) = &operations[2] else {
+            panic!("expected source text edit");
+        };
+        let OneOf::Left(text_edit) = &source_edit.edits[0] else {
+            panic!("expected plain text edit");
+        };
+        assert!(text_edit.new_text.contains("pub(crate) mod feature;"));
+    }
+
+    #[test]
+    fn reports_an_existing_destination_conflict_during_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("lib.rs");
+        let destination_path = root.path().join("feature.rs");
+        fs::write(&source_path, "mod feature { fn run() {} }\n").unwrap();
+        fs::write(&destination_path, "// existing\n").unwrap();
+        let boundary = crate::edit_paths::WorkspaceBoundary::new(root.path()).unwrap();
+        let edit =
+            move_inline_module_preview(&source_path, "feature", PositionEncoding::Utf8).unwrap();
+
+        let error = preview_workspace_edit(
+            &boundary,
+            "project",
+            edit,
+            PositionEncoding::Utf8,
+            &DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
+            PreviewLimits::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("destination already exists"));
     }
 
     #[test]

@@ -14,11 +14,11 @@ use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
-    DefinitionResult, DiagnosticsResult, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, LocationsResult, LogEntry, LogLevel,
-    OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult, RenameResult,
-    ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult, SignatureHelpResult,
-    Translator, TranslatorTemplate, WorkspaceSymbolResult,
+    DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolsResult,
+    FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, LocationsResult,
+    LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult,
+    RenameResult, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
+    SignatureHelpResult, Translator, TranslatorTemplate, WorkspaceSymbolResult,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig};
 use crate::edit_apply::{
@@ -27,10 +27,12 @@ use crate::edit_apply::{
 use crate::edit_backup::BackupPolicy;
 use crate::edit_paths::WorkspaceBoundary;
 use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore, PlanId};
-use crate::edit_preview::{PreviewArtifact, PreviewLimits, preview_workspace_edit};
+use crate::edit_preview::{
+    PreviewArtifact, PreviewLimits, VerificationStatus, preview_workspace_edit,
+};
 use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
-use crate::rust_refactor::move_inline_module_preview_with_source;
+use crate::rust_refactor::{logical_module_name, move_inline_module_preview_with_source};
 use lsp_types::WorkspaceEdit;
 
 #[derive(Debug, thiserror::Error)]
@@ -1207,6 +1209,8 @@ pub struct AppliedEditPlan {
     pub unified_diff: String,
     /// Files replaced successfully.
     pub committed_files: Vec<PathBuf>,
+    /// Optional semantic verification outcome for a specialized refactor.
+    pub verification: Option<VerificationStatus>,
 }
 
 impl AppliedEditPlan {
@@ -2704,17 +2708,36 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
+    inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
 }
 
+#[derive(Debug, Clone)]
+struct InlineModuleSemanticCheck {
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    module_name: String,
+    source_position: lsp_types::Position,
+    pre_verification: VerificationStatus,
+}
+
 const LANGUAGE_SERVER_EXITED: &str = "language server exited";
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
+const MAX_INLINE_MODULE_CHECKS: usize = 256;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
     Duration::from_millis(500),
     Duration::from_secs(2),
 ];
+
+const fn position_in_mcp_range(line: u32, character: u32, range: &crate::bridge::Range) -> bool {
+    let after_start =
+        line > range.start.line || (line == range.start.line && character >= range.start.character);
+    let before_end =
+        line < range.end.line || (line == range.end.line && character <= range.end.character);
+    after_start && before_end
+}
 
 #[derive(Debug, Default)]
 struct AutomaticRestartPolicy {
@@ -2811,6 +2834,7 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             edit_safety,
             code_actions: CodeActionStore::new(),
+            inline_module_checks: HashMap::new(),
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
         }
@@ -2878,7 +2902,57 @@ impl ProjectRuntime {
         Ok(artifact)
     }
 
-    fn move_inline_module_preview(
+    async fn verify_inline_module_before_preview(
+        &mut self,
+        source_path: &Path,
+        module_name: &str,
+        module_position: Option<lsp_types::Position>,
+    ) -> Result<(VerificationStatus, Option<lsp_types::Position>), String> {
+        if !self.translator.semantic_server_ready_for_file(source_path) {
+            return Ok((VerificationStatus::StructuralUnverified, module_position));
+        }
+        let Ok(symbols) = self
+            .translator
+            .handle_document_symbols(source_path.display().to_string())
+            .await
+        else {
+            return Ok((VerificationStatus::StructuralUnverified, module_position));
+        };
+        let matches = symbols
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                logical_module_name(&symbol.name) == logical_module_name(module_name)
+                    && symbol.kind.eq_ignore_ascii_case("Module")
+                    && module_position.is_none_or(|position| {
+                        let line = position.line.saturating_add(1);
+                        let character = position.character.saturating_add(1);
+                        position_in_mcp_range(line, character, &symbol.range)
+                    })
+            })
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "rust-analyzer did not identify exactly one module `{module_name}` at the requested location"
+            ));
+        }
+        let selected_position = module_position.or_else(|| {
+            symbols
+                .symbols
+                .iter()
+                .find(|symbol| {
+                    logical_module_name(&symbol.name) == logical_module_name(module_name)
+                        && symbol.kind.eq_ignore_ascii_case("Module")
+                })
+                .map(|symbol| lsp_types::Position {
+                    line: symbol.range.start.line.saturating_sub(1),
+                    character: symbol.range.start.character.saturating_sub(1),
+                })
+        });
+        Ok((VerificationStatus::SemanticVerified, selected_position))
+    }
+
+    async fn move_inline_module_preview(
         &mut self,
         project_id: &str,
         file_path: &str,
@@ -2895,16 +2969,48 @@ impl ProjectRuntime {
             .translator
             .document_tracker()
             .get(&source_path)
-            .map(|document| document.content.as_str());
+            .map(|document| document.content.clone());
+        let (verification, verified_position) = self
+            .verify_inline_module_before_preview(&source_path, module_name, module_position)
+            .await?;
         let edit = move_inline_module_preview_with_source(
             &source_path,
             module_name,
             encoding,
-            source_override,
+            source_override.as_deref(),
             module_position,
         )
         .map_err(|error| error.to_string())?;
-        self.preview_edit(project_id, edit, encoding, root)
+        let mut artifact = self.preview_edit(project_id, edit, encoding, root)?;
+        artifact.verification = Some(verification);
+        if let Some(destination_path) = artifact
+            .plan
+            .files()
+            .iter()
+            .find(|file| file.was_created())
+            .map(|file| file.path().clone())
+        {
+            if self.inline_module_checks.len() >= MAX_INLINE_MODULE_CHECKS
+                && let Some(oldest) = self.inline_module_checks.keys().next().cloned()
+            {
+                self.inline_module_checks.remove(&oldest);
+            }
+            let source_position = verified_position.unwrap_or(lsp_types::Position {
+                line: 0,
+                character: 0,
+            });
+            self.inline_module_checks.insert(
+                artifact.plan.id().clone(),
+                InlineModuleSemanticCheck {
+                    source_path,
+                    destination_path,
+                    module_name: module_name.to_string(),
+                    source_position,
+                    pre_verification: verification,
+                },
+            );
+        }
+        Ok(artifact)
     }
 
     fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
@@ -2952,6 +3058,56 @@ impl ProjectRuntime {
         error
     }
 
+    async fn verify_inline_module_after_apply(
+        &mut self,
+        check: &InlineModuleSemanticCheck,
+    ) -> VerificationStatus {
+        if check.pre_verification != VerificationStatus::SemanticVerified {
+            return check.pre_verification;
+        }
+        let source_symbols = self
+            .translator
+            .handle_document_symbols(check.source_path.display().to_string())
+            .await;
+        let destination_symbols = self
+            .translator
+            .handle_document_symbols(check.destination_path.display().to_string())
+            .await;
+        let source_diagnostics = self
+            .translator
+            .handle_diagnostics(check.source_path.display().to_string())
+            .await;
+        let destination_diagnostics = self
+            .translator
+            .handle_diagnostics(check.destination_path.display().to_string())
+            .await;
+        let references = self
+            .translator
+            .handle_references(
+                check.source_path.display().to_string(),
+                check.source_position.line.saturating_add(1),
+                check.source_position.character.saturating_add(1),
+                true,
+            )
+            .await;
+        let source_module_present = source_symbols.is_ok_and(|result| {
+            result.symbols.iter().any(|symbol| {
+                logical_module_name(&symbol.name) == logical_module_name(&check.module_name)
+                    && symbol.kind.eq_ignore_ascii_case("Module")
+            })
+        });
+        if source_module_present
+            && destination_symbols.is_ok()
+            && source_diagnostics.is_ok()
+            && destination_diagnostics.is_ok_and(|result| diagnostics_are_error_free(&result))
+            && references.is_ok()
+        {
+            VerificationStatus::SemanticVerified
+        } else {
+            VerificationStatus::SemanticPostcheckFailed
+        }
+    }
+
     async fn apply_edit_plan_with_context(
         &mut self,
         plan_id: &PlanId,
@@ -2966,6 +3122,7 @@ impl ProjectRuntime {
             .edit_plans
             .take_for_project(plan_id, project_id)
             .map_err(|error| error.to_string())?;
+        let semantic_check = self.inline_module_checks.remove(plan_id);
         let open_documents = plan
             .open_document_snapshots()
             .map(|snapshot| {
@@ -3001,6 +3158,11 @@ impl ProjectRuntime {
                 return Err(self.record_edit_failure(audit, error.to_string()));
             }
         }
+        let verification = if let Some(check) = semantic_check.as_ref() {
+            Some(self.verify_inline_module_after_apply(check).await)
+        } else {
+            None
+        };
         self.edit_plans
             .record_audit_with_policy(audit.committed(committed_files.clone()))
             .map_err(|error| error.to_string())?;
@@ -3009,6 +3171,7 @@ impl ProjectRuntime {
             operations: plan.operations().to_vec(),
             unified_diff: plan.unified_diff().to_string(),
             committed_files,
+            verification,
         })
     }
 
@@ -3472,6 +3635,13 @@ impl ProjectRuntime {
             .map(PathBuf::from)
             .collect()
     }
+}
+
+fn diagnostics_are_error_free(result: &DiagnosticsResult) -> bool {
+    result
+        .diagnostics
+        .iter()
+        .all(|diagnostic| !matches!(diagnostic.severity, DiagnosticSeverity::Error))
 }
 
 async fn recover_project_after_server_exit(
@@ -4150,14 +4320,18 @@ async fn handle_project_request(
             root,
             reply,
         } => {
-            let _ = reply.send(runtime.move_inline_module_preview(
-                &project_id,
-                &file_path,
-                &module_name,
-                module_position,
-                encoding,
-                &root,
-            ));
+            let _ = reply.send(
+                runtime
+                    .move_inline_module_preview(
+                        &project_id,
+                        &file_path,
+                        &module_name,
+                        module_position,
+                        encoding,
+                        &root,
+                    )
+                    .await,
+            );
         }
         ProjectRequest::TakeEditPlan {
             plan_id,
@@ -7519,6 +7693,72 @@ while True:
                 .await,
             Err(ProjectActorError::Operation(message)) if message.contains("not found")
         ));
+    }
+
+    #[tokio::test]
+    async fn project_runtime_moves_from_authoritative_open_document_content() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "pub mod feature { fn disk() {} }\n").unwrap();
+        let dirty = "// dirty\npub mod feature { fn open() {} }\n";
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker_mut()
+            .open(source.clone(), dirty.to_string())
+            .unwrap();
+        let mut runtime = ProjectRuntime::new(translator);
+
+        let artifact = runtime
+            .move_inline_module_preview(
+                "project",
+                &source.display().to_string(),
+                "feature",
+                None,
+                PositionEncoding::Utf8,
+                root.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact.verification,
+            Some(VerificationStatus::StructuralUnverified)
+        );
+        let destination = root.path().join("feature.rs");
+        assert!(
+            artifact
+                .plan
+                .files()
+                .iter()
+                .any(|file| file.path() == &destination && file.was_created())
+        );
+        assert!(
+            artifact
+                .plan
+                .files()
+                .iter()
+                .any(|file| file.path() == &source && file.original_content() == dirty)
+        );
+
+        let plan_id = artifact.plan.id().clone();
+        let applied = runtime
+            .apply_edit_plan_with_context(&plan_id, "project", root.path(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.verification,
+            Some(VerificationStatus::StructuralUnverified)
+        );
+        assert_eq!(
+            runtime
+                .translator
+                .document_tracker()
+                .get(&source)
+                .unwrap()
+                .content,
+            "// dirty\n#[path = \"feature.rs\"] pub mod feature;\n"
+        );
+        assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
     }
 
     #[tokio::test]
