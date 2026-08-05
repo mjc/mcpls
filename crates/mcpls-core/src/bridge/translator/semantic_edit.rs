@@ -272,7 +272,7 @@ impl Translator {
                 continue;
             }
             let (registrations, notifications) =
-                match client.synchronize_watched_files(*timeout).await {
+                match client.synchronize_watched_files(&[], *timeout).await {
                     Ok(counts) => counts,
                     Err(error) => {
                         results.push(ProviderSynchronization {
@@ -463,19 +463,25 @@ impl Translator {
             if provider_changes.is_empty() {
                 continue;
             }
-            let (registrations, notifications) =
-                match client.synchronize_watched_files(*timeout).await {
-                    Ok(counts) => counts,
-                    Err(error) => {
-                        results.push(ProviderSynchronization {
-                            provider: id.to_string(),
-                            synchronized: false,
-                            watched_file_notifications: 0,
-                            message: Some(format!("watched-file synchronization failed: {error}")),
-                        });
-                        continue;
-                    }
-                };
+            let changed_paths = provider_changes
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            let (registrations, notifications) = match client
+                .synchronize_watched_files(&changed_paths, *timeout)
+                .await
+            {
+                Ok(counts) => counts,
+                Err(error) => {
+                    results.push(ProviderSynchronization {
+                        provider: id.to_string(),
+                        synchronized: false,
+                        watched_file_notifications: 0,
+                        message: Some(format!("watched-file synchronization failed: {error}")),
+                    });
+                    continue;
+                }
+            };
             if registrations == 0 {
                 results.push(ProviderSynchronization {
                     provider: id.to_string(),

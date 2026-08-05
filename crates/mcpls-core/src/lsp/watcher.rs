@@ -330,6 +330,20 @@ impl WatchRegistry {
         self.rescan()
     }
 
+    /// Emit explicit modifications for committed files without waiting for the OS watcher.
+    pub(super) fn synchronize_paths(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<WatchedFileEvent>, JsonRpcError> {
+        self.apply_changes(
+            &paths
+                .iter()
+                .cloned()
+                .map(|path| (path, 2))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub(super) fn registration_count(&self) -> usize {
         self.registrations.len()
     }

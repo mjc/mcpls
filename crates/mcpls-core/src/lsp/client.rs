@@ -1,6 +1,7 @@
 //! LSP client implementation with async request/response handling.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -128,6 +129,7 @@ enum ClientCommand {
     },
     /// Rescan active dynamic watched-file registrations and flush matching notifications.
     SynchronizeWatchedFiles {
+        changed_paths: Vec<PathBuf>,
         response_tx: oneshot::Sender<Result<(usize, usize)>>,
     },
     /// Cancel an in-flight request whose caller timed out.
@@ -486,15 +488,20 @@ impl LspClient {
         Ok(())
     }
 
-    /// Rescan active dynamic watched-file registrations and wait until every
-    /// matching notification has been written to the provider transport.
+    /// Rescan active dynamic watched-file registrations, explicitly flush
+    /// committed paths, and wait until every matching notification has been
+    /// written to the provider transport.
     pub(crate) async fn synchronize_watched_files(
         &self,
+        changed_paths: &[PathBuf],
         timeout_duration: Duration,
     ) -> Result<(usize, usize)> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
-            .send(ClientCommand::SynchronizeWatchedFiles { response_tx })
+            .send(ClientCommand::SynchronizeWatchedFiles {
+                changed_paths: changed_paths.to_vec(),
+                response_tx,
+            })
             .await
             .map_err(|_| Error::ServerTerminated)?;
         timeout(timeout_duration, response_rx)
@@ -601,9 +608,16 @@ impl LspClient {
                             });
                             transport.send(&notification).await?;
                         }
-                        ClientCommand::SynchronizeWatchedFiles { response_tx } => {
+                        ClientCommand::SynchronizeWatchedFiles {
+                            changed_paths,
+                            response_tx,
+                        } => {
                             let registrations = watch_registry.registration_count();
-                            let events = match watch_registry.synchronize() {
+                            let events = match if changed_paths.is_empty() {
+                                watch_registry.synchronize()
+                            } else {
+                                watch_registry.synchronize_paths(&changed_paths)
+                            } {
                                 Ok(events) => events,
                                 Err(error) => {
                                     let _ = response_tx.send(Err(Error::Transport(error.message)));

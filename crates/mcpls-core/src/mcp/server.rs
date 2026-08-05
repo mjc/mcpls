@@ -3635,6 +3635,12 @@ while True:
         )
         .unwrap();
         assert_eq!(applied["semantic_state"], "synchronized", "{applied}");
+        assert!(
+            applied["provider_synchronization"][0]["watched_file_notifications"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{applied}"
+        );
 
         let reverse: serde_json::Value = serde_json::from_str(
             &server
