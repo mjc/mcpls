@@ -68,6 +68,34 @@ const ENV_PASSTHROUGH_WINDOWS: &[&str] = &[
     "USERNAME",
 ];
 
+/// Apply allowlisted values from a project's effective environment.
+///
+/// Explicit server configuration wins because it is the most specific source.
+/// All other project variables are intentionally ignored so evaluating an
+/// `.envrc` cannot leak arbitrary secrets into language-server processes.
+pub fn apply_project_environment(
+    config: &mut LspServerConfig,
+    project_environment: &HashMap<String, Option<String>>,
+) {
+    for key in ENV_PASSTHROUGH {
+        if let Some(Some(value)) = project_environment.get(*key) {
+            config
+                .env
+                .entry((*key).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    #[cfg(windows)]
+    for key in ENV_PASSTHROUGH_WINDOWS {
+        if let Some(Some(value)) = project_environment.get(*key) {
+            config
+                .env
+                .entry((*key).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
 /// State of an LSP server connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -2268,6 +2296,26 @@ fn main() {
         let envs = effective_envs(&command);
 
         assert_eq!(envs.get("PATH"), Some(&"/parent/bin".to_string()));
+    }
+
+    #[test]
+    fn test_project_environment_overrides_parent_without_leaking_secrets() {
+        let mut config = bare_server_config(HashMap::new());
+        let project_environment = HashMap::from([
+            ("PATH".to_string(), Some("/project/bin".to_string())),
+            (
+                "MCPLS_TEST_LEAK_CANARY".to_string(),
+                Some("should-not-reach-child".to_string()),
+            ),
+        ]);
+
+        apply_project_environment(&mut config, &project_environment);
+        let command =
+            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+        let envs = effective_envs(&command);
+
+        assert_eq!(envs.get("PATH"), Some(&"/project/bin".to_string()));
+        assert!(!envs.contains_key("MCPLS_TEST_LEAK_CANARY"));
     }
 
     /// Regression test for #247: `LspServerConfig::env` entries must reach

@@ -16,7 +16,10 @@ use crate::config::{
     LspServerConfig, ProjectConfig, ServerId, ToolRouter, default_position_encodings,
 };
 use crate::error::{Error, Result};
-use crate::lsp::{LspNotification, LspServer, ServerInitConfig};
+use crate::lsp::{
+    LspNotification, LspServer, ServerInitConfig, apply_project_environment,
+    load_project_environment,
+};
 
 /// Health of a project activation across its configured language servers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,22 +419,30 @@ impl Translator {
                 .map(LspServerConfig::id)
                 .collect(),
         );
-        let init_configs = pending
-            .iter()
-            .map(|config| {
-                let server_roots = self.server_workspace_roots(config, &roots);
-                Ok(ServerInitConfig {
-                    server_config: config.clone(),
-                    workspace_roots: server_roots.clone(),
-                    initialization_options: rust_analyzer_initialization_options(
-                        config,
-                        &server_roots,
-                    )?,
-                    position_encodings: self.position_encodings.clone(),
-                    notification_tx: None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut project_environments = HashMap::new();
+        let mut init_configs = Vec::with_capacity(pending.len());
+        for config in &pending {
+            let server_roots = self.server_workspace_roots(config, &roots);
+            let mut server_config = config.clone();
+            if let Some(root) = server_roots.first() {
+                if !project_environments.contains_key(root) {
+                    project_environments.insert(root.clone(), load_project_environment(root).await);
+                }
+                if let Some(Some(project_environment)) = project_environments.get(root) {
+                    apply_project_environment(&mut server_config, project_environment);
+                }
+            }
+            init_configs.push(ServerInitConfig {
+                initialization_options: rust_analyzer_initialization_options(
+                    &server_config,
+                    &server_roots,
+                )?,
+                server_config,
+                workspace_roots: server_roots,
+                position_encodings: self.position_encodings.clone(),
+                notification_tx: None,
+            });
+        }
         self.set_workspace_roots(roots);
         let result = LspServer::spawn_batch(&init_configs).await;
         if result.all_failed() {
