@@ -5888,12 +5888,12 @@ impl ProjectRegistry {
         let Some(template) = translator_template else {
             return spawn_project_actor_for_root(self.actor_capacity, root);
         };
-        let residency = (template.configures_language("rust")
-            && root.as_path().join("Cargo.toml").is_file())
-        .then(|| ProjectResidency {
-            controller: self.rust_residency.clone(),
-            group: RustGroupId(self.next_rust_group_id.fetch_add(1, Ordering::Relaxed)),
-        });
+        let residency = template
+            .language_applies_to_root("rust", root.as_path())
+            .then(|| ProjectResidency {
+                controller: self.rust_residency.clone(),
+                group: RustGroupId(self.next_rust_group_id.fetch_add(1, Ordering::Relaxed)),
+            });
         spawn_project_actor_with_runtime(
             self.actor_capacity,
             template.translator_for_root(root.as_path().to_path_buf()),
@@ -9531,6 +9531,42 @@ while True:
             state.runtime().configured_language_ids(),
             &["rust".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn nested_cargo_project_is_governed_by_rust_residency_budget() {
+        let root = TempDir::new().unwrap();
+        let nested = root.path().join("crates/fixture");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+        let registry =
+            ProjectRegistry::with_translator_template(2, translator.configuration_template());
+        let id = ProjectId::new("nested").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let projects = registry.projects.read().await;
+        let governed = projects.get(&id).unwrap().actors[0]
+            .actor
+            .sender
+            .residency
+            .is_some();
+        drop(projects);
+        assert!(governed);
     }
 
     #[tokio::test]

@@ -87,10 +87,15 @@ pub struct TranslatorTemplate {
 
 impl TranslatorTemplate {
     #[must_use]
-    pub(crate) fn configures_language(&self, language_id: &str) -> bool {
+    pub(crate) fn language_applies_to_root(&self, language_id: &str, root: &Path) -> bool {
         self.lsp_configs
             .iter()
-            .any(|config| config.language_id.eq_ignore_ascii_case(language_id))
+            .filter(|config| config.language_id.eq_ignore_ascii_case(language_id))
+            .any(|config| {
+                config.heuristics.as_ref().is_none_or(|heuristics| {
+                    heuristics.is_applicable_recursive(root, self.heuristics_max_depth)
+                })
+            })
     }
 
     #[must_use]
