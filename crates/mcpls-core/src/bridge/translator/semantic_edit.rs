@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 
 const MAX_DISCOVERY_ITEMS: usize = 100;
 const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
-const RESOURCE_SYNC_STABILITY_WINDOW: Duration = Duration::from_millis(100);
+const PROVIDER_SYNC_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 /// Edits returned by language servers participating in a file rename.
@@ -393,7 +393,7 @@ impl Translator {
                     }
                     if matches_expected_state {
                         let since = *stable_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= RESOURCE_SYNC_STABILITY_WINDOW {
+                        if since.elapsed() >= PROVIDER_SYNC_STABILITY_WINDOW {
                             converged = true;
                             break;
                         }
@@ -524,7 +524,7 @@ impl Translator {
                     {
                         Ok(actual) if actual == *expected => {
                             let since = *stable_since.get_or_insert_with(Instant::now);
-                            if since.elapsed() >= RESOURCE_SYNC_STABILITY_WINDOW {
+                            if since.elapsed() >= PROVIDER_SYNC_STABILITY_WINDOW {
                                 converged = true;
                                 break;
                             }

@@ -1239,7 +1239,7 @@ pub struct AppliedEditPlan {
     pub committed_files: Vec<PathBuf>,
     /// Optional semantic verification outcome for a specialized refactor.
     pub verification: Option<VerificationStatus>,
-    /// Post-commit provider convergence results for resource operations.
+    /// Post-commit provider convergence results for workspace changes.
     pub provider_synchronization: Vec<ProviderSynchronization>,
 }
 
