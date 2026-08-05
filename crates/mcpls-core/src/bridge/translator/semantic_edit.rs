@@ -1,7 +1,7 @@
 //! Lossless semantic-edit requests and bounded structural fallbacks.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lsp_types::{
     DidCloseTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 
 const MAX_DISCOVERY_ITEMS: usize = 100;
 const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
+const RESOURCE_SYNC_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 /// Edits returned by language servers participating in a file rename.
@@ -241,16 +242,20 @@ impl Translator {
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
-        let document_symbols = lock_std(&self.lsp_servers)
+        let probe_capabilities = lock_std(&self.lsp_servers)
             .iter()
             .map(|(id, server)| {
                 (
                     id.clone(),
-                    server
-                        .capabilities()
-                        .document_symbol_provider
-                        .as_ref()
-                        .is_some_and(one_of_enabled),
+                    (
+                        server
+                            .capabilities()
+                            .document_symbol_provider
+                            .as_ref()
+                            .is_some_and(one_of_enabled),
+                        server.is_rust_analyzer()
+                            && experimental_enabled(server.capabilities(), "parentModule"),
+                    ),
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
@@ -291,7 +296,9 @@ impl Translator {
                 });
                 continue;
             }
-            if !document_symbols.get(&id).copied().unwrap_or(false) {
+            let (supports_document_symbols, supports_parent_module) =
+                probe_capabilities.get(&id).copied().unwrap_or_default();
+            if !supports_document_symbols {
                 results.push(ProviderSynchronization {
                     provider: id.to_string(),
                     synchronized: false,
@@ -335,22 +342,18 @@ impl Translator {
                     partial_result_params: PartialResultParams::default(),
                 };
                 let mut converged = false;
+                let mut stable_since = None;
                 for _ in 0..128 {
                     let response: Result<serde_json::Value> = client
                         .request("textDocument/documentSymbol", params.clone(), *timeout)
                         .await;
-                    match response {
-                        Ok(value) if value.is_null() != probe.expect_present => {
-                            converged = true;
-                            break;
-                        }
-                        Ok(_) => {}
+                    let mut matches_expected_state = match response {
+                        Ok(value) => value.is_null() != probe.expect_present,
                         Err(error)
                             if !probe.expect_present
                                 && error_indicates_missing_document(&error) =>
                         {
-                            converged = true;
-                            break;
+                            true
                         }
                         Err(error) => {
                             message = Some(format!(
@@ -359,6 +362,43 @@ impl Translator {
                             ));
                             break;
                         }
+                    };
+                    if matches_expected_state && probe.expect_present && supports_parent_module {
+                        let parent_params = TextDocumentPositionParams {
+                            text_document: params.text_document.clone(),
+                            position: lsp_types::Position::new(0, 0),
+                        };
+                        match client
+                            .request::<_, serde_json::Value>(
+                                "experimental/parentModule",
+                                parent_params,
+                                *timeout,
+                            )
+                            .await
+                        {
+                            Ok(value) => {
+                                matches_expected_state = !value.is_null()
+                                    && value
+                                        .as_array()
+                                        .is_none_or(|locations| !locations.is_empty());
+                            }
+                            Err(error) => {
+                                message = Some(format!(
+                                    "provider semantic probe failed for {}: {error}",
+                                    probe.path.display()
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    if matches_expected_state {
+                        let since = *stable_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= RESOURCE_SYNC_STABILITY_WINDOW {
+                            converged = true;
+                            break;
+                        }
+                    } else {
+                        stable_since = None;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
