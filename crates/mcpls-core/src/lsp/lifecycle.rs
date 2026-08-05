@@ -970,7 +970,17 @@ impl LspServer {
         capabilities: ServerCapabilities,
         position_encoding: PositionEncodingKind,
     ) -> Self {
-        let child = Command::new("echo")
+        #[cfg(unix)]
+        let mut command = Command::new("sleep");
+        #[cfg(unix)]
+        command.arg("3600");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping -n 3600 127.0.0.1 >NUL"]);
+            command
+        };
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .kill_on_drop(true)
