@@ -1,11 +1,18 @@
 {
   description = "MCPLS development and benchmark environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs = {
     self,
     nixpkgs,
+    rust-overlay,
     ...
   }: let
     systems = [
@@ -22,9 +29,14 @@
         })
         systems
       );
+    pkgsFor = system:
+      import nixpkgs {
+        inherit system;
+        overlays = [(import rust-overlay)];
+      };
   in {
     packages = forAllSystems (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = pkgsFor system;
       gungraun-runner = pkgs.rustPlatform.buildRustPackage rec {
         pname = "gungraun-runner";
         version = "0.19.4";
@@ -41,20 +53,19 @@
     });
 
     devShells = forAllSystems (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = pkgsFor system;
+      rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        extensions = ["rust-src" "rust-analyzer" "clippy" "rustfmt"];
+      };
     in {
       default = pkgs.mkShell {
         packages = with pkgs;
           [
             actionlint
-            cargo
             cargo-nextest
-            clippy
             self.packages.${system}.gungraun-runner
             python3
-            rust-analyzer
-            rustc
-            rustfmt
+            rustToolchain
           ]
           ++ lib.optionals stdenv.isLinux [
             valgrind
