@@ -16,11 +16,13 @@ use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
 use self::respawn::RespawnBackoff;
 use crate::bridge::encoding::PositionEncoding;
+use crate::bridge::notifications::RedactionPolicy;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std};
-use crate::config::{ServerId, ToolKind, ToolRouter};
+use crate::config::{LspServerConfig, ServerId, ToolKind, ToolRouter};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 
+mod actor;
 mod assist;
 mod call_hierarchy;
 mod clock;
@@ -31,13 +33,15 @@ mod encoding_ctx;
 mod navigation;
 mod respawn;
 mod routing;
+mod semantic_edit;
 mod symbols;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod testing;
 
+pub use actor::*;
 pub use dto::*;
-pub use routing::validate_path_against_roots;
+pub use semantic_edit::*;
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
@@ -107,6 +111,19 @@ pub struct Translator {
     /// it to invalidate a respawned server's stale cached diagnostics --
     /// see that method's docs for why that matters.
     notification_cache: Option<Arc<Mutex<NotificationCache>>>,
+    /// Project-actor-owned notification state. Unlike `notification_cache`,
+    /// this is updated serially by the actor mailbox and needs no async lock.
+    actor_notification_cache: NotificationCache,
+    /// Declarative server configuration retained for project activation.
+    project_lsp_configs: Arc<StdMutex<Vec<LspServerConfig>>>,
+    /// Workspace roots used by each active project server.
+    project_lsp_roots: Arc<StdMutex<HashMap<ServerId, Vec<PathBuf>>>>,
+    /// Values removed from actor-delivered server output.
+    redaction_policy: RedactionPolicy,
+    /// Maximum marker-search depth for project activation.
+    heuristics_max_depth: Option<usize>,
+    /// Position encodings offered during project-owned server startup.
+    position_encodings: Vec<String>,
     /// Time source for respawn-backoff bookkeeping ([`respawn`](self::respawn)).
     /// Always [`SystemClock`] in production; overridden via
     /// [`Self::with_clock`] in tests so backoff-window tests can advance
@@ -142,6 +159,12 @@ impl Translator {
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),
             notification_cache: None,
+            actor_notification_cache: NotificationCache::new(),
+            project_lsp_configs: Arc::new(StdMutex::new(Vec::new())),
+            project_lsp_roots: Arc::new(StdMutex::new(HashMap::new())),
+            redaction_policy: RedactionPolicy::default(),
+            heuristics_max_depth: None,
+            position_encodings: crate::config::default_position_encodings(),
             clock: Arc::new(SystemClock),
         }
     }
@@ -314,18 +337,6 @@ impl Translator {
     /// reader.
     pub(crate) fn register_server_config(&self, id: impl Into<ServerId>, config: ServerInitConfig) {
         lock_std(&self.server_configs).insert(id.into(), config);
-    }
-
-    /// Number of currently registered LSP servers.
-    ///
-    /// Test-only: `lsp_servers` is private, so this is the one way a test
-    /// outside this module (e.g. `crate::tests`, exercising
-    /// [`Translator::shutdown_servers`] indirectly through `serve_with`'s
-    /// shutdown sequence) can observe that a registered server was actually
-    /// drained.
-    #[cfg(test)]
-    pub(crate) fn registered_server_count(&self) -> usize {
-        lock_std(&self.lsp_servers).len()
     }
 
     /// Snapshot of currently open document paths, used for MCP resource listing.

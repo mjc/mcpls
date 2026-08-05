@@ -325,6 +325,15 @@ impl WatchRegistry {
             .is_some_and(|registration| registration.generation == event.generation)
     }
 
+    /// Rescan only the server's active dynamic registrations.
+    pub(super) fn synchronize(&mut self) -> Result<Vec<WatchedFileEvent>, JsonRpcError> {
+        self.rescan()
+    }
+
+    pub(super) fn registration_count(&self) -> usize {
+        self.registrations.len()
+    }
+
     pub(super) fn handle_signal(
         &mut self,
         signal: WatchSignal,
@@ -396,7 +405,7 @@ impl WatchRegistry {
             events.extend(watched_events(
                 registration_id,
                 registration.generation,
-                changes,
+                &changes,
             ));
         }
         Ok(events)
@@ -412,7 +421,7 @@ impl WatchRegistry {
             events.extend(watched_events(
                 registration_id,
                 registration.generation,
-                changes,
+                &changes,
             ));
         }
         Ok(events)
@@ -625,17 +634,6 @@ fn set_diff(
     specs: &[WatchSpec],
 ) -> Vec<Value> {
     let mut changes = Vec::new();
-    for (path, is_dir) in current {
-        if previous.contains_key(path) {
-            continue;
-        }
-        if specs
-            .iter()
-            .any(|spec| spec.matches(path, *is_dir) && spec.kind & WATCH_CREATE != 0)
-        {
-            push_change(&mut changes, path, 1);
-        }
-    }
     for (path, is_dir) in previous {
         if current.contains_key(path) {
             continue;
@@ -647,7 +645,23 @@ fn set_diff(
             push_change(&mut changes, path, 3);
         }
     }
-    changes.sort_by(|left, right| left["uri"].as_str().cmp(&right["uri"].as_str()));
+    for (path, is_dir) in current {
+        if previous.contains_key(path) {
+            continue;
+        }
+        if specs
+            .iter()
+            .any(|spec| spec.matches(path, *is_dir) && spec.kind & WATCH_CREATE != 0)
+        {
+            push_change(&mut changes, path, 1);
+        }
+    }
+    changes.sort_by(|left, right| {
+        let priority = |change: &Value| usize::from(change["type"] != 3);
+        priority(left)
+            .cmp(&priority(right))
+            .then_with(|| left["uri"].as_str().cmp(&right["uri"].as_str()))
+    });
     changes
 }
 
@@ -888,9 +902,8 @@ const fn watch_bit(change_type: u8) -> u8 {
 fn watched_events(
     registration_id: &str,
     generation: u64,
-    mut changes: Vec<Value>,
+    changes: &[Value],
 ) -> Vec<WatchedFileEvent> {
-    changes.sort_by(|left, right| left["uri"].as_str().cmp(&right["uri"].as_str()));
     changes
         .chunks(MAX_CHANGES_PER_NOTIFICATION)
         .map(|chunk| WatchedFileEvent {
@@ -1262,6 +1275,41 @@ mod tests {
     }
 
     #[test]
+    fn synchronization_preserves_delete_create_order_across_folder_boundaries() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+        let source = temp.path().join("item.rs");
+        let ignored = temp.path().join("ignored.txt");
+        fs::write(&source, "pub struct Item;").unwrap();
+        fs::write(&ignored, "ignored").unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let destination = folder.join("item.rs");
+        let (signal_tx, _signal_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
+        let mut registry = WatchRegistry::new(vec![temp.path().to_path_buf()], signal_tx).unwrap();
+        registry
+            .register(Some(&registration(
+                "rust-files",
+                &json!("**/*.rs"),
+                all_watch_kinds(),
+            )))
+            .unwrap();
+
+        fs::rename(&source, &destination).unwrap();
+        fs::write(&ignored, "still ignored").unwrap();
+        let into_folder = changes(registry.synchronize().unwrap());
+        assert_eq!(into_folder.len(), 2);
+        assert_eq!(into_folder[0]["type"], 3);
+        assert_eq!(into_folder[1]["type"], 1);
+
+        fs::rename(&destination, &source).unwrap();
+        let out_of_folder = changes(registry.synchronize().unwrap());
+        assert_eq!(out_of_folder.len(), 2);
+        assert_eq!(out_of_folder[0]["type"], 3);
+        assert_eq!(out_of_folder[1]["type"], 1);
+    }
+
+    #[test]
     fn overflow_rescans_and_notifications_have_bounded_payloads() {
         let temp = TempDir::new().unwrap();
         fs::create_dir(temp.path().join(".git")).unwrap();
@@ -1285,10 +1333,10 @@ mod tests {
             Url::from_file_path(created).unwrap().as_str()
         );
 
-        let payload = (0..=MAX_CHANGES_PER_NOTIFICATION)
+        let payload: Vec<Value> = (0..=MAX_CHANGES_PER_NOTIFICATION)
             .map(|index| json!({ "uri": format!("file:///tmp/{index}"), "type": 1 }))
             .collect();
-        let events = watched_events("bounded", 1, payload);
+        let events = watched_events("bounded", 1, &payload);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].params["changes"].as_array().unwrap().len(),

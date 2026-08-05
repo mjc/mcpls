@@ -313,6 +313,12 @@ impl DocumentTracker {
         lock_std(&self.documents).get(path).cloned()
     }
 
+    /// Snapshot all currently open documents.
+    #[must_use]
+    pub(crate) fn open_documents(&self) -> Vec<DocumentState> {
+        lock_std(&self.documents).values().cloned().collect()
+    }
+
     /// Text of the 0-based `line`'th line of `path`'s currently tracked
     /// content, or `None` if the document is not open or has no such line.
     ///
@@ -431,6 +437,17 @@ impl DocumentTracker {
         lock_std(&self.documents).keys().cloned().collect()
     }
 
+    /// Return whether any tracked content differs from its file on disk.
+    ///
+    /// Unreadable files are treated as dirty so callers fail closed before
+    /// discarding language-server state associated with unsaved content.
+    #[must_use]
+    pub(crate) fn has_dirty_documents(&self) -> bool {
+        lock_std(&self.documents).iter().any(|(path, state)| {
+            std::fs::read_to_string(path).map_or(true, |disk| disk != state.content)
+        })
+    }
+
     /// Forget `server`'s last-synced version for every currently open
     /// document, so the next `ensure_open` call sends `didOpen` again
     /// instead of `didChange`.
@@ -455,6 +472,14 @@ impl DocumentTracker {
             .or_insert(0) += 1;
         for state in lock_std(&self.documents).values_mut() {
             state.forget_server(server);
+        }
+    }
+
+    /// Record that an actor-delivered full-document change was sent to a
+    /// server without forcing the next tool call to repeat it.
+    pub(crate) fn mark_server_synced(&self, path: &Path, server: ServerId, version: i32) {
+        if let Some(state) = lock_std(&self.documents).get_mut(path) {
+            state.mark_synced(server, version);
         }
     }
 
@@ -576,6 +601,35 @@ impl DocumentTracker {
         let decision = self.disk_phase(path).await?;
         self.sync_phase(path, server, lsp_client, decision, generation)
             .await
+    }
+
+    /// Push the authoritative in-memory state of an already tracked document
+    /// to `server` without consulting disk.
+    ///
+    /// This is used when a language server is replaced. Unsaved editor state
+    /// must survive that replacement; routing the reopen through
+    /// [`Self::ensure_open`] would first reload the path from disk and could
+    /// overwrite that newer in-memory content.
+    pub(crate) async fn sync_tracked(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        lsp_client: &LspClient,
+    ) -> Result<Uri> {
+        let _path_guard = self.lock_path(path).await;
+        let generation = self.generation(server);
+        let (uri, version) = lock_std(&self.documents)
+            .get(path)
+            .map(|state| (state.uri.clone(), state.version))
+            .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
+        self.sync_phase(
+            path,
+            server,
+            lsp_client,
+            Decision::unchanged(uri, version),
+            generation,
+        )
+        .await
     }
 
     /// Disk-verification phase of `ensure_open`: decides the version `path`
@@ -1838,7 +1892,7 @@ mod tests {
 
     #[test]
     fn test_open_documents_snapshot_preserves_state() {
-        let mut tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let path = PathBuf::from("/a.rs");
         tracker
             .open(path.clone(), "fn main() {}".to_string())
@@ -1847,10 +1901,22 @@ mod tests {
 
         let documents = tracker.open_documents();
 
-        assert_eq!(
-            documents,
-            vec![tracker.get(Path::new("/a.rs")).unwrap().clone()]
-        );
+        assert_eq!(documents, vec![tracker.get(Path::new("/a.rs")).unwrap()]);
+    }
+
+    #[test]
+    fn dirty_document_detection_compares_tracked_content_with_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lib.rs");
+        std::fs::write(&path, "fn clean() {}\n").unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker
+            .open(path.clone(), "fn clean() {}\n".to_string())
+            .unwrap();
+
+        assert!(!tracker.has_dirty_documents());
+        tracker.update(&path, "fn dirty() {}\n".to_string());
+        assert!(tracker.has_dirty_documents());
     }
 
     #[test]
@@ -2273,6 +2339,36 @@ mod tests {
             tracker.get(&path).unwrap().disk.is_none(),
             "update() must clear disk provenance so the next ensure_open re-verifies by content"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_tracked_reopens_unsaved_content_after_server_replacement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn disk() {}").unwrap();
+
+        let id = ServerId::from("rust");
+        let (old_client, _old_server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker.ensure_open(&path, &id, &old_client).await.unwrap();
+        tracker.update(&path, "fn unsaved() {}".to_string());
+
+        tracker.forget_server(&id);
+        let (replacement, mut replacement_server) = fake_lsp_client();
+        tracker
+            .sync_tracked(&path, &id, &replacement)
+            .await
+            .unwrap();
+
+        let mut wire = BufReader::new(&mut replacement_server.write_stdout);
+        let reopened = read_framed_message(&mut wire).await;
+        assert_eq!(reopened["method"], "textDocument/didOpen");
+        assert_eq!(reopened["params"]["textDocument"]["version"], 2);
+        assert_eq!(
+            reopened["params"]["textDocument"]["text"],
+            "fn unsaved() {}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "fn disk() {}");
     }
 
     #[tokio::test]

@@ -16,12 +16,14 @@ use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolsResult,
     FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, LocationsResult,
-    LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult,
-    RenameResult, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
-    SignatureHelpResult, StructuralMatch, StructuralSearchResult, Translator, TranslatorTemplate,
-    WillRenameFilesResult, WorkspaceSymbolResult, path_to_uri, uri_to_path,
+    LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation,
+    ProviderSynchronization, ReferencesResult, RenameResult, SemanticDiscoveryKind,
+    SemanticDiscoveryResult, ServerCapability, ServerLogsResult, ServerMessage,
+    ServerMessagesResult, SignatureHelpResult, StructuralMatch, StructuralSearchResult,
+    SupportedWorkspaceEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolResult, path_to_uri, uri_to_path,
 };
-use crate::config::{EditSafetyConfig, ProjectConfig};
+use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
     ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
 };
@@ -1213,6 +1215,8 @@ pub struct AppliedEditPlan {
     pub committed_files: Vec<PathBuf>,
     /// Optional semantic verification outcome for a specialized refactor.
     pub verification: Option<VerificationStatus>,
+    /// Post-commit provider convergence results for resource operations.
+    pub provider_synchronization: Vec<ProviderSynchronization>,
 }
 
 impl AppliedEditPlan {
@@ -1377,6 +1381,28 @@ enum ProjectRequest {
         insert_spaces: bool,
         reply: oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
     },
+    RangeFormatWorkspaceEdit {
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+        reply: oneshot::Sender<Result<SupportedWorkspaceEdit, String>>,
+    },
+    MoveItemWorkspaceEdit {
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        direction: String,
+        reply: oneshot::Sender<Result<SupportedWorkspaceEdit, String>>,
+    },
+    SemanticDiscovery {
+        file_path: String,
+        line: u32,
+        character: u32,
+        kind: SemanticDiscoveryKind,
+        reply: oneshot::Sender<Result<SemanticDiscoveryResult, String>>,
+    },
     WorkspaceSymbol {
         query: String,
         kind_filter: Option<String>,
@@ -1531,6 +1557,7 @@ enum ProjectRequest {
     },
     Notification {
         generation: u64,
+        server_id: ServerId,
         notification: LspNotification,
     },
     ServerExited {
@@ -1574,6 +1601,9 @@ impl ProjectRequest {
             Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
                 reject!(reply)
             }
+            Self::RangeFormatWorkspaceEdit { reply, .. }
+            | Self::MoveItemWorkspaceEdit { reply, .. } => reject!(reply),
+            Self::SemanticDiscovery { reply, .. } => reject!(reply),
             Self::Completions { reply, .. } => reject!(reply),
             Self::DocumentSymbols { reply, .. } => reject!(reply),
             Self::FormatDocument { reply, .. } => reject!(reply),
@@ -1615,6 +1645,9 @@ impl ProjectRequest {
             Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
                 reply.is_closed()
             }
+            Self::RangeFormatWorkspaceEdit { reply, .. }
+            | Self::MoveItemWorkspaceEdit { reply, .. } => reply.is_closed(),
+            Self::SemanticDiscovery { reply, .. } => reply.is_closed(),
             Self::Completions { reply, .. } => reply.is_closed(),
             Self::DocumentSymbols { reply, .. } => reply.is_closed(),
             Self::FormatDocument { reply, .. } => reply.is_closed(),
@@ -2053,6 +2086,80 @@ impl ProjectHandle {
                 file_path,
                 tab_size,
                 insert_spaces,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    pub(crate) async fn range_format_workspace_edit(
+        &self,
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<SupportedWorkspaceEdit, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::RangeFormatWorkspaceEdit {
+                file_path,
+                start,
+                end,
+                tab_size,
+                insert_spaces,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    pub(crate) async fn move_item_workspace_edit(
+        &self,
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        direction: String,
+    ) -> Result<SupportedWorkspaceEdit, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::MoveItemWorkspaceEdit {
+                file_path,
+                start,
+                end,
+                direction,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    pub(crate) async fn semantic_discovery(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        kind: SemanticDiscoveryKind,
+    ) -> Result<SemanticDiscoveryResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::SemanticDiscovery {
+                file_path,
+                line,
+                character,
+                kind,
                 reply,
             })
             .await
@@ -2960,8 +3067,8 @@ fn compose_path_rename_edit(
     }
     operations.push(lsp_types::DocumentChangeOperation::Op(
         lsp_types::ResourceOp::Rename(lsp_types::RenameFile {
-            old_uri: path_to_uri(old_path),
-            new_uri: path_to_uri(new_path),
+            old_uri: path_to_uri(old_path).map_err(|error| error.to_string())?,
+            new_uri: path_to_uri(new_path).map_err(|error| error.to_string())?,
             options: None,
             annotation_id: None,
         }),
@@ -3277,7 +3384,7 @@ impl ProjectRuntime {
     }
 
     async fn verify_inline_module_before_preview(
-        &mut self,
+        &self,
         source_path: &Path,
         module_name: &str,
         module_position: Option<lsp_types::Position>,
@@ -3343,7 +3450,7 @@ impl ProjectRuntime {
             .translator
             .document_tracker()
             .get(&source_path)
-            .map(|document| document.content.clone());
+            .map(|document| document.content().to_string());
         let (verification, verified_position) = self
             .verify_inline_module_before_preview(&source_path, module_name, module_position)
             .await?;
@@ -3404,7 +3511,7 @@ impl ProjectRuntime {
     }
 
     async fn native_inline_module_move_edit(
-        &mut self,
+        &self,
         source_path: &Path,
         position: lsp_types::Position,
     ) -> Option<WorkspaceEdit> {
@@ -3501,11 +3608,11 @@ impl ProjectRuntime {
             .await;
         let source_diagnostics = self
             .translator
-            .handle_diagnostics(check.source_path.display().to_string())
+            .handle_actor_diagnostics(check.source_path.display().to_string())
             .await;
         let destination_diagnostics = self
             .translator
-            .handle_diagnostics(check.destination_path.display().to_string())
+            .handle_actor_diagnostics(check.destination_path.display().to_string())
             .await;
         let references = self
             .translator
@@ -3549,6 +3656,7 @@ impl ProjectRuntime {
             .take_for_project(plan_id, project_id)
             .map_err(|error| error.to_string())?;
         let semantic_check = self.inline_module_checks.remove(plan_id);
+        let resource_operations = plan.file_operations().to_vec();
         let open_documents = plan
             .open_document_snapshots()
             .map(|snapshot| {
@@ -3575,13 +3683,39 @@ impl ProjectRuntime {
                 return Err(self.record_edit_failure(audit, error.to_string()));
             }
         };
+        let mut document_sync_failures = Vec::new();
         for (path, version, content) in open_documents {
-            if let Err(error) = self
+            match self
                 .translator
                 .apply_open_document_content(&path, version, content)
                 .await
             {
-                return Err(self.record_edit_failure(audit, error.to_string()));
+                Ok(failures) => document_sync_failures.extend(failures),
+                Err(error) => return Err(self.record_edit_failure(audit, error.to_string())),
+            }
+        }
+        let mut provider_synchronization = self
+            .translator
+            .synchronize_resource_operations(&resource_operations)
+            .await;
+        for (provider, error) in document_sync_failures {
+            let message = format!("open-document synchronization failed: {error}");
+            if let Some(result) = provider_synchronization
+                .iter_mut()
+                .find(|result| result.provider == provider.as_str())
+            {
+                result.synchronized = false;
+                result.message = Some(result.message.take().map_or_else(
+                    || message.clone(),
+                    |existing| format!("{message}; {existing}"),
+                ));
+            } else {
+                provider_synchronization.push(ProviderSynchronization {
+                    provider: provider.to_string(),
+                    synchronized: false,
+                    watched_file_notifications: 0,
+                    message: Some(message),
+                });
             }
         }
         let verification = if let Some(check) = semantic_check.as_ref() {
@@ -3598,11 +3732,12 @@ impl ProjectRuntime {
             unified_diff: plan.unified_diff().to_string(),
             committed_files,
             verification,
+            provider_synchronization,
         })
     }
 
     async fn hover(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3614,7 +3749,7 @@ impl ProjectRuntime {
     }
 
     async fn definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3626,7 +3761,7 @@ impl ProjectRuntime {
     }
 
     async fn references(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3640,13 +3775,13 @@ impl ProjectRuntime {
 
     async fn diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult, String> {
         self.translator
-            .handle_diagnostics(file_path)
+            .handle_actor_diagnostics(file_path)
             .await
             .map_err(|error| error.to_string())
     }
 
     async fn rename(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3659,7 +3794,7 @@ impl ProjectRuntime {
     }
 
     async fn rename_workspace_edit(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3672,7 +3807,7 @@ impl ProjectRuntime {
     }
 
     async fn completions(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3684,10 +3819,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn document_symbols(
-        &mut self,
-        file_path: String,
-    ) -> Result<DocumentSymbolsResult, String> {
+    async fn document_symbols(&self, file_path: String) -> Result<DocumentSymbolsResult, String> {
         self.translator
             .handle_document_symbols(file_path)
             .await
@@ -3695,7 +3827,7 @@ impl ProjectRuntime {
     }
 
     async fn format_document(
-        &mut self,
+        &self,
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
@@ -3707,7 +3839,7 @@ impl ProjectRuntime {
     }
 
     async fn format_workspace_edit(
-        &mut self,
+        &self,
         file_path: String,
         tab_size: u32,
         insert_spaces: bool,
@@ -3718,8 +3850,48 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    async fn range_format_workspace_edit(
+        &self,
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<SupportedWorkspaceEdit, String> {
+        self.translator
+            .request_range_format_workspace_edit(file_path, start, end, tab_size, insert_spaces)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn move_item_workspace_edit(
+        &self,
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        direction: &str,
+    ) -> Result<SupportedWorkspaceEdit, String> {
+        self.translator
+            .request_move_item_workspace_edit(file_path, start, end, direction)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn semantic_discovery(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        kind: SemanticDiscoveryKind,
+    ) -> Result<SemanticDiscoveryResult, String> {
+        self.translator
+            .request_semantic_discovery(file_path, line, character, kind)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn workspace_symbol(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -3731,7 +3903,7 @@ impl ProjectRuntime {
     }
 
     async fn code_actions(
-        &mut self,
+        &self,
         file_path: String,
         start_line: u32,
         start_character: u32,
@@ -3838,7 +4010,7 @@ impl ProjectRuntime {
     }
 
     async fn prepare_call_hierarchy(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3849,20 +4021,14 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn incoming_calls(
-        &mut self,
-        item: serde_json::Value,
-    ) -> Result<IncomingCallsResult, String> {
+    async fn incoming_calls(&self, item: serde_json::Value) -> Result<IncomingCallsResult, String> {
         self.translator
             .handle_incoming_calls(item)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn outgoing_calls(
-        &mut self,
-        item: serde_json::Value,
-    ) -> Result<OutgoingCallsResult, String> {
+    async fn outgoing_calls(&self, item: serde_json::Value) -> Result<OutgoingCallsResult, String> {
         self.translator
             .handle_outgoing_calls(item)
             .await
@@ -3870,7 +4036,7 @@ impl ProjectRuntime {
     }
 
     async fn signature_help(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3882,7 +4048,7 @@ impl ProjectRuntime {
     }
 
     async fn inlay_hints(
-        &mut self,
+        &self,
         file_path: String,
         start_line: u32,
         start_character: u32,
@@ -3902,7 +4068,7 @@ impl ProjectRuntime {
     }
 
     async fn go_to_implementation(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3914,7 +4080,7 @@ impl ProjectRuntime {
     }
 
     async fn go_to_type_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -3925,7 +4091,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn cached_diagnostics(&mut self, file_path: &str) -> Result<DiagnosticsResult, String> {
+    fn cached_diagnostics(&self, file_path: &str) -> Result<DiagnosticsResult, String> {
         self.translator
             .handle_cached_diagnostics(file_path)
             .map_err(|error| error.to_string())
@@ -3945,18 +4111,18 @@ impl ProjectRuntime {
     }
 
     fn server_logs(
-        &mut self,
+        &self,
         limit: usize,
         min_level: Option<String>,
     ) -> Result<ServerLogsResult, String> {
         self.translator
-            .handle_server_logs(limit, min_level)
+            .actor_server_logs(limit, min_level)
             .map_err(|error| error.to_string())
     }
 
-    fn server_messages(&mut self, limit: usize) -> Result<ServerMessagesResult, String> {
+    fn server_messages(&self, limit: usize) -> Result<ServerMessagesResult, String> {
         self.translator
-            .handle_server_messages(limit)
+            .actor_server_messages(limit)
             .map_err(|error| error.to_string())
     }
 
@@ -3972,6 +4138,7 @@ impl ProjectRuntime {
     fn notification(
         &mut self,
         generation: u64,
+        server_id: &ServerId,
         notification: LspNotification,
     ) -> Option<ProjectEvent> {
         let completes_initial_load = notification.completes_initial_load();
@@ -3983,6 +4150,7 @@ impl ProjectRuntime {
                     diagnostic_count: params.diagnostics.len(),
                 };
                 self.translator.notification_cache_mut().store_diagnostics(
+                    server_id,
                     &params.uri,
                     params.version,
                     params.diagnostics,
@@ -4003,7 +4171,7 @@ impl ProjectRuntime {
             }
             LspNotification::ServerStatus(_) | LspNotification::Progress { .. } => {
                 if completes_initial_load {
-                    self.translator.clear_expected_languages();
+                    self.translator.clear_expected_server(server_id);
                 }
                 None
             }
@@ -4055,11 +4223,7 @@ impl ProjectRuntime {
     }
 
     fn open_document_paths(&self) -> Vec<PathBuf> {
-        self.translator
-            .document_tracker()
-            .open_paths()
-            .map(PathBuf::from)
-            .collect()
+        self.translator.document_tracker().open_paths()
     }
 }
 
@@ -4255,12 +4419,13 @@ impl ProjectActorChannels {
         &self,
         runtime: &mut ProjectRuntime,
         generation: u64,
+        server_id: &ServerId,
         notification: LspNotification,
     ) {
         if !runtime.owns_generation(generation) {
             return;
         }
-        if let Some(event) = runtime.notification(generation, notification) {
+        if let Some(event) = runtime.notification(generation, server_id, notification) {
             self.publish(event);
         }
     }
@@ -4316,17 +4481,20 @@ async fn next_project_request(
 }
 
 fn spawn_notification_forwarders(
-    notification_receivers: Vec<mpsc::Receiver<LspNotification>>,
+    notification_receivers: Vec<(ServerId, mpsc::Receiver<LspNotification>)>,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     generation: u64,
 ) {
-    for receiver in notification_receivers {
+    for (server_id, receiver) in notification_receivers {
         let sender = actor_sender.clone();
-        tokio::spawn(forward_lsp_notifications(receiver, sender, generation));
+        tokio::spawn(forward_lsp_notifications(
+            server_id, receiver, sender, generation,
+        ));
     }
 }
 
 async fn forward_lsp_notifications(
+    server_id: ServerId,
     mut receiver: mpsc::Receiver<LspNotification>,
     sender: mpsc::WeakSender<ProjectRequest>,
     generation: u64,
@@ -4338,6 +4506,7 @@ async fn forward_lsp_notifications(
         if sender
             .send(ProjectRequest::Notification {
                 generation,
+                server_id: server_id.clone(),
                 notification,
             })
             .await
@@ -4577,6 +4746,46 @@ async fn handle_project_request(
             let _ = reply.send(
                 runtime
                     .format_workspace_edit(file_path, tab_size, insert_spaces)
+                    .await,
+            );
+        }
+        ProjectRequest::RangeFormatWorkspaceEdit {
+            file_path,
+            start,
+            end,
+            tab_size,
+            insert_spaces,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .range_format_workspace_edit(file_path, start, end, tab_size, insert_spaces)
+                    .await,
+            );
+        }
+        ProjectRequest::MoveItemWorkspaceEdit {
+            file_path,
+            start,
+            end,
+            direction,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .move_item_workspace_edit(file_path, start, end, &direction)
+                    .await,
+            );
+        }
+        ProjectRequest::SemanticDiscovery {
+            file_path,
+            line,
+            character,
+            kind,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .semantic_discovery(file_path, line, character, kind)
                     .await,
             );
         }
@@ -4855,10 +5064,11 @@ async fn handle_project_request(
         }
         ProjectRequest::Notification {
             generation,
+            server_id,
             notification,
         } => {
             let was_initializing = runtime.translator.is_initializing();
-            channels.publish_notification(runtime, generation, notification);
+            channels.publish_notification(runtime, generation, &server_id, notification);
             if was_initializing && !runtime.translator.is_initializing() {
                 let health = if state.status == ProjectStatus::Degraded {
                     ActivationHealth::Degraded
@@ -7745,6 +7955,7 @@ mod tests {
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification,
             })
             .await
@@ -7774,6 +7985,7 @@ mod tests {
             .sender
             .send(ProjectRequest::Notification {
                 generation: 99,
+                server_id: ServerId::from("rust"),
                 notification: LspNotification::parse(
                     "textDocument/publishDiagnostics",
                     Some(serde_json::json!({
@@ -7788,6 +8000,7 @@ mod tests {
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification,
             })
             .await
@@ -7812,11 +8025,12 @@ mod tests {
         let file = root.path().join("src.rs");
         fs::write(&file, "fn main() {}\n").unwrap();
         let actor = spawn_project_actor_for_root(2, &CanonicalRoot::new(root.path()).unwrap());
-        let uri = crate::bridge::path_to_uri(&file);
+        let uri = crate::bridge::path_to_uri(&file).unwrap();
         actor
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification: LspNotification::parse(
                     "textDocument/publishDiagnostics",
                     Some(serde_json::json!({
@@ -7838,7 +8052,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_actor_becomes_ready_when_initial_rust_indexing_finishes() {
-        let mut translator = Translator::new();
+        let translator = Translator::new();
         translator.set_expected_languages(HashSet::from(["rust".to_string()]));
         let actor = spawn_project_actor_with_translator(2, translator);
 
@@ -7846,6 +8060,7 @@ mod tests {
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification: LspNotification::parse(
                     "experimental/serverStatus",
                     Some(serde_json::json!({
@@ -7865,6 +8080,7 @@ mod tests {
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification: LspNotification::parse(
                     "$/progress",
                     Some(serde_json::json!({
@@ -8289,7 +8505,7 @@ while True:
                 .document_tracker()
                 .get(&source)
                 .unwrap()
-                .content,
+                .content(),
             "// dirty\n#[path = \"feature.rs\"] pub mod feature;\n"
         );
         assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
@@ -8305,7 +8521,7 @@ while True:
         fs::write(&reference, "old_name();\n").unwrap();
         let dirty = "old_name(); // dirty\n";
 
-        let reference_uri = path_to_uri(&reference).to_string();
+        let reference_uri = path_to_uri(&reference).unwrap().to_string();
         let edit = serde_json::from_value(serde_json::json!({
             "changes": {
                 (reference_uri): [{
@@ -8730,6 +8946,7 @@ while True:
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification: LspNotification::parse(
                     "window/logMessage",
                     Some(serde_json::json!({"type": 1, "message": "retained log"})),
@@ -8741,6 +8958,7 @@ while True:
             .sender
             .send(ProjectRequest::Notification {
                 generation: 0,
+                server_id: ServerId::from("rust"),
                 notification: LspNotification::parse(
                     "window/showMessage",
                     Some(serde_json::json!({"type": 2, "message": "retained message"})),

@@ -546,10 +546,10 @@ fn initial_file(path: &PathBuf, documents: &DocumentTracker) -> Result<PlannedFi
     if let Some(document) = documents.get(path) {
         return Ok(PlannedFile {
             source: SnapshotSource::OpenDocument,
-            version: Some(document.version),
+            version: Some(document.version()),
             created: false,
-            original: document.content.clone(),
-            planned: document.content.clone(),
+            original: document.content().to_string(),
+            planned: document.content().to_string(),
         });
     }
     let original = fs::read_to_string(path).map_err(|source| PreviewError::Read {

@@ -13,9 +13,6 @@
 #[cfg(feature = "transport-http")]
 use std::sync::Arc;
 
-#[cfg(feature = "transport-http")]
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-
 /// The transport over which the MCP server communicates with clients.
 ///
 /// # Examples
@@ -222,10 +219,7 @@ impl HttpConfig {
         self.max_concurrent_sessions = max;
         self
     }
-}
 
-#[cfg(feature = "transport-http")]
-impl HttpConfig {
     fn validate(&self) -> Result<(), crate::Error> {
         if self.bind.ip().is_loopback() {
             return Ok(());
@@ -483,6 +477,8 @@ pub(crate) async fn run_http(
     };
     use tokio_util::sync::CancellationToken;
 
+    cfg.validate()?;
+
     let session_manager = Arc::new(CappedSessionManager::new(cfg.max_concurrent_sessions));
     let cancel = CancellationToken::new();
 
@@ -508,15 +504,6 @@ pub(crate) async fn run_http(
         .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
 
     tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
-    if !cfg.bind.ip().is_loopback() {
-        tracing::warn!(
-            addr = %cfg.bind,
-            "binding to a non-loopback address: mcpls performs no authentication of its own on \
-             any transport — place this endpoint behind a reverse proxy that enforces \
-             authentication. The proxy must also rewrite the Host header, since rmcp's Host \
-             validation allows only localhost/127.0.0.1/::1 by default"
-        );
-    }
 
     // `cancel` is cancelled exactly once, when the shutdown signal fires
     // (below). Cloned first so the force-timeout branch can observe that
@@ -792,19 +779,12 @@ mod tests {
     /// missing a branch, or awaiting the wrong future) would look like.
     #[tokio::test]
     async fn test_run_stdio_returns_promptly_when_stdin_is_already_closed() {
-        use std::path::PathBuf;
+        use crate::bridge::ResourceSubscriptions;
+        use crate::mcp::McplsServer;
         use std::sync::Arc;
 
-        use tokio::sync::Mutex;
-
-        use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
-        use crate::mcp::McplsServer;
-
-        let translator = Arc::new(Translator::new());
-        let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
         let subs = Arc::new(ResourceSubscriptions::new());
-        let server = McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+        let server = McplsServer::new(subs);
         let peer_cell = tokio::sync::OnceCell::new();
 
         let outcome = tokio::time::timeout(
@@ -828,7 +808,7 @@ mod tests {
     mod http_tests {
         use std::net::SocketAddr;
 
-        use super::super::{HttpConfig, LocalSessionManager, Transport};
+        use super::super::{HttpConfig, Transport};
 
         #[test]
         fn test_http_config_fields() {
@@ -891,20 +871,13 @@ mod tests {
         /// Verifies `run_http` binds successfully and accepts TCP connections.
         #[tokio::test]
         async fn test_run_http_binds() {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
-            use tokio::sync::Mutex;
-
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::ResourceSubscriptions;
             use crate::mcp::McplsServer;
 
-            let translator = Arc::new(Translator::new());
-            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server =
-                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+            let server = McplsServer::new(subs);
 
             // Bind port 0 so the OS assigns a free port.
             let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -988,24 +961,17 @@ mod tests {
         /// Verifies `run_http` returns an error when the bind address is already in use.
         #[tokio::test]
         async fn test_run_http_bind_error() {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
-            use tokio::sync::Mutex;
-
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::ResourceSubscriptions;
             use crate::mcp::McplsServer;
 
             // Hold a listener to make the port unavailable.
             let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = occupied.local_addr().unwrap();
 
-            let translator = Arc::new(Translator::new());
-            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            let server =
-                McplsServer::new(translator, notification_cache, workspace_roots, subs, false);
+            let server = McplsServer::new(subs);
 
             let cfg = HttpConfig::new(addr, "/mcp");
 
@@ -1022,19 +988,13 @@ mod tests {
         /// Builds a `McplsServer` with empty/default collaborators, matching the
         /// setup shared by every `run_http`-driving test in this module.
         fn test_server() -> crate::mcp::McplsServer {
-            use std::path::PathBuf;
             use std::sync::Arc;
 
-            use tokio::sync::Mutex;
-
-            use crate::bridge::{NotificationCache, ResourceSubscriptions, Translator};
+            use crate::bridge::ResourceSubscriptions;
             use crate::mcp::McplsServer;
 
-            let translator = Arc::new(Translator::new());
-            let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
-            let workspace_roots: Arc<[PathBuf]> = Arc::from(Vec::new());
             let subs = Arc::new(ResourceSubscriptions::new());
-            McplsServer::new(translator, notification_cache, workspace_roots, subs, false)
+            McplsServer::new(subs)
         }
 
         /// Sends a raw HTTP/1.1 POST request over TCP and returns the raw response
@@ -1367,69 +1327,18 @@ mod tests {
             server_task.abort();
         }
 
-        /// Captures `tracing` events emitted while a closure runs, since this
-        /// codebase has no existing `tracing_test`-style capture helper to
-        /// reuse (only `mcpls-cli/src/logging.rs` sets up a real/global
-        /// subscriber, which isn't suitable for assertions).
-        #[derive(Clone, Default)]
-        struct CapturedMessages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedMessages {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct MessageVisitor(String);
-                impl tracing::field::Visit for MessageVisitor {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "message" {
-                            self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.0.lock().unwrap().push(visitor.0);
-            }
-        }
-
-        /// #233: binding to a non-loopback address must log a warning that
-        /// tells operators to put the endpoint behind a reverse proxy that
-        /// *enforces* authentication (not the inverted "ensure no
-        /// authentication is required" wording it replaced).
+        /// Binding without an authenticated reverse proxy is unsupported, so
+        /// non-loopback addresses fail before opening a listener.
         #[tokio::test]
-        async fn test_run_http_non_loopback_bind_warns_to_use_reverse_proxy() {
-            use tracing_subscriber::layer::SubscriberExt as _;
-
+        async fn test_run_http_rejects_non_loopback_bind() {
             let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
             let cfg = HttpConfig::new(addr, "/mcp");
-
-            let captured = CapturedMessages::default();
-            let subscriber = tracing_subscriber::registry().with(captured.clone());
-            let guard = tracing::subscriber::set_default(subscriber);
-
-            // The warning fires synchronously right after bind, before
-            // `axum::serve` starts running indefinitely, so a short timeout
-            // is enough to observe it.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                super::super::run_http(test_server(), cfg, super::super::ShutdownSignal::new()),
-            )
-            .await;
-
-            drop(guard);
-
-            let messages = captured.0.lock().unwrap().clone();
+            let result =
+                super::super::run_http(test_server(), cfg, super::super::ShutdownSignal::new())
+                    .await;
             assert!(
-                messages.iter().any(|m| m.contains(
-                    "place this endpoint behind a reverse proxy that enforces authentication"
-                )),
-                "expected reverse-proxy warning in captured tracing events, got: {messages:?}"
+                matches!(result, Err(crate::Error::Config(message)) if message.contains("loopback")),
+                "expected a loopback validation error"
             );
         }
     }

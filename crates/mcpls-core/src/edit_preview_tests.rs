@@ -15,7 +15,7 @@ fn previews_disk_text_edit_without_writing() {
     let boundary = WorkspaceBoundary::new(root.path()).unwrap();
     let edit = WorkspaceEdit {
         changes: Some(HashMap::from([(
-            path_to_uri(&file),
+            path_to_uri(&file).unwrap(),
             vec![lsp_types::TextEdit {
                 range: lsp_types::Range::new(
                     lsp_types::Position::new(0, 0),
@@ -50,12 +50,12 @@ fn previews_text_edit_after_ordered_create() {
     let edit = NormalizedWorkspaceEdit {
         operations: vec![
             EditOperation::Create {
-                uri: path_to_uri(&file),
+                uri: path_to_uri(&file).unwrap(),
                 options: None,
                 annotation_id: None,
             },
             EditOperation::Text {
-                uri: path_to_uri(&file),
+                uri: path_to_uri(&file).unwrap(),
                 version: None,
                 edits: vec![NormalizedTextEdit {
                     range: lsp_types::Range::default(),
@@ -94,7 +94,7 @@ fn rejects_text_before_create_in_the_same_transaction() {
     let edit = NormalizedWorkspaceEdit {
         operations: vec![
             EditOperation::Text {
-                uri: path_to_uri(&file),
+                uri: path_to_uri(&file).unwrap(),
                 version: None,
                 edits: vec![NormalizedTextEdit {
                     range: lsp_types::Range::new(
@@ -106,7 +106,7 @@ fn rejects_text_before_create_in_the_same_transaction() {
                 }],
             },
             EditOperation::Create {
-                uri: path_to_uri(&file),
+                uri: path_to_uri(&file).unwrap(),
                 options: Some(lsp_types::CreateFileOptions {
                     overwrite: Some(true),
                     ignore_if_exists: Some(false),
@@ -145,7 +145,7 @@ fn create_overwrite_then_text_retains_existing_preimage() {
     let edit = NormalizedWorkspaceEdit {
         operations: vec![
             EditOperation::Create {
-                uri: path_to_uri(&file),
+                uri: path_to_uri(&file).unwrap(),
                 options: Some(lsp_types::CreateFileOptions {
                     overwrite: Some(true),
                     ignore_if_exists: Some(false),
@@ -153,7 +153,7 @@ fn create_overwrite_then_text_retains_existing_preimage() {
                 annotation_id: None,
             },
             EditOperation::Text {
-                uri: path_to_uri(&file),
+                uri: path_to_uri(&file).unwrap(),
                 version: None,
                 edits: vec![NormalizedTextEdit {
                     range: lsp_types::Range::default(),
@@ -188,7 +188,7 @@ fn rejects_resource_operation_limit() {
     let path = root.path().join("created.rs");
     let edit = NormalizedWorkspaceEdit {
         operations: vec![EditOperation::Create {
-            uri: path_to_uri(&path),
+            uri: path_to_uri(&path).unwrap(),
             options: None,
             annotation_id: None,
         }],
@@ -230,7 +230,7 @@ fn permits_text_edits_followed_by_one_rename() {
     let edit = NormalizedWorkspaceEdit {
         operations: vec![
             EditOperation::Text {
-                uri: path_to_uri(&reference),
+                uri: path_to_uri(&reference).unwrap(),
                 version: None,
                 edits: vec![NormalizedTextEdit {
                     range: lsp_types::Range::new(
@@ -242,8 +242,8 @@ fn permits_text_edits_followed_by_one_rename() {
                 }],
             },
             EditOperation::Rename {
-                old_uri: path_to_uri(&source),
-                new_uri: path_to_uri(&destination),
+                old_uri: path_to_uri(&source).unwrap(),
+                new_uri: path_to_uri(&destination).unwrap(),
                 options: None,
                 annotation_id: None,
             },
@@ -281,13 +281,13 @@ fn rejects_text_edits_that_follow_a_rename() {
     let edit = NormalizedWorkspaceEdit {
         operations: vec![
             EditOperation::Rename {
-                old_uri: path_to_uri(&source),
-                new_uri: path_to_uri(&destination),
+                old_uri: path_to_uri(&source).unwrap(),
+                new_uri: path_to_uri(&destination).unwrap(),
                 options: None,
                 annotation_id: None,
             },
             EditOperation::Text {
-                uri: path_to_uri(&reference),
+                uri: path_to_uri(&reference).unwrap(),
                 version: None,
                 edits: vec![],
             },
@@ -322,7 +322,7 @@ fn rejects_per_file_byte_limit() {
     let boundary = WorkspaceBoundary::new(root.path()).unwrap();
     let edit = NormalizedWorkspaceEdit {
         operations: vec![EditOperation::Text {
-            uri: path_to_uri(&file),
+            uri: path_to_uri(&file).unwrap(),
             version: None,
             edits: vec![NormalizedTextEdit {
                 range: lsp_types::Range::new(

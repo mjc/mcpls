@@ -223,8 +223,8 @@ async fn test_hover_on_u64_type() {
         Duration::from_secs(10),
         translator.lock().await.handle_hover(
             file_path.to_string_lossy().to_string(),
-            19,
-            13, // Position on "u64"
+            line,
+            character,
         ),
     )
     .await;
@@ -263,8 +263,8 @@ async fn test_definition_user_struct() {
         Duration::from_secs(10),
         translator.lock().await.handle_definition(
             types_file.to_string_lossy().to_string(),
-            9,
-            16, // Position on "User"
+            line,
+            character,
         ),
     )
     .await;

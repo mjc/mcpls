@@ -12,6 +12,13 @@ use tracing::warn;
 use crate::config::ServerId;
 use crate::util::{truncate_str, truncate_string};
 
+fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {
+    if queue.len() == capacity {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
 
@@ -369,6 +376,33 @@ impl RedactionPolicy {
         self.secrets.iter().fold(message, |message, secret| {
             message.replace(secret, "[REDACTED]")
         })
+    }
+
+    /// Redact secret strings and sensitive-key values in structured server data.
+    pub fn redact_json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(string) => *string = self.redact(string),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.redact_json(value);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if key
+                        .to_ascii_lowercase()
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .any(|part| SENSITIVE_KEYS.contains(&part))
+                    {
+                        *value = serde_json::Value::String("[REDACTED]".to_string());
+                    } else {
+                        self.redact_json(value);
+                    }
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
     }
 }
 
@@ -1575,7 +1609,7 @@ mod tests {
     fn test_store_log_preserves_generation() {
         let mut cache = NotificationCache::new();
         cache.store_log_with_generation(7, LogLevel::Info, "generation".to_string());
-        assert_eq!(cache.get_logs().front().unwrap().generation, 7);
+        assert_eq!(cache.logs().front().unwrap().generation, 7);
     }
 
     #[test]
@@ -1652,7 +1686,7 @@ mod tests {
     fn test_store_message_preserves_generation() {
         let mut cache = NotificationCache::new();
         cache.store_message_with_generation(9, MessageType::Info, "generation".to_string());
-        assert_eq!(cache.get_messages().front().unwrap().generation, 9);
+        assert_eq!(cache.messages().front().unwrap().generation, 9);
     }
 
     #[test]

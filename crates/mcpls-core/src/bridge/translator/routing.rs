@@ -612,6 +612,7 @@ mod tests {
                 max_file_size: DEFAULT_MAX_FILE_SIZE,
             },
             lsp_servers: vec![],
+            daemon: crate::config::DaemonConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1354,17 +1355,16 @@ mod tests {
             lsp_types::ServerCapabilities::default(),
         );
 
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn fallback_main() {}").unwrap();
+
         let result = translator
             .handle_workspace_symbol("main".to_string(), None, 100)
-            .await;
+            .await
+            .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(Error::CapabilityNotSupported {
-                capability: "workspaceSymbolProvider",
-                ..
-            })
-        ));
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "fallback_main");
     }
 
     #[tokio::test]

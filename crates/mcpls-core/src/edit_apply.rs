@@ -480,7 +480,7 @@ fn validate_open_document_snapshot(
             actual: None,
         }));
     };
-    snapshot.validate(&document.content, Some(document.version))?;
+    snapshot.validate(document.content(), Some(document.version()))?;
     Ok(())
 }
 

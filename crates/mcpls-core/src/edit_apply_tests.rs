@@ -127,7 +127,7 @@ fn applies_open_document_snapshot_against_tracked_content() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("open.rs");
     fs::write(&file, "disk\n").unwrap();
-    let mut documents = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+    let documents = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
     documents.open(file.clone(), "dirty\n".to_string()).unwrap();
     let plan = EditPlan::new(
         "project".to_string(),

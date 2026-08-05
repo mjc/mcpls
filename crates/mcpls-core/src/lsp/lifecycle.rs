@@ -8,6 +8,7 @@
 //! 5. Graceful shutdown sequence
 
 use std::collections::HashMap;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -248,6 +249,7 @@ impl Default for ServerInitResult {
 pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
+    server_name: Option<String>,
     position_encoding: PositionEncodingKind,
     workspace_roots: Vec<PathBuf>,
     /// Receiver for push notifications from the LSP server.
@@ -268,6 +270,7 @@ impl std::fmt::Debug for LspServer {
         f.debug_struct("LspServer")
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
+            .field("server_name", &self.server_name)
             .field("position_encoding", &self.position_encoding)
             .field("workspace_roots", &self.workspace_roots)
             .field("notification_rx", &"<channel>")
@@ -308,6 +311,9 @@ impl LspServer {
         );
 
         let mut command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
+        if let Some(root) = config.workspace_roots.first() {
+            command.current_dir(root);
+        }
 
         // Log allowlist presence and an override count only — never the
         // configured keys themselves, since `config.server_config.env` may
@@ -356,13 +362,15 @@ impl LspServer {
             config.workspace_roots.clone(),
         );
 
-        let (capabilities, position_encoding) = Self::initialize(&client, &config).await?;
+        let (capabilities, position_encoding, server_name) =
+            Self::initialize(&client, &config).await?;
 
         info!("LSP server initialized successfully");
 
         Ok(Self {
             client,
             capabilities,
+            server_name,
             position_encoding,
             workspace_roots: config.workspace_roots,
             notification_rx,
@@ -415,7 +423,7 @@ impl LspServer {
     async fn initialize(
         client: &LspClient,
         config: &ServerInitConfig,
-    ) -> Result<(ServerCapabilities, PositionEncodingKind)> {
+    ) -> Result<(ServerCapabilities, PositionEncodingKind, Option<String>)> {
         debug!("Sending initialize request");
 
         let workspace_folders: Vec<WorkspaceFolder> = config
@@ -450,6 +458,13 @@ impl LspServer {
                     definition: Some(lsp_types::GotoCapability {
                         dynamic_registration: Some(false),
                         link_support: Some(true),
+                    }),
+                    declaration: Some(lsp_types::GotoCapability {
+                        dynamic_registration: Some(false),
+                        link_support: Some(true),
+                    }),
+                    selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
+                        dynamic_registration: Some(false),
                     }),
                     references: Some(lsp_types::ReferenceClientCapabilities {
                         dynamic_registration: Some(false),
@@ -538,6 +553,7 @@ impl LspServer {
             .position_encoding
             .clone()
             .unwrap_or(PositionEncodingKind::UTF16);
+        let server_name = result.server_info.as_ref().map(|info| info.name.clone());
 
         debug!(
             "Server capabilities received, encoding: {:?}",
@@ -553,13 +569,21 @@ impl LspServer {
 
         client.set_ready().await;
 
-        Ok((result.capabilities, position_encoding))
+        Ok((result.capabilities, position_encoding, server_name))
     }
 
     /// Get server capabilities.
     #[must_use]
     pub const fn capabilities(&self) -> &ServerCapabilities {
         &self.capabilities
+    }
+
+    /// Whether the initialized server identifies itself as rust-analyzer.
+    #[must_use]
+    pub fn is_rust_analyzer(&self) -> bool {
+        self.server_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("rust-analyzer"))
     }
 
     /// Get negotiated position encoding.
@@ -698,16 +722,16 @@ impl LspServer {
     /// ```
     pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
         let mut result = ServerInitResult::new();
-
-        for config in configs {
+        let attempts = configs.iter().cloned().map(|config| async move {
             let server_id = config.server_config.id();
             let language_id = config.server_config.language_id.clone();
             let command = config.server_config.command.clone();
             let outcome = Self::spawn(config).await;
-            (language_id, command, outcome)
+            (server_id, language_id, command, outcome)
         });
 
-        for (language_id, command, outcome) in futures::future::join_all(attempts).await {
+        for (server_id, language_id, command, outcome) in futures::future::join_all(attempts).await
+        {
             match outcome {
                 Ok(server) => {
                     info!(
@@ -787,6 +811,91 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
     })
 }
 
+/// Load the effective process environment for one project root.
+pub async fn load_project_environment(root: &Path) -> Option<HashMap<String, Option<String>>> {
+    if root.join(".envrc").is_file()
+        && let Some(root_string) = root.to_str()
+        && let Some(environment) =
+            command_environment("direnv", ["exec", root_string, "env"], root).await
+    {
+        info!("Loaded LSP environment from direnv: {}", root.display());
+        return Some(environment);
+    }
+
+    let root_string = root.to_str()?;
+    if root.join("flake.nix").is_file()
+        && let Some(environment) =
+            command_environment("nix", ["develop", root_string, "-c", "env"], root).await
+    {
+        info!(
+            "Loaded LSP environment from nix develop: {}",
+            root.display()
+        );
+        return Some(environment);
+    }
+
+    None
+}
+
+async fn command_environment<I, S>(
+    command: &str,
+    args: I,
+    root: &Path,
+) -> Option<HashMap<String, Option<String>>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = Command::new(command)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_string(), Some(value.to_string())))
+            })
+            .collect(),
+    )
+}
+
+/// Resolve a configured command against the daemon and project environments.
+pub fn resolve_command(
+    command: &str,
+    project_env: Option<&HashMap<String, Option<String>>>,
+) -> PathBuf {
+    let command_path = PathBuf::from(command);
+    if command_path.is_absolute() || command_path.components().count() > 1 {
+        return command_path;
+    }
+
+    let current_path = env::var("PATH").ok();
+    let project_path = project_env
+        .and_then(|environment| environment.get("PATH"))
+        .and_then(Option::as_deref);
+    for path in [current_path.as_deref(), project_path]
+        .into_iter()
+        .flatten()
+    {
+        for directory in env::split_paths(path) {
+            let candidate = directory.join(command);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    command_path
+}
+
 /// Builds an `LspServer` backed by mock `echo`/`cat` child processes, so it
 /// can be registered without a real language server.
 ///
@@ -826,7 +935,9 @@ pub fn fake_lsp_server() -> LspServer {
     LspServer {
         client,
         capabilities: lsp_types::ServerCapabilities::default(),
+        server_name: None,
         position_encoding: PositionEncodingKind::UTF8,
+        workspace_roots: Vec::new(),
         notification_rx: mock_notification_rx,
         child: mock_child,
     }
@@ -872,7 +983,9 @@ impl LspServer {
         Self {
             client,
             capabilities,
+            server_name: None,
             position_encoding,
+            workspace_roots: Vec::new(),
             notification_rx,
             child,
         }
@@ -1240,7 +1353,9 @@ fn main() {
         let mut server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
+            server_name: None,
             position_encoding: PositionEncodingKind::UTF8,
+            workspace_roots: Vec::new(),
             notification_rx: mock_notification_rx,
             child: mock_child,
         };
@@ -1293,6 +1408,7 @@ fn main() {
         let server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
+            server_name: Some("rust-analyzer".to_string()),
             position_encoding: PositionEncodingKind::UTF8,
             workspace_roots: vec![],
             notification_rx: mock_notification_rx,
@@ -1301,6 +1417,7 @@ fn main() {
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
         assert!(server.capabilities().text_document_sync.is_none());
+        assert!(server.is_rust_analyzer());
 
         let debug_str = format!("{server:?}");
         assert!(debug_str.contains("LspServer"));
@@ -1384,6 +1501,7 @@ fn main() {
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
+            server_name: None,
             position_encoding: PositionEncodingKind::UTF8,
             workspace_roots: vec![],
             notification_rx: mock_notification_rx1,
@@ -1433,6 +1551,7 @@ fn main() {
         let server = LspServer {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
+            server_name: None,
             position_encoding: PositionEncodingKind::UTF8,
             workspace_roots: vec![],
             notification_rx: mock_notification_rx,
@@ -1497,6 +1616,7 @@ fn main() {
             let server = LspServer {
                 client,
                 capabilities: lsp_types::ServerCapabilities::default(),
+                server_name: None,
                 position_encoding: PositionEncodingKind::UTF8,
                 workspace_roots: vec![],
                 notification_rx: mock_notification_rx,
@@ -1547,6 +1667,7 @@ fn main() {
         let server1 = LspServer {
             client: client1,
             capabilities: lsp_types::ServerCapabilities::default(),
+            server_name: None,
             position_encoding: PositionEncodingKind::UTF8,
             workspace_roots: vec![],
             notification_rx: mock_notification_rx1,
@@ -1586,6 +1707,7 @@ fn main() {
         let server2 = LspServer {
             client: client2,
             capabilities: lsp_types::ServerCapabilities::default(),
+            server_name: None,
             position_encoding: PositionEncodingKind::UTF16,
             workspace_roots: vec![],
             notification_rx: mock_notification_rx2,
@@ -1662,10 +1784,14 @@ fn main() {
                 file_patterns: vec![],
                 initialization_options: None,
                 timeout_seconds: 1,
+                request_timeout_seconds: 30,
                 heuristics: None,
+                name: None,
+                handles: None,
             },
             workspace_roots: vec![directory.path().to_path_buf()],
             initialization_options: None,
+            position_encodings: crate::config::default_position_encodings(),
             notification_tx: None,
         };
         let configs = [
@@ -2215,11 +2341,15 @@ fn main() {
         let mut result = ServerInitResult::new();
         result.add_server(pylsp_id.clone(), fake_lsp_server());
 
-        let registered = crate::register_servers(result, &translator, &HashMap::new());
+        let registered_ids = result
+            .servers
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        translator.rebind_router(&registered_ids);
 
-        assert_eq!(
-            registered.diagnostics_flags.get(&pylsp_id),
-            Some(&true),
+        assert!(
+            translator.is_diagnostics_route("python", &pylsp_id),
             "pylsp must inherit the diagnostics route once pyright-diag is \
              known dead, and the flag must reflect that post-rebind state"
         );

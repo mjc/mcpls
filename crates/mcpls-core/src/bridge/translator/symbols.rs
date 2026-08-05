@@ -8,8 +8,8 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
-use crate::bridge::lock_std;
-use crate::config::{NoServerReason, ToolKind};
+use crate::bridge::{ast_grep, lock_std, path_to_uri};
+use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
 /// Validate parameters for `handle_workspace_symbol`.
@@ -177,8 +177,9 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LSP request fails, no server is configured, or
-    /// the routed server does not advertise `workspaceSymbolProvider` support.
+    /// Returns an error when the request parameters are invalid. Missing,
+    /// initializing, unsupported, or failed LSP servers use the bounded
+    /// in-process AST fallback.
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
@@ -186,58 +187,84 @@ impl Translator {
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
+        if limit == 0 {
+            return Ok(WorkspaceSymbolResult {
+                symbols: Vec::new(),
+            });
+        }
+
+        let fallback = || async {
+            let mut languages = lock_std(&self.project_lsp_configs)
+                .iter()
+                .map(|config| config.language_id.clone())
+                .chain(self.extension_map.values().cloned())
+                .collect::<Vec<_>>();
+            languages.sort_unstable();
+            languages.dedup();
+            Ok(WorkspaceSymbolResult {
+                symbols: self
+                    .ast_grep_workspace_symbols(
+                        &languages,
+                        &query,
+                        kind_filter.as_deref(),
+                        limit as usize,
+                    )
+                    .await,
+            })
+        };
 
         // Workspace search has no document, so it resolves via `resolve_any`
         // rather than a per-language route. If the resolved server is not
         // registered yet but is expected, tell the caller to wait and retry
         // rather than implying nothing is configured.
-        let server_id = lock_std(&self.router)
-            .resolve_any(ToolKind::WorkspaceSymbols)
-            .cloned()
-            .map_err(|reason| match reason {
-                // `resolve_any` reports "nothing registered", which also
-                // covers a server that is configured but has not finished
-                // spawning yet -- check `expected_servers` (unavailable to
-                // `ToolRouter` itself) to tell the two apart, mirroring
-                // `get_client_for_file`'s `ServerInitializing` check below.
-                NoServerReason::NothingRegistered => {
-                    if lock_std(&self.expected_servers).is_empty() {
-                        Error::NoServerConfigured
-                    } else {
-                        Error::WorkspaceServersInitializing
-                    }
-                }
-                NoServerReason::NoClaimant => Error::NoServerForWorkspaceTool {
-                    tool: ToolKind::WorkspaceSymbols,
-                },
-            })?;
-        self.respawn_if_dead(&server_id).await?;
-        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
-        let client = client.ok_or_else(|| {
-            if lock_std(&self.expected_servers).contains(&server_id) {
-                Error::ServerInitializing {
-                    server_id: server_id.clone(),
-                }
-            } else {
-                Error::NoServerConfigured
+        let routed = {
+            lock_std(&self.router)
+                .resolve_any(ToolKind::WorkspaceSymbols)
+                .cloned()
+        };
+        let server_id = match routed {
+            Ok(server_id) => server_id,
+            Err(reason) => {
+                tracing::debug!(?reason, "using AST workspace-symbol fallback");
+                return fallback().await;
             }
-        })?;
-        self.require_capability(&server_id, "workspaceSymbolProvider", |caps| {
-            matches!(
-                caps.workspace_symbol_provider,
-                Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
-            )
-        })?;
+        };
+        if let Err(error) = self.respawn_if_dead(&server_id).await {
+            tracing::debug!(%error, "workspace-symbol server unavailable; using AST fallback");
+            return fallback().await;
+        }
+        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
+        let Some(client) = client else {
+            return fallback().await;
+        };
+        if self
+            .require_capability(&server_id, "workspaceSymbolProvider", |caps| {
+                matches!(
+                    caps.workspace_symbol_provider,
+                    Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                )
+            })
+            .is_err()
+        {
+            return fallback().await;
+        }
 
         let params = LspWorkspaceSymbolParams {
-            query,
+            query: query.clone(),
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response: Option<Vec<lsp_types::SymbolInformation>> = client
+        let response: Option<Vec<lsp_types::SymbolInformation>> = match client
             .request("workspace/symbol", params, client.request_timeout())
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%error, "workspace-symbol request failed; using AST fallback");
+                return fallback().await;
+            }
+        };
 
         let ctx = self.encoding_ctx(&server_id);
         let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
@@ -266,46 +293,115 @@ impl Translator {
 
         Ok(WorkspaceSymbolResult { symbols })
     }
+
+    async fn ast_grep_workspace_symbols(
+        &self,
+        languages: &[String],
+        query: &str,
+        kind_filter: Option<&str>,
+        limit: usize,
+    ) -> Vec<WorkspaceSymbol> {
+        ast_grep::search(&self.workspace_roots, languages, query, kind_filter, limit)
+            .await
+            .into_iter()
+            .filter_map(|symbol| {
+                let kind = ast_grep_symbol_kind(&symbol.kind)?;
+                let uri = path_to_uri(&symbol.path).ok()?;
+                kind_filter
+                    .is_none_or(|filter| kind.eq_ignore_ascii_case(filter))
+                    .then_some(WorkspaceSymbol {
+                        name: symbol.name,
+                        kind: kind.to_string(),
+                        location: Location {
+                            uri: uri.to_string(),
+                            range: super::Range {
+                                start: super::Position2D {
+                                    line: symbol.start_line + 1,
+                                    character: symbol.start_character + 1,
+                                },
+                                end: super::Position2D {
+                                    line: symbol.end_line + 1,
+                                    character: symbol.end_character + 1,
+                                },
+                            },
+                        },
+                        container_name: None,
+                    })
+            })
+            .take(limit)
+            .collect()
+    }
+}
+
+fn ast_grep_symbol_kind(symbol_type: &str) -> Option<&'static str> {
+    match symbol_type.to_ascii_lowercase().as_str() {
+        "class" => Some("Class"),
+        "constant" | "const" => Some("Constant"),
+        "enum" => Some("Enum"),
+        "enum_member" => Some("EnumMember"),
+        "field" => Some("Field"),
+        "function" => Some("Function"),
+        "interface" | "trait" => Some("Interface"),
+        "method" => Some("Method"),
+        "module" | "namespace" => Some("Module"),
+        "struct" | "union" => Some("Struct"),
+        "type" | "typealias" => Some("TypeParameter"),
+        "variable" => Some("Variable"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::fs;
 
     use super::*;
     use crate::config::{ServerId, ToolRouter};
+    use tempfile::TempDir;
+
+    fn fallback_translator(dir: &TempDir) -> Translator {
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        fs::write(dir.path().join("main.rs"), "fn fallback_target() {}\n").unwrap();
+        translator
+    }
 
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_server() {
-        let translator = Translator::new();
+        let dir = TempDir::new().unwrap();
+        let translator = fallback_translator(&dir);
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
-            .await;
-        assert!(matches!(result, Err(Error::NoServerConfigured)));
+            .handle_workspace_symbol("fallback_target".to_string(), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "fallback_target");
     }
 
     /// #242/S4 regression: a server is configured and still spawning (large
     /// project load) rather than never having existed -- the router alone
     /// cannot tell these apart (both look like "nothing registered"), so
-    /// `handle_workspace_symbol` must consult `expected_servers` to report
-    /// "still initializing" instead of the misleading "no server configured".
+    /// `handle_workspace_symbol` must remain useful while the configured
+    /// server is still initializing.
     #[tokio::test]
     async fn test_handle_workspace_symbol_reports_initializing_when_expected_but_not_registered() {
-        let translator = Translator::new();
+        let dir = TempDir::new().unwrap();
+        let translator = fallback_translator(&dir);
         translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
-            .await;
-        assert!(matches!(result, Err(Error::WorkspaceServersInitializing)));
+            .handle_workspace_symbol("fallback_target".to_string(), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.symbols[0].name, "fallback_target");
     }
 
     /// #242 regression: a server *is* configured and running, it just
     /// doesn't claim `workspace_symbols` and there is no catch-all -- the
-    /// error must name the tool rather than collapse into the generic
-    /// "no LSP server configured" message a client would also see if
-    /// nothing were running at all.
+    /// structural fallback must still answer the query.
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_claimant_names_tool() {
         let configs = vec![crate::config::LspServerConfig {
@@ -322,16 +418,14 @@ mod tests {
             handles: Some(vec![ToolKind::Hover]),
         }];
         let router = ToolRouter::from_configs(&configs).unwrap();
-        let translator = Translator::new().with_router(router);
+        let dir = TempDir::new().unwrap();
+        let mut translator = fallback_translator(&dir).with_router(router);
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
-            .await;
-        assert!(matches!(
-            result,
-            Err(Error::NoServerForWorkspaceTool {
-                tool: ToolKind::WorkspaceSymbols
-            })
-        ));
+            .handle_workspace_symbol("fallback_target".to_string(), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.symbols[0].name, "fallback_target");
     }
 }

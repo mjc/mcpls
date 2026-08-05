@@ -20,6 +20,8 @@ pub use server::{
 };
 
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
+use crate::edit_backup::BackupFailureMode;
+use crate::edit_plan::AuditFailureMode;
 use crate::error::{Error, Result};
 
 /// Maps file extensions to LSP language identifiers.
@@ -46,6 +48,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub lsp_servers: Vec<LspServerConfig>,
 
+    /// Long-lived daemon settings.
+    #[serde(default = "default_daemon_config")]
+    pub daemon: DaemonConfig,
+
     /// Whether a CWD-discovered `./mcpls.toml` was ignored as untrusted
     /// during this load (see [`ProjectConfigTrust`]).
     ///
@@ -57,6 +63,170 @@ pub struct ServerConfig {
     /// typically invisible to an MCP client).
     #[serde(skip)]
     pub project_config_ignored: bool,
+}
+
+/// Optional configuration supplied when registering one project at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Project-specific language-server definitions.
+    #[serde(default)]
+    pub lsp_servers: Option<Vec<LspServerConfig>>,
+    /// Override the recursive project-marker search depth.
+    #[serde(default)]
+    pub heuristics_max_depth: Option<usize>,
+    /// Literal values to redact from project-scoped LSP notifications.
+    #[serde(default)]
+    pub redaction_patterns: Option<Vec<String>>,
+    /// Persist LSP environment values in the registration state file.
+    #[serde(default)]
+    pub persist_environment: bool,
+    /// Project-specific edit-safety policies replacing daemon defaults.
+    #[serde(default)]
+    pub edit_safety: Option<EditSafetyConfig>,
+}
+
+impl ProjectConfig {
+    /// Return whether this payload leaves all daemon settings unchanged.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.lsp_servers.is_none()
+            && self.heuristics_max_depth.is_none()
+            && self.redaction_patterns.is_none()
+            && match self.edit_safety.as_ref() {
+                None => true,
+                Some(config) => config.is_empty(),
+            }
+            && !self.persist_environment
+    }
+
+    /// Return the configuration representation safe for the registration store.
+    #[must_use]
+    pub fn for_persistence(&self) -> Self {
+        if self.persist_environment {
+            return self.clone();
+        }
+
+        let mut persisted = self.clone();
+        if let Some(servers) = &mut persisted.lsp_servers {
+            for server in servers {
+                server.env.clear();
+            }
+        }
+        persisted
+    }
+}
+
+fn default_daemon_config() -> DaemonConfig {
+    DaemonConfig::default()
+}
+
+/// Durable audit-log configuration for edit applications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLogConfig {
+    /// JSONL path, resolved relative to the project root when not absolute.
+    pub path: PathBuf,
+    /// Maximum bytes retained in the append-only file.
+    #[serde(default = "default_audit_max_bytes")]
+    pub max_bytes: usize,
+    /// Whether a sink failure blocks a successful edit.
+    #[serde(default)]
+    pub failure_mode: AuditFailureMode,
+}
+
+/// Optional bounded backup configuration for edit applications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupConfig {
+    /// Archive directory, resolved relative to the project root when not absolute.
+    pub root: PathBuf,
+    /// Maximum number of retained plan archives.
+    #[serde(default = "default_backup_max_archives")]
+    pub max_archives: usize,
+    /// Maximum combined bytes retained by the archive directory.
+    #[serde(default = "default_backup_max_bytes")]
+    pub max_bytes: usize,
+    /// Whether a backup failure blocks the edit.
+    #[serde(default)]
+    pub failure_mode: BackupFailureMode,
+}
+
+/// Optional edit-safety policies inherited by projects from the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditSafetyConfig {
+    /// Durable audit sink configuration.
+    #[serde(default)]
+    pub audit_log: Option<AuditLogConfig>,
+    /// Bounded backup archive configuration.
+    #[serde(default)]
+    pub backup: Option<BackupConfig>,
+}
+
+impl EditSafetyConfig {
+    /// Return whether no edit-safety override is configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.audit_log.is_none() && self.backup.is_none()
+    }
+}
+
+const fn default_audit_max_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+const fn default_backup_max_archives() -> usize {
+    16
+}
+
+const fn default_backup_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+/// Configuration for daemon-owned runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Optional JSON state file for dynamic project registrations.
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
+    /// Maximum time to wait for each project actor during daemon shutdown.
+    #[serde(default = "default_shutdown_timeout_seconds")]
+    pub shutdown_timeout_seconds: u64,
+    /// Maximum number of resident rust-analyzer actor groups.
+    #[serde(default = "default_rust_analyzer_resident_groups")]
+    pub rust_analyzer_resident_groups: usize,
+    /// Optional edit-safety defaults inherited by registered projects.
+    #[serde(default)]
+    pub edit_safety: Option<EditSafetyConfig>,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            state_file: None,
+            shutdown_timeout_seconds: default_shutdown_timeout_seconds(),
+            rust_analyzer_resident_groups: default_rust_analyzer_resident_groups(),
+            edit_safety: None,
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// Return the configured project shutdown deadline.
+    #[must_use]
+    pub const fn shutdown_timeout(&self) -> Duration {
+        Duration::from_secs(self.shutdown_timeout_seconds)
+    }
+}
+
+const fn default_shutdown_timeout_seconds() -> u64 {
+    30
+}
+
+const fn default_rust_analyzer_resident_groups() -> usize {
+    1
 }
 
 /// Workspace-level configuration.
@@ -657,6 +827,11 @@ impl ServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
+        if self.daemon.rust_analyzer_resident_groups == 0 {
+            return Err(Error::InvalidConfig(
+                "daemon.rust_analyzer_resident_groups must be at least one".to_string(),
+            ));
+        }
         if self.workspace.position_encodings.is_empty() {
             return Err(Error::InvalidConfig(
                 "workspace.position_encodings cannot be empty".to_string(),
@@ -766,6 +941,7 @@ impl Default for ServerConfig {
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
             ],
+            daemon: DaemonConfig::default(),
             project_config_ignored: false,
         }
     }
@@ -1031,6 +1207,21 @@ mod tests {
         let config: ServerConfig = toml::from_str("").unwrap();
 
         assert_eq!(config.daemon.shutdown_timeout_seconds, 30);
+        assert_eq!(config.daemon.rust_analyzer_resident_groups, 1);
+    }
+
+    #[test]
+    fn daemon_rejects_zero_rust_analyzer_resident_groups() {
+        let tmp_dir = TempDir::new().unwrap();
+        let config_path = tmp_dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[daemon]\nrust_analyzer_resident_groups = 0\n",
+        )
+        .unwrap();
+
+        let error = ServerConfig::load_from(&config_path).unwrap_err();
+        assert!(error.to_string().contains("must be at least one"));
     }
 
     #[test]
@@ -1515,6 +1706,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            daemon: DaemonConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1540,6 +1732,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            daemon: DaemonConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1565,6 +1758,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            daemon: DaemonConfig::default(),
             project_config_ignored: false,
         };
 
@@ -1590,6 +1784,7 @@ mod tests {
                 name: None,
                 handles: None,
             }],
+            daemon: DaemonConfig::default(),
             project_config_ignored: false,
         };
 

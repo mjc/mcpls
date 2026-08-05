@@ -275,7 +275,7 @@ fn structural_search_sync(
         let end = byte_offset_to_position(&source, source.len(), encoding)
             .ok_or_else(|| "ast-grep source end is not a valid text position".to_string())?;
         changes.insert(
-            path_to_uri(&path),
+            path_to_uri(&path).map_err(|error| error.to_string())?,
             vec![lsp_types::TextEdit {
                 range: lsp_types::Range {
                     start: lsp_types::Position::new(0, 0),
@@ -818,7 +818,7 @@ mod tests {
             .expect("replacement should produce changes");
         assert_eq!(changes.len(), 1);
         assert_eq!(
-            changes[&path_to_uri(&path)][0].new_text,
+            changes[&path_to_uri(&path).expect("temporary path must convert to URI")][0].new_text,
             "fn main() { bar(2); }\n"
         );
     }
@@ -952,7 +952,11 @@ mod tests {
         let planned = result
             .edit
             .and_then(|edit| edit.changes)
-            .and_then(|changes| changes.get(&path_to_uri(&path)).cloned())
+            .and_then(|changes| {
+                changes
+                    .get(&path_to_uri(&path).expect("temporary path must convert to URI"))
+                    .cloned()
+            })
             .and_then(|edits| edits.into_iter().next())
             .map(|edit| edit.new_text);
         assert_eq!(planned.as_deref(), Some("const value = bar(1);\n"));

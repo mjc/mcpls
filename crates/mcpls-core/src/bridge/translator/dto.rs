@@ -186,6 +186,9 @@ pub struct WorkspaceSymbolResult {
 /// A single code action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeAction {
+    /// Opaque project-scoped reference for previewing this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
     /// Title of the code action.
     pub title: String,
     /// Kind of code action (quickfix, refactor, etc.).
@@ -197,12 +200,21 @@ pub struct CodeAction {
     /// Workspace edit to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit: Option<WorkspaceEditDescription>,
+    /// Lossless raw workspace edit, including resource operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_edit: Option<serde_json::Value>,
     /// Command to execute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<CommandDescription>,
     /// Whether this is the preferred action.
     #[serde(default)]
     pub is_preferred: bool,
+    /// LSP-disabled reason, when the action cannot currently run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
+    /// Opaque LSP data used by `codeAction/resolve`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Description of a workspace edit.

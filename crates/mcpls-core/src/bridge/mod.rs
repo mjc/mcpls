@@ -5,6 +5,7 @@
 
 use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 
+pub(crate) mod ast_grep;
 mod encoding;
 mod notifications;
 pub mod resources;
@@ -22,15 +23,16 @@ pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentState, DocumentTracker, ResourceLimits,
     path_to_uri, uri_to_path,
 };
-pub(crate) use translator::validate_path_against_roots;
 pub use translator::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
     DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges,
     DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
     InlayHintsResult, Location, LocationsResult, OutgoingCallsResult, Position2D,
-    ProjectActivation, Range, ReferencesResult, RenameResult, ServerCapability, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, Symbol, TextEdit, Translator, TranslatorTemplate,
-    WorkspaceSymbolResult,
+    ProjectActivation, ProviderSynchronization, Range, ReferencesResult, RenameResult,
+    SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, SupportedWorkspaceEdit, Symbol, TextEdit,
+    Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolResult,
+    convert_code_action_or_command,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

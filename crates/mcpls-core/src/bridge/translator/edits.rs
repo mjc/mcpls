@@ -105,6 +105,10 @@ async fn convert_code_action(
     ctx: &EncodingCtx,
     uri: &lsp_types::Uri,
 ) -> CodeAction {
+    let workspace_edit = action
+        .edit
+        .as_ref()
+        .and_then(|edit| serde_json::to_value(edit).ok());
     let diagnostics = match action.diagnostics {
         Some(diags) => {
             let mut result = Vec::with_capacity(diags.len());
@@ -153,12 +157,16 @@ async fn convert_code_action(
     });
 
     CodeAction {
+        action_id: None,
         title: action.title,
         kind: action.kind.map(|k| k.as_str().to_string()),
         diagnostics,
         edit,
+        workspace_edit,
         command,
         is_preferred: action.is_preferred.unwrap_or(false),
+        disabled: action.disabled.map(|disabled| disabled.reason),
+        data: action.data,
     }
 }
 
@@ -406,16 +414,20 @@ impl Translator {
                 lsp_types::CodeActionOrCommand::Command(cmd) => {
                     let arguments = cmd.arguments.unwrap_or_else(Vec::new);
                     CodeAction {
+                        action_id: None,
                         title: cmd.title.clone(),
                         kind: None,
                         diagnostics: Vec::new(),
                         edit: None,
+                        workspace_edit: None,
                         command: Some(CommandDescription {
                             title: cmd.title,
                             command: cmd.command,
                             arguments,
                         }),
                         is_preferred: false,
+                        disabled: None,
+                        data: None,
                     }
                 }
             };

@@ -126,6 +126,10 @@ enum ClientCommand {
         method: String,
         params: Option<Value>,
     },
+    /// Rescan active dynamic watched-file registrations and flush matching notifications.
+    SynchronizeWatchedFiles {
+        response_tx: oneshot::Sender<Result<(usize, usize)>>,
+    },
     /// Cancel an in-flight request whose caller timed out.
     CancelRequest { id: RequestId },
     /// Shutdown the client.
@@ -482,6 +486,23 @@ impl LspClient {
         Ok(())
     }
 
+    /// Rescan active dynamic watched-file registrations and wait until every
+    /// matching notification has been written to the provider transport.
+    pub(crate) async fn synchronize_watched_files(
+        &self,
+        timeout_duration: Duration,
+    ) -> Result<(usize, usize)> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::SynchronizeWatchedFiles { response_tx })
+            .await
+            .map_err(|_| Error::ServerTerminated)?;
+        timeout(timeout_duration, response_rx)
+            .await
+            .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
+            .map_err(|_| Error::ServerTerminated)?
+    }
+
     /// Shutdown client gracefully.
     ///
     /// This sends a shutdown command to the background task and waits for it to complete.
@@ -579,6 +600,32 @@ impl LspClient {
                                 "params": params,
                             });
                             transport.send(&notification).await?;
+                        }
+                        ClientCommand::SynchronizeWatchedFiles { response_tx } => {
+                            let registrations = watch_registry.registration_count();
+                            let events = match watch_registry.synchronize() {
+                                Ok(events) => events,
+                                Err(error) => {
+                                    let _ = response_tx.send(Err(Error::Transport(error.message)));
+                                    continue;
+                                }
+                            };
+                            let mut sent = 0usize;
+                            for event in events {
+                                if !watch_registry.accepts(&event) {
+                                    continue;
+                                }
+                                if let Err(error) = transport.send(&serde_json::json!({
+                                    "jsonrpc": JSONRPC_VERSION,
+                                    "method": "workspace/didChangeWatchedFiles",
+                                    "params": event.params,
+                                })).await {
+                                    let _ = response_tx.send(Err(Error::Transport(error.to_string())));
+                                    return Err(error);
+                                }
+                                sent = sent.saturating_add(1);
+                            }
+                            let _ = response_tx.send(Ok((registrations, sent)));
                         }
                         ClientCommand::CancelRequest { id } => {
                             pending_requests.lock().await.remove(&id);

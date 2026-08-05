@@ -1,4 +1,4 @@
-//! End-to-end test suite exercising all 16 MCP tools against a real rust-analyzer.
+//! End-to-end test suite exercising MCPLS tools against a real rust-analyzer.
 //!
 //! # Process model
 //!
@@ -95,6 +95,43 @@ fn stage_workspace() -> TempDir {
     lib_content
         .push_str("\npub mod move_target {\n    pub fn answer() -> u32 {\n        42\n    }\n}\n");
     lib_content.push_str("\npub mod folder_mod;\n");
+    lib_content.push_str("\npub mod move_items;\n");
+    lib_content.push_str(
+        r"
+macro_rules! semantic_answer {
+    () => { 7_u32 };
+}
+
+pub trait SemanticDeclaration {
+    fn semantic_value(&self) -> u32;
+}
+
+pub struct SemanticType;
+
+impl SemanticDeclaration for SemanticType {
+    fn semantic_value(&self) -> u32 { semantic_answer!() }
+}
+
+pub fn tested_semantic_value() -> u32 { SemanticType.semantic_value() }
+
+pub fn café_value() -> u32 { 7 }
+
+pub fn unicode_declaration_user() -> u32 { café_value() }
+
+pub fn nested_selection_target() -> u32 {
+    let nested = (tested_semantic_value() + 1) * 2;
+    nested
+}
+
+#[cfg(test)]
+mod semantic_discovery_tests {
+    #[test]
+    fn semantic_related_test() {
+        assert_eq!(super::tested_semantic_value(), 7);
+    }
+}
+",
+    );
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
 
     let folder_module = tmp.path().join("src/folder_mod");
@@ -110,6 +147,11 @@ fn stage_workspace() -> TempDir {
     )
     .expect("failed to write nested folder module");
     fs::create_dir(tmp.path().join("src/moved")).expect("failed to create move destination");
+    fs::write(
+        tmp.path().join("src/move_items.rs"),
+        "pub fn first() -> u32 { 1 }\n\npub fn second() -> u32 { 2 }\n",
+    )
+    .expect("failed to write move-item fixture");
 
     // Copy bad_format.rs into src/ — NOT added to lib.rs (no mod declaration).
     let fmt_src = fixture_dir.join("extras/bad_format.rs");
@@ -207,6 +249,23 @@ fn find_line(file: &Path, needle: &str) -> u32 {
             } else {
                 None
             }
+        })
+        .unwrap_or_else(|| panic!("anchor '{needle}' not found in {}", file.display()))
+}
+
+/// Find a 1-based line and UTF-8 byte character for the first matching needle.
+fn find_position(file: &Path, needle: &str) -> (u32, u32) {
+    let content = fs::read_to_string(file).expect("failed to read file for anchor search");
+    content
+        .lines()
+        .enumerate()
+        .find_map(|(line_index, line)| {
+            line.find(needle).map(|character_index| {
+                (
+                    u32::try_from(line_index + 1).expect("line number fits u32"),
+                    u32::try_from(character_index + 1).expect("character fits u32"),
+                )
+            })
         })
         .unwrap_or_else(|| panic!("anchor '{needle}' not found in {}", file.display()))
 }
@@ -1595,6 +1654,281 @@ fn semantic_path_rename_plan(preview: &Value, label: &str) -> Result<String, Str
         .ok_or_else(|| format!("{label} omitted plan_id: {preview}"))
 }
 
+/// Read-only semantic context used to plan and validate edits.
+fn sc_semantic_discovery(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let (call_line, receiver_character) = find_position(&lib, "SemanticType.semantic_value()");
+    let call_character = receiver_character
+        .saturating_add(u32::try_from("SemanticType.".len()).map_err(|error| error.to_string())?);
+    let position = json!({
+        "project_id": "default",
+        "file_path": lib,
+        "line": call_line,
+        "character": call_character,
+    });
+    let declaration = call_json(client, "get_declaration", &position)?;
+    let definition = call_json(
+        client,
+        "get_definition",
+        &json!({
+            "file_path": lib,
+            "line": call_line,
+            "character": call_character,
+        }),
+    )?;
+    if declaration["supported"] != true || declaration["provider"] != "standard_lsp" {
+        return Err(format!(
+            "declaration lookup was not capability-gated: {declaration}"
+        ));
+    }
+    let declaration_line = declaration["locations"][0]["range"]["start"]["line"]
+        .as_u64()
+        .ok_or_else(|| format!("declaration lookup returned no location: {declaration}"))?;
+    let definition_line = definition["locations"][0]["range"]["start"]["line"]
+        .as_u64()
+        .ok_or_else(|| format!("definition lookup returned no location: {definition}"))?;
+    if declaration_line == definition_line {
+        return Err(format!(
+            "declaration and definition were not distinguished: {declaration} / {definition}"
+        ));
+    }
+
+    let (unicode_line, unicode_character) = find_position(&lib, "café_value() }");
+    let unicode = call_json(
+        client,
+        "get_declaration",
+        &json!({
+            "project_id": "default",
+            "file_path": lib,
+            "line": unicode_line,
+            "character": unicode_character,
+        }),
+    )?;
+    if unicode["locations"].as_array().is_none_or(Vec::is_empty) {
+        return Err(format!(
+            "UTF-8 declaration position returned no location: {unicode}"
+        ));
+    }
+
+    let nested = workspace.join("src/folder_mod/nested.rs");
+    let parent = call_json(
+        client,
+        "get_parent_module",
+        &json!({
+            "project_id": "default",
+            "file_path": nested,
+            "line": 1,
+            "character": 1,
+        }),
+    )?;
+    if parent["supported"] != true
+        || !parent["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with("/folder_mod/mod.rs"))
+            })
+        })
+    {
+        return Err(format!("parent-module lookup missed folder_mod: {parent}"));
+    }
+
+    let folder = workspace.join("src/folder_mod/mod.rs");
+    let children = call_json(
+        client,
+        "get_child_modules",
+        &json!({
+            "project_id": "default",
+            "file_path": folder,
+            "line": 2,
+            "character": 5,
+        }),
+    )?;
+    if children["supported"] != true
+        || !children["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with("/folder_mod/mod.rs"))
+                    && location["range"]["start"]["line"] == 1
+            })
+        })
+    {
+        return Err(format!(
+            "child-module lookup missed the nested declaration: {children}"
+        ));
+    }
+
+    let macro_line = find_line(&lib, "semantic_answer!()");
+    let expansion = call_json(
+        client,
+        "expand_macro",
+        &json!({
+            "project_id": "default",
+            "file_path": lib,
+            "line": macro_line,
+            "character": 42,
+        }),
+    )?;
+    if expansion["supported"] != true
+        || !expansion["macro_expansion"]["expansion"]
+            .as_str()
+            .is_some_and(|value| value.contains("7_u32"))
+    {
+        return Err(format!("macro expansion was unavailable: {expansion}"));
+    }
+
+    let selection_line = find_line(&lib, "let nested = (");
+    let selections = call_json(
+        client,
+        "get_selection_ranges",
+        &json!({
+            "project_id": "default",
+            "file_path": lib,
+            "line": selection_line,
+            "character": 31,
+        }),
+    )?;
+    if selections["provider"] != "standard_lsp"
+        || selections["selection_ranges"]
+            .as_array()
+            .is_none_or(|ranges| ranges.len() < 3)
+    {
+        return Err(format!("nested selections were not expanded: {selections}"));
+    }
+
+    let test_line = find_line(&lib, "fn semantic_related_test()");
+    let runnables = call_json(
+        client,
+        "discover_runnables",
+        &json!({
+            "project_id": "default",
+            "file_path": lib,
+            "line": test_line,
+            "character": 8,
+        }),
+    )?;
+    if runnables["supported"] != true
+        || !runnables["runnables"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["label"]
+                    .as_str()
+                    .is_some_and(|label| label.contains("semantic_related_test"))
+                    && item["args"]["cargoArgs"].is_array()
+            })
+        })
+    {
+        return Err(format!("runnable command data was incomplete: {runnables}"));
+    }
+
+    let tested_line = find_line(&lib, "pub fn tested_semantic_value()");
+    let related = call_json(
+        client,
+        "discover_related_tests",
+        &json!({
+            "project_id": "default",
+            "file_path": lib,
+            "line": tested_line,
+            "character": 8,
+        }),
+    )?;
+    if related["supported"] != true
+        || !related["runnables"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["runnable"]["label"]
+                    .as_str()
+                    .is_some_and(|label| label.contains("semantic_related_test"))
+            })
+        })
+    {
+        return Err(format!("related-test discovery missed the test: {related}"));
+    }
+    Ok(())
+}
+
+/// Capability-gated local edits against the deployed rust-analyzer fork.
+fn sc_local_edit_previews(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    let range = call_json(
+        client,
+        "range_format_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": lib_rs,
+            "start_line": 1,
+            "start_character": 1,
+            "end_line": 2,
+            "end_character": 1,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if range["supported"] != false || range["changed"] != false || range.get("plan_id").is_some() {
+        return Err(format!(
+            "disabled rust-analyzer range formatting was not capability-gated: {range}"
+        ));
+    }
+
+    let source = workspace.join("src/move_items.rs");
+    let second_line = find_line(&source, "pub fn second");
+    let movement = call_json(
+        client,
+        "move_item_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": source,
+            "start_line": second_line,
+            "start_character": 8,
+            "end_line": second_line,
+            "end_character": 8,
+            "direction": "up",
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if movement["supported"] != true || movement["changed"] != true {
+        return Err(format!(
+            "rust-analyzer move-item returned no edit: {movement}"
+        ));
+    }
+    let plan_id = movement["plan_id"]
+        .as_str()
+        .ok_or_else(|| format!("move-item preview omitted plan_id: {movement}"))?;
+    call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    let moved = fs::read_to_string(&source)
+        .map_err(|error| format!("failed to read moved items: {error}"))?;
+    if moved
+        .find("pub fn second")
+        .zip(moved.find("pub fn first"))
+        .is_none_or(|(second, first)| second >= first)
+    {
+        return Err(format!(
+            "move-item apply did not reorder functions: {moved}"
+        ));
+    }
+
+    let no_op = call_json(
+        client,
+        "move_item_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": source,
+            "start_line": 1,
+            "start_character": 8,
+            "end_line": 1,
+            "end_character": 8,
+            "direction": "up",
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if no_op["supported"] != true || no_op["changed"] != false {
+        return Err(format!("top-item no-op was misreported: {no_op}"));
+    }
+    Ok(())
+}
+
 /// Compose rust-analyzer's folder-module edits with one filesystem rename.
 fn sc_path_rename_folder_semantic_edit(
     client: &mut McpClient,
@@ -1612,7 +1946,49 @@ fn sc_path_rename_folder_semantic_edit(
             "position_encoding": "utf-8",
         }),
     )?;
-    semantic_path_rename_plan(&preview, "module folder rename")?;
+    let plan_id = semantic_path_rename_plan(&preview, "module folder rename")?;
+    let applied = call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    if applied["semantic_state"] != "synchronized"
+        || applied["provider_synchronization"][0]["provider"] != "rust"
+        || applied["provider_synchronization"][0]["synchronized"] != true
+    {
+        return Err(format!(
+            "folder rename did not report synchronized provider state: {applied}"
+        ));
+    }
+
+    let nested = renamed_folder.join("nested.rs");
+    let renamed_nested = renamed_folder.join("child.rs");
+    let immediate = call_json(
+        client,
+        "path_rename_preview",
+        &json!({
+            "project_id": "default",
+            "old_path": nested,
+            "new_path": renamed_nested,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    let plan_id = semantic_path_rename_plan(&immediate, "immediate nested module rename")?;
+    let applied = call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    if applied["semantic_state"] != "synchronized" {
+        return Err(format!(
+            "nested file rename did not report synchronized provider state: {applied}"
+        ));
+    }
+    if folder.exists() || nested.exists() || !renamed_nested.exists() {
+        return Err(format!(
+            "ordered folder/file rename did not commit: {immediate}"
+        ));
+    }
     Ok(())
 }
 
@@ -1888,6 +2264,13 @@ fn ra_e2e_suite() {
         sub_case!(sc_read_resource),
         sub_case!(sc_subscribe_unsubscribe_resource),
         sub_case!(sc_subscribe_no_replay_without_cached_diagnostics),
+        sub_case!(sc_native_module_rename_preview),
+        sub_case!(sc_native_module_move_code_action_preview),
+        sub_case!(sc_semantic_discovery),
+        sub_case!(sc_local_edit_previews),
+        sub_case!(sc_path_rename_folder_semantic_edit),
+        sub_case!(sc_path_rename_semantic_edit),
+        sub_case!(sc_move_inline_module_semantic_edit),
     ];
 
     let filter = std::env::var("MCPLS_RA_FILTER").ok();
