@@ -420,6 +420,144 @@ impl Translator {
         results
     }
 
+    /// Flush watched-file changes and prove exact post-commit text for each provider.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn synchronize_text_changes(
+        &self,
+        changes: &[(PathBuf, String)],
+    ) -> Vec<ProviderSynchronization> {
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        let clients = lock_std(&self.lsp_clients).clone();
+        let configs = lock_std(&self.project_lsp_configs)
+            .iter()
+            .map(|config| {
+                (
+                    config.id(),
+                    (
+                        config.language_id.clone(),
+                        Duration::from_secs(config.request_timeout_seconds.clamp(1, 5)),
+                    ),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let rust_analyzer = lock_std(&self.lsp_servers)
+            .iter()
+            .map(|(id, server)| (id.clone(), server.is_rust_analyzer()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut ids = clients.keys().cloned().collect::<Vec<_>>();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut results = Vec::new();
+        for id in ids {
+            let client = &clients[&id];
+            let Some((language, timeout)) = configs.get(&id) else {
+                continue;
+            };
+            let provider_changes = changes
+                .iter()
+                .filter(|(path, _)| {
+                    path.is_file() && detect_language(path, &self.extension_map) == *language
+                })
+                .collect::<Vec<_>>();
+            if provider_changes.is_empty() {
+                continue;
+            }
+            let (registrations, notifications) =
+                match client.synchronize_watched_files(*timeout).await {
+                    Ok(counts) => counts,
+                    Err(error) => {
+                        results.push(ProviderSynchronization {
+                            provider: id.to_string(),
+                            synchronized: false,
+                            watched_file_notifications: 0,
+                            message: Some(format!("watched-file synchronization failed: {error}")),
+                        });
+                        continue;
+                    }
+                };
+            if registrations == 0 {
+                results.push(ProviderSynchronization {
+                    provider: id.to_string(),
+                    synchronized: false,
+                    watched_file_notifications: notifications,
+                    message: Some(
+                        "provider has no dynamic workspace/didChangeWatchedFiles registration"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+            if !rust_analyzer.get(&id).copied().unwrap_or_default() {
+                results.push(ProviderSynchronization {
+                    provider: id.to_string(),
+                    synchronized: false,
+                    watched_file_notifications: notifications,
+                    message: Some("provider cannot prove exact post-edit file content".to_string()),
+                });
+                continue;
+            }
+            let mut synchronized = true;
+            let mut message = None;
+            for (path, expected) in provider_changes {
+                let params = match path_to_uri(path) {
+                    Ok(uri) => TextDocumentIdentifier { uri },
+                    Err(error) => {
+                        synchronized = false;
+                        message = Some(format!(
+                            "provider text probe path failed for {}: {error}",
+                            path.display()
+                        ));
+                        break;
+                    }
+                };
+                let mut stable_since = None;
+                let mut converged = false;
+                for _ in 0..128 {
+                    match client
+                        .request::<_, String>(
+                            "rust-analyzer/viewFileText",
+                            params.clone(),
+                            *timeout,
+                        )
+                        .await
+                    {
+                        Ok(actual) if actual == *expected => {
+                            let since = *stable_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= RESOURCE_SYNC_STABILITY_WINDOW {
+                                converged = true;
+                                break;
+                            }
+                        }
+                        Ok(_) => stable_since = None,
+                        Err(error) => {
+                            message = Some(format!(
+                                "provider text probe failed for {}: {error}",
+                                path.display()
+                            ));
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if !converged {
+                    synchronized = false;
+                    message.get_or_insert_with(|| {
+                        format!("provider file text did not converge for {}", path.display())
+                    });
+                    break;
+                }
+            }
+            results.push(ProviderSynchronization {
+                provider: id.to_string(),
+                synchronized,
+                watched_file_notifications: notifications,
+                message,
+            });
+        }
+        results
+    }
+
     async fn reconcile_resource_documents(
         &self,
         operations: &[FileOperation],

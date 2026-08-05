@@ -1258,6 +1258,42 @@ impl AppliedEditPlan {
     }
 }
 
+fn merge_provider_synchronization(
+    results: &mut Vec<ProviderSynchronization>,
+    result: ProviderSynchronization,
+) {
+    let Some(existing) = results
+        .iter_mut()
+        .find(|existing| existing.provider == result.provider)
+    else {
+        results.push(result);
+        return;
+    };
+    existing.synchronized &= result.synchronized;
+    existing.watched_file_notifications = existing
+        .watched_file_notifications
+        .saturating_add(result.watched_file_notifications);
+    if let Some(message) = result.message {
+        existing.message = Some(existing.message.take().map_or_else(
+            || message.clone(),
+            |current| format!("{current}; {message}"),
+        ));
+    }
+}
+
+fn planned_text_changes(plan: &EditPlan) -> Vec<(PathBuf, String)> {
+    plan.files()
+        .iter()
+        .filter(|snapshot| snapshot.original_content() != snapshot.planned_content())
+        .map(|snapshot| {
+            (
+                snapshot.path().clone(),
+                snapshot.planned_content().to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Explicit syntax accepted by the structural preview tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StructuralDialect {
@@ -3755,6 +3791,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         let semantic_check = self.inline_module_checks.remove(plan_id);
         let resource_operations = plan.file_operations().to_vec();
+        let text_changes = planned_text_changes(&plan);
         let open_documents = plan
             .open_document_snapshots()
             .map(|snapshot| {
@@ -3796,6 +3833,13 @@ impl ProjectRuntime {
             .translator
             .synchronize_resource_operations(&resource_operations)
             .await;
+        for result in self
+            .translator
+            .synchronize_text_changes(&text_changes)
+            .await
+        {
+            merge_provider_synchronization(&mut provider_synchronization, result);
+        }
         for (provider, error) in document_sync_failures {
             let message = format!("open-document synchronization failed: {error}");
             if let Some(result) = provider_synchronization

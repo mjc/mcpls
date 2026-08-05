@@ -3365,6 +3365,15 @@ import sys
 import urllib.parse
 
 counter = pathlib.Path(os.environ["MCPLS_COUNTER"])
+vfs = {}
+
+def path_for_uri(uri):
+    return pathlib.Path(urllib.parse.unquote(urllib.parse.urlparse(uri).path))
+
+def file_text(uri):
+    if uri not in vfs:
+        vfs[uri] = path_for_uri(uri).read_text()
+    return vfs[uri]
 
 def read_message():
     headers = b""
@@ -3428,18 +3437,27 @@ while True:
                       {"globPattern": "**/*.rs", "kind": 7}
                   ]}
               }]}})
+    elif method == "textDocument/didOpen":
+        document = message["params"]["textDocument"]
+        vfs[document["uri"]] = document["text"]
+    elif method == "textDocument/didChange":
+        uri = message["params"]["textDocument"]["uri"]
+        vfs[uri] = message["params"]["contentChanges"][-1]["text"]
     elif method == "textDocument/rename":
         bump()
         uri = message["params"]["textDocument"]["uri"]
         sibling_uri = uri.replace("src.rs", "other.rs")
-        edit = {"changes": {
-            uri: [{"range": {"start": {"line": 0, "character": 0},
+        old_name = file_text(uri).splitlines()[0][:8]
+        new_name = message["params"]["newName"]
+        changes = {}
+        for target in (uri, sibling_uri):
+            if file_text(target).startswith(old_name):
+                changes[target] = [{
+                    "range": {"start": {"line": 0, "character": 0},
                               "end": {"line": 0, "character": 8}},
-                   "newText": "new_name"}],
-            sibling_uri: [{"range": {"start": {"line": 0, "character": 0},
-                                      "end": {"line": 0, "character": 8}},
-                           "newText": "new_name"}],
-        }}
+                    "newText": new_name
+                }]
+        edit = {"changes": changes}
         send({"jsonrpc": "2.0", "id": message["id"], "result": edit})
     elif method == "textDocument/formatting":
         bump()
@@ -3511,12 +3529,22 @@ while True:
         }]})
     elif method == "textDocument/documentSymbol":
         uri = message["params"]["textDocument"]["uri"]
-        path = pathlib.Path(urllib.parse.unquote(urllib.parse.urlparse(uri).path))
+        path = path_for_uri(uri)
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": [] if path.exists() else None})
+    elif method == "rust-analyzer/viewFileText":
+        uri = message["params"]["uri"]
+        send({"jsonrpc": "2.0", "id": message["id"], "result": file_text(uri)})
     elif method == "workspace/didChangeWatchedFiles":
         if False:
             sys.exit(0)
+        for change in message["params"]["changes"]:
+            uri = change["uri"]
+            path = path_for_uri(uri)
+            if path.exists():
+                vfs[uri] = path.read_text()
+            else:
+                vfs.pop(uri, None)
     elif method == "experimental/ssr":
         bump()
         uri = message["params"]["textDocument"]["uri"]
@@ -3539,6 +3567,91 @@ while True:
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
 "#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_only_apply_synchronizes_unopened_files_before_follow_up_rename() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("src.rs");
+        let sibling = root.path().join("other.rs");
+        let counter = root.path().join("request-count");
+        fs::write(&source, "old_name\n").unwrap();
+        fs::write(&sibling, "old_name();\n").unwrap();
+
+        let lsp = root.path().join("fake-edit-lsp.py");
+        fs::write(&lsp, FAKE_EDIT_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut server_config = crate::config::LspServerConfig::rust_analyzer();
+        server_config.command = lsp.display().to_string();
+        server_config.heuristics = None;
+        server_config.env =
+            HashMap::from([("MCPLS_COUNTER".to_string(), counter.display().to_string())]);
+        let mut template_source = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        template_source.set_lsp_configs(vec![server_config], Some(3));
+        let registry =
+            ProjectRegistry::with_translator_template(4, template_source.configuration_template());
+        let project_id = ProjectId::new("fixture").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry.activate(&project_id).await.unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let rename: serde_json::Value = serde_json::from_str(
+            &server
+                .rename_preview(Parameters(RenamePreviewParams {
+                    project_id: project_id.as_str().to_string(),
+                    file_path: source.display().to_string(),
+                    line: 1,
+                    character: 1,
+                    new_name: "new_name".to_string(),
+                    position_encoding: Some("utf-8".to_string()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let applied: serde_json::Value = serde_json::from_str(
+            &server
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.as_str().to_string(),
+                    plan_id: rename["plan_id"].as_str().unwrap().to_string(),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied["semantic_state"], "synchronized", "{applied}");
+
+        let reverse: serde_json::Value = serde_json::from_str(
+            &server
+                .rename_preview(Parameters(RenamePreviewParams {
+                    project_id: project_id.as_str().to_string(),
+                    file_path: source.display().to_string(),
+                    line: 1,
+                    character: 1,
+                    new_name: "old_name".to_string(),
+                    position_encoding: Some("utf-8".to_string()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reverse["affected_files"].as_array().unwrap().len(), 2);
+    }
 
     #[cfg(unix)]
     #[tokio::test]
