@@ -500,8 +500,9 @@ fn has_dynamic_project_environment(root: &Path) -> bool {
 /// Return a conservative fingerprint for the inputs that shape Rust analysis.
 ///
 /// A missing explicit toolchain or Cargo manifest is deliberately treated as
-/// unknown rather than compatible. This keeps linked-project reuse fail-closed
-/// until the daemon can resolve the effective toolchain and environment.
+/// unknown rather than compatible. Manifest and lockfile contents are not
+/// process-wide constraints: rust-analyzer receives each manifest separately
+/// through `linkedProjects`.
 async fn rust_project_compatibility_key(
     root: &Path,
     translator_template: Option<&TranslatorTemplate>,
@@ -509,8 +510,6 @@ async fn rust_project_compatibility_key(
     const INPUTS: &[&str] = &[
         "rust-toolchain",
         "rust-toolchain.toml",
-        "Cargo.toml",
-        "Cargo.lock",
         ".cargo/config",
         ".cargo/config.toml",
     ];
@@ -527,14 +526,12 @@ async fn rust_project_compatibility_key(
 
     let mut hasher = Sha256::new();
     let mut has_toolchain = false;
-    let mut has_manifest = false;
     for relative in INPUTS {
         let path = root.join(relative);
         match std::fs::read(&path) {
             Ok(contents) => {
                 has_toolchain |=
                     *relative == "rust-toolchain" || *relative == "rust-toolchain.toml";
-                has_manifest |= *relative == "Cargo.toml";
                 hash_compatibility_field(&mut hasher, relative.as_bytes());
                 hash_compatibility_field(&mut hasher, &contents);
             }
@@ -553,7 +550,8 @@ async fn rust_project_compatibility_key(
         hash_rust_server_config(&mut hasher, template, project_environment.as_ref())?;
     }
 
-    (has_toolchain && has_manifest).then(|| ProjectCompatibilityKey(hasher.finalize().into()))
+    (has_toolchain && root.join("Cargo.toml").is_file())
+        .then(|| ProjectCompatibilityKey(hasher.finalize().into()))
 }
 
 fn hash_rust_server_config(
@@ -7367,6 +7365,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rust_compatibility_key_ignores_manifest_and_lockfile_contents() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        for root in [first.path(), second.path()] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            first.path().join("Cargo.toml"),
+            "[package]\nname = \"first\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            second.path().join("Cargo.toml"),
+            "[package]\nname = \"second\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        fs::write(first.path().join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(
+            second.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"dependency\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(10),
+        );
+        let template = translator.configuration_template();
+
+        assert_eq!(
+            rust_project_compatibility_key(first.path(), Some(&template)).await,
+            rust_project_compatibility_key(second.path(), Some(&template)).await
+        );
+    }
+
+    #[tokio::test]
     async fn rust_compatibility_key_rejects_dynamic_project_environment() {
         let root = TempDir::new().unwrap();
         fs::write(
@@ -8442,6 +8480,32 @@ while True:
         break
 "#;
 
+    fn write_compatible_roots_with_changed_manifests(first: &Path, second: &Path) {
+        for root in [first, second] {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            first.join("Cargo.toml"),
+            "[package]\nname = \"fixture-main\"\n",
+        )
+        .unwrap();
+        fs::write(
+            second.join("Cargo.toml"),
+            "[package]\nname = \"fixture-linked\"\n",
+        )
+        .unwrap();
+        fs::write(first.join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(
+            second.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"changed\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn repeated_activation_does_not_spawn_a_duplicate_lsp_process() {
@@ -8983,14 +9047,7 @@ while True:
             format!("gitdir: {}\n", worktree_git_dir.display()),
         )
         .unwrap();
-        for root in [repository.path(), worktree.path()] {
-            fs::write(
-                root.join("rust-toolchain.toml"),
-                "[toolchain]\nchannel = \"stable\"\n",
-            )
-            .unwrap();
-            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
-        }
+        write_compatible_roots_with_changed_manifests(repository.path(), worktree.path());
         let main_repository = GitRepositoryIdentity::discover(repository.path())
             .unwrap()
             .unwrap();
@@ -10127,14 +10184,7 @@ while True:
             format!("gitdir: {}\n", worktree_git_dir.display()),
         )
         .unwrap();
-        for root in [repository.path(), worktree.path()] {
-            fs::write(
-                root.join("rust-toolchain.toml"),
-                "[toolchain]\nchannel = \"stable\"\n",
-            )
-            .unwrap();
-            fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
-        }
+        write_compatible_roots_with_changed_manifests(repository.path(), worktree.path());
         let counter = repository.path().join("spawn-count");
         let lsp = repository.path().join("counting-lsp.py");
         fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
