@@ -229,6 +229,10 @@ impl Translator {
                 return fallback().await;
             }
         };
+        if lock_std(&self.expected_servers).contains(&server_id) {
+            tracing::debug!(%server_id, "workspace-symbol server still initializing; using AST fallback");
+            return fallback().await;
+        }
         if let Err(error) = self.respawn_if_dead(&server_id).await {
             tracing::debug!(%error, "workspace-symbol server unavailable; using AST fallback");
             return fallback().await;
@@ -356,10 +360,16 @@ fn ast_grep_symbol_kind(symbol_type: &str) -> Option<&'static str> {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::time::Duration;
 
     use super::*;
+    use crate::bridge::translator::testing::{
+        read_framed_message, translator_with_capabilities, write_response,
+    };
     use crate::config::{ServerId, ToolRouter};
     use tempfile::TempDir;
+    use tokio::io::BufReader;
+    use tokio::time::timeout;
 
     fn fallback_translator(dir: &TempDir) -> Translator {
         let mut translator = Translator::new()
@@ -396,6 +406,45 @@ mod tests {
             .handle_workspace_symbol("fallback_target".to_string(), None, 100)
             .await
             .unwrap();
+        assert_eq!(result.symbols[0].name, "fallback_target");
+    }
+
+    /// MCPLS-43 regression: rust-analyzer accepts requests before its first
+    /// indexing pass is authoritative. An empty response from that interval
+    /// must not masquerade as a successful semantic result.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_falls_back_while_registered_server_initializes() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, capabilities);
+        translator.set_expected_servers(HashSet::from([server_id]));
+        fs::write(dir.path().join("main.rs"), "fn fallback_target() {}\n").unwrap();
+
+        let responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut wire).await;
+            assert_eq!(request["method"], "workspace/symbol");
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!([]),
+            )
+            .await;
+        });
+
+        let result = timeout(
+            Duration::from_secs(2),
+            translator.handle_workspace_symbol("fallback_target".to_string(), None, 100),
+        )
+        .await
+        .expect("handler call should not hang")
+        .unwrap();
+        responder.abort();
+        assert_eq!(result.symbols.len(), 1);
         assert_eq!(result.symbols[0].name, "fallback_target");
     }
 
