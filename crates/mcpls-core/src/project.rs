@@ -1146,6 +1146,7 @@ impl ProjectRequestGate {
 struct ProjectRequestSender {
     sender: mpsc::Sender<ProjectRequest>,
     gate: ProjectRequestGate,
+    residency: Option<ProjectResidency>,
 }
 
 impl ProjectRequestSender {
@@ -1153,6 +1154,15 @@ impl ProjectRequestSender {
         Self {
             sender,
             gate: ProjectRequestGate::new(),
+            residency: None,
+        }
+    }
+
+    fn with_residency(sender: mpsc::Sender<ProjectRequest>, residency: ProjectResidency) -> Self {
+        Self {
+            sender,
+            gate: ProjectRequestGate::new(),
+            residency: Some(residency),
         }
     }
 
@@ -1177,10 +1187,20 @@ impl ProjectRequestSender {
 
     async fn send(
         &self,
-        request: ProjectRequest,
+        mut request: ProjectRequest,
     ) -> Result<(), mpsc::error::SendError<ProjectRequest>> {
         if !self.gate.is_accepting() {
             return Err(mpsc::error::SendError(request));
+        }
+
+        if request.uses_rust_residency()
+            && let Some(residency) = &self.residency
+        {
+            let guard = residency.controller.acquire(residency.group).await;
+            request = ProjectRequest::Resident {
+                request: Box::new(request),
+                guard,
+            };
         }
 
         let permit = tokio::select! {
@@ -1309,6 +1329,10 @@ pub(crate) struct PathRenamePreview {
 }
 
 enum ProjectRequest {
+    Resident {
+        request: Box<Self>,
+        guard: residency::RustResidencyGuard,
+    },
     Query {
         reply: oneshot::Sender<ProjectState>,
     },
@@ -1585,6 +1609,13 @@ enum ProjectRequest {
 }
 
 impl ProjectRequest {
+    fn into_resident(self) -> (Self, Option<residency::RustResidencyGuard>) {
+        match self {
+            Self::Resident { request, guard } => (*request, Some(guard)),
+            request => (request, None),
+        }
+    }
+
     const fn uses_rust_residency(&self) -> bool {
         matches!(
             self,
@@ -1695,6 +1726,7 @@ impl ProjectRequest {
 impl ProjectRequest {
     fn is_cancelled(&self) -> bool {
         match self {
+            Self::Resident { request, .. } => request.is_cancelled(),
             Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
                 reply.is_closed()
             }
@@ -4466,7 +4498,10 @@ fn spawn_project_actor_with_runtime(
             .controller
             .register(residency.group, actor_sender.clone());
     }
-    let sender = ProjectRequestSender::new(sender);
+    let sender = residency.as_ref().map_or_else(
+        || ProjectRequestSender::new(sender.clone()),
+        |residency| ProjectRequestSender::with_residency(sender.clone(), residency.clone()),
+    );
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
     let event_sender = event_tx.clone();
@@ -4556,16 +4591,8 @@ async fn run_project_actor(
     residency: Option<ProjectResidency>,
 ) {
     while let Some(request) = next_project_request(&mut receiver).await {
-        let uses_residency = request.uses_rust_residency();
+        let (request, _residency_guard) = request.into_resident();
         let resumes_runtime = request.resumes_rust_runtime();
-        let _residency_guard = if uses_residency {
-            match &residency {
-                Some(residency) => Some(residency.controller.acquire(residency.group).await),
-                None => None,
-            }
-        } else {
-            None
-        };
         if residency.is_some()
             && resumes_runtime
             && !runtime.has_active_workspace_roots(runtime.translator.workspace_roots())
@@ -4756,6 +4783,9 @@ async fn handle_project_request(
     };
 
     match request {
+        ProjectRequest::Resident { .. } => {
+            unreachable!("resident request must be unwrapped by the actor loop")
+        }
         ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
             state.sync_runtime(runtime);
             let _ = reply.send(state.clone());
@@ -7626,6 +7656,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_resident_request_pins_group_before_actor_dequeues_it() {
+        let controller = RustResidencyController::new(1);
+        let (first_channel, mut first_receiver) = mpsc::channel(4);
+        let (second_channel, mut second_receiver) = mpsc::channel(4);
+        let first_residency = ProjectResidency {
+            controller: controller.clone(),
+            group: RustGroupId(1),
+        };
+        let second_residency = ProjectResidency {
+            controller: controller.clone(),
+            group: RustGroupId(2),
+        };
+        controller.register(RustGroupId(1), first_channel.downgrade());
+        controller.register(RustGroupId(2), second_channel.downgrade());
+        let first_sender = ProjectRequestSender::with_residency(first_channel, first_residency);
+        let second_sender = ProjectRequestSender::with_residency(second_channel, second_residency);
+
+        let (first_reply, _first_response) = oneshot::channel();
+        first_sender
+            .send(ProjectRequest::Activate {
+                root: PathBuf::from("first"),
+                reply: first_reply,
+            })
+            .await
+            .unwrap();
+
+        let (second_reply, _second_response) = oneshot::channel();
+        let mut second_send = tokio::spawn(async move {
+            second_sender
+                .send(ProjectRequest::Activate {
+                    root: PathBuf::from("second"),
+                    reply: second_reply,
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second_send)
+                .await
+                .is_err()
+        );
+
+        let first_request = first_receiver.recv().await.unwrap();
+        assert!(matches!(first_request, ProjectRequest::Resident { .. }));
+        drop(first_request);
+        let suspend = tokio::time::timeout(Duration::from_secs(1), first_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ProjectRequest::Suspend { reply } = suspend else {
+            panic!("expected eviction only after the queued request completed");
+        };
+        reply.send(Ok(())).unwrap();
+
+        second_send.await.unwrap().unwrap();
+        assert!(matches!(
+            second_receiver.recv().await.unwrap(),
+            ProjectRequest::Resident { .. }
+        ));
     }
 
     #[tokio::test]
