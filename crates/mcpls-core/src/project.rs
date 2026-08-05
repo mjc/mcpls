@@ -19,7 +19,7 @@ use crate::bridge::{
     LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ReferencesResult,
     RenameResult, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
     SignatureHelpResult, StructuralMatch, StructuralSearchResult, Translator, TranslatorTemplate,
-    WorkspaceSymbolResult, uri_to_path,
+    WillRenameFilesResult, WorkspaceSymbolResult, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig};
 use crate::edit_apply::{
@@ -1284,6 +1284,20 @@ pub(crate) struct StructuralPreview {
     pub(crate) parse_only: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PathRenameRequest {
+    pub(crate) old_path: String,
+    pub(crate) new_path: String,
+    pub(crate) encoding: PositionEncoding,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PathRenamePreview {
+    pub(crate) artifact: PreviewArtifact,
+    pub(crate) providers: Vec<String>,
+    pub(crate) semantic_edit_count: usize,
+}
+
 enum ProjectRequest {
     Query {
         reply: oneshot::Sender<ProjectState>,
@@ -1496,6 +1510,12 @@ enum ProjectRequest {
         root: PathBuf,
         reply: oneshot::Sender<Result<StructuralPreview, String>>,
     },
+    PathRenamePreview {
+        project_id: String,
+        request: PathRenameRequest,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<PathRenamePreview, String>>,
+    },
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
@@ -1606,6 +1626,7 @@ impl ProjectRequest {
             | Self::PreviewEdit { reply, .. }
             | Self::MoveInlineModulePreview { reply, .. } => reply.is_closed(),
             Self::StructuralReplacePreview { reply, .. } => reply.is_closed(),
+            Self::PathRenamePreview { reply, .. } => reply.is_closed(),
             Self::PrepareCallHierarchy { reply, .. } => reply.is_closed(),
             Self::IncomingCalls { reply, .. } => reply.is_closed(),
             Self::OutgoingCalls { reply, .. } => reply.is_closed(),
@@ -2554,6 +2575,28 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    pub(crate) async fn path_rename_preview(
+        &self,
+        project_id: String,
+        request: PathRenameRequest,
+        root: PathBuf,
+    ) -> Result<PathRenamePreview, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::PathRenamePreview {
+                project_id,
+                request,
+                root,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Consume one project-owned workspace edit preview.
     ///
     /// # Errors
@@ -2864,6 +2907,76 @@ fn structural_matches_from_workspace_edit(
     Ok(matches)
 }
 
+#[allow(clippy::mutable_key_type)]
+fn compose_path_rename_edit(
+    result: WillRenameFilesResult,
+    old_path: &Path,
+    new_path: &Path,
+) -> Result<(WorkspaceEdit, Vec<String>, usize), String> {
+    let mut changes = HashMap::new();
+    let mut operations = Vec::new();
+    let mut annotations = HashMap::new();
+    let mut semantic_edit_count = 0usize;
+    for edit in result.edits {
+        for (uri, edits) in edit.changes.unwrap_or_default() {
+            semantic_edit_count = semantic_edit_count.saturating_add(edits.len());
+            changes.entry(uri).or_insert_with(Vec::new).extend(edits);
+        }
+        if let Some(document_changes) = edit.document_changes {
+            match document_changes {
+                lsp_types::DocumentChanges::Edits(edits) => {
+                    semantic_edit_count = semantic_edit_count
+                        .saturating_add(edits.iter().map(|edit| edit.edits.len()).sum::<usize>());
+                    operations.extend(
+                        edits
+                            .into_iter()
+                            .map(lsp_types::DocumentChangeOperation::Edit),
+                    );
+                }
+                lsp_types::DocumentChanges::Operations(returned) => {
+                    for operation in returned {
+                        let lsp_types::DocumentChangeOperation::Edit(edit) = operation else {
+                            return Err(
+                                "workspace/willRenameFiles returned a resource operation; MCPLS adds exactly one requested RenameFile"
+                                    .to_string(),
+                            );
+                        };
+                        semantic_edit_count = semantic_edit_count.saturating_add(edit.edits.len());
+                        operations.push(lsp_types::DocumentChangeOperation::Edit(edit));
+                    }
+                }
+            }
+        }
+        for (id, annotation) in edit.change_annotations.unwrap_or_default() {
+            if annotations
+                .insert(id.clone(), annotation.clone())
+                .is_some_and(|existing| existing != annotation)
+            {
+                return Err(format!(
+                    "workspace/willRenameFiles returned conflicting annotation {id}"
+                ));
+            }
+        }
+    }
+    operations.push(lsp_types::DocumentChangeOperation::Op(
+        lsp_types::ResourceOp::Rename(lsp_types::RenameFile {
+            old_uri: path_to_uri(old_path),
+            new_uri: path_to_uri(new_path),
+            options: None,
+            annotation_id: None,
+        }),
+    ));
+    Ok((
+        WorkspaceEdit {
+            changes: (!changes.is_empty()).then_some(changes),
+            document_changes: Some(lsp_types::DocumentChanges::Operations(operations)),
+            change_annotations: (!annotations.is_empty()).then_some(annotations),
+        },
+        result.providers,
+        semantic_edit_count,
+    ))
+}
+
 #[derive(Debug, Default)]
 struct AutomaticRestartPolicy {
     attempts: usize,
@@ -3107,6 +3220,59 @@ impl ProjectRuntime {
             dialect,
             matches,
             parse_only,
+        })
+    }
+
+    async fn path_rename_preview(
+        &mut self,
+        project_id: &str,
+        request: PathRenameRequest,
+        root: &Path,
+    ) -> Result<PathRenamePreview, String> {
+        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let old_path = boundary
+            .validate_existing(&request.old_path)
+            .map_err(|error| error.to_string())?;
+        let new_path = boundary
+            .validate_target(&request.new_path)
+            .map_err(|error| error.to_string())?;
+        if old_path == boundary.root() {
+            return Err("cannot rename the project root".to_string());
+        }
+        if old_path == new_path {
+            return Err("old_path and new_path resolve to the same path".to_string());
+        }
+        if old_path.is_dir() && new_path.starts_with(&old_path) {
+            return Err("cannot rename a directory into itself".to_string());
+        }
+        boundary
+            .validate_operation(&crate::edit_paths::FileOperation::Rename {
+                from: old_path.clone(),
+                to: new_path.clone(),
+                overwrite: false,
+            })
+            .map_err(|error| error.to_string())?;
+
+        let result = self
+            .translator
+            .request_will_rename_files(&old_path, &new_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (edit, providers, semantic_edit_count) =
+            compose_path_rename_edit(result, &old_path, &new_path)?;
+        let mut artifact = self.preview_edit(project_id, edit, request.encoding, root)?;
+        artifact.verification = Some(if semantic_edit_count > 0 {
+            VerificationStatus::SemanticVerified
+        } else {
+            VerificationStatus::StructuralUnverified
+        });
+        if !providers.is_empty() {
+            artifact.producer = Some(EditProducer::LanguageServerFileOperations);
+        }
+        Ok(PathRenamePreview {
+            artifact,
+            providers,
+            semantic_edit_count,
         })
     }
 
@@ -4632,6 +4798,21 @@ async fn handle_project_request(
                 () = reply.closed() => {}
             }
         }
+        ProjectRequest::PathRenamePreview {
+            project_id,
+            request,
+            root,
+            mut reply,
+        } => {
+            let operation = runtime.path_rename_preview(&project_id, request, &root);
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => {
+                    let _ = reply.send(result);
+                }
+                () = reply.closed() => {}
+            }
+        }
         ProjectRequest::TakeEditPlan {
             plan_id,
             project_id,
@@ -5998,6 +6179,32 @@ impl ProjectRegistry {
                 end_character,
                 kind_filter,
             )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
+    pub(crate) async fn path_rename_preview(
+        &self,
+        id: &ProjectId,
+        request: PathRenameRequest,
+    ) -> Result<PathRenamePreview, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let path = canonicalize(Path::new(&request.old_path))?;
+        let roots = identity
+            .roots()
+            .iter()
+            .map(CanonicalRoot::as_path)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        let root = longest_matching_root(&path, &roots)
+            .ok_or_else(|| ProjectIdentityError::ProjectPathMismatch {
+                id: id.clone(),
+                path: path.clone(),
+            })?
+            .to_path_buf();
+        let _mutation = mutation.lock().await;
+        actor
+            .path_rename_preview(id.as_str().to_string(), request, root)
             .await
             .map_err(ProjectRegistryError::from)
     }
@@ -8086,6 +8293,75 @@ while True:
             "// dirty\n#[path = \"feature.rs\"] pub mod feature;\n"
         );
         assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
+    }
+
+    #[test]
+    fn path_rename_composition_uses_authoritative_open_document_content() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("old.rs");
+        let destination = root.path().join("renamed.rs");
+        let reference = root.path().join("reference.rs");
+        fs::write(&source, "pub fn old() {}\n").unwrap();
+        fs::write(&reference, "old_name();\n").unwrap();
+        let dirty = "old_name(); // dirty\n";
+
+        let reference_uri = path_to_uri(&reference).to_string();
+        let edit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                (reference_uri): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 8}
+                    },
+                    "newText": "new_name"
+                }]
+            }
+        }))
+        .unwrap();
+        let (edit, providers, semantic_edit_count) = compose_path_rename_edit(
+            WillRenameFilesResult {
+                providers: vec!["rust".to_string()],
+                edits: vec![edit],
+            },
+            &source,
+            &destination,
+        )
+        .unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker_mut()
+            .open(reference.clone(), dirty.to_string())
+            .unwrap();
+        let mut runtime = ProjectRuntime::new(translator);
+        let artifact = runtime
+            .preview_edit("project", edit, PositionEncoding::Utf8, root.path())
+            .unwrap();
+
+        assert_eq!(providers, ["rust"]);
+        assert_eq!(semantic_edit_count, 1);
+        let snapshot = artifact
+            .plan
+            .files()
+            .iter()
+            .find(|snapshot| snapshot.path() == &reference)
+            .unwrap();
+        assert_eq!(
+            snapshot.source(),
+            crate::edit_plan::SnapshotSource::OpenDocument
+        );
+        assert_eq!(snapshot.original_content(), dirty);
+        assert_eq!(snapshot.planned_content(), "new_name(); // dirty\n");
+        assert_eq!(
+            artifact
+                .plan
+                .operations()
+                .iter()
+                .filter(|operation| operation.starts_with("rename "))
+                .count(),
+            1
+        );
     }
 
     #[test]

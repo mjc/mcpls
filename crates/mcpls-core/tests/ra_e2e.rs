@@ -22,6 +22,7 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
+    clippy::too_many_lines,
     clippy::missing_docs_in_private_items,
     missing_docs
 )]
@@ -93,7 +94,22 @@ fn stage_workspace() -> TempDir {
     lib_content.push_str("\npub mod broken;\n");
     lib_content
         .push_str("\npub mod move_target {\n    pub fn answer() -> u32 {\n        42\n    }\n}\n");
+    lib_content.push_str("\npub mod folder_mod;\n");
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
+
+    let folder_module = tmp.path().join("src/folder_mod");
+    fs::create_dir(&folder_module).expect("failed to create folder module");
+    fs::write(
+        folder_module.join("mod.rs"),
+        "pub mod nested;\npub fn folder_answer() -> u32 { 42 }\n",
+    )
+    .expect("failed to write folder module");
+    fs::write(
+        folder_module.join("nested.rs"),
+        "pub struct Item;\npub fn item() -> Item { crate::folder_mod::nested::Item }\n",
+    )
+    .expect("failed to write nested folder module");
+    fs::create_dir(tmp.path().join("src/moved")).expect("failed to create move destination");
 
     // Copy bad_format.rs into src/ — NOT added to lib.rs (no mod declaration).
     let fmt_src = fixture_dir.join("extras/bad_format.rs");
@@ -1544,6 +1560,118 @@ fn sc_native_module_move_code_action_preview(
             "native module move preview omitted its CreateFile operation: {preview}"
         ));
     }
+    Ok(())
+}
+
+fn semantic_path_rename_plan(preview: &Value, label: &str) -> Result<String, String> {
+    if preview["verification"] != "semantic_verified"
+        || preview["semantic_edit_count"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        || !preview["semantic_providers"]
+            .as_array()
+            .is_some_and(|providers| providers.iter().any(|provider| provider == "rust"))
+    {
+        return Err(format!("{label} was not semantically verified: {preview}"));
+    }
+    let rename_count = preview["operations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|operation| {
+            operation
+                .as_str()
+                .is_some_and(|value| value.starts_with("rename "))
+        })
+        .count();
+    if rename_count != 1 {
+        return Err(format!(
+            "{label} did not contain exactly one RenameFile: {preview}"
+        ));
+    }
+    preview["plan_id"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{label} omitted plan_id: {preview}"))
+}
+
+/// Compose rust-analyzer's folder-module edits with one filesystem rename.
+fn sc_path_rename_folder_semantic_edit(
+    client: &mut McpClient,
+    workspace: &Path,
+) -> Result<(), String> {
+    let folder = workspace.join("src/folder_mod");
+    let renamed_folder = workspace.join("src/folder_renamed");
+    let preview = call_json(
+        client,
+        "path_rename_preview",
+        &json!({
+            "project_id": "default",
+            "old_path": folder,
+            "new_path": renamed_folder,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    semantic_path_rename_plan(&preview, "module folder rename")?;
+    Ok(())
+}
+
+/// Compose rust-analyzer's file-module edits with one filesystem rename.
+fn sc_path_rename_semantic_edit(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib_rs = workspace.join("src/lib.rs");
+    let functions = workspace.join("src/functions.rs");
+    let renamed_functions = workspace.join("src/functions_path.rs");
+    let file_preview = call_json(
+        client,
+        "path_rename_preview",
+        &json!({
+            "project_id": "default",
+            "old_path": functions,
+            "new_path": renamed_functions,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    let plan_id = semantic_path_rename_plan(&file_preview, "module file rename")?;
+
+    let types = workspace.join("src/types.rs");
+    let cross_level = workspace.join("src/moved/types.rs");
+    let limited = call_json(
+        client,
+        "path_rename_preview",
+        &json!({
+            "project_id": "default",
+            "old_path": types,
+            "new_path": cross_level,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if limited["semantic_providers"]
+        .as_array()
+        .is_none_or(|providers| !providers.iter().any(|provider| provider == "rust"))
+        || limited["semantic_edit_count"] != 0
+        || limited["verification"] != "structural_unverified"
+    {
+        return Err(format!(
+            "cross-level rust-analyzer limitation was misreported: {limited}"
+        ));
+    }
+
+    call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    let lib_content = fs::read_to_string(&lib_rs)
+        .map_err(|error| format!("failed to read renamed module declaration: {error}"))?;
+    if functions.exists()
+        || !renamed_functions.exists()
+        || !lib_content.contains("pub mod functions_path;")
+    {
+        return Err(format!(
+            "module file rename did not update declaration and filesystem: {lib_content}"
+        ));
+    }
+
     Ok(())
 }
 

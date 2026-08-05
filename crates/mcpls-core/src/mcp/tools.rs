@@ -167,6 +167,21 @@ pub struct MoveInlineModulePreviewParams {
     pub position_encoding: Option<String>,
 }
 
+/// Parameters for previewing one filesystem path rename with semantic updates.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for a preview-first project path rename.")]
+pub struct PathRenamePreviewParams {
+    /// Registered project that owns both paths and the resulting plan.
+    pub project_id: String,
+    /// Existing absolute file or directory path.
+    pub old_path: String,
+    /// Non-existing absolute destination path.
+    pub new_path: String,
+    /// Position encoding for language-server text edits.
+    #[serde(default)]
+    pub position_encoding: Option<String>,
+}
+
 /// Parameters for structural search and replacement preview.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for explicit-dialect structural search and replacement.")]

@@ -1266,6 +1266,7 @@ dependencies = [
  "dirs",
  "dunce",
  "futures",
+ "globset",
  "gungraun",
  "ignore",
  "lsp-types",

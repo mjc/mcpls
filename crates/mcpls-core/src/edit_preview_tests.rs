@@ -219,6 +219,102 @@ fn rejects_resource_operation_limit() {
 }
 
 #[test]
+fn permits_text_edits_followed_by_one_rename() {
+    let root = TempDir::new().unwrap();
+    let source = root.path().join("source.rs");
+    let reference = root.path().join("lib.rs");
+    let destination = root.path().join("renamed.rs");
+    fs::write(&source, "pub fn value() {}\n").unwrap();
+    fs::write(&reference, "mod source;\n").unwrap();
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let edit = NormalizedWorkspaceEdit {
+        operations: vec![
+            EditOperation::Text {
+                uri: path_to_uri(&reference),
+                version: None,
+                edits: vec![NormalizedTextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 4),
+                        lsp_types::Position::new(0, 10),
+                    ),
+                    new_text: "renamed".to_string(),
+                    annotation_id: None,
+                }],
+            },
+            EditOperation::Rename {
+                old_uri: path_to_uri(&source),
+                new_uri: path_to_uri(&destination),
+                options: None,
+                annotation_id: None,
+            },
+        ],
+        change_annotations: None,
+    };
+
+    let artifact = preview_normalized(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits::default(),
+    )
+    .unwrap();
+
+    assert!(artifact.plan.safe_to_apply(), "{:?}", artifact.conflicts);
+    assert_eq!(artifact.plan.files()[0].planned_content(), "mod renamed;\n");
+    assert!(matches!(
+        artifact.plan.file_operations(),
+        [FileOperation::Rename { from, to, .. }] if from == &source && to == &destination
+    ));
+}
+
+#[test]
+fn rejects_text_edits_that_follow_a_rename() {
+    let root = TempDir::new().unwrap();
+    let source = root.path().join("source.rs");
+    let reference = root.path().join("lib.rs");
+    let destination = root.path().join("renamed.rs");
+    fs::write(&source, "pub fn value() {}\n").unwrap();
+    fs::write(&reference, "mod source;\n").unwrap();
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let edit = NormalizedWorkspaceEdit {
+        operations: vec![
+            EditOperation::Rename {
+                old_uri: path_to_uri(&source),
+                new_uri: path_to_uri(&destination),
+                options: None,
+                annotation_id: None,
+            },
+            EditOperation::Text {
+                uri: path_to_uri(&reference),
+                version: None,
+                edits: vec![],
+            },
+        ],
+        change_annotations: None,
+    };
+
+    let artifact = preview_normalized(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits::default(),
+    )
+    .unwrap();
+
+    assert!(!artifact.plan.safe_to_apply());
+    assert!(
+        artifact
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("follow a rename"))
+    );
+}
+
+#[test]
 fn rejects_per_file_byte_limit() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("large.rs");

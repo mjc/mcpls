@@ -65,6 +65,8 @@ pub enum EditProducer {
     RustAnalyzer,
     /// MCPLS's in-process structural Rust refactor.
     StructuralAstGrep,
+    /// Edits returned by `workspace/willRenameFiles` providers.
+    LanguageServerFileOperations,
 }
 
 impl EditProducer {
@@ -74,6 +76,7 @@ impl EditProducer {
         match self {
             Self::RustAnalyzer => "rust_analyzer",
             Self::StructuralAstGrep => "structural_ast_grep",
+            Self::LanguageServerFileOperations => "language_server_file_operations",
         }
     }
 }
@@ -194,6 +197,7 @@ struct PreviewBuilder<'a> {
     created_paths: BTreeSet<PathBuf>,
     create_overwrites: BTreeMap<PathBuf, bool>,
     saw_text_edits: bool,
+    saw_non_create_resource_operation: bool,
     file_operations: Vec<FileOperation>,
     operations: Vec<String>,
     conflicts: Vec<String>,
@@ -220,6 +224,7 @@ impl<'a> PreviewBuilder<'a> {
             created_paths: BTreeSet::new(),
             create_overwrites: BTreeMap::new(),
             saw_text_edits: false,
+            saw_non_create_resource_operation: false,
             file_operations: Vec::new(),
             operations: Vec::new(),
             conflicts: Vec::new(),
@@ -264,10 +269,10 @@ impl<'a> PreviewBuilder<'a> {
             && self
                 .file_operations
                 .iter()
-                .any(|operation| !matches!(operation, FileOperation::Create { .. }))
+                .any(|operation| matches!(operation, FileOperation::Delete { .. }))
         {
             self.conflicts
-                .push("text edits can only be combined with ordered create operations".to_string());
+                .push("text edits cannot be combined with delete operations".to_string());
         }
 
         let snapshots = self
@@ -360,6 +365,7 @@ impl<'a> PreviewBuilder<'a> {
                 options,
                 ..
             } => {
+                self.saw_non_create_resource_operation = true;
                 self.count_resource_operation()?;
                 let from = self
                     .boundary
@@ -394,6 +400,7 @@ impl<'a> PreviewBuilder<'a> {
                 Ok(())
             }
             EditOperation::Delete { uri, options, .. } => {
+                self.saw_non_create_resource_operation = true;
                 self.count_resource_operation()?;
                 let path = self
                     .boundary
@@ -455,6 +462,10 @@ impl<'a> PreviewBuilder<'a> {
         version: Option<i32>,
         edits: &[crate::workspace_edit::NormalizedTextEdit],
     ) -> Result<(), PreviewError> {
+        if self.saw_non_create_resource_operation {
+            self.conflicts
+                .push("text edits follow a rename or delete operation".to_string());
+        }
         self.saw_text_edits = true;
         self.edit_count = self.edit_count.saturating_add(edits.len());
         if self.edit_count > self.limits.max_edits {

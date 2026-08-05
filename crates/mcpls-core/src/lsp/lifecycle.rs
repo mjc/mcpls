@@ -140,6 +140,13 @@ fn mcpls_workspace_edit_capabilities() -> lsp_types::WorkspaceEditClientCapabili
     }
 }
 
+fn mcpls_file_operations_capabilities() -> lsp_types::WorkspaceFileOperationsClientCapabilities {
+    lsp_types::WorkspaceFileOperationsClientCapabilities {
+        will_rename: Some(true),
+        ..Default::default()
+    }
+}
+
 /// Result of attempting to spawn multiple LSP servers.
 ///
 /// This type enables graceful degradation by collecting both
@@ -478,6 +485,7 @@ impl LspServer {
                 }),
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
                     workspace_edit: Some(mcpls_workspace_edit_capabilities()),
+                    file_operations: Some(mcpls_file_operations_capabilities()),
                     workspace_folders: Some(true),
                     did_change_watched_files: Some(
                         lsp_types::DidChangeWatchedFilesClientCapabilities {
@@ -889,6 +897,13 @@ mod tests {
                 lsp_types::ResourceOperationKind::Delete,
             ])
         );
+    }
+
+    #[test]
+    fn client_capabilities_advertise_will_rename_files() {
+        let file_operations = mcpls_file_operations_capabilities();
+
+        assert_eq!(file_operations.will_rename, Some(true));
     }
 
     #[cfg(unix)]
