@@ -1813,7 +1813,15 @@ fn main() {
         assert_eq!(result.failure_count(), 0);
         assert_eq!(result.server_count(), 2);
         for server in result.servers.into_values() {
+            let process_id = server.child.id();
             server.shutdown().await.unwrap();
+            #[cfg(target_os = "linux")]
+            assert!(
+                process_id.is_none_or(|process_id| {
+                    !std::path::Path::new(&format!("/proc/{process_id}")).exists()
+                }),
+                "shutdown must reap the language-server process"
+            );
         }
     }
 

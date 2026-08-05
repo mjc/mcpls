@@ -1,0 +1,350 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+
+use super::ProjectRequest;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct RustGroupId(pub(super) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidencyDecision {
+    Admit,
+    Reuse,
+    Evict(RustGroupId),
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResidentGroup {
+    pins: usize,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct RustResidencyBudget {
+    limit: usize,
+    clock: u64,
+    residents: HashMap<RustGroupId, ResidentGroup>,
+}
+
+impl RustResidencyBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            clock: 0,
+            residents: HashMap::new(),
+        }
+    }
+
+    fn pin(&mut self, group: RustGroupId, excluded: &HashSet<RustGroupId>) -> ResidencyDecision {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(resident) = self.residents.get_mut(&group) {
+            resident.pins = resident.pins.saturating_add(1);
+            resident.last_used = self.clock;
+            return ResidencyDecision::Reuse;
+        }
+        if self.residents.len() < self.limit {
+            self.residents.insert(
+                group,
+                ResidentGroup {
+                    pins: 1,
+                    last_used: self.clock,
+                },
+            );
+            return ResidencyDecision::Admit;
+        }
+        self.residents
+            .iter()
+            .filter(|(candidate, resident)| resident.pins == 0 && !excluded.contains(candidate))
+            .min_by_key(|(_, resident)| resident.last_used)
+            .map_or(ResidencyDecision::Wait, |(candidate, _)| {
+                ResidencyDecision::Evict(*candidate)
+            })
+    }
+
+    fn replace(&mut self, victim: RustGroupId, group: RustGroupId) {
+        self.clock = self.clock.wrapping_add(1);
+        self.residents.remove(&victim);
+        self.residents.insert(
+            group,
+            ResidentGroup {
+                pins: 1,
+                last_used: self.clock,
+            },
+        );
+    }
+
+    fn unpin(&mut self, group: RustGroupId) {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(resident) = self.residents.get_mut(&group) {
+            resident.pins = resident.pins.saturating_sub(1);
+            resident.last_used = self.clock;
+        }
+    }
+
+    fn remove(&mut self, group: RustGroupId) {
+        self.residents.remove(&group);
+    }
+
+    #[cfg(test)]
+    fn resident_count(&self) -> usize {
+        self.residents.len()
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RustResidencyController {
+    inner: Arc<RustResidencyInner>,
+}
+
+struct RustResidencyInner {
+    state: StdMutex<RustResidencyState>,
+    transition: Mutex<()>,
+    changed: Notify,
+}
+
+struct RustResidencyState {
+    budget: RustResidencyBudget,
+    actors: HashMap<RustGroupId, mpsc::WeakSender<ProjectRequest>>,
+}
+
+impl RustResidencyController {
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(RustResidencyInner {
+                state: StdMutex::new(RustResidencyState {
+                    budget: RustResidencyBudget::new(limit),
+                    actors: HashMap::new(),
+                }),
+                transition: Mutex::new(()),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
+    pub(super) fn register(&self, group: RustGroupId, sender: mpsc::WeakSender<ProjectRequest>) {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .actors
+            .insert(group, sender);
+    }
+
+    pub(super) async fn acquire(&self, group: RustGroupId) -> RustResidencyGuard {
+        let mut excluded = HashSet::new();
+        loop {
+            let transition = self.inner.transition.lock().await;
+            let decision = self.state().budget.pin(group, &excluded);
+            match decision {
+                ResidencyDecision::Admit | ResidencyDecision::Reuse => {
+                    return RustResidencyGuard {
+                        group,
+                        inner: Arc::clone(&self.inner),
+                    };
+                }
+                ResidencyDecision::Evict(victim) => {
+                    let sender = self
+                        .state()
+                        .actors
+                        .get(&victim)
+                        .and_then(mpsc::WeakSender::upgrade);
+                    let Some(sender) = sender else {
+                        self.remove(victim);
+                        continue;
+                    };
+                    let (reply, response) = oneshot::channel();
+                    if sender
+                        .send(ProjectRequest::Suspend { reply })
+                        .await
+                        .is_err()
+                    {
+                        self.remove(victim);
+                        continue;
+                    }
+                    match response.await {
+                        Ok(Ok(())) => {
+                            self.state().budget.replace(victim, group);
+                            return RustResidencyGuard {
+                                group,
+                                inner: Arc::clone(&self.inner),
+                            };
+                        }
+                        Ok(Err(())) => {
+                            excluded.insert(victim);
+                        }
+                        Err(_) => self.remove(victim),
+                    }
+                }
+                ResidencyDecision::Wait => {
+                    let changed = self.inner.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    drop(transition);
+                    changed.await;
+                    excluded.clear();
+                    continue;
+                }
+            }
+            drop(transition);
+        }
+    }
+
+    pub(super) fn remove(&self, group: RustGroupId) {
+        let mut state = self.state();
+        state.budget.remove(group);
+        state.actors.remove(&group);
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RustResidencyState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+pub(super) struct RustResidencyGuard {
+    group: RustGroupId,
+    inner: Arc<RustResidencyInner>,
+}
+
+impl Drop for RustResidencyGuard {
+    fn drop(&mut self) {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .budget
+            .unpin(self.group);
+        self.inner.changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn pinned_group_forces_second_cold_group_to_wait() {
+        let mut budget = RustResidencyBudget::new(1);
+
+        assert_eq!(
+            budget.pin(RustGroupId(1), &HashSet::new()),
+            ResidencyDecision::Admit
+        );
+        assert_eq!(
+            budget.pin(RustGroupId(2), &HashSet::new()),
+            ResidencyDecision::Wait
+        );
+        assert_eq!(budget.resident_count(), 1);
+    }
+
+    #[test]
+    fn least_recently_used_unpinned_group_is_evicted() {
+        let mut budget = RustResidencyBudget::new(2);
+        let excluded = HashSet::new();
+
+        assert_eq!(
+            budget.pin(RustGroupId(1), &excluded),
+            ResidencyDecision::Admit
+        );
+        budget.unpin(RustGroupId(1));
+        assert_eq!(
+            budget.pin(RustGroupId(2), &excluded),
+            ResidencyDecision::Admit
+        );
+        budget.unpin(RustGroupId(2));
+
+        assert_eq!(
+            budget.pin(RustGroupId(3), &excluded),
+            ResidencyDecision::Evict(RustGroupId(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_suspends_unpinned_victim_before_admission() {
+        let controller = RustResidencyController::new(1);
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let suspension = tokio::spawn(async move {
+            let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+                panic!("expected suspension request");
+            };
+            reply.send(Ok(())).unwrap();
+        });
+        let guard =
+            tokio::time::timeout(Duration::from_secs(1), controller.acquire(RustGroupId(2)))
+                .await
+                .expect("second group should be admitted after suspension");
+
+        suspension.await.unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn controller_queues_while_every_resident_group_is_pinned() {
+        let controller = RustResidencyController::new(1);
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        let first_guard = controller.acquire(RustGroupId(1)).await;
+        let second = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.acquire(RustGroupId(2)).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!second.is_finished());
+        drop(first_guard);
+        let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+            panic!("expected suspension request");
+        };
+        reply.send(Ok(())).unwrap();
+
+        let second_guard = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("queued group should wake")
+            .unwrap();
+        drop(second_guard);
+    }
+
+    #[tokio::test]
+    async fn controller_keeps_waiting_when_victim_refuses_suspension() {
+        let controller = RustResidencyController::new(1);
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+        let second = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.acquire(RustGroupId(2)).await }
+        });
+
+        let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+            panic!("expected suspension request");
+        };
+        reply.send(Err(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!second.is_finished());
+
+        controller.remove(RustGroupId(1));
+        let second_guard = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("queued group should wake after the pinned group leaves")
+            .unwrap();
+        drop(second_guard);
+    }
+}

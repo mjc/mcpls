@@ -1,10 +1,12 @@
 //! Project identity and canonical path routing primitives.
 
+mod residency;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -38,6 +40,7 @@ use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use crate::rust_refactor::{logical_module_name, move_inline_module_preview_with_source};
 use crate::workspace_edit::{EditOperation, normalize};
 use lsp_types::WorkspaceEdit;
+use residency::{RustGroupId, RustResidencyController};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -696,6 +699,8 @@ pub enum ProjectStatus {
     Degraded,
     /// The project is replacing or restarting a language server.
     Restarting,
+    /// The actor remains registered but owns no resident language server.
+    Dormant,
     /// The actor is draining work before shutdown.
     Stopping,
     /// The actor has stopped and accepts no new requests.
@@ -713,6 +718,7 @@ impl ProjectStatus {
             Self::Ready => "Ready",
             Self::Degraded => "Degraded",
             Self::Restarting => "Restarting",
+            Self::Dormant => "Dormant",
             Self::Stopping => "Stopping",
             Self::Stopped => "Stopped",
             Self::Failed => "Failed",
@@ -1018,7 +1024,7 @@ const fn project_status_priority(status: ProjectStatus) -> u8 {
         ProjectStatus::Degraded => 3,
         ProjectStatus::Starting => 2,
         ProjectStatus::Ready => 1,
-        ProjectStatus::Stopped => 0,
+        ProjectStatus::Dormant | ProjectStatus::Stopped => 0,
     }
 }
 
@@ -1573,9 +1579,70 @@ enum ProjectRequest {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+    Suspend {
+        reply: oneshot::Sender<Result<(), ()>>,
+    },
 }
 
 impl ProjectRequest {
+    const fn uses_rust_residency(&self) -> bool {
+        matches!(
+            self,
+            Self::Activate { .. }
+                | Self::ActivateWorkspaceRoots { .. }
+                | Self::Hover { .. }
+                | Self::Definition { .. }
+                | Self::References { .. }
+                | Self::Diagnostics { .. }
+                | Self::Rename { .. }
+                | Self::RenameWorkspaceEdit { .. }
+                | Self::Completions { .. }
+                | Self::DocumentSymbols { .. }
+                | Self::FormatDocument { .. }
+                | Self::FormatWorkspaceEdit { .. }
+                | Self::RangeFormatWorkspaceEdit { .. }
+                | Self::MoveItemWorkspaceEdit { .. }
+                | Self::SemanticDiscovery { .. }
+                | Self::WorkspaceSymbol { .. }
+                | Self::CodeActions { .. }
+                | Self::CodeActionList { .. }
+                | Self::PrepareCallHierarchy { .. }
+                | Self::IncomingCalls { .. }
+                | Self::OutgoingCalls { .. }
+                | Self::SignatureHelp { .. }
+                | Self::InlayHints { .. }
+                | Self::GoToImplementation { .. }
+                | Self::GoToTypeDefinition { .. }
+                | Self::AddWorkspaceRoot { .. }
+                | Self::ApplyEditPlan { .. }
+                | Self::MoveInlineModulePreview { .. }
+                | Self::PathRenamePreview { .. }
+                | Self::Restart { .. }
+                | Self::ServerExited { .. }
+        ) || matches!(
+            self,
+            Self::StructuralReplacePreview {
+                request: StructuralReplaceRequest {
+                    dialect: StructuralDialect::RustAnalyzerSsr,
+                    ..
+                },
+                ..
+            }
+        )
+    }
+
+    const fn resumes_rust_runtime(&self) -> bool {
+        self.uses_rust_residency()
+            && !matches!(
+                self,
+                Self::Activate { .. }
+                    | Self::ActivateWorkspaceRoots { .. }
+                    | Self::AddWorkspaceRoot { .. }
+                    | Self::Restart { .. }
+                    | Self::ServerExited { .. }
+            )
+    }
+
     /// Fail LSP work that was queued while this actor exhausted recovery.
     ///
     /// Inspection and lifecycle requests still pass through so callers can
@@ -1681,6 +1748,7 @@ impl ProjectRequest {
             Self::ServerCapabilities { reply, .. } => reply.is_closed(),
             Self::PublishEvent { .. }
             | Self::Shutdown { .. }
+            | Self::Suspend { .. }
             | Self::Notification { .. }
             | Self::ServerExited { .. } => false,
         }
@@ -4225,6 +4293,10 @@ impl ProjectRuntime {
     fn open_document_paths(&self) -> Vec<PathBuf> {
         self.translator.document_tracker().open_paths()
     }
+
+    fn has_dirty_documents(&self) -> bool {
+        self.translator.document_tracker().has_dirty_documents()
+    }
 }
 
 fn code_action_has_assist_id(action: &lsp_types::CodeAction, expected: &str) -> bool {
@@ -4323,7 +4395,10 @@ async fn handle_server_exit(
         ProjectStatus::Starting | ProjectStatus::Restarting => {
             channels.publish_failure(state, LANGUAGE_SERVER_EXITED);
         }
-        ProjectStatus::Failed | ProjectStatus::Stopping | ProjectStatus::Stopped => {}
+        ProjectStatus::Failed
+        | ProjectStatus::Stopping
+        | ProjectStatus::Dormant
+        | ProjectStatus::Stopped => {}
     }
 }
 
@@ -4369,8 +4444,28 @@ fn spawn_project_actor_with_translator_and_safety(
     translator: Translator,
     edit_safety: Option<EditSafetyConfig>,
 ) -> ProjectHandle {
+    spawn_project_actor_with_runtime(capacity, translator, edit_safety, None)
+}
+
+#[derive(Clone)]
+struct ProjectResidency {
+    controller: RustResidencyController,
+    group: RustGroupId,
+}
+
+fn spawn_project_actor_with_runtime(
+    capacity: usize,
+    translator: Translator,
+    edit_safety: Option<EditSafetyConfig>,
+    residency: Option<ProjectResidency>,
+) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.downgrade();
+    if let Some(residency) = &residency {
+        residency
+            .controller
+            .register(residency.group, actor_sender.clone());
+    }
     let sender = ProjectRequestSender::new(sender);
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (event_tx, _) = broadcast::channel(256);
@@ -4391,6 +4486,7 @@ fn spawn_project_actor_with_translator_and_safety(
         channels,
         ProjectState::new(ProjectStatus::Starting, runtime.summary()),
         runtime,
+        residency,
     ));
     ProjectHandle {
         sender,
@@ -4457,8 +4553,25 @@ async fn run_project_actor(
     channels: ProjectActorChannels,
     mut state: ProjectState,
     mut runtime: ProjectRuntime,
+    residency: Option<ProjectResidency>,
 ) {
     while let Some(request) = next_project_request(&mut receiver).await {
+        let uses_residency = request.uses_rust_residency();
+        let resumes_runtime = request.resumes_rust_runtime();
+        let _residency_guard = if uses_residency {
+            match &residency {
+                Some(residency) => Some(residency.controller.acquire(residency.group).await),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if residency.is_some()
+            && resumes_runtime
+            && !runtime.has_active_workspace_roots(runtime.translator.workspace_roots())
+        {
+            resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
+        }
         if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
         {
             break;
@@ -4466,6 +4579,30 @@ async fn run_project_actor(
     }
     if state.status != ProjectStatus::Stopped {
         stop_project_runtime(&channels, &mut state, &mut runtime, false).await;
+    }
+    if let Some(residency) = residency {
+        residency.controller.remove(residency.group);
+    }
+}
+
+async fn resume_project_runtime(
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) {
+    let roots = runtime.translator.workspace_roots().to_vec();
+    runtime.begin_transition();
+    state.last_error = None;
+    channels.publish_status(state, ProjectStatus::Starting);
+    match runtime.activate_workspace_roots(roots).await {
+        Ok(activation) => {
+            mark_project_started(activation, actor_sender, channels, state, runtime);
+        }
+        Err(error) => {
+            state.sync_runtime(runtime);
+            channels.publish_failure(state, error);
+        }
     }
 }
 
@@ -4581,6 +4718,28 @@ async fn stop_project_runtime(
     channels.publish_status(state, ProjectStatus::Stopped);
 }
 
+async fn suspend_project_runtime(
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+) -> Result<(), ()> {
+    if runtime.has_dirty_documents() {
+        return Err(());
+    }
+    runtime.begin_transition();
+    state.last_error = None;
+    channels.publish_status(state, ProjectStatus::Stopping);
+    if let Err(error) = runtime.shutdown().await {
+        state.last_error = Some(error);
+        state.sync_runtime(runtime);
+        channels.publish_status(state, ProjectStatus::Failed);
+        return Err(());
+    }
+    state.sync_runtime(runtime);
+    channels.publish_status(state, ProjectStatus::Dormant);
+    Ok(())
+}
+
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
@@ -4600,6 +4759,9 @@ async fn handle_project_request(
         ProjectRequest::Query { reply } | ProjectRequest::Refresh { reply } => {
             state.sync_runtime(runtime);
             let _ = reply.send(state.clone());
+        }
+        ProjectRequest::Suspend { reply } => {
+            let _ = reply.send(suspend_project_runtime(channels, state, runtime).await);
         }
         ProjectRequest::Activate { root, reply } => {
             if runtime.activation_is_reusable(state.status, std::slice::from_ref(&root)) {
@@ -5511,6 +5673,8 @@ pub struct ProjectRegistry {
     persistence_error: std::sync::Arc<RwLock<Option<String>>>,
     lifecycle: std::sync::Arc<RegistryLifecycle>,
     shutdown_timeout: Duration,
+    rust_residency: RustResidencyController,
+    next_rust_group_id: std::sync::Arc<AtomicU64>,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -5524,6 +5688,8 @@ pub struct ProjectStatusCounts {
     pub degraded: usize,
     /// Projects currently restarting.
     pub restarting: usize,
+    /// Registered projects without resident language-server processes.
+    pub dormant: usize,
     /// Projects draining before shutdown.
     pub stopping: usize,
     /// Stopped projects still retained by the registry.
@@ -5607,6 +5773,7 @@ impl ProjectStatusCounts {
             ProjectStatus::Ready => self.ready += 1,
             ProjectStatus::Degraded => self.degraded += 1,
             ProjectStatus::Restarting => self.restarting += 1,
+            ProjectStatus::Dormant => self.dormant += 1,
             ProjectStatus::Stopping => self.stopping += 1,
             ProjectStatus::Stopped => self.stopped += 1,
             ProjectStatus::Failed => self.failed += 1,
@@ -5688,11 +5855,20 @@ impl ProjectRegistry {
         root: &CanonicalRoot,
         translator_template: Option<&TranslatorTemplate>,
     ) -> ProjectHandle {
-        translator_template.map_or_else(
-            || spawn_project_actor_for_root(self.actor_capacity, root),
-            |template| {
-                spawn_project_actor_for_root_with_template(self.actor_capacity, root, template)
-            },
+        let Some(template) = translator_template else {
+            return spawn_project_actor_for_root(self.actor_capacity, root);
+        };
+        let residency = (template.configures_language("rust")
+            && root.as_path().join("Cargo.toml").is_file())
+        .then(|| ProjectResidency {
+            controller: self.rust_residency.clone(),
+            group: RustGroupId(self.next_rust_group_id.fetch_add(1, Ordering::Relaxed)),
+        });
+        spawn_project_actor_with_runtime(
+            self.actor_capacity,
+            template.translator_for_root(root.as_path().to_path_buf()),
+            template.edit_safety().cloned(),
+            residency,
         )
     }
 
@@ -5709,6 +5885,8 @@ impl ProjectRegistry {
             persistence_error: std::sync::Arc::new(RwLock::new(None)),
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
             shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
+            rust_residency: RustResidencyController::new(1),
+            next_rust_group_id: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -5728,6 +5906,13 @@ impl ProjectRegistry {
     #[must_use]
     pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Set the process-wide resident rust-analyzer group limit.
+    #[must_use]
+    pub fn with_rust_residency_limit(mut self, limit: usize) -> Self {
+        self.rust_residency = RustResidencyController::new(limit);
         self
     }
 
