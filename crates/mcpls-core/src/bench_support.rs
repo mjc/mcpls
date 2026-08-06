@@ -23,3 +23,9 @@ pub fn rust_analyzer_initialization_options(
     crate::bridge::translator::benchmark_rust_analyzer_initialization_options(roots)
         .map_err(|error| error.to_string())
 }
+
+/// Count Rust workspace-symbol fallback results for a query.
+#[must_use]
+pub fn ast_workspace_symbol_count(root: &Path, query: &str, limit: usize) -> usize {
+    crate::bridge::ast_grep::benchmark_workspace_symbol_count(root, query, limit)
+}

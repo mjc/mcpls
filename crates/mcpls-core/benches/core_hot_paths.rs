@@ -2,6 +2,7 @@
 
 #![allow(missing_docs, clippy::expect_used)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -11,7 +12,7 @@ use gungraun::{
     library_benchmark_group, main,
 };
 use mcpls_core::bench_support::{
-    desired_watch_directory_count, rust_analyzer_initialization_options,
+    ast_workspace_symbol_count, desired_watch_directory_count, rust_analyzer_initialization_options,
 };
 use mcpls_core::config::ServerHeuristics;
 use mcpls_core::project::longest_matching_root;
@@ -21,6 +22,7 @@ struct WorkspaceFixture {
     temp: TempDir,
     roots: Vec<PathBuf>,
     nested_file: PathBuf,
+    symbol_root: PathBuf,
 }
 
 fn workspace_fixture() -> &'static WorkspaceFixture {
@@ -46,11 +48,24 @@ fn workspace_fixture() -> &'static WorkspaceFixture {
         }
         roots.push(root);
     }
+    let symbol_root = temp.path().join("symbol-workspace");
+    fs::create_dir(&symbol_root).expect("create symbol workspace");
+    for file in 0..128 {
+        let mut source = String::new();
+        for symbol in 0..64 {
+            writeln!(source, "pub fn unrelated_{file}_{symbol}() {{}}")
+                .expect("write symbol fixture");
+        }
+        fs::write(symbol_root.join(format!("{file:03}.rs")), source).expect("write symbol source");
+    }
+    fs::write(symbol_root.join("zzz.rs"), "pub struct RootDatabase;\n")
+        .expect("write matching symbol source");
     let nested_file = roots[4].join("src/nested/file.rs");
     Box::leak(Box::new(WorkspaceFixture {
         temp,
         roots,
         nested_file,
+        symbol_root,
     }))
 }
 
@@ -109,6 +124,16 @@ fn recursive_marker_detection(fixture: &WorkspaceFixture) -> bool {
     )
 }
 
+#[library_benchmark]
+#[bench::late_match(setup = workspace_fixture)]
+fn ast_workspace_symbol_scan(fixture: &WorkspaceFixture) -> usize {
+    black_box(ast_workspace_symbol_count(
+        black_box(&fixture.symbol_root),
+        black_box("RootDatabase"),
+        black_box(5),
+    ))
+}
+
 library_benchmark_group!(
     name = core_hot_paths,
     config = LibraryBenchmarkConfig::default()
@@ -128,7 +153,8 @@ library_benchmark_group!(
         rust_analyzer_options_one_root,
         rust_analyzer_options_five_roots,
         route_to_longest_root,
-        recursive_marker_detection
+        recursive_marker_detection,
+        ast_workspace_symbol_scan
     ]
 );
 

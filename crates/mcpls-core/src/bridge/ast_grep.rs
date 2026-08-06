@@ -429,6 +429,9 @@ fn search_sync(
         let Ok(source) = fs::read_to_string(&path) else {
             continue;
         };
+        if !contains_ascii_case_insensitive(&source, &query) {
+            continue;
+        }
 
         let tree = language.ast_grep(&source);
         for node in tree.root().dfs() {
@@ -444,7 +447,7 @@ fn search_sync(
             let Some(name) = symbol_name(&node) else {
                 continue;
             };
-            if !name.to_ascii_lowercase().contains(&query) {
+            if !contains_ascii_case_insensitive(&name, &query) {
                 continue;
             }
             let range = node.range();
@@ -473,6 +476,31 @@ fn search_sync(
         }
     }
     symbols
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    needle.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(feature = "bench")]
+pub fn benchmark_workspace_symbol_count(
+    root: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> usize {
+    search_sync(
+        &[root.to_path_buf()],
+        &["rust".to_string()],
+        query,
+        None,
+        limit,
+        &AtomicBool::new(false),
+    )
+    .len()
 }
 
 /// Convert tree-sitter byte offsets to the daemon's default UTF-8 MCP units.
@@ -635,6 +663,22 @@ mod tests {
         assert_eq!(symbols[0].kind, "struct");
         assert_eq!(symbols[1].name, "fallback_function");
         assert_eq!(symbols[1].kind, "function");
+    }
+
+    #[test]
+    fn text_prefilter_matches_symbol_query_case_insensitively() {
+        assert!(contains_ascii_case_insensitive(
+            "pub struct RootDatabase;",
+            "rootdatabase"
+        ));
+        assert!(contains_ascii_case_insensitive(
+            "fn überRoot() {}",
+            "überroot"
+        ));
+        assert!(!contains_ascii_case_insensitive(
+            "pub struct OtherDatabase;",
+            "rootdatabase"
+        ));
     }
 
     #[test]
