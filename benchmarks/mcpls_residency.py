@@ -192,9 +192,9 @@ def descendants(pid):
     return result
 
 
-def pss_kib(pid):
+def pss_kib(pid, process_ids=None):
     total = 0
-    for current in descendants(pid):
+    for current in descendants(pid) if process_ids is None else process_ids:
         try:
             with open(f"/proc/{current}/smaps_rollup", encoding="utf-8") as file:
                 total += next(
@@ -205,10 +205,10 @@ def pss_kib(pid):
     return total
 
 
-def process_summary(pid):
+def process_summary(pid, process_ids=None):
     """Summarize the daemon's live descendant process tree."""
     names = []
-    for current in descendants(pid):
+    for current in descendants(pid) if process_ids is None else process_ids:
         try:
             name = pathlib.Path(f"/proc/{current}/comm").read_text().strip()
         except (FileNotFoundError, PermissionError, ProcessLookupError):
@@ -216,6 +216,15 @@ def process_summary(pid):
         if name:
             names.append(name)
     return {"process_count": len(names), "process_names": sorted(names)}
+
+
+def resource_snapshot(pid):
+    """Capture PSS and process names from one daemon process-tree snapshot."""
+    process_ids = descendants(pid)
+    return {
+        "pss_kib": pss_kib(pid, process_ids),
+        "processes": process_summary(pid, process_ids),
+    }
 
 
 def register_groups(client, groups, prefix, ids=None):
@@ -307,8 +316,7 @@ def run(args):
             "project_count": len(groups),
             "roots_per_project": 5,
             "daemon_only": {
-                "pss_kib": pss_kib(args.pid),
-                "processes": process_summary(args.pid),
+                **resource_snapshot(args.pid),
                 "server_status": daemon_status,
                 "registered_projects": registered_states,
             },
@@ -338,8 +346,7 @@ def run(args):
                     ),
                     "activation_status": activation_state.get("status"),
                     **result,
-                    "pss_kib": pss_kib(args.pid),
-                    "processes": process_summary(args.pid),
+                    **resource_snapshot(args.pid),
                     "status": state.get("status"),
                     "active_language_servers": state.get("active_language_servers", []),
                     "active_group_count": len(active_projects),

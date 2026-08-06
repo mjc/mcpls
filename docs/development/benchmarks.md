@@ -108,9 +108,12 @@ python3 benchmarks/mcpls_residency.py \
   --output target/benchmarks/mcpls-residency-report.json
 ```
 
-It records daemon-only PSS after registration, then PSS and activation-to-first
+It records daemon-only PSS and the daemon descendant process count/names after
+registration, then the same PSS/process snapshot plus activation-to-first
 authoritative `Ready`/`Degraded` `workspace_symbol_search` result time across a
-forward and reverse group-switch sequence. Symbol counts are read from MCPLS's
+forward and reverse group-switch sequence. The process snapshot is what lets
+the report distinguish one rust-analyzer process plus its children from a
+second resident analyzer. Symbol counts are read from MCPLS's
 `{"symbols": [...]}` result object. Registration fails if a logical project
 does not collapse to one actor group, and every switch fails if more than the
 configured active-group limit is observed. Registrations are removed in a
