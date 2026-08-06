@@ -5405,10 +5405,16 @@ pub enum ProjectRegistryError {
     Actor(#[from] ProjectActorError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectCompatibility {
+    Deferred,
+    Resolved(Option<ProjectCompatibilityKey>),
+}
+
 struct ProjectActorEntry {
     actor: ProjectHandle,
     mutation: MutationGate,
-    compatibility_key: Option<ProjectCompatibilityKey>,
+    compatibility: ProjectCompatibility,
     translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
     roots: Vec<CanonicalRoot>,
 }
@@ -5424,7 +5430,7 @@ impl ProjectActorEntry {
         Self {
             actor,
             mutation,
-            compatibility_key,
+            compatibility: ProjectCompatibility::Resolved(compatibility_key),
             translator_template,
             roots: vec![root],
         }
@@ -5610,6 +5616,10 @@ impl ProjectEntry {
         &self.actors[0]
     }
 
+    fn primary_mut(&mut self) -> &mut ProjectActorEntry {
+        &mut self.actors[0]
+    }
+
     fn removal_snapshot(&self) -> ProjectRemovalSnapshot {
         let (actors, mutations): (Vec<_>, Vec<_>) = self
             .actors
@@ -5639,7 +5649,9 @@ impl ProjectEntry {
         let compatibility_key = compatibility_key?;
         self.actors
             .iter()
-            .find(|actor| actor.compatibility_key == Some(compatibility_key))
+            .find(|actor| {
+                actor.compatibility == ProjectCompatibility::Resolved(Some(compatibility_key))
+            })
             .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
     }
 
@@ -5647,9 +5659,9 @@ impl ProjectEntry {
         let Some(compatibility_key) = compatibility_key else {
             return false;
         };
-        self.actors
-            .iter()
-            .any(|actor| actor.compatibility_key == Some(compatibility_key))
+        self.actors.iter().any(|actor| {
+            actor.compatibility == ProjectCompatibility::Resolved(Some(compatibility_key))
+        })
     }
 
     fn status(&self) -> ProjectStatus {
@@ -6059,7 +6071,7 @@ impl ProjectRegistry {
                 }
                 _ => ProjectIdentity::new(id.clone(), root),
             };
-            self.add_with_config(identity, persisted.config.clone())
+            self.add_restored_with_config(identity, persisted.config.clone())
                 .await?;
             for additional_root in &persisted.additional_roots {
                 let Ok(additional_root) = CanonicalRoot::new(additional_root) else {
@@ -6093,7 +6105,7 @@ impl ProjectRegistry {
         &self,
         identity: ProjectIdentity,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.add_registration(identity, None, None).await
+        self.add_registration(identity, None, None, false).await
     }
 
     /// Add a project with an optional JSON-facing configuration override.
@@ -6107,6 +6119,25 @@ impl ProjectRegistry {
         identity: ProjectIdentity,
         config: Option<ProjectConfig>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.add_configured_registration(identity, config, false)
+            .await
+    }
+
+    async fn add_restored_with_config(
+        &self,
+        identity: ProjectIdentity,
+        config: Option<ProjectConfig>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.add_configured_registration(identity, config, true)
+            .await
+    }
+
+    async fn add_configured_registration(
+        &self,
+        identity: ProjectIdentity,
+        config: Option<ProjectConfig>,
+        defer_compatibility: bool,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
         let config = config.filter(|config| !config.is_empty());
         let template = config.as_ref().map(|config| {
             self.translator_template
@@ -6115,7 +6146,8 @@ impl ProjectRegistry {
                 .unwrap_or_default()
                 .with_project_config(config)
         });
-        self.add_registration(identity, config, template).await
+        self.add_registration(identity, config, template, defer_compatibility)
+            .await
     }
 
     /// Add a project with an optional runtime translator configuration.
@@ -6134,7 +6166,7 @@ impl ProjectRegistry {
         identity: ProjectIdentity,
         translator_template: Option<TranslatorTemplate>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.add_registration(identity, None, translator_template)
+        self.add_registration(identity, None, translator_template, false)
             .await
     }
 
@@ -6144,13 +6176,28 @@ impl ProjectRegistry {
         identity: ProjectIdentity,
         config: Option<ProjectConfig>,
         translator_template: Option<TranslatorTemplate>,
+        defer_compatibility: bool,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         let translator_template = translator_template
             .map(std::sync::Arc::new)
             .or_else(|| self.translator_template.clone());
-        let compatibility_key =
+        self.resolve_deferred_compatibility_keys(identity.repository_identity())
+            .await;
+        let repository_registered = {
+            let projects = self.projects.read().await;
+            identity.repository_identity().is_some_and(|repository| {
+                projects
+                    .values()
+                    .any(|project| project.identity.repository_identity() == Some(repository))
+            })
+        };
+        let defer_compatibility = defer_compatibility && !repository_registered;
+        let compatibility_key = if defer_compatibility {
+            None
+        } else {
             rust_project_compatibility_key(identity.root.as_path(), translator_template.as_deref())
-                .await;
+                .await
+        };
         let mut projects = self.projects.write().await;
         self.lifecycle
             .ensure_project_available(identity.id())
@@ -6246,21 +6293,66 @@ impl ProjectRegistry {
         let project_id = identity.id().clone();
         let actor = self.spawn_actor(&primary_root, translator_template.as_deref());
         let mutation = std::sync::Arc::new(Mutex::new(()));
-        projects.insert(
-            identity.id().clone(),
-            ProjectEntry::new(
-                identity,
-                actor.clone(),
-                mutation,
-                compatibility_key,
-                translator_template,
-                config,
-            ),
+        let mut entry = ProjectEntry::new(
+            identity,
+            actor.clone(),
+            mutation,
+            compatibility_key,
+            translator_template,
+            config,
         );
+        if defer_compatibility {
+            entry.primary_mut().compatibility = ProjectCompatibility::Deferred;
+        }
+        projects.insert(project_id.clone(), entry);
         drop(projects);
         self.retained_history.write().await.remove(&project_id);
         self.persist().await?;
         Ok(actor)
+    }
+
+    async fn resolve_deferred_compatibility_keys(
+        &self,
+        repository: Option<&GitRepositoryIdentity>,
+    ) {
+        let Some(repository) = repository else {
+            return;
+        };
+        let pending = {
+            let projects = self.projects.read().await;
+            projects
+                .values()
+                .filter(|project| project.identity.repository_identity() == Some(repository))
+                .flat_map(|project| &project.actors)
+                .filter(|actor| matches!(actor.compatibility, ProjectCompatibility::Deferred))
+                .map(|actor| {
+                    (
+                        actor.actor.clone(),
+                        actor.roots[0].as_path().to_path_buf(),
+                        actor.translator_template.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut resolved = Vec::with_capacity(pending.len());
+        for (actor, root, translator_template) in pending {
+            let key = rust_project_compatibility_key(&root, translator_template.as_deref()).await;
+            resolved.push((actor, key));
+        }
+        if resolved.is_empty() {
+            return;
+        }
+        let mut projects = self.projects.write().await;
+        for (handle, key) in resolved {
+            for actor in projects
+                .values_mut()
+                .filter(|project| project.identity.repository_identity() == Some(repository))
+                .flat_map(|project| &mut project.actors)
+                .filter(|actor| actor.actor.sender.same_channel(&handle.sender))
+            {
+                actor.compatibility = ProjectCompatibility::Resolved(key);
+            }
+        }
     }
 
     /// List registered project identities without waiting on any actor.
@@ -9431,7 +9523,7 @@ while True:
                         )),
                     },
                     mutation: std::sync::Arc::new(Mutex::new(())),
-                    compatibility_key: None,
+                    compatibility: ProjectCompatibility::Resolved(None),
                     translator_template: None,
                     roots: vec![identity.root().clone()],
                 }],
@@ -9491,7 +9583,7 @@ while True:
                 actors: vec![ProjectActorEntry {
                     actor: actor.clone(),
                     mutation: std::sync::Arc::new(Mutex::new(())),
-                    compatibility_key: None,
+                    compatibility: ProjectCompatibility::Resolved(None),
                     translator_template: None,
                     roots: vec![CanonicalRoot::new(root.path()).unwrap()],
                 }],
@@ -9547,6 +9639,79 @@ while True:
         assert_eq!(registry.list().await.len(), 1);
         assert_eq!(registry.list().await[0].id().as_str(), "existing");
         assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_registry_defers_compatibility_for_a_restored_single_root() {
+        let root = TempDir::new().unwrap();
+        let store = ProjectRegistrationStore::new(root.path().join("state/projects.json"));
+        store
+            .save(&[PersistedProject {
+                project_id: "dormant".to_string(),
+                root: root.path().to_path_buf(),
+                additional_roots: Vec::new(),
+                config: None,
+            }])
+            .unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(store);
+
+        registry.restore_from_persistence().await.unwrap();
+
+        let projects = registry.projects.read().await;
+        assert_eq!(
+            projects[&ProjectId::new("dormant").unwrap()]
+                .primary()
+                .compatibility,
+            ProjectCompatibility::Deferred
+        );
+        drop(projects);
+    }
+
+    #[tokio::test]
+    async fn adding_a_linked_root_resolves_deferred_compatibility() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees/linked");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        fs::create_dir(git_dir.join("objects")).unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+        let worktree = TempDir::new().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        write_compatible_roots_with_changed_manifests(repository.path(), worktree.path());
+        let project_id = ProjectId::new("repository").unwrap();
+        let store = ProjectRegistrationStore::new(repository.path().join("state/projects.json"));
+        store
+            .save(&[PersistedProject {
+                project_id: project_id.to_string(),
+                root: repository.path().to_path_buf(),
+                additional_roots: Vec::new(),
+                config: None,
+            }])
+            .unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(store);
+        registry.restore_from_persistence().await.unwrap();
+        let linked_repository = GitRepositoryIdentity::discover(worktree.path())
+            .unwrap()
+            .unwrap();
+
+        registry
+            .add(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktree.path()).unwrap(),
+                )
+                .with_repository_identity(linked_repository),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -10051,7 +10216,7 @@ while True:
                 actors: vec![ProjectActorEntry {
                     actor,
                     mutation: std::sync::Arc::new(Mutex::new(())),
-                    compatibility_key: None,
+                    compatibility: ProjectCompatibility::Resolved(None),
                     translator_template: None,
                     roots: vec![CanonicalRoot::new(root.path()).unwrap()],
                 }],
