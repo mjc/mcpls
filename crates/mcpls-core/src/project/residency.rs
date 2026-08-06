@@ -64,6 +64,16 @@ impl RustResidencyBudget {
             })
     }
 
+    fn pin_existing(&mut self, group: RustGroupId) -> bool {
+        self.clock = self.clock.wrapping_add(1);
+        let Some(resident) = self.residents.get_mut(&group) else {
+            return false;
+        };
+        resident.pins = resident.pins.saturating_add(1);
+        resident.last_used = self.clock;
+        true
+    }
+
     fn replace(&mut self, victim: RustGroupId, group: RustGroupId) {
         self.clock = self.clock.wrapping_add(1);
         self.residents.remove(&victim);
@@ -190,6 +200,16 @@ impl RustResidencyController {
             }
             drop(transition);
         }
+    }
+
+    pub(super) fn try_acquire_existing(&self, group: RustGroupId) -> Option<RustResidencyGuard> {
+        self.state()
+            .budget
+            .pin_existing(group)
+            .then(|| RustResidencyGuard {
+                group,
+                inner: Arc::clone(&self.inner),
+            })
     }
 
     pub(super) fn remove(&self, group: RustGroupId) {

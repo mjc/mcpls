@@ -4460,7 +4460,13 @@ async fn handle_server_exit(
     match state.status {
         ProjectStatus::Ready | ProjectStatus::Degraded => {
             let _recovery_guard = match residency {
-                Some(residency) => Some(residency.acquire().await),
+                Some(residency) => {
+                    if let Some(guard) = residency.try_acquire_existing() {
+                        Some(guard)
+                    } else {
+                        Some(residency.acquire().await)
+                    }
+                }
                 None => None,
             };
             recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
@@ -4529,6 +4535,10 @@ struct ProjectResidency {
 impl ProjectResidency {
     async fn acquire(&self) -> residency::RustResidencyGuard {
         self.controller.acquire(self.group).await
+    }
+
+    fn try_acquire_existing(&self) -> Option<residency::RustResidencyGuard> {
+        self.controller.try_acquire_existing(self.group)
     }
 
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
@@ -7426,6 +7436,56 @@ mod tests {
             }
         ));
         actor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_exit_recovery_does_not_wait_behind_eviction_transition() {
+        let controller = RustResidencyController::new(1);
+        let (victim_sender, mut victim_receiver) = mpsc::channel(1);
+        let (replacement_sender, _replacement_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), victim_sender.downgrade());
+        controller.register(RustGroupId(2), replacement_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let residency = ProjectResidency {
+            controller: controller.clone(),
+            group: RustGroupId(1),
+        };
+        let (actor_sender, _actor_receiver) = mpsc::channel(1);
+        let (status_tx, _) = watch::channel(ProjectStatus::Ready);
+        let (event_tx, _) = broadcast::channel(1);
+        let channels = ProjectActorChannels {
+            status_tx,
+            event_tx,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
+        let mut state = ProjectState::new(ProjectStatus::Ready, ProjectRuntimeSummary::default());
+        let mut runtime = ProjectRuntime::new(Translator::new());
+
+        let replacement = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.acquire(RustGroupId(2)).await }
+        });
+        let Some(ProjectRequest::Suspend { reply }) = victim_receiver.recv().await else {
+            panic!("expected eviction to suspend the victim");
+        };
+
+        let recovery = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_server_exit(
+                0,
+                &actor_sender.downgrade(),
+                &channels,
+                &mut state,
+                &mut runtime,
+                Some(&residency),
+            ),
+        )
+        .await;
+        assert!(recovery.is_ok(), "server-exit recovery deadlocked");
+
+        reply.send(Ok(())).unwrap();
+        drop(replacement.await.unwrap());
     }
 
     #[test]
