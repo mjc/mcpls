@@ -15,6 +15,7 @@ from mcpls_residency import (
     load_manifest,
     register_groups,
     process_summary,
+    rust_analyzer_count,
     validate_registered_groups,
     wait_until_ready,
 )
@@ -158,6 +159,14 @@ class RegistrationTests(unittest.TestCase):
 
 
 class ResultTests(unittest.TestCase):
+    def test_counts_rust_analyzer_processes_in_a_process_name_sample(self):
+        self.assertEqual(
+            rust_analyzer_count(
+                ["mcpls", "rust-analyzer", "proc-macro-srv", "rust-analyzer"]
+            ),
+            2,
+        )
+
     def test_process_summary_includes_the_requested_process(self):
         summary = process_summary(os.getpid())
 
