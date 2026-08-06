@@ -4432,7 +4432,7 @@ async fn recover_project_after_server_exit(
                     channels,
                     state,
                     runtime,
-                    residency.cloned(),
+                    residency,
                 );
                 return;
             }
@@ -4692,7 +4692,7 @@ async fn resume_project_runtime(
                 channels,
                 state,
                 runtime,
-                residency.cloned(),
+                residency,
             );
         }
         Err(error) => {
@@ -4717,7 +4717,7 @@ fn spawn_notification_forwarders(
     notification_receivers: Vec<(ServerId, mpsc::Receiver<LspNotification>)>,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     generation: u64,
-    residency: Option<ProjectResidency>,
+    residency: Option<&ProjectResidency>,
 ) {
     for (server_id, receiver) in notification_receivers {
         let sender = actor_sender.clone();
@@ -4726,7 +4726,7 @@ fn spawn_notification_forwarders(
             receiver,
             sender,
             generation,
-            residency.clone(),
+            residency.cloned(),
         ));
     }
 }
@@ -4736,7 +4736,7 @@ async fn forward_lsp_notifications(
     mut receiver: mpsc::Receiver<LspNotification>,
     sender: mpsc::WeakSender<ProjectRequest>,
     generation: u64,
-    _residency: Option<ProjectResidency>,
+    residency: Option<ProjectResidency>,
 ) {
     while let Some(notification) = receiver.recv().await {
         let Some(sender) = sender.upgrade() else {
@@ -4756,7 +4756,7 @@ async fn forward_lsp_notifications(
     }
     if let Some(sender) = sender.upgrade() {
         let request = ProjectRequest::ServerExited { generation };
-        let request = if let Some(residency) = _residency {
+        let request = if let Some(residency) = residency {
             let guard = residency.controller.acquire(residency.group).await;
             ProjectRequest::Resident {
                 request: Box::new(request),
@@ -4775,7 +4775,7 @@ fn mark_project_started(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
-    residency: Option<ProjectResidency>,
+    residency: Option<&ProjectResidency>,
 ) {
     runtime.reset_automatic_restart();
     let health = activation.health();
@@ -4896,7 +4896,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
-                        residency.cloned(),
+                        residency,
                     );
                     let _ = reply.send(Ok(state.clone()));
                 }
@@ -4924,7 +4924,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
-                        residency.cloned(),
+                        residency,
                     );
                     let _ = reply.send(Ok(state.clone()));
                 }
@@ -5228,7 +5228,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
-                        residency.cloned(),
+                        residency,
                     );
                     let _ = reply.send(Ok(state.clone()));
                 }
@@ -5389,7 +5389,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
-                        residency.cloned(),
+                        residency,
                     );
                     let _ = reply.send(state.clone());
                 }
