@@ -225,6 +225,28 @@ def remove_groups(client, project_ids):
             pass
 
 
+def wait_until_ready(client, project_id, timeout, poll_interval=0.25):
+    """Wait until activation is authoritative before measuring a result."""
+    deadline = time.monotonic() + timeout
+    while True:
+        state = client.tool("project_status", {"project_id": project_id})
+        status = state.get("status")
+        if status in ("Ready", "Degraded"):
+            return state
+        if status in ("Failed", "Stopped"):
+            raise RuntimeError(f"{project_id} entered {status}: {state}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{project_id} did not become ready before activation timeout")
+        time.sleep(poll_interval)
+
+
+def symbol_count(result):
+    if isinstance(result, list):
+        return len(result)
+    symbols = result.get("symbols") if isinstance(result, dict) else None
+    return len(symbols) if isinstance(symbols, list) else None
+
+
 def first_result(client, project_id, query):
     started = time.monotonic()
     result = client.tool(
@@ -233,7 +255,7 @@ def first_result(client, project_id, query):
     )
     return {
         "time_to_first_result_ms": round((time.monotonic() - started) * 1000, 1),
-        "result_count": len(result) if isinstance(result, list) else None,
+        "result_count": symbol_count(result),
     }
 
 
@@ -260,6 +282,9 @@ def run(args):
             project_id = project_ids[index]
             started = time.monotonic()
             client.tool("project_activate", {"project_id": project_id})
+            activation_state = wait_until_ready(
+                client, project_id, args.activation_timeout
+            )
             result = first_result(client, project_id, args.query)
             state = client.tool("project_status", {"project_id": project_id})
             report["switches"].append(
@@ -269,6 +294,7 @@ def run(args):
                     "activation_to_result_ms": round(
                         (time.monotonic() - started) * 1000, 1
                     ),
+                    "activation_status": activation_state.get("status"),
                     **result,
                     "pss_kib": pss_kib(args.pid),
                     "status": state.get("status"),
@@ -287,6 +313,7 @@ def parse_args():
     parser.add_argument("--pid", type=int, required=True, help="MCPLS daemon PID")
     parser.add_argument("--url", default="http://127.0.0.1:8445/mcp")
     parser.add_argument("--query", default="main")
+    parser.add_argument("--activation-timeout", type=float, default=180.0)
     parser.add_argument("--project-prefix", default="mcpls43-bench")
     parser.add_argument("--output", type=pathlib.Path)
     return parser.parse_args()

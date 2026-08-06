@@ -7,7 +7,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcpls_residency import ProjectGroup, decode_sse, load_manifest, register_groups
+from mcpls_residency import (
+    ProjectGroup,
+    decode_sse,
+    first_result,
+    load_manifest,
+    register_groups,
+    wait_until_ready,
+)
 
 
 class ManifestTests(unittest.TestCase):
@@ -145,6 +152,31 @@ class RegistrationTests(unittest.TestCase):
             register_groups(client, (group,), "bench", registered)
 
         self.assertEqual(registered, ["bench-repo"])
+
+
+class ResultTests(unittest.TestCase):
+    def test_counts_symbols_in_the_mcp_result_object(self):
+        class Client:
+            def tool(self, name, arguments):
+                return {"symbols": [{"name": "one"}, {"name": "two"}]}
+
+        result = first_result(Client(), "repo", "main")
+
+        self.assertEqual(result["result_count"], 2)
+
+    def test_waits_for_ready_before_measuring_a_result(self):
+        class Client:
+            def __init__(self):
+                self.statuses = iter(("Starting", "Ready"))
+
+            def tool(self, name, arguments):
+                if name != "project_status":
+                    raise AssertionError(f"unexpected tool: {name}")
+                return {"status": next(self.statuses)}
+
+        state = wait_until_ready(Client(), "repo", timeout=1, poll_interval=0)
+
+        self.assertEqual(state["status"], "Ready")
 
 
 if __name__ == "__main__":
