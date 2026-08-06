@@ -2468,6 +2468,31 @@ finally:
     }
 
     #[cfg(unix)]
+    async fn add_two_projects(
+        registry: &ProjectRegistry,
+        first_root: &std::path::Path,
+        second_root: &std::path::Path,
+    ) -> (ProjectId, ProjectId) {
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first_root).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root).unwrap(),
+            ))
+            .await
+            .unwrap();
+        (first_id, second_id)
+    }
+
+    #[cfg(unix)]
     fn document_symbols_params(path: &std::path::Path) -> Parameters<DocumentSymbolsParams> {
         Parameters(DocumentSymbolsParams {
             file_path: path.display().to_string(),
@@ -2580,22 +2605,8 @@ finally:
         let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
             .with_rust_residency_limit(1);
-        let first_id = ProjectId::new("first").unwrap();
-        let second_id = ProjectId::new("second").unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                first_id.clone(),
-                CanonicalRoot::new(first_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                second_id.clone(),
-                CanonicalRoot::new(second_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
+        let (first_id, second_id) =
+            add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
@@ -2636,22 +2647,8 @@ finally:
         let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
             .with_rust_residency_limit(1);
-        let first_id = ProjectId::new("first").unwrap();
-        let second_id = ProjectId::new("second").unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                first_id.clone(),
-                CanonicalRoot::new(first_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                second_id.clone(),
-                CanonicalRoot::new(second_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
+        let (first_id, second_id) =
+            add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
@@ -2692,34 +2689,16 @@ finally:
         );
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
             .with_rust_residency_limit(1);
-        let first_id = ProjectId::new("first").unwrap();
-        let second_id = ProjectId::new("second").unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                first_id,
-                CanonicalRoot::new(first_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                second_id.clone(),
-                CanonicalRoot::new(second_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
+        let (first_id, second_id) =
+            add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
         server
-            .project_activate(project_params("first"))
+            .project_activate(project_params(first_id.as_str()))
             .await
             .unwrap();
-        wait_for_project_ready(
-            &server.context.project_registry,
-            &ProjectId::new("first").unwrap(),
-        )
-        .await;
+        wait_for_project_ready(&server.context.project_registry, &first_id).await;
 
         let blocked_server = server.for_session();
         let blocked = tokio::spawn(async move {
@@ -2784,22 +2763,8 @@ finally:
         let counter = first_root.path().join("spawn-count");
         let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
-        let first_id = ProjectId::new("first").unwrap();
-        let second_id = ProjectId::new("second").unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                first_id.clone(),
-                CanonicalRoot::new(first_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                second_id.clone(),
-                CanonicalRoot::new(second_root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
+        let (first_id, second_id) =
+            add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
