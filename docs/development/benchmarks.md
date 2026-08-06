@@ -76,6 +76,18 @@ repositories, with five existing linked-worktree roots for each repository:
     {
       "project_id": "repository-a",
       "roots": ["/path/a-1", "/path/a-2", "/path/a-3", "/path/a-4", "/path/a-5"]
+    },
+    {
+      "project_id": "repository-b",
+      "roots": ["/path/b-1", "/path/b-2", "/path/b-3", "/path/b-4", "/path/b-5"]
+    },
+    {
+      "project_id": "repository-c",
+      "roots": ["/path/c-1", "/path/c-2", "/path/c-3", "/path/c-4", "/path/c-5"]
+    },
+    {
+      "project_id": "repository-d",
+      "roots": ["/path/d-1", "/path/d-2", "/path/d-3", "/path/d-4", "/path/d-5"]
     }
   ]
 }
