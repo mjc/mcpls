@@ -132,14 +132,15 @@ def initialization_options(profile, roots):
     }
     if len(roots) > 1:
         options["linkedProjects"] = [str(root / "Cargo.toml") for root in roots]
-    if profile in ("mcpls", "lean"):
+    if profile in ("mcpls", "mcpls-cold", "lean"):
         options.update(
             {
-                "cachePriming": {"enable": False},
                 "cargo": {"allTargets": False},
                 "checkOnSave": False,
+                "lru": {"capacity": 32},
             }
         )
+        options["cachePriming"] = {"enable": profile != "mcpls-cold"}
     if profile == "lean":
         options["cargo"]["buildScripts"] = {"enable": False}
         options.update(
@@ -165,7 +166,9 @@ def parse_args():
         help="Rust project root; repeat to exercise linkedProjects",
     )
     parser.add_argument(
-        "--profile", choices=("default", "mcpls", "lean"), default="lean"
+        "--profile",
+        choices=("default", "mcpls", "mcpls-cold", "lean"),
+        default="lean",
     )
     parser.add_argument("--query", default="workspace_symbol_search")
     parser.add_argument("--settle-timeout", type=float, default=45.0)
