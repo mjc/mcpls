@@ -232,6 +232,7 @@ def main():
                             "symbol": {"symbolKind": {"valueSet": list(range(1, 27))}},
                         },
                         "window": {"workDoneProgress": True},
+                        "experimental": {"serverStatusNotification": True},
                     },
                     "initializationOptions": initialization_options(
                         args.profile, roots
