@@ -2,6 +2,7 @@
 """Tests for the MCPLS resident-budget benchmark."""
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from mcpls_residency import (
     first_result,
     load_manifest,
     register_groups,
+    process_summary,
     validate_registered_groups,
     wait_until_ready,
 )
@@ -156,6 +158,12 @@ class RegistrationTests(unittest.TestCase):
 
 
 class ResultTests(unittest.TestCase):
+    def test_process_summary_includes_the_requested_process(self):
+        summary = process_summary(os.getpid())
+
+        self.assertGreaterEqual(summary["process_count"], 1)
+        self.assertTrue(summary["process_names"])
+
     def test_counts_symbols_in_the_mcp_result_object(self):
         class Client:
             def tool(self, name, arguments):
