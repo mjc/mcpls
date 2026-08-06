@@ -639,15 +639,16 @@ fn find_line(path: &Path, needle: &str) -> u32 {
 }
 
 fn wait_project_ready(client: &mut HttpClient, project_id: &str) {
+    let mut latest = Value::Null;
     for _ in 0..120 {
-        let status = client.call_tool("project_status", json!({"project_id": project_id}));
-        match status["status"].as_str() {
+        latest = client.call_tool("project_status", json!({"project_id": project_id}));
+        match latest["status"].as_str() {
             Some("Ready") => return,
-            Some("Failed") => panic!("project {project_id} failed: {status}"),
+            Some("Failed") => panic!("project {project_id} failed: {latest}"),
             _ => thread::sleep(Duration::from_millis(250)),
         }
     }
-    panic!("project {project_id} did not become ready")
+    panic!("project {project_id} did not become ready: {latest}")
 }
 
 fn project_ids(client: &mut HttpClient) -> Vec<String> {

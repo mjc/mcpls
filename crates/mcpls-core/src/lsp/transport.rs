@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tracing::{debug, trace, warn};
 
@@ -29,6 +29,8 @@ const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
 pub struct LspTransport {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    read_buffer: Vec<u8>,
+    pending_frame: Option<(usize, usize)>,
 }
 
 impl LspTransport {
@@ -43,6 +45,8 @@ impl LspTransport {
         Self {
             stdin,
             stdout: BufReader::new(stdout),
+            read_buffer: Vec::new(),
+            pending_frame: None,
         }
     }
 
@@ -85,23 +89,17 @@ impl LspTransport {
     /// - Message format is invalid
     pub async fn receive(&mut self) -> Result<InboundMessage> {
         loop {
-            let headers = self.read_headers().await?;
+            let content = loop {
+                if let Some(content) = self.try_read_content()? {
+                    break content;
+                }
 
-            let content_length = headers
-                .get("content-length")
-                .ok_or_else(|| {
-                    Error::LspProtocolError("Missing Content-Length header".to_string())
-                })?
-                .parse::<usize>()
-                .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
-
-            if content_length > MAX_CONTENT_LENGTH {
-                return Err(Error::LspProtocolError(format!(
-                    "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
-                )));
-            }
-
-            let content = self.read_content(content_length).await?;
+                let bytes_read = self.stdout.read_buf(&mut self.read_buffer).await?;
+                if bytes_read == 0 {
+                    trace!("EOF detected while receiving LSP message");
+                    return Err(Error::ServerTerminated);
+                }
+            };
 
             trace!("Received LSP message: {}", content);
 
@@ -122,51 +120,73 @@ impl LspTransport {
         }
     }
 
-    /// Read headers until blank line.
+    /// Extract one complete frame from the persistent read buffer.
     ///
-    /// Headers are in the format "Key: Value\r\n" and are terminated by
-    /// a blank line ("\r\n").
-    async fn read_headers(&mut self) -> Result<HashMap<String, String>> {
-        let mut headers = HashMap::new();
-        let mut line = String::new();
+    /// Keeping partial frames on the transport makes `receive` cancellation
+    /// safe when the client message loop selects an outbound command.
+    fn try_read_content(&mut self) -> Result<Option<String>> {
+        let (content_start, content_length) = if let Some(frame) = self.pending_frame {
+            frame
+        } else {
+            let Some((header_end, separator_len)) = find_header_end(&self.read_buffer) else {
+                return Ok(None);
+            };
 
-        loop {
-            line.clear();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
-
-            // EOF - stream closed (read_line returns 0 bytes on EOF)
-            if bytes_read == 0 || line.is_empty() {
-                trace!(
-                    "EOF detected in read_headers: bytes_read={}, line_len={}",
-                    bytes_read,
-                    line.len()
-                );
-                return Err(Error::ServerTerminated);
+            let headers_text = std::str::from_utf8(&self.read_buffer[..header_end])
+                .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in headers: {e}")))?;
+            let mut headers = HashMap::new();
+            for line in headers_text.lines() {
+                if let Some((key, value)) = line.trim_end().split_once(':') {
+                    headers.insert(key.trim().to_lowercase(), value.trim().to_string());
+                } else {
+                    warn!("Malformed header: {}", line.trim());
+                }
             }
 
-            if line == "\r\n" || line == "\n" {
-                break;
+            let content_length = headers
+                .get("content-length")
+                .ok_or_else(|| {
+                    Error::LspProtocolError("Missing Content-Length header".to_string())
+                })?
+                .parse::<usize>()
+                .map_err(|e| Error::LspProtocolError(format!("Invalid Content-Length: {e}")))?;
+
+            if content_length > MAX_CONTENT_LENGTH {
+                return Err(Error::LspProtocolError(format!(
+                    "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
+                )));
             }
 
-            if let Some((key, value)) = line.trim_end().split_once(':') {
-                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
-            } else {
-                warn!("Malformed header: {}", line.trim());
-            }
+            let frame = (header_end + separator_len, content_length);
+            self.pending_frame = Some(frame);
+            frame
+        };
+        let frame_end = content_start + content_length;
+        if self.read_buffer.len() < frame_end {
+            return Ok(None);
         }
 
-        Ok(headers)
+        let content = String::from_utf8(self.read_buffer[content_start..frame_end].to_vec())
+            .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in content: {e}")))?;
+        self.read_buffer.drain(..frame_end);
+        self.pending_frame = None;
+        Ok(Some(content))
     }
+}
 
-    /// Read exact number of content bytes.
-    ///
-    /// Reads exactly `length` bytes from stdout and converts to UTF-8 string.
-    async fn read_content(&mut self, length: usize) -> Result<String> {
-        let mut buffer = vec![0u8; length];
-        self.stdout.read_exact(&mut buffer).await?;
-
-        String::from_utf8(buffer)
-            .map_err(|e| Error::LspProtocolError(format!("Invalid UTF-8 in content: {e}")))
+fn find_header_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| (position, 4));
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|position| (position, 2));
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(if crlf.0 < lf.0 { crlf } else { lf }),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
     }
 }
 

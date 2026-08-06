@@ -1452,6 +1452,66 @@ mod tests {
             stdin.flush().await.unwrap();
         }
 
+        #[tokio::test]
+        async fn partial_inbound_frame_survives_outbound_command() {
+            let (client, mut server) = fake_lsp_client();
+            let request_client = client.clone();
+            let request_task = tokio::spawn(async move {
+                request_client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(1),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": { "contents": "x".repeat(4096) },
+            });
+            let content = serde_json::to_vec(&response).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            let split = content.len() / 2;
+            server
+                .read_half_stdin
+                .write_all(header.as_bytes())
+                .await
+                .unwrap();
+            server
+                .read_half_stdin
+                .write_all(&content[..split])
+                .await
+                .unwrap();
+            server.read_half_stdin.flush().await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            client
+                .notify("workspace/didChangeConfiguration", serde_json::json!({}))
+                .await
+                .unwrap();
+            let Ok(notification) =
+                tokio::time::timeout(Duration::from_secs(1), read_framed_message(&mut reader))
+                    .await
+            else {
+                panic!("outbound command must interrupt the pending receive");
+            };
+            assert_eq!(notification["method"], "workspace/didChangeConfiguration");
+
+            server
+                .read_half_stdin
+                .write_all(&content[split..])
+                .await
+                .unwrap();
+            server.read_half_stdin.flush().await.unwrap();
+
+            let result = request_task.await.unwrap().unwrap();
+            assert_eq!(result, response["result"]);
+        }
+
         // Not `start_paused`: the retry loop's real backoff sleeps
         // interleave with real subprocess pipe I/O below, and paused
         // virtual time does not reliably auto-advance across both.
