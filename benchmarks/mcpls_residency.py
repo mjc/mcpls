@@ -5,6 +5,7 @@ import argparse
 import http.client
 import json
 import pathlib
+import subprocess
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -39,12 +40,20 @@ def load_manifest(value):
             raise ValueError(f"project {project_id} must contain exactly five roots")
 
         checked_roots = []
+        common_dir = None
         for root in roots:
             path = pathlib.Path(root).expanduser().resolve()
             if path in seen_roots:
                 raise ValueError(f"root appears more than once: {path}")
             if not (path / "Cargo.toml").is_file():
                 raise ValueError(f"root has no Cargo.toml: {path}")
+            root_common_dir = git_common_dir(path)
+            if common_dir is None:
+                common_dir = root_common_dir
+            elif root_common_dir != common_dir:
+                raise ValueError(
+                    f"project {project_id} roots must be linked Git worktrees"
+                )
             seen_roots.add(path)
             checked_roots.append(path)
         groups.append(ProjectGroup(project_id, tuple(checked_roots)))
@@ -66,6 +75,34 @@ def decode_sse(body):
         except json.JSONDecodeError:
             continue
     return None
+
+
+def git_common_dir(root):
+    """Return the shared Git directory for a worktree, or reject the root."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--show-toplevel",
+                "--git-common-dir",
+                "--is-inside-work-tree",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(f"root is not a Git worktree: {root}") from error
+    top_level, common_dir, inside_worktree = result.stdout.splitlines()
+    if inside_worktree != "true":
+        raise ValueError(f"root is not a Git worktree: {root}")
+    common_path = pathlib.Path(common_dir)
+    if not common_path.is_absolute():
+        common_path = pathlib.Path(top_level) / common_path
+    return common_path.resolve()
 
 
 class McpClient:
