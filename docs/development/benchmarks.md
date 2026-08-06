@@ -36,10 +36,12 @@ nix develop --command python3 benchmarks/rust_analyzer_memory.py \
   --output target/benchmarks/rust-analyzer-memory.json
 ```
 
-The report includes initialization latency, the pre-query wait and quiescence
-state, process count, PSS before and after `workspace/symbol`, query latency,
-and result count. Repeat `--root` for compatible worktrees to exercise
-`linkedProjects`.
+The report includes initialization latency, the initial-indexing wait and
+quiescence state, process count, PSS before and after `workspace/symbol`, query
+latency, and result count. Repeat `--root` for compatible worktrees to exercise
+`linkedProjects`. Use `--profile mcpls` for the deployed low-memory settings
+while keeping proc macros and build scripts enabled. Initial indexing gates the
+query; rust-analyzer's user-facing quiescence flag is reported but does not.
 
 Optional `--max-before-mib`, `--max-query-delta-mib`, and `--max-query-ms`
 limits turn a recorded measurement into a failing regression guard. Establish

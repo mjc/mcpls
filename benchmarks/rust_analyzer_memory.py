@@ -86,6 +86,15 @@ def handle_message(process, message, status):
         respond_to_server_request(process, message)
     if message.get("method") == "experimental/serverStatus":
         status.update(message.get("params", {}))
+        status["initial_load_complete"] = status.get(
+            "initial_load_complete", False
+        ) or status.get("quiescent", False)
+    if (
+        message.get("method") == "$/progress"
+        and message.get("params", {}).get("token") == "rustAnalyzer/Indexing"
+        and message.get("params", {}).get("value", {}).get("kind") == "end"
+    ):
+        status["initial_load_complete"] = True
 
 
 def wait_for_response(messages, process, request_id, deadline, status):
@@ -100,8 +109,10 @@ def wait_for_response(messages, process, request_id, deadline, status):
     raise TimeoutError(f"timed out waiting for response {request_id}")
 
 
-def wait_until_quiescent(messages, process, deadline, status):
-    while time.monotonic() < deadline and not status.get("quiescent", False):
+def wait_until_initial_load(messages, process, deadline, status):
+    while time.monotonic() < deadline and not status.get(
+        "initial_load_complete", False
+    ):
         try:
             message = messages.get(timeout=0.25)
         except queue.Empty:
@@ -121,15 +132,18 @@ def initialization_options(profile, roots):
     }
     if len(roots) > 1:
         options["linkedProjects"] = [str(root / "Cargo.toml") for root in roots]
-    if profile == "lean":
+    if profile in ("mcpls", "lean"):
         options.update(
             {
                 "cachePriming": {"enable": False},
-                "cargo": {
-                    "allTargets": False,
-                    "buildScripts": {"enable": False},
-                },
+                "cargo": {"allTargets": False},
                 "checkOnSave": False,
+            }
+        )
+    if profile == "lean":
+        options["cargo"]["buildScripts"] = {"enable": False}
+        options.update(
+            {
                 "lru": {"capacity": 32},
                 "procMacro": {"enable": False},
             }
@@ -150,7 +164,9 @@ def parse_args():
         default=[],
         help="Rust project root; repeat to exercise linkedProjects",
     )
-    parser.add_argument("--profile", choices=("default", "lean"), default="lean")
+    parser.add_argument(
+        "--profile", choices=("default", "mcpls", "lean"), default="lean"
+    )
     parser.add_argument("--query", default="workspace_symbol_search")
     parser.add_argument("--settle-timeout", type=float, default=45.0)
     parser.add_argument("--request-timeout", type=float, default=60.0)
@@ -234,7 +250,7 @@ def main():
             raise RuntimeError(initialized["error"])
         initialized_ms = (time.monotonic() - started) * 1000
         send(process, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
-        wait_until_quiescent(
+        wait_until_initial_load(
             messages,
             process,
             time.monotonic() + args.settle_timeout,
@@ -269,6 +285,7 @@ def main():
             "query": args.query,
             "initialized_ms": round(initialized_ms, 1),
             "pre_query_wait_ms": round(pre_query_wait_ms, 1),
+            "initial_load_complete": status.get("initial_load_complete", False),
             "quiescent": status.get("quiescent", False),
             "process_count": len(descendants(process.pid)),
             "pss_before_query_kib": before_kib,
