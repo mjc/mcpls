@@ -2627,6 +2627,54 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_activation_and_restart_respect_one_resident_group() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        write_rust_fixture(first_root.path());
+        write_rust_fixture(second_root.path());
+        let counter = first_root.path().join("spawn-count");
+        let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
+            .with_rust_residency_limit(1);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        server
+            .project_activate(project_params(first_id.as_str()))
+            .await
+            .unwrap();
+        let (restart, activate) = tokio::join!(
+            server.project_restart_lsp(project_params(first_id.as_str())),
+            server.project_activate(project_params(second_id.as_str())),
+        );
+        restart.unwrap();
+        activate.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "3");
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
+            "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn rust_residency_evicts_before_spawn_and_resumes_on_semantic_request() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
