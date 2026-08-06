@@ -205,6 +205,14 @@ def pss_kib(pid, process_ids=None):
     return total
 
 
+RUST_ANALYZER_NAMES = ("rust-analyzer", "rust_analyzer")
+
+
+def rust_analyzer_count(process_names):
+    """Count rust-analyzer processes in a `/proc/*/comm` name sample."""
+    return sum(name in RUST_ANALYZER_NAMES for name in process_names)
+
+
 def process_summary(pid, process_ids=None):
     """Summarize the daemon's live descendant process tree."""
     names = []
@@ -220,11 +228,6 @@ def process_summary(pid, process_ids=None):
         "process_names": sorted(names),
         "rust_analyzer_count": rust_analyzer_count(names),
     }
-
-
-def rust_analyzer_count(process_names):
-    """Count rust-analyzer processes in a `/proc/*/comm` name sample."""
-    return sum(name in ("rust-analyzer", "rust_analyzer") for name in process_names)
 
 
 def resource_snapshot(pid):
