@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// Count native watch directories selected for one recursive glob.
+/// Count native watch directories selected for recursive globs.
 ///
 /// # Errors
 ///
 /// Returns an error when the benchmark fixture or glob is invalid.
-pub fn desired_watch_directory_count(root: &Path, pattern: &str) -> Result<usize, String> {
-    crate::lsp::watcher::benchmark_desired_watch_directory_count(root, pattern)
+pub fn desired_watch_directory_count(root: &Path, patterns: &[&str]) -> Result<usize, String> {
+    crate::lsp::watcher::benchmark_desired_watch_directory_count(root, patterns)
         .map_err(|error| format!("{error:?}"))
 }
 

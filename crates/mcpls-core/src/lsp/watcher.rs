@@ -694,43 +694,52 @@ fn desired_watch_directories(
     }
     for registration in registrations.values() {
         for spec in &registration.specs {
-            match &spec.matcher {
-                WatchMatcher::Exact(path) => {
-                    if let Some(parent) = nearest_existing_directory(path.parent()) {
-                        directories.insert(parent);
-                    }
-                }
-                WatchMatcher::Glob(_) => {
-                    if !spec.root.exists() {
-                        continue;
-                    }
-                    let builder = configured_walk(&spec.root);
-                    for entry in builder.build() {
-                        let entry = entry.map_err(|error| {
-                            internal_error(format!(
-                                "failed to enumerate watched directories under {}: {error}",
-                                spec.root.display()
-                            ))
-                        })?;
-                        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                            directories.insert(entry.into_path());
-                        }
-                    }
-                }
+            if let WatchMatcher::Exact(path) = &spec.matcher
+                && let Some(parent) = nearest_existing_directory(path.parent())
+            {
+                directories.insert(parent);
+            }
+        }
+    }
+    for root in glob_watch_roots(registrations) {
+        if !root.exists() {
+            continue;
+        }
+        let builder = configured_walk(root);
+        for entry in builder.build() {
+            let entry = entry.map_err(|error| {
+                internal_error(format!(
+                    "failed to enumerate watched directories under {}: {error}",
+                    root.display()
+                ))
+            })?;
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                directories.insert(entry.into_path());
             }
         }
     }
     Ok(directories)
 }
 
+fn glob_watch_roots(registrations: &HashMap<String, RegisteredWatch>) -> HashSet<&Path> {
+    registrations
+        .values()
+        .flat_map(|registration| &registration.specs)
+        .filter_map(|spec| matches!(spec.matcher, WatchMatcher::Glob(_)).then_some(&*spec.root))
+        .collect()
+}
+
 #[cfg(feature = "bench")]
 pub fn benchmark_desired_watch_directory_count(
     root: &Path,
-    pattern: &str,
+    patterns: &[&str],
 ) -> Result<usize, JsonRpcError> {
     let registration = RegisteredWatch {
         generation: 0,
-        specs: vec![WatchSpec::glob(root.to_path_buf(), pattern, WATCH_CREATE)?],
+        specs: patterns
+            .iter()
+            .map(|pattern| WatchSpec::glob(root.to_path_buf(), pattern, WATCH_CREATE))
+            .collect::<Result<_, _>>()?,
         known_paths: HashMap::new(),
     };
     let registrations = HashMap::from([("benchmark".to_string(), registration)]);
@@ -963,6 +972,26 @@ mod tests {
 
     fn rust_spec(root: &Path) -> WatchSpec {
         WatchSpec::glob(root.to_path_buf(), "**/*.rs", all_watch_kinds()).unwrap()
+    }
+
+    #[test]
+    fn glob_watch_roots_are_unique() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let registrations = HashMap::from([(
+            "watchers".to_string(),
+            RegisteredWatch {
+                generation: 0,
+                specs: vec![
+                    rust_spec(first.path()),
+                    rust_spec(first.path()),
+                    rust_spec(second.path()),
+                ],
+                known_paths: HashMap::new(),
+            },
+        )]);
+
+        assert_eq!(glob_watch_roots(&registrations).len(), 2);
     }
 
     fn registration(id: &str, pattern: &Value, kind: u8) -> Value {

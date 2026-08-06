@@ -59,7 +59,16 @@ fn workspace_fixture() -> &'static WorkspaceFixture {
 fn watch_directory_scan(fixture: &WorkspaceFixture) -> Result<usize, String> {
     black_box(desired_watch_directory_count(
         black_box(&fixture.roots[0]),
-        black_box("**/*.rs"),
+        black_box(&[
+            "**/*.rs",
+            "**/Cargo.toml",
+            "**/Cargo.lock",
+            "**/rust-toolchain.toml",
+            "**/.cargo/config.toml",
+            "**/*.json",
+            "**/*.yaml",
+            "**/*.yml",
+        ]),
     ))
 }
 
