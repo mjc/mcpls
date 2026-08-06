@@ -103,11 +103,13 @@ acceptance matrix. Run it against the live MCPLS daemon with its PID:
 python3 benchmarks/mcpls_residency.py \
   --manifest target/benchmarks/mcpls-residency.json \
   --pid "$(systemctl --user show mcpls.service -p MainPID --value)" \
+  --activation-timeout 180 \
   --output target/benchmarks/mcpls-residency-report.json
 ```
 
 It records daemon-only PSS after registration, then PSS and activation-to-first
-`workspace_symbol_search` result time across a forward and reverse group-switch
-sequence. Registrations are removed in a `finally` cleanup block. The manifest
-must be assembled from existing worktrees; do not manufacture repeated paths to
-make the matrix pass.
+authoritative `Ready`/`Degraded` `workspace_symbol_search` result time across a
+forward and reverse group-switch sequence. Symbol counts are read from MCPLS's
+`{"symbols": [...]}` result object. Registrations are removed in a `finally`
+cleanup block. The manifest must be assembled from existing worktrees; do not
+manufacture repeated paths to make the matrix pass.
