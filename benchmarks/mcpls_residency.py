@@ -240,6 +240,27 @@ def wait_until_ready(client, project_id, timeout, poll_interval=0.25):
         time.sleep(poll_interval)
 
 
+def validate_registered_groups(client, project_ids):
+    states = []
+    for project_id in project_ids:
+        state = client.tool("project_status", {"project_id": project_id})
+        if state.get("actor_group_count") != 1:
+            raise RuntimeError(
+                f"{project_id} registered {state.get('actor_group_count')} actor groups"
+            )
+        states.append(state)
+    return states
+
+
+def active_group_ids(client, project_ids):
+    active = []
+    for project_id in project_ids:
+        state = client.tool("project_status", {"project_id": project_id})
+        if state.get("active_language_servers"):
+            active.append(project_id)
+    return active
+
+
 def symbol_count(result):
     if isinstance(result, list):
         return len(result)
@@ -266,6 +287,7 @@ def run(args):
     try:
         client.initialize()
         register_groups(client, groups, args.project_prefix, project_ids)
+        registered_states = validate_registered_groups(client, project_ids)
         daemon_status = client.tool("server_status", {})
         report = {
             "manifest": str(args.manifest),
@@ -274,6 +296,7 @@ def run(args):
             "daemon_only": {
                 "pss_kib": pss_kib(args.pid),
                 "server_status": daemon_status,
+                "registered_projects": registered_states,
             },
             "switches": [],
         }
@@ -287,6 +310,11 @@ def run(args):
             )
             result = first_result(client, project_id, args.query)
             state = client.tool("project_status", {"project_id": project_id})
+            active_projects = active_group_ids(client, project_ids)
+            if len(active_projects) > args.max_active_groups:
+                raise RuntimeError(
+                    f"resident group limit exceeded: {len(active_projects)} active groups"
+                )
             report["switches"].append(
                 {
                     "project_id": project_id,
@@ -299,6 +327,7 @@ def run(args):
                     "pss_kib": pss_kib(args.pid),
                     "status": state.get("status"),
                     "active_language_servers": state.get("active_language_servers", []),
+                    "active_group_count": len(active_projects),
                 }
             )
         return report
@@ -314,6 +343,7 @@ def parse_args():
     parser.add_argument("--url", default="http://127.0.0.1:8445/mcp")
     parser.add_argument("--query", default="main")
     parser.add_argument("--activation-timeout", type=float, default=180.0)
+    parser.add_argument("--max-active-groups", type=int, default=1)
     parser.add_argument("--project-prefix", default="mcpls43-bench")
     parser.add_argument("--output", type=pathlib.Path)
     return parser.parse_args()

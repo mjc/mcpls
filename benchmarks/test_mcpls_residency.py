@@ -13,6 +13,7 @@ from mcpls_residency import (
     first_result,
     load_manifest,
     register_groups,
+    validate_registered_groups,
     wait_until_ready,
 )
 
@@ -177,6 +178,16 @@ class ResultTests(unittest.TestCase):
         state = wait_until_ready(Client(), "repo", timeout=1, poll_interval=0)
 
         self.assertEqual(state["status"], "Ready")
+
+
+class ResidencyGuardTests(unittest.TestCase):
+    def test_rejects_a_project_that_registered_multiple_actor_groups(self):
+        class Client:
+            def tool(self, name, arguments):
+                return {"project_id": arguments["project_id"], "actor_group_count": 2}
+
+        with self.assertRaisesRegex(RuntimeError, "actor groups"):
+            validate_registered_groups(Client(), ["repo"])
 
 
 if __name__ == "__main__":
