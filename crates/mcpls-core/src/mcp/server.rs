@@ -2727,13 +2727,16 @@ finally:
                 .get_document_symbols(document_symbols_params(&first_file))
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let entered_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while !entered.exists() {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("in-flight request did not reach the language server");
+        .await;
+        assert!(
+            entered_result.is_ok(),
+            "in-flight request did not reach the language server"
+        );
 
         let second_server = server.for_session();
         let mut second_request = tokio::spawn(async move {
@@ -2755,11 +2758,13 @@ finally:
 
         std::fs::write(&release, "release").unwrap();
         blocked.await.unwrap().unwrap();
-        let second_result = tokio::time::timeout(std::time::Duration::from_secs(3), second_request)
-            .await
-            .expect("second request remained queued after the first completed")
-            .unwrap()
-            .unwrap();
+        let second_result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), second_request).await;
+        assert!(
+            second_result.is_ok(),
+            "second request remained queued after the first completed"
+        );
+        let second_result = second_result.unwrap().unwrap().unwrap();
         let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
         assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
