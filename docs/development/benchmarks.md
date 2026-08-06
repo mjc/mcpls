@@ -104,12 +104,15 @@ python3 benchmarks/mcpls_residency.py \
   --manifest target/benchmarks/mcpls-residency.json \
   --pid "$(systemctl --user show mcpls.service -p MainPID --value)" \
   --activation-timeout 180 \
+  --max-active-groups 1 \
   --output target/benchmarks/mcpls-residency-report.json
 ```
 
 It records daemon-only PSS after registration, then PSS and activation-to-first
 authoritative `Ready`/`Degraded` `workspace_symbol_search` result time across a
 forward and reverse group-switch sequence. Symbol counts are read from MCPLS's
-`{"symbols": [...]}` result object. Registrations are removed in a `finally`
-cleanup block. The manifest must be assembled from existing worktrees; do not
-manufacture repeated paths to make the matrix pass.
+`{"symbols": [...]}` result object. Registration fails if a logical project
+does not collapse to one actor group, and every switch fails if more than the
+configured active-group limit is observed. Registrations are removed in a
+`finally` cleanup block. The manifest must be assembled from existing
+worktrees; do not manufacture repeated paths to make the matrix pass.
