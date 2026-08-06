@@ -8756,6 +8756,39 @@ while True:
         }
     }
 
+    fn compatible_worktree_fixture() -> (TempDir, Vec<TempDir>, Vec<PathBuf>) {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n").unwrap();
+
+        let worktrees: Vec<_> = (0..4)
+            .map(|index| {
+                let worktree_git_dir = git_dir.join("worktrees").join(format!("linked-{index}"));
+                fs::create_dir_all(&worktree_git_dir).unwrap();
+                fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+                let worktree = TempDir::new().unwrap();
+                fs::write(
+                    worktree.path().join(".git"),
+                    format!("gitdir: {}\n", worktree_git_dir.display()),
+                )
+                .unwrap();
+                worktree
+            })
+            .collect();
+        let roots: Vec<_> = std::iter::once(repository.path().to_path_buf())
+            .chain(
+                worktrees
+                    .iter()
+                    .map(|worktree| worktree.path().to_path_buf()),
+            )
+            .collect();
+        let root_refs: Vec<_> = roots.iter().map(PathBuf::as_path).collect();
+        write_compatible_roots_with_changed_manifests(&root_refs);
+        (repository, worktrees, roots)
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn repeated_activation_does_not_spawn_a_duplicate_lsp_process() {
@@ -10523,29 +10556,7 @@ while True:
         use std::collections::HashMap;
         use std::os::unix::fs::PermissionsExt;
 
-        let repository = TempDir::new().unwrap();
-        let git_dir = repository.path().join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(git_dir.join("config"), "[core]\n").unwrap();
-        let worktrees: Vec<_> = (0..4)
-            .map(|index| {
-                let worktree_git_dir = git_dir.join("worktrees").join(format!("linked-{index}"));
-                fs::create_dir_all(&worktree_git_dir).unwrap();
-                fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
-                let worktree = TempDir::new().unwrap();
-                fs::write(
-                    worktree.path().join(".git"),
-                    format!("gitdir: {}\n", worktree_git_dir.display()),
-                )
-                .unwrap();
-                worktree
-            })
-            .collect();
-        let roots: Vec<_> = std::iter::once(repository.path())
-            .chain(worktrees.iter().map(TempDir::path))
-            .collect();
-        write_compatible_roots_with_changed_manifests(&roots);
+        let (repository, _worktrees, roots) = compatible_worktree_fixture();
         let counter = repository.path().join("spawn-count");
         let lsp = repository.path().join("counting-lsp.py");
         fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
@@ -10567,7 +10578,7 @@ while True:
             ProjectRegistry::with_translator_template(4, template_source.configuration_template());
         let project_id = ProjectId::new("repository").unwrap();
         for root in roots {
-            let repository_identity = GitRepositoryIdentity::discover(root).unwrap().unwrap();
+            let repository_identity = GitRepositoryIdentity::discover(&root).unwrap().unwrap();
             registry
                 .add(
                     ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root).unwrap())
@@ -10598,6 +10609,60 @@ while True:
         assert_eq!(state.workspace_roots().len(), 5);
         assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
         assert_eq!(fs::read_to_string(counter).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn twenty_registered_worktrees_remain_four_idle_actor_groups() {
+        let mut template_source = Translator::new().with_extensions(
+            std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]),
+        );
+        template_source.set_lsp_configs(
+            vec![crate::config::LspServerConfig::rust_analyzer()],
+            Some(3),
+        );
+        let registry =
+            ProjectRegistry::with_translator_template(4, template_source.configuration_template())
+                .with_rust_residency_limit(1);
+        let mut fixtures = Vec::new();
+
+        for index in 0..4 {
+            let (repository, worktrees, roots) = compatible_worktree_fixture();
+            let project_id = ProjectId::new(format!("repository-{index}")).unwrap();
+            for root in &roots {
+                let repository_identity = GitRepositoryIdentity::discover(root).unwrap().unwrap();
+                registry
+                    .add(
+                        ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root).unwrap())
+                            .with_repository_identity(repository_identity),
+                    )
+                    .await
+                    .unwrap();
+            }
+            fixtures.push((repository, worktrees));
+        }
+
+        let snapshot = registry.status_snapshot().await;
+        assert_eq!(registry.list().await.len(), 4);
+        assert_eq!(registry.total_actor_group_count().await, 4);
+        assert_eq!(snapshot.actor_groups, 4);
+        assert_eq!(snapshot.counts.starting, 0);
+        assert_eq!(snapshot.counts.ready + snapshot.counts.dormant, 4);
+        assert_eq!(snapshot.counts.failed, 0);
+        assert_eq!(snapshot.queue_pressure.queued, 0);
+        assert!(
+            snapshot
+                .summaries
+                .iter()
+                .all(|summary| summary.actor_group_count == 1)
+        );
+        assert_eq!(
+            snapshot
+                .summaries
+                .iter()
+                .map(|summary| summary.roots.len())
+                .sum::<usize>(),
+            20
+        );
     }
 
     #[cfg(unix)]
