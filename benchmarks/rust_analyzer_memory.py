@@ -132,7 +132,7 @@ def initialization_options(profile, roots):
     }
     if len(roots) > 1:
         options["linkedProjects"] = [str(root / "Cargo.toml") for root in roots]
-    if profile in ("mcpls", "mcpls-cold", "lean"):
+    if profile in ("mcpls", "mcpls-no-priming", "lean"):
         options.update(
             {
                 "cargo": {"allTargets": False},
@@ -140,7 +140,7 @@ def initialization_options(profile, roots):
                 "lru": {"capacity": 32},
             }
         )
-        options["cachePriming"] = {"enable": profile != "mcpls-cold"}
+        options["cachePriming"] = {"enable": profile != "mcpls-no-priming"}
     if profile == "lean":
         options["cargo"]["buildScripts"] = {"enable": False}
         options.update(
@@ -167,8 +167,8 @@ def parse_args():
     )
     parser.add_argument(
         "--profile",
-        choices=("default", "mcpls", "mcpls-cold", "lean"),
-        default="lean",
+        choices=("default", "mcpls", "mcpls-no-priming", "lean"),
+        default="mcpls",
     )
     parser.add_argument("--query", default="workspace_symbol_search")
     parser.add_argument("--settle-timeout", type=float, default=45.0)

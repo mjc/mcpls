@@ -31,7 +31,7 @@ rust-analyzer process. On Linux, run:
 
 ```sh
 nix develop --command python3 benchmarks/rust_analyzer_memory.py \
-  --profile lean \
+  --profile mcpls \
   --root "$PWD" \
   --output target/benchmarks/rust-analyzer-memory.json
 ```
@@ -41,7 +41,9 @@ quiescence state, process count, PSS before and after `workspace/symbol`, query
 latency, and result count. Repeat `--root` for compatible worktrees to exercise
 `linkedProjects`. Use `--profile mcpls` for the deployed low-memory settings
 while keeping cache priming, proc macros, and build scripts enabled. Use
-`--profile mcpls-cold` to isolate the cost of disabling cache priming. Initial
+`--profile mcpls-no-priming` to isolate the cost of disabling cache priming. The
+`lean` profile is an intentionally aggressive stress profile that also disables
+proc macros and build scripts; it is not the deployed MCPLS configuration. Initial
 indexing gates the query; rust-analyzer's user-facing quiescence flag is
 reported but does not.
 
