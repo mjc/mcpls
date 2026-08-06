@@ -37,6 +37,9 @@ tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 anyhow = { workspace = true }
 gungraun = { workspace = true }

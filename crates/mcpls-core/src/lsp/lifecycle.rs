@@ -12,10 +12,15 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use lsp_types::{
     ClientCapabilities, ClientInfo, GeneralClientCapabilities, InitializeParams, InitializeResult,
     InitializedParams, PositionEncodingKind, ServerCapabilities, WorkspaceFolder,
 };
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -291,19 +296,24 @@ pub struct LspServer {
     /// times out, dropping it terminates the process via SIGKILL
     /// (`kill_on_drop`).
     child: tokio::process::Child,
+    #[cfg(unix)]
+    process_group: Option<Pid>,
 }
 
 impl std::fmt::Debug for LspServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LspServer")
+        let mut debug = f.debug_struct("LspServer");
+        debug
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
             .field("server_name", &self.server_name)
             .field("position_encoding", &self.position_encoding)
             .field("workspace_roots", &self.workspace_roots)
             .field("notification_rx", &"<channel>")
-            .field("child", &"<process>")
-            .finish()
+            .field("child", &"<process>");
+        #[cfg(unix)]
+        debug.field("process_group", &self.process_group);
+        debug.finish()
     }
 }
 
@@ -371,6 +381,11 @@ impl LspServer {
             command: config.server_config.command.clone(),
             source: e,
         })?;
+        #[cfg(unix)]
+        let process_group = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(Pid::from_raw);
 
         let stdin = child
             .stdin
@@ -403,6 +418,8 @@ impl LspServer {
             workspace_roots: config.workspace_roots,
             notification_rx,
             child,
+            #[cfg(unix)]
+            process_group,
         })
     }
 
@@ -440,6 +457,8 @@ impl LspServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
 
         command
     }
@@ -676,22 +695,34 @@ impl LspServer {
         .await;
 
         let mut child = self.child;
-        match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
+        let child_reaped = match tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await {
             Ok(Ok(status)) => {
                 debug!(
                     ?status,
                     "LSP server process exited after `exit` notification"
                 );
+                true
             }
-            Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
-            Err(_) => warn!(
-                timeout = ?CHILD_EXIT_GRACE,
-                "LSP server process did not exit within grace period after `exit` \
-                 notification, killing it"
-            ),
+            Ok(Err(e)) => {
+                warn!(error = %e, "failed to wait for LSP server process exit");
+                false
+            }
+            Err(_) => {
+                warn!(
+                    timeout = ?CHILD_EXIT_GRACE,
+                    "LSP server process did not exit within grace period after `exit` \
+                     notification, killing it"
+                );
+                false
+            }
+        };
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            terminate_process_group(process_group).await;
         }
-        // `child` drops here: `kill_on_drop` kills it if still running, and is a
-        // no-op if `wait()` above already reaped it.
+        if !child_reaped && let Err(error) = child.wait().await {
+            warn!(%error, "failed to reap killed LSP server process");
+        }
 
         handshake?;
         info!("LSP server shut down successfully");
@@ -786,6 +817,18 @@ impl LspServer {
         }
 
         result
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_process_group(process_group: Pid) {
+    match kill_process_group(process_group, Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+        Err(error) => warn!(%error, "failed to kill LSP server process group"),
+    }
+    let deadline = tokio::time::Instant::now() + CHILD_EXIT_GRACE;
+    while test_kill_process_group(process_group).is_ok() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -968,6 +1011,8 @@ pub fn fake_lsp_server() -> LspServer {
         workspace_roots: Vec::new(),
         notification_rx: mock_notification_rx,
         child: mock_child,
+        #[cfg(unix)]
+        process_group: None,
     }
 }
 
@@ -1026,6 +1071,8 @@ impl LspServer {
             workspace_roots: Vec::new(),
             notification_rx,
             child,
+            #[cfg(unix)]
+            process_group: None,
         }
     }
 }
@@ -1396,6 +1443,7 @@ fn main() {
             workspace_roots: Vec::new(),
             notification_rx: mock_notification_rx,
             child: mock_child,
+            process_group: None,
         };
 
         assert!(
@@ -1409,6 +1457,72 @@ fn main() {
         assert!(
             server.has_exited().unwrap(),
             "killed child must report as exited"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_kills_language_server_descendants_before_returning() {
+        use lsp_types::ServerCapabilities;
+
+        let directory = tempfile::tempdir().unwrap();
+        let descendant_pid_path = directory.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 3600 & echo $! > \"$1\"; wait",
+                "mcpls-lsp-fixture",
+            ])
+            .arg(&descendant_pid_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().unwrap();
+        let parent_pid = child.id().unwrap();
+        let mock_stdin = child.stdin.take().unwrap();
+        let mock_stdout = child.stdout.take().unwrap();
+        let transport = LspTransport::new(mock_stdin, mock_stdout);
+        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let (_, notification_rx) = mpsc::channel(1);
+        let server = LspServer {
+            client,
+            capabilities: ServerCapabilities::default(),
+            server_name: None,
+            position_encoding: PositionEncodingKind::UTF8,
+            workspace_roots: Vec::new(),
+            notification_rx,
+            child,
+            process_group: Pid::from_raw(i32::try_from(parent_pid).unwrap()),
+        };
+
+        let descendant_pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&descendant_pid_path)
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(server.shutdown().await.is_err());
+        let parent_exists = Path::new(&format!("/proc/{parent_pid}")).exists();
+        let descendant_exists = Path::new(&format!("/proc/{descendant_pid}")).exists();
+        if descendant_exists {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &descendant_pid.to_string()])
+                .status();
+        }
+
+        assert!(!parent_exists, "shutdown must reap the server parent");
+        assert!(
+            !descendant_exists,
+            "shutdown must kill language-server descendants before returning"
         );
     }
 
@@ -1451,6 +1565,8 @@ fn main() {
             workspace_roots: vec![],
             notification_rx: mock_notification_rx,
             child: mock_child,
+            #[cfg(unix)]
+            process_group: None,
         };
 
         assert_eq!(server.position_encoding(), PositionEncodingKind::UTF8);
@@ -1544,6 +1660,8 @@ fn main() {
             workspace_roots: vec![],
             notification_rx: mock_notification_rx1,
             child: mock_child1,
+            #[cfg(unix)]
+            process_group: None,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1594,6 +1712,8 @@ fn main() {
             workspace_roots: vec![],
             notification_rx: mock_notification_rx,
             child: mock_child,
+            #[cfg(unix)]
+            process_group: None,
         };
 
         result.add_server("rust".to_string(), server);
@@ -1659,6 +1779,8 @@ fn main() {
                 workspace_roots: vec![],
                 notification_rx: mock_notification_rx,
                 child: mock_child,
+                #[cfg(unix)]
+                process_group: None,
             };
 
             result.add_server(config.language_id, server);
@@ -1710,6 +1832,8 @@ fn main() {
             workspace_roots: vec![],
             notification_rx: mock_notification_rx1,
             child: mock_child1,
+            #[cfg(unix)]
+            process_group: None,
         };
 
         result.add_server("rust".to_string(), server1);
@@ -1750,6 +1874,8 @@ fn main() {
             workspace_roots: vec![],
             notification_rx: mock_notification_rx2,
             child: mock_child2,
+            #[cfg(unix)]
+            process_group: None,
         };
 
         result.add_server("rust".to_string(), server2);
