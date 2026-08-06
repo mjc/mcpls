@@ -95,9 +95,9 @@ repositories, with five existing linked-worktree roots for each repository:
 
 The runner refuses fewer than four projects, fewer than five roots per project,
 duplicate roots, non-Git roots, or roots from different Git common directories
-within one project; this keeps an incomplete or fabricated local checkout from
-being reported as the acceptance matrix. Run it against the live MCPLS daemon
-with its PID:
+within one project, or roots without explicit `rust-toolchain` metadata; this
+keeps an incomplete or fabricated local checkout from being reported as the
+acceptance matrix. Run it against the live MCPLS daemon with its PID:
 
 ```sh
 python3 benchmarks/mcpls_residency.py \
