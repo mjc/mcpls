@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mcpls_residency import decode_sse, load_manifest
+from mcpls_residency import ProjectGroup, decode_sse, load_manifest, register_groups
 
 
 class ManifestTests(unittest.TestCase):
@@ -108,6 +108,28 @@ class SseTests(unittest.TestCase):
         body = "data: stale\n\ndata: " + json.dumps(payload) + "\n\n"
 
         self.assertEqual(decode_sse(body), payload)
+
+
+class RegistrationTests(unittest.TestCase):
+    def test_tracks_a_group_before_registering_all_roots(self):
+        class FailingClient:
+            def __init__(self):
+                self.calls = 0
+
+            def tool(self, name, arguments):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("incompatible root")
+                return None
+
+        client = FailingClient()
+        registered = []
+        group = ProjectGroup("repo", tuple(Path(f"/root-{index}") for index in range(5)))
+
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            register_groups(client, (group,), "bench", registered)
+
+        self.assertEqual(registered, ["bench-repo"])
 
 
 if __name__ == "__main__":

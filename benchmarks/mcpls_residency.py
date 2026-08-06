@@ -200,15 +200,15 @@ def pss_kib(pid):
     return total
 
 
-def register_groups(client, groups, prefix):
-    ids = []
+def register_groups(client, groups, prefix, ids=None):
+    ids = [] if ids is None else ids
     for index, group in enumerate(groups):
         project_id = f"{prefix}-{group.project_id}"
+        ids.append(project_id)
         for root in group.roots:
             client.tool(
                 "project_add", {"project_id": project_id, "root": str(root)}
             )
-        ids.append(project_id)
     return ids
 
 
@@ -238,7 +238,7 @@ def run(args):
     project_ids = []
     try:
         client.initialize()
-        project_ids = register_groups(client, groups, args.project_prefix)
+        register_groups(client, groups, args.project_prefix, project_ids)
         daemon_status = client.tool("server_status", {})
         report = {
             "manifest": str(args.manifest),
