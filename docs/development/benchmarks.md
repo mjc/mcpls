@@ -64,3 +64,37 @@ portable enough for a shared hosted-runner threshold.
 
 The final two live-daemon checks belong in the resident-budget benchmark tracked
 by MCPLS-43; the direct rust-analyzer benchmark is the reproducible lower layer.
+
+### Resident-budget matrix
+
+The daemon-level measurement requires a manifest containing four real Git
+repositories, with five existing linked-worktree roots for each repository:
+
+```json
+{
+  "projects": [
+    {
+      "project_id": "repository-a",
+      "roots": ["/path/a-1", "/path/a-2", "/path/a-3", "/path/a-4", "/path/a-5"]
+    }
+  ]
+}
+```
+
+The runner refuses fewer than four projects, fewer than five roots per project,
+duplicate roots, or roots without `Cargo.toml`; this keeps an incomplete local
+checkout from being reported as the acceptance matrix. Run it against the live
+MCPLS daemon with its PID:
+
+```sh
+python3 benchmarks/mcpls_residency.py \
+  --manifest target/benchmarks/mcpls-residency.json \
+  --pid "$(systemctl --user show mcpls.service -p MainPID --value)" \
+  --output target/benchmarks/mcpls-residency-report.json
+```
+
+It records daemon-only PSS after registration, then PSS and activation-to-first
+`workspace_symbol_search` result time across a forward and reverse group-switch
+sequence. Registrations are removed in a `finally` cleanup block. The manifest
+must be assembled from existing worktrees; do not manufacture repeated paths to
+make the matrix pass.
