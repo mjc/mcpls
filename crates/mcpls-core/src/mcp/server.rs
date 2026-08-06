@@ -2675,6 +2675,102 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn in_flight_request_pins_group_before_second_cold_request() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        let first_file = write_rust_fixture(first_root.path());
+        write_rust_fixture(second_root.path());
+        let counter = first_root.path().join("spawn-count");
+        let entered = first_root.path().join("request-entered");
+        let release = first_root.path().join("request-release");
+        let config = write_concurrency_lsp(
+            first_root.path(),
+            &counter,
+            Some(first_root.path()),
+            Some(&entered),
+            Some(&release),
+        );
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
+            .with_rust_residency_limit(1);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                first_id,
+                CanonicalRoot::new(first_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        server
+            .project_activate(project_params("first"))
+            .await
+            .unwrap();
+        wait_for_project_ready(
+            &server.context.project_registry,
+            &ProjectId::new("first").unwrap(),
+        )
+        .await;
+
+        let blocked_server = server.for_session();
+        let blocked = tokio::spawn(async move {
+            blocked_server
+                .get_document_symbols(document_symbols_params(&first_file))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !entered.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("in-flight request did not reach the language server");
+
+        let second_server = server.for_session();
+        let mut second_request = tokio::spawn(async move {
+            second_server
+                .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                    project_id: second_id.as_str().to_string(),
+                    query: "fixture".to_string(),
+                    kind_filter: None,
+                    limit: 20,
+                }))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second_request)
+                .await
+                .is_err(),
+            "second cold request bypassed the pinned in-flight group"
+        );
+
+        std::fs::write(&release, "release").unwrap();
+        blocked.await.unwrap().unwrap();
+        let second_result = tokio::time::timeout(std::time::Duration::from_secs(3), second_request)
+            .await
+            .expect("second request remained queued after the first completed")
+            .unwrap()
+            .unwrap();
+        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
+        assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
+            "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn rust_residency_evicts_before_spawn_and_resumes_on_semantic_request() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
