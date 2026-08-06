@@ -9096,6 +9096,37 @@ while True:
         assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
     }
 
+    #[tokio::test]
+    async fn dirty_documents_refuse_residency_suspension() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "pub fn on_disk() {}\n").unwrap();
+
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker_mut()
+            .open(source, "pub fn unsaved() {}\n".to_string())
+            .unwrap();
+        let mut runtime = ProjectRuntime::new(translator);
+        let (status_tx, _) = watch::channel(ProjectStatus::Ready);
+        let (event_tx, _) = broadcast::channel(1);
+        let channels = ProjectActorChannels {
+            status_tx,
+            event_tx,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+        };
+        let mut state = ProjectState::new(ProjectStatus::Ready, runtime.summary());
+
+        assert!(
+            suspend_project_runtime(&channels, &mut state, &mut runtime)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.status(), ProjectStatus::Ready);
+        assert_eq!(runtime.summary().open_document_count(), 1);
+    }
+
     #[test]
     fn path_rename_composition_uses_authoritative_open_document_content() {
         let root = TempDir::new().unwrap();
