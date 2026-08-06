@@ -52,6 +52,32 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// `kill_on_drop`.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct ProcessGroup(Pid);
+
+#[cfg(unix)]
+impl ProcessGroup {
+    fn for_child(child: &tokio::process::Child) -> Option<Self> {
+        child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(Pid::from_raw)
+            .map(Self)
+    }
+
+    async fn terminate(self) {
+        match kill_process_group(self.0, Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => warn!(%error, "failed to kill LSP server process group"),
+        }
+        let deadline = tokio::time::Instant::now() + CHILD_EXIT_GRACE;
+        while test_kill_process_group(self.0).is_ok() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
 ///
 /// `SystemRoot`/`SystemDrive`/`windir` are required by the Windows process
@@ -297,7 +323,7 @@ pub struct LspServer {
     /// (`kill_on_drop`).
     child: tokio::process::Child,
     #[cfg(unix)]
-    process_group: Option<Pid>,
+    process_group: Option<ProcessGroup>,
 }
 
 impl std::fmt::Debug for LspServer {
@@ -382,10 +408,7 @@ impl LspServer {
             source: e,
         })?;
         #[cfg(unix)]
-        let process_group = child
-            .id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .and_then(Pid::from_raw);
+        let process_group = ProcessGroup::for_child(&child);
 
         let stdin = child
             .stdin
@@ -716,12 +739,24 @@ impl LspServer {
                 false
             }
         };
-        #[cfg(unix)]
-        if let Some(process_group) = self.process_group {
-            terminate_process_group(process_group).await;
-        }
-        if !child_reaped && let Err(error) = child.wait().await {
-            warn!(%error, "failed to reap killed LSP server process");
+        if child_reaped {
+            #[cfg(unix)]
+            if let Some(process_group) = self.process_group {
+                process_group.terminate().await;
+            }
+        } else {
+            #[cfg(unix)]
+            let wait_result = if let Some(process_group) = self.process_group {
+                let ((), wait_result) = tokio::join!(process_group.terminate(), child.wait());
+                wait_result
+            } else {
+                child.wait().await
+            };
+            #[cfg(not(unix))]
+            let wait_result = child.wait().await;
+            if let Err(error) = wait_result {
+                warn!(%error, "failed to reap killed LSP server process");
+            }
         }
 
         handshake?;
@@ -817,18 +852,6 @@ impl LspServer {
         }
 
         result
-    }
-}
-
-#[cfg(unix)]
-async fn terminate_process_group(process_group: Pid) {
-    match kill_process_group(process_group, Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-        Err(error) => warn!(%error, "failed to kill LSP server process group"),
-    }
-    let deadline = tokio::time::Instant::now() + CHILD_EXIT_GRACE;
-    while test_kill_process_group(process_group).is_ok() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1479,13 +1502,11 @@ fn main() {
             .stdout(Stdio::piped())
             .kill_on_drop(true);
         command.as_std_mut().process_group(0);
-        let mut child = command.spawn().unwrap();
+        let child = command.spawn().unwrap();
         let parent_pid = child.id().unwrap();
-        let mock_stdin = child.stdin.take().unwrap();
-        let mock_stdout = child.stdout.take().unwrap();
-        let transport = LspTransport::new(mock_stdin, mock_stdout);
-        let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
+        let client = LspClient::new(LspServerConfig::rust_analyzer());
         let (_, notification_rx) = mpsc::channel(1);
+        let process_group = ProcessGroup::for_child(&child);
         let server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
@@ -1494,7 +1515,7 @@ fn main() {
             workspace_roots: Vec::new(),
             notification_rx,
             child,
-            process_group: Pid::from_raw(i32::try_from(parent_pid).unwrap()),
+            process_group,
         };
 
         let descendant_pid = tokio::time::timeout(Duration::from_secs(1), async {
