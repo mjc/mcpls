@@ -8789,6 +8789,23 @@ while True:
         (repository, worktrees, roots)
     }
 
+    async fn add_compatible_roots(
+        registry: &ProjectRegistry,
+        project_id: &ProjectId,
+        roots: &[PathBuf],
+    ) {
+        for root in roots {
+            let repository_identity = GitRepositoryIdentity::discover(root).unwrap().unwrap();
+            registry
+                .add(
+                    ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root).unwrap())
+                        .with_repository_identity(repository_identity),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn repeated_activation_does_not_spawn_a_duplicate_lsp_process() {
@@ -10577,16 +10594,7 @@ while True:
         let registry =
             ProjectRegistry::with_translator_template(4, template_source.configuration_template());
         let project_id = ProjectId::new("repository").unwrap();
-        for root in roots {
-            let repository_identity = GitRepositoryIdentity::discover(&root).unwrap().unwrap();
-            registry
-                .add(
-                    ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root).unwrap())
-                        .with_repository_identity(repository_identity),
-                )
-                .await
-                .unwrap();
-        }
+        add_compatible_roots(&registry, &project_id, &roots).await;
 
         let state = registry.activate(&project_id).await.unwrap();
         assert!(matches!(
@@ -10628,16 +10636,7 @@ while True:
         for index in 0..4 {
             let (repository, worktrees, roots) = compatible_worktree_fixture();
             let project_id = ProjectId::new(format!("repository-{index}")).unwrap();
-            for root in &roots {
-                let repository_identity = GitRepositoryIdentity::discover(root).unwrap().unwrap();
-                registry
-                    .add(
-                        ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root).unwrap())
-                            .with_repository_identity(repository_identity),
-                    )
-                    .await
-                    .unwrap();
-            }
+            add_compatible_roots(&registry, &project_id, &roots).await;
             fixtures.push((repository, worktrees));
         }
 
@@ -10663,6 +10662,7 @@ while True:
                 .sum::<usize>(),
             20
         );
+        drop(fixtures);
     }
 
     #[cfg(unix)]
