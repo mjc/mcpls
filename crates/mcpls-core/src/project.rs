@@ -1194,11 +1194,7 @@ impl ProjectRequestSender {
         if request.uses_rust_residency()
             && let Some(residency) = &self.residency
         {
-            let guard = residency.controller.acquire(residency.group).await;
-            request = ProjectRequest::Resident {
-                request: Box::new(request),
-                guard,
-            };
+            request = residency.resident_request(request).await;
         }
 
         let permit = tokio::select! {
@@ -4531,6 +4527,16 @@ struct ProjectResidency {
     group: RustGroupId,
 }
 
+impl ProjectResidency {
+    async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
+        let guard = self.controller.acquire(self.group).await;
+        ProjectRequest::Resident {
+            request: Box::new(request),
+            guard,
+        }
+    }
+}
+
 fn spawn_project_actor_with_runtime(
     capacity: usize,
     translator: Translator,
@@ -4757,11 +4763,7 @@ async fn forward_lsp_notifications(
     if let Some(sender) = sender.upgrade() {
         let request = ProjectRequest::ServerExited { generation };
         let request = if let Some(residency) = residency {
-            let guard = residency.controller.acquire(residency.group).await;
-            ProjectRequest::Resident {
-                request: Box::new(request),
-                guard,
-            }
+            residency.resident_request(request).await
         } else {
             request
         };
