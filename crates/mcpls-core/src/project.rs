@@ -4409,6 +4409,7 @@ async fn recover_project_after_server_exit(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
+    residency: Option<&ProjectResidency>,
 ) {
     loop {
         let Some(attempt) = runtime.begin_automatic_restart() else {
@@ -4431,6 +4432,7 @@ async fn recover_project_after_server_exit(
                     channels,
                     state,
                     runtime,
+                    residency.cloned(),
                 );
                 return;
             }
@@ -4456,6 +4458,7 @@ async fn handle_server_exit(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
+    residency: Option<&ProjectResidency>,
 ) {
     if !runtime.owns_generation(generation) {
         return;
@@ -4464,7 +4467,8 @@ async fn handle_server_exit(
     channels.publish(ProjectEvent::ServerExited { generation });
     match state.status {
         ProjectStatus::Ready | ProjectStatus::Degraded => {
-            recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
+            recover_project_after_server_exit(actor_sender, channels, state, runtime, residency)
+                .await;
         }
         ProjectStatus::Starting | ProjectStatus::Restarting => {
             channels.publish_failure(state, LANGUAGE_SERVER_EXITED);
@@ -4639,9 +4643,24 @@ async fn run_project_actor(
             && resumes_runtime
             && !runtime.has_active_workspace_roots(runtime.translator.workspace_roots())
         {
-            resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
+            resume_project_runtime(
+                &actor_sender,
+                &channels,
+                &mut state,
+                &mut runtime,
+                residency.as_ref(),
+            )
+            .await;
         }
-        if handle_project_request(request, &actor_sender, &channels, &mut state, &mut runtime).await
+        if handle_project_request(
+            request,
+            &actor_sender,
+            &channels,
+            &mut state,
+            &mut runtime,
+            residency.as_ref(),
+        )
+        .await
         {
             break;
         }
@@ -4659,6 +4678,7 @@ async fn resume_project_runtime(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
+    residency: Option<&ProjectResidency>,
 ) {
     let roots = runtime.translator.workspace_roots().to_vec();
     runtime.begin_transition();
@@ -4666,7 +4686,14 @@ async fn resume_project_runtime(
     channels.publish_status(state, ProjectStatus::Starting);
     match runtime.activate_workspace_roots(roots).await {
         Ok(activation) => {
-            mark_project_started(activation, actor_sender, channels, state, runtime);
+            mark_project_started(
+                activation,
+                actor_sender,
+                channels,
+                state,
+                runtime,
+                residency.cloned(),
+            );
         }
         Err(error) => {
             state.sync_runtime(runtime);
@@ -4690,11 +4717,16 @@ fn spawn_notification_forwarders(
     notification_receivers: Vec<(ServerId, mpsc::Receiver<LspNotification>)>,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     generation: u64,
+    residency: Option<ProjectResidency>,
 ) {
     for (server_id, receiver) in notification_receivers {
         let sender = actor_sender.clone();
         tokio::spawn(forward_lsp_notifications(
-            server_id, receiver, sender, generation,
+            server_id,
+            receiver,
+            sender,
+            generation,
+            residency.clone(),
         ));
     }
 }
@@ -4704,6 +4736,7 @@ async fn forward_lsp_notifications(
     mut receiver: mpsc::Receiver<LspNotification>,
     sender: mpsc::WeakSender<ProjectRequest>,
     generation: u64,
+    _residency: Option<ProjectResidency>,
 ) {
     while let Some(notification) = receiver.recv().await {
         let Some(sender) = sender.upgrade() else {
@@ -4722,9 +4755,17 @@ async fn forward_lsp_notifications(
         }
     }
     if let Some(sender) = sender.upgrade() {
-        let _ = sender
-            .send(ProjectRequest::ServerExited { generation })
-            .await;
+        let request = ProjectRequest::ServerExited { generation };
+        let request = if let Some(residency) = _residency {
+            let guard = residency.controller.acquire(residency.group).await;
+            ProjectRequest::Resident {
+                request: Box::new(request),
+                guard,
+            }
+        } else {
+            request
+        };
+        let _ = sender.send(request).await;
     }
 }
 
@@ -4734,6 +4775,7 @@ fn mark_project_started(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
+    residency: Option<ProjectResidency>,
 ) {
     runtime.reset_automatic_restart();
     let health = activation.health();
@@ -4741,6 +4783,7 @@ fn mark_project_started(
         activation.into_notification_receivers(),
         actor_sender,
         runtime.generation(),
+        residency,
     );
     publish_project_readiness(channels, state, runtime, health);
 }
@@ -4819,6 +4862,7 @@ async fn handle_project_request(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
+    residency: Option<&ProjectResidency>,
 ) -> bool {
     let Ok(request) = request.reject_if_failed(state.status) else {
         return false;
@@ -4852,6 +4896,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
+                        residency.cloned(),
                     );
                     let _ = reply.send(Ok(state.clone()));
                 }
@@ -4879,6 +4924,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
+                        residency.cloned(),
                     );
                     let _ = reply.send(Ok(state.clone()));
                 }
@@ -5182,6 +5228,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
+                        residency.cloned(),
                     );
                     let _ = reply.send(Ok(state.clone()));
                 }
@@ -5313,7 +5360,15 @@ async fn handle_project_request(
             }
         }
         ProjectRequest::ServerExited { generation } => {
-            handle_server_exit(generation, actor_sender, channels, state, runtime).await;
+            handle_server_exit(
+                generation,
+                actor_sender,
+                channels,
+                state,
+                runtime,
+                residency,
+            )
+            .await;
         }
         ProjectRequest::SetStatus { status, reply } => {
             state.sync_runtime(runtime);
@@ -5334,6 +5389,7 @@ async fn handle_project_request(
                         channels,
                         state,
                         runtime,
+                        residency.cloned(),
                     );
                     let _ = reply.send(state.clone());
                 }
@@ -7320,6 +7376,37 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn server_exit_forwarder_wraps_exit_in_residency_guard() {
+        let controller = RustResidencyController::new(1);
+        let (request_sender, mut request_receiver) = mpsc::channel(1);
+        let (notification_sender, notification_receiver) = mpsc::channel(1);
+        let residency = ProjectResidency {
+            controller,
+            group: RustGroupId(1),
+        };
+
+        let forwarder = tokio::spawn(forward_lsp_notifications(
+            "rust".into(),
+            notification_receiver,
+            request_sender.downgrade(),
+            7,
+            Some(residency),
+        ));
+        drop(notification_sender);
+
+        let request = tokio::time::timeout(Duration::from_secs(1), request_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            request,
+            ProjectRequest::Resident { request, .. }
+                if matches!(*request, ProjectRequest::ServerExited { generation: 7 })
+        ));
+        forwarder.await.unwrap();
+    }
+
     #[test]
     fn code_action_store_references_are_bounded_and_single_use() {
         let mut store = CodeActionStore {
@@ -7789,6 +7876,7 @@ mod tests {
                 &channels,
                 &mut state,
                 &mut runtime,
+                None,
             )
             .await
         );
