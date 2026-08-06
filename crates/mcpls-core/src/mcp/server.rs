@@ -3569,8 +3569,9 @@ while True:
 "#;
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn text_only_apply_synchronizes_unopened_files_before_follow_up_rename() {
+    async fn fake_text_edit_fixture(
+        exit_on_watched_files: bool,
+    ) -> (TempDir, PathBuf, PathBuf, McplsServer) {
         use std::collections::HashMap;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
@@ -3583,21 +3584,28 @@ while True:
         fs::write(&sibling, "old_name();\n").unwrap();
 
         let lsp = root.path().join("fake-edit-lsp.py");
-        fs::write(&lsp, FAKE_EDIT_LSP).unwrap();
+        let script = if exit_on_watched_files {
+            FAKE_EDIT_LSP.replace(
+                "if False:\n            sys.exit(0)",
+                "if True:\n            sys.exit(0)",
+            )
+        } else {
+            FAKE_EDIT_LSP.to_string()
+        };
+        fs::write(&lsp, script).unwrap();
         let mut permissions = fs::metadata(&lsp).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&lsp, permissions).unwrap();
 
-        let mut server_config = crate::config::LspServerConfig::rust_analyzer();
-        server_config.command = lsp.display().to_string();
-        server_config.heuristics = None;
-        server_config.env =
-            HashMap::from([("MCPLS_COUNTER".to_string(), counter.display().to_string())]);
-        let mut template_source = Translator::new()
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.env = HashMap::from([("MCPLS_COUNTER".to_string(), counter.display().to_string())]);
+        let mut translator = Translator::new()
             .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        template_source.set_lsp_configs(vec![server_config], Some(3));
+        translator.set_lsp_configs(vec![config], Some(3));
         let registry =
-            ProjectRegistry::with_translator_template(4, template_source.configuration_template());
+            ProjectRegistry::with_translator_template(4, translator.configuration_template());
         let project_id = ProjectId::new("fixture").unwrap();
         registry
             .add(ProjectIdentity::new(
@@ -3609,6 +3617,127 @@ while True:
         registry.activate(&project_id).await.unwrap();
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        (root, source, sibling, server)
+    }
+
+    #[cfg(unix)]
+    async fn apply_two_file_text_edit(
+        server: &McplsServer,
+        source: &Path,
+        sibling: &Path,
+    ) -> serde_json::Value {
+        let source_uri = url::Url::from_file_path(source).unwrap().to_string();
+        let sibling_uri = url::Url::from_file_path(sibling).unwrap().to_string();
+        let preview: serde_json::Value = serde_json::from_str(
+            &server
+                .workspace_edit_preview(Parameters(WorkspaceEditPreviewParams {
+                    project_id: "fixture".to_string(),
+                    workspace_edit: serde_json::json!({
+                        "changes": {
+                            source_uri: [{
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 8}
+                                },
+                                "newText": "new_name"
+                            }],
+                            sibling_uri: [{
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 8}
+                                },
+                                "newText": "new_name"
+                            }]
+                        }
+                    }),
+                    position_encoding: Some("utf-8".to_string()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        serde_json::from_str(
+            &server
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: "fixture".to_string(),
+                    plan_id: preview["plan_id"].as_str().unwrap().to_string(),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn assert_inverse_rename_sees_both_files(server: &McplsServer, source: &Path) {
+        let reverse: serde_json::Value = serde_json::from_str(
+            &server
+                .rename_preview(Parameters(RenamePreviewParams {
+                    project_id: "fixture".to_string(),
+                    file_path: source.display().to_string(),
+                    line: 1,
+                    character: 1,
+                    new_name: "old_name".to_string(),
+                    position_encoding: Some("utf-8".to_string()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reverse["affected_files"].as_array().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_only_apply_synchronizes_when_all_files_are_unopened() {
+        let (_root, source, sibling, server) = fake_text_edit_fixture(false).await;
+
+        let applied = apply_two_file_text_edit(&server, &source, &sibling).await;
+
+        assert_eq!(applied["semantic_state"], "synchronized", "{applied}");
+        assert_inverse_rename_sees_both_files(&server, &source).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_only_apply_synchronizes_multiple_tracked_files() {
+        let (_root, source, sibling, server) = fake_text_edit_fixture(false).await;
+        for path in [&source, &sibling] {
+            server
+                .get_document_symbols(Parameters(DocumentSymbolsParams {
+                    file_path: path.display().to_string(),
+                }))
+                .await
+                .unwrap();
+        }
+
+        let applied = apply_two_file_text_edit(&server, &source, &sibling).await;
+
+        assert_eq!(applied["semantic_state"], "synchronized", "{applied}");
+        assert_inverse_rename_sees_both_files(&server, &source).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_exit_during_text_sync_keeps_the_committed_apply_result() {
+        let (_root, source, sibling, server) = fake_text_edit_fixture(true).await;
+
+        let applied = apply_two_file_text_edit(&server, &source, &sibling).await;
+
+        assert_eq!(applied["semantic_state"], "degraded", "{applied}");
+        assert_eq!(
+            applied["provider_synchronization"][0]["synchronized"],
+            false
+        );
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "new_name\n");
+        assert_eq!(std::fs::read_to_string(sibling).unwrap(), "new_name();\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_only_apply_synchronizes_unopened_files_before_follow_up_rename() {
+        let (_root, source, _sibling, server) = fake_text_edit_fixture(false).await;
+        let project_id = ProjectId::new("fixture").unwrap();
 
         let rename: serde_json::Value = serde_json::from_str(
             &server
@@ -4312,50 +4441,9 @@ while True:
     #[cfg(unix)]
     #[tokio::test]
     async fn provider_exit_during_resource_sync_keeps_the_committed_apply_result() {
-        use std::collections::HashMap;
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = TempDir::new().unwrap();
-        let source = root.path().join("src.rs");
+        let (root, source, sibling, server) = fake_text_edit_fixture(true).await;
         let destination = root.path().join("renamed.rs");
-        let sibling = root.path().join("other.rs");
-        let counter = root.path().join("request-count");
-        fs::write(&source, "old_name\n").unwrap();
-        fs::write(&sibling, "old_name();\n").unwrap();
-        let lsp = root.path().join("fake-edit-lsp.py");
-        fs::write(
-            &lsp,
-            FAKE_EDIT_LSP.replace(
-                "if False:\n            sys.exit(0)",
-                "if True:\n            sys.exit(0)",
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&lsp, permissions).unwrap();
-
-        let mut config = crate::config::LspServerConfig::rust_analyzer();
-        config.command = lsp.display().to_string();
-        config.heuristics = None;
-        config.env = HashMap::from([("MCPLS_COUNTER".to_string(), counter.display().to_string())]);
-        let mut translator = Translator::new()
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
-        translator.set_lsp_configs(vec![config], Some(3));
-        let registry =
-            ProjectRegistry::with_translator_template(4, translator.configuration_template());
         let project_id = ProjectId::new("fixture").unwrap();
-        registry
-            .add(ProjectIdentity::new(
-                project_id.clone(),
-                CanonicalRoot::new(root.path()).unwrap(),
-            ))
-            .await
-            .unwrap();
-        registry.activate(&project_id).await.unwrap();
-        let server =
-            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
         let preview: serde_json::Value = serde_json::from_str(
             &server
@@ -4391,8 +4479,8 @@ while True:
         assert!(message.contains("failed"), "{message}");
         assert!(!message.contains("no dynamic"), "{message}");
         assert!(!source.exists());
-        assert_eq!(fs::read_to_string(destination).unwrap(), "old_name\n");
-        assert_eq!(fs::read_to_string(sibling).unwrap(), "path_ref();\n");
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "old_name\n");
+        assert_eq!(std::fs::read_to_string(sibling).unwrap(), "path_ref();\n");
     }
 
     #[tokio::test]
