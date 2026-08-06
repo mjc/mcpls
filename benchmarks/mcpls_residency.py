@@ -215,7 +215,16 @@ def process_summary(pid, process_ids=None):
             continue
         if name:
             names.append(name)
-    return {"process_count": len(names), "process_names": sorted(names)}
+    return {
+        "process_count": len(names),
+        "process_names": sorted(names),
+        "rust_analyzer_count": rust_analyzer_count(names),
+    }
+
+
+def rust_analyzer_count(process_names):
+    """Count rust-analyzer processes in a `/proc/*/comm` name sample."""
+    return sum(name in ("rust-analyzer", "rust_analyzer") for name in process_names)
 
 
 def resource_snapshot(pid):
@@ -337,6 +346,12 @@ def run(args):
                 raise RuntimeError(
                     f"resident group limit exceeded: {len(active_projects)} active groups"
                 )
+            snapshot = resource_snapshot(args.pid)
+            analyzer_count = snapshot["processes"]["rust_analyzer_count"]
+            if analyzer_count > args.max_active_groups:
+                raise RuntimeError(
+                    f"rust-analyzer process limit exceeded: {analyzer_count} processes"
+                )
             report["switches"].append(
                 {
                     "project_id": project_id,
@@ -346,7 +361,7 @@ def run(args):
                     ),
                     "activation_status": activation_state.get("status"),
                     **result,
-                    **resource_snapshot(args.pid),
+                    **snapshot,
                     "status": state.get("status"),
                     "active_language_servers": state.get("active_language_servers", []),
                     "active_group_count": len(active_projects),

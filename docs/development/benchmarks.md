@@ -118,4 +118,6 @@ second resident analyzer. Symbol counts are read from MCPLS's
 does not collapse to one actor group, and every switch fails if more than the
 configured active-group limit is observed. Registrations are removed in a
 `finally` cleanup block. The manifest must be assembled from existing
-worktrees; do not manufacture repeated paths to make the matrix pass.
+worktrees; do not manufacture repeated paths to make the matrix pass. A
+switch also fails if the sampled process tree contains more `rust-analyzer`
+processes than the configured active-group limit.
