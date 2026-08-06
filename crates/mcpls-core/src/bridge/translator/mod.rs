@@ -364,10 +364,9 @@ impl Translator {
     /// Drains the registered LSP servers and, for each one concurrently,
     /// sends the LSP `shutdown` request and `exit` notification via
     /// [`LspServer::shutdown`], bounded by a fixed per-server timeout. A
-    /// server that errors or fails to respond in time is simply dropped
-    /// instead: its child process handle is `kill_on_drop(true)`, so the
-    /// process is killed rather than left running. Call this once, from the
-    /// top-level shutdown path, after the MCP transport has stopped
+    /// server that errors or fails to respond in time is terminated with its
+    /// owned process group before the child is reaped. Call this once, from
+    /// the top-level shutdown path, after the MCP transport has stopped
     /// accepting new requests.
     ///
     /// # Limitations
@@ -377,10 +376,9 @@ impl Translator {
     /// workspace `[profile.release]` builds with `panic = "abort"`, so a
     /// panic reachable from a request handler or background pump task in a
     /// release build still terminates the process without unwinding — this
-    /// method never runs, and spawned LSP children are orphaned exactly as
-    /// before this fix. Making that path safe would need process-group
-    /// isolation (`kill_on_drop` alone doesn't help, since no `Drop` runs
-    /// either); tracked separately, out of scope here.
+    /// method never runs, and spawned LSP children can still be orphaned on
+    /// an abort. Process-group cleanup handles ordinary shutdown, teardown,
+    /// and initialization-failure paths, but cannot run after an abort.
     ///
     /// `pub(crate)` rather than `pub`: this is meant for exactly one call
     /// site (`serve_with`'s post-transport shutdown sequence), after the MCP
