@@ -6131,6 +6131,12 @@ impl ProjectRegistry {
                 )
                 .await?;
             }
+            for actor in self.actors_for_project(&id).await? {
+                actor
+                    .set_status(ProjectStatus::Dormant)
+                    .await
+                    .map_err(ProjectRegistryError::from)?;
+            }
             restored += 1;
         }
         self.persist().await?;
@@ -9893,6 +9899,14 @@ while True:
         assert_eq!(registry.restore_from_persistence().await.unwrap(), 1);
         assert_eq!(registry.list().await.len(), 1);
         assert_eq!(registry.list().await[0].id().as_str(), "existing");
+        assert_eq!(
+            registry
+                .status(&ProjectId::new("existing").unwrap())
+                .await
+                .unwrap()
+                .status(),
+            ProjectStatus::Dormant
+        );
         assert_eq!(store.load().unwrap().projects.len(), 1);
     }
 
