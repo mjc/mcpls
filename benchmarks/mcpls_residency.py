@@ -205,6 +205,19 @@ def pss_kib(pid):
     return total
 
 
+def process_summary(pid):
+    """Summarize the daemon's live descendant process tree."""
+    names = []
+    for current in descendants(pid):
+        try:
+            name = pathlib.Path(f"/proc/{current}/comm").read_text().strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if name:
+            names.append(name)
+    return {"process_count": len(names), "process_names": sorted(names)}
+
+
 def register_groups(client, groups, prefix, ids=None):
     ids = [] if ids is None else ids
     for index, group in enumerate(groups):
@@ -295,6 +308,7 @@ def run(args):
             "roots_per_project": 5,
             "daemon_only": {
                 "pss_kib": pss_kib(args.pid),
+                "processes": process_summary(args.pid),
                 "server_status": daemon_status,
                 "registered_projects": registered_states,
             },
@@ -325,6 +339,7 @@ def run(args):
                     "activation_status": activation_state.get("status"),
                     **result,
                     "pss_kib": pss_kib(args.pid),
+                    "processes": process_summary(args.pid),
                     "status": state.get("status"),
                     "active_language_servers": state.get("active_language_servers", []),
                     "active_group_count": len(active_projects),
