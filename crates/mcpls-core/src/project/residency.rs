@@ -150,10 +150,7 @@ impl RustResidencyController {
             let decision = self.state().budget.pin(group, &excluded);
             match decision {
                 ResidencyDecision::Admit | ResidencyDecision::Reuse => {
-                    return RustResidencyGuard {
-                        group,
-                        inner: Arc::clone(&self.inner),
-                    };
+                    return self.guard(group);
                 }
                 ResidencyDecision::Evict(victim) => {
                     let sender = self
@@ -177,10 +174,7 @@ impl RustResidencyController {
                     match response.await {
                         Ok(Ok(())) => {
                             self.state().budget.replace(victim, group);
-                            return RustResidencyGuard {
-                                group,
-                                inner: Arc::clone(&self.inner),
-                            };
+                            return self.guard(group);
                         }
                         Ok(Err(())) => {
                             excluded.insert(victim);
@@ -206,10 +200,14 @@ impl RustResidencyController {
         self.state()
             .budget
             .pin_existing(group)
-            .then(|| RustResidencyGuard {
-                group,
-                inner: Arc::clone(&self.inner),
-            })
+            .then(|| self.guard(group))
+    }
+
+    fn guard(&self, group: RustGroupId) -> RustResidencyGuard {
+        RustResidencyGuard {
+            group,
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     pub(super) fn remove(&self, group: RustGroupId) {
