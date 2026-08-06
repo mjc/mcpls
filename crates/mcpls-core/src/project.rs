@@ -1699,7 +1699,6 @@ impl ProjectRequest {
                     | Self::ActivateWorkspaceRoots { .. }
                     | Self::AddWorkspaceRoot { .. }
                     | Self::Restart { .. }
-                    | Self::ServerExited { .. }
             )
     }
 
@@ -4460,8 +4459,8 @@ async fn handle_server_exit(
     channels.publish(ProjectEvent::ServerExited { generation });
     match state.status {
         ProjectStatus::Ready | ProjectStatus::Degraded => {
-            let _residency_guard = match residency {
-                Some(residency) => Some(residency.controller.acquire(residency.group).await),
+            let _recovery_guard = match residency {
+                Some(residency) => Some(residency.acquire().await),
                 None => None,
             };
             recover_project_after_server_exit(actor_sender, channels, state, runtime).await;
@@ -4528,8 +4527,12 @@ struct ProjectResidency {
 }
 
 impl ProjectResidency {
+    async fn acquire(&self) -> residency::RustResidencyGuard {
+        self.controller.acquire(self.group).await
+    }
+
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
-        let guard = self.controller.acquire(self.group).await;
+        let guard = self.acquire().await;
         ProjectRequest::Resident {
             request: Box::new(request),
             guard,
@@ -4740,6 +4743,8 @@ async fn forward_lsp_notifications(
         }
     }
     if let Some(sender) = sender.upgrade() {
+        // Closing a receiver is also the normal result of intentional eviction.
+        // Let the actor inspect its lifecycle state before acquiring residency.
         let _ = sender
             .send(ProjectRequest::ServerExited { generation })
             .await;
