@@ -1697,7 +1697,7 @@ fn main() {
 
         let debug_str = format!("{server:?}");
         assert!(debug_str.contains("LspServer"));
-        assert!(debug_str.contains("<process>"));
+        assert!(debug_str.contains("<process tree>"));
     }
 
     #[test]
