@@ -1508,13 +1508,6 @@ impl McplsServer {
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
         let id = parse_project_id(project_id)?;
-        if let Err(error) = self.context.project_registry.activate(&id).await {
-            tracing::warn!(
-                project_id = %id,
-                error = %error,
-                "workspace symbol activation failed; trying degraded lookup"
-            );
-        }
         let actor = self
             .context
             .project_registry
@@ -2451,7 +2444,7 @@ finally:
         .unwrap();
         std::fs::create_dir(root.join("src")).unwrap();
         let file = root.join("src/main.rs");
-        std::fs::write(&file, "fn main() {}\n").unwrap();
+        std::fs::write(&file, "fn main() {}\nfn fixture_symbol() {}\n").unwrap();
         file
     }
 
@@ -2574,6 +2567,62 @@ finally:
 
         assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
         assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_cold_semantic_requests_respect_one_resident_group() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        write_rust_fixture(first_root.path());
+        write_rust_fixture(second_root.path());
+        let counter = first_root.path().join("spawn-count");
+        let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
+            .with_rust_residency_limit(1);
+        let first_id = ProjectId::new("first").unwrap();
+        let second_id = ProjectId::new("second").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let (first, second) = tokio::join!(
+            server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: first_id.as_str().to_string(),
+                query: "fixture".to_string(),
+                kind_filter: None,
+                limit: 20,
+            })),
+            server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: second_id.as_str().to_string(),
+                query: "fixture".to_string(),
+                kind_filter: None,
+                limit: 20,
+            })),
+        );
+        let first: serde_json::Value = serde_json::from_str(&first.unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&second.unwrap()).unwrap();
+
+        assert_eq!(first["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(second["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
+            "1"
+        );
     }
 
     #[cfg(unix)]
