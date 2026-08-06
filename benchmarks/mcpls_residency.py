@@ -54,6 +54,11 @@ def load_manifest(value):
                 raise ValueError(
                     f"project {project_id} roots must be linked Git worktrees"
                 )
+            if not any(
+                (path / filename).is_file()
+                for filename in ("rust-toolchain", "rust-toolchain.toml")
+            ):
+                raise ValueError(f"root has no explicit Rust toolchain: {path}")
             seen_roots.add(path)
             checked_roots.append(path)
         groups.append(ProjectGroup(project_id, tuple(checked_roots)))

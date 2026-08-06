@@ -24,7 +24,13 @@ class ManifestTests(unittest.TestCase):
             (repository / "Cargo.toml").write_text(
                 "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n"
             )
-            subprocess.run(["git", "-C", str(repository), "add", "Cargo.toml"], check=True)
+            (repository / "rust-toolchain.toml").write_text(
+                "[toolchain]\nchannel = \"stable\"\n"
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "Cargo.toml", "rust-toolchain.toml"],
+                check=True,
+            )
             subprocess.run(
                 [
                     "git",
@@ -100,6 +106,15 @@ class ManifestTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Git worktree"):
             load_manifest({"projects": projects})
+
+    def test_rejects_roots_without_explicit_toolchain_metadata(self):
+        temporary, manifest = self.make_manifest()
+        self.addCleanup(temporary.cleanup)
+        root = Path(manifest["projects"][0]["roots"][0])
+        (root / "rust-toolchain.toml").unlink()
+
+        with self.assertRaisesRegex(ValueError, "explicit Rust toolchain"):
+            load_manifest(manifest)
 
 
 class SseTests(unittest.TestCase):
