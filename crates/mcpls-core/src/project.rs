@@ -10520,20 +10520,43 @@ while True:
 
         let repository = TempDir::new().unwrap();
         let git_dir = repository.path().join(".git");
-        let worktree_git_dir = git_dir.join("worktrees").join("linked");
-        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(git_dir.join("config"), "[core]\n").unwrap();
-        fs::create_dir(git_dir.join("objects")).unwrap();
-        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
-
-        let worktree = TempDir::new().unwrap();
-        fs::write(
-            worktree.path().join(".git"),
-            format!("gitdir: {}\n", worktree_git_dir.display()),
-        )
-        .unwrap();
-        write_compatible_roots_with_changed_manifests(repository.path(), worktree.path());
+        let worktrees: Vec<_> = (0..4)
+            .map(|index| {
+                let worktree_git_dir = git_dir.join("worktrees").join(format!("linked-{index}"));
+                fs::create_dir_all(&worktree_git_dir).unwrap();
+                fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+                let worktree = TempDir::new().unwrap();
+                fs::write(
+                    worktree.path().join(".git"),
+                    format!("gitdir: {}\n", worktree_git_dir.display()),
+                )
+                .unwrap();
+                worktree
+            })
+            .collect();
+        let roots: Vec<_> = std::iter::once(repository.path())
+            .chain(worktrees.iter().map(TempDir::path))
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[package]\nname = \"fixture-{index}\"\n"),
+            )
+            .unwrap();
+            fs::write(
+                root.join("Cargo.lock"),
+                format!("version = {}\n", if index == 0 { 3 } else { 4 }),
+            )
+            .unwrap();
+        }
         let counter = repository.path().join("spawn-count");
         let lsp = repository.path().join("counting-lsp.py");
         fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
@@ -10554,32 +10577,16 @@ while True:
         let registry =
             ProjectRegistry::with_translator_template(4, template_source.configuration_template());
         let project_id = ProjectId::new("repository").unwrap();
-        let repository_identity = GitRepositoryIdentity::discover(repository.path())
-            .unwrap()
-            .unwrap();
-        let linked_identity = GitRepositoryIdentity::discover(worktree.path())
-            .unwrap()
-            .unwrap();
-        registry
-            .add(
-                ProjectIdentity::new(
-                    project_id.clone(),
-                    CanonicalRoot::new(repository.path()).unwrap(),
+        for root in roots {
+            let repository_identity = GitRepositoryIdentity::discover(root).unwrap().unwrap();
+            registry
+                .add(
+                    ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root).unwrap())
+                        .with_repository_identity(repository_identity),
                 )
-                .with_repository_identity(repository_identity),
-            )
-            .await
-            .unwrap();
-        registry
-            .add(
-                ProjectIdentity::new(
-                    project_id.clone(),
-                    CanonicalRoot::new(worktree.path()).unwrap(),
-                )
-                .with_repository_identity(linked_identity),
-            )
-            .await
-            .unwrap();
+                .await
+                .unwrap();
+        }
 
         let state = registry.activate(&project_id).await.unwrap();
         assert!(matches!(
@@ -10599,7 +10606,7 @@ while True:
             ready.is_ok(),
             "linked-worktree project did not become ready"
         );
-        assert_eq!(state.workspace_roots().len(), 2);
+        assert_eq!(state.workspace_roots().len(), 5);
         assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
         assert_eq!(fs::read_to_string(counter).unwrap(), "1");
     }
