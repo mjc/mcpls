@@ -8725,30 +8725,35 @@ while True:
         break
 "#;
 
-    fn write_compatible_roots_with_changed_manifests(first: &Path, second: &Path) {
-        for root in [first, second] {
+    fn write_compatible_roots_with_changed_manifests(roots: &[&Path]) {
+        for root in roots {
             fs::write(
                 root.join("rust-toolchain.toml"),
                 "[toolchain]\nchannel = \"stable\"\n",
             )
             .unwrap();
         }
+        let Some((first, linked)) = roots.split_first() else {
+            return;
+        };
         fs::write(
             first.join("Cargo.toml"),
             "[package]\nname = \"fixture-main\"\n",
         )
         .unwrap();
-        fs::write(
-            second.join("Cargo.toml"),
-            "[package]\nname = \"fixture-linked\"\n",
-        )
-        .unwrap();
         fs::write(first.join("Cargo.lock"), "version = 3\n").unwrap();
-        fs::write(
-            second.join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"changed\"\nversion = \"1.0.0\"\n",
-        )
-        .unwrap();
+        for root in linked {
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture-linked\"\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("Cargo.lock"),
+                "version = 4\n\n[[package]]\nname = \"changed\"\nversion = \"1.0.0\"\n",
+            )
+            .unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -9323,7 +9328,7 @@ while True:
             format!("gitdir: {}\n", worktree_git_dir.display()),
         )
         .unwrap();
-        write_compatible_roots_with_changed_manifests(repository.path(), worktree.path());
+        write_compatible_roots_with_changed_manifests(&[repository.path(), worktree.path()]);
         let main_repository = GitRepositoryIdentity::discover(repository.path())
             .unwrap()
             .unwrap();
@@ -9823,7 +9828,7 @@ while True:
             format!("gitdir: {}\n", worktree_git_dir.display()),
         )
         .unwrap();
-        write_compatible_roots_with_changed_manifests(repository.path(), worktree.path());
+        write_compatible_roots_with_changed_manifests(&[repository.path(), worktree.path()]);
         let project_id = ProjectId::new("repository").unwrap();
         let store = ProjectRegistrationStore::new(repository.path().join("state/projects.json"));
         store
@@ -10540,23 +10545,7 @@ while True:
         let roots: Vec<_> = std::iter::once(repository.path())
             .chain(worktrees.iter().map(TempDir::path))
             .collect();
-        for (index, root) in roots.iter().enumerate() {
-            fs::write(
-                root.join("rust-toolchain.toml"),
-                "[toolchain]\nchannel = \"stable\"\n",
-            )
-            .unwrap();
-            fs::write(
-                root.join("Cargo.toml"),
-                format!("[package]\nname = \"fixture-{index}\"\n"),
-            )
-            .unwrap();
-            fs::write(
-                root.join("Cargo.lock"),
-                format!("version = {}\n", if index == 0 { 3 } else { 4 }),
-            )
-            .unwrap();
-        }
+        write_compatible_roots_with_changed_manifests(&roots);
         let counter = repository.path().join("spawn-count");
         let lsp = repository.path().join("counting-lsp.py");
         fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
