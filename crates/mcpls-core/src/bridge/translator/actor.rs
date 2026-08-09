@@ -26,7 +26,7 @@ use crate::lsp::{
 pub enum ActivationHealth {
     /// Every applicable language server initialized successfully.
     Ready,
-    /// At least one applicable language server failed while another started.
+    /// The project is usable but is not fully backed by language servers.
     Degraded,
 }
 
@@ -333,7 +333,7 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error when no server applies or every server fails to start.
+    /// Returns an error when every applicable server fails to start.
     pub async fn activate_project(&mut self, root: PathBuf) -> Result<ProjectActivation> {
         self.activate_project_with_roots(vec![root]).await
     }
@@ -345,7 +345,7 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error when no server applies or every server fails to start.
+    /// Returns an error when every applicable server fails to start.
     #[allow(clippy::too_many_lines)]
     pub async fn activate_project_with_roots(
         &mut self,
@@ -386,7 +386,13 @@ impl Translator {
             self.document_tracker.forget_server(&id);
         }
         if configs.is_empty() {
-            return Err(Error::NoServerConfigured);
+            self.clear_expected_servers();
+            self.actor_notification_cache.set_diagnostics_route_count(0);
+            self.set_workspace_roots(roots);
+            return Ok(ProjectActivation::new(
+                Vec::new(),
+                ActivationHealth::Degraded,
+            ));
         }
 
         let pending = configs
