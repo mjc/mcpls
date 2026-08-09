@@ -4,7 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    DocumentSymbolOptions, SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope,
+    DocumentSymbolOptions, SemanticResultLimits, SymbolHandle, WorkspaceSymbolMatchMode,
+    WorkspaceSymbolScope,
 };
 
 /// Parameters for the `get_hover` tool.
@@ -93,6 +94,9 @@ pub struct ReferencesParams {
     #[schemars(description = "Whether to include the declaration in the results.")]
     #[serde(default)]
     pub include_declaration: bool,
+    /// Bounds applied to references and groups.
+    #[serde(default)]
+    pub limits: SemanticResultLimits,
 }
 
 /// Parameters for the `get_diagnostics` tool.
@@ -461,6 +465,9 @@ pub struct CallHierarchyCallsParams {
     pub project_id: Option<String>,
     /// Snapshot-bound handle returned by a prior semantic result.
     pub symbol_handle: Option<SymbolHandle>,
+    /// Bounds applied to call groups and call sites.
+    #[serde(default)]
+    pub limits: SemanticResultLimits,
 }
 
 /// Parameters for the `get_cached_diagnostics` tool.

@@ -20,11 +20,11 @@ use crate::bridge::{
     DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
     InlayHintsResult, LocationsResult, LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding,
     ProjectActivation, ProviderSynchronization, ReferencesResult, RenameResult,
-    SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
-    ServerMessage, ServerMessagesResult, SignatureHelpResult, SourceContext, StructuralMatch,
-    StructuralSearchResult, SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate,
-    WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
-    path_to_uri, uri_to_path,
+    SemanticDiscoveryKind, SemanticDiscoveryResult, SemanticResultLimits, ServerCapability,
+    ServerLogsResult, ServerMessage, ServerMessagesResult, SignatureHelpResult, SourceContext,
+    StructuralMatch, StructuralSearchResult, SupportedWorkspaceEdit, SymbolHandle, Translator,
+    TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult,
+    WorkspaceSymbolScope, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1407,6 +1407,7 @@ enum ProjectRequest {
         line: u32,
         character: u32,
         include_declaration: bool,
+        limits: SemanticResultLimits,
         reply: oneshot::Sender<Result<ReferencesResult, String>>,
     },
     ResolveSymbolHandle {
@@ -1518,10 +1519,12 @@ enum ProjectRequest {
     },
     IncomingCalls {
         item: serde_json::Value,
+        limits: SemanticResultLimits,
         reply: oneshot::Sender<Result<IncomingCallsResult, String>>,
     },
     OutgoingCalls {
         item: serde_json::Value,
+        limits: SemanticResultLimits,
         reply: oneshot::Sender<Result<OutgoingCallsResult, String>>,
     },
     SignatureHelp {
@@ -2037,6 +2040,7 @@ impl ProjectHandle {
         line: u32,
         character: u32,
         include_declaration: bool,
+        limits: SemanticResultLimits,
     ) -> Result<ReferencesResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2045,6 +2049,7 @@ impl ProjectHandle {
                 line,
                 character,
                 include_declaration,
+                limits,
                 reply,
             })
             .await
@@ -2513,10 +2518,15 @@ impl ProjectHandle {
     pub async fn incoming_calls(
         &self,
         item: serde_json::Value,
+        limits: SemanticResultLimits,
     ) -> Result<IncomingCallsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::IncomingCalls { item, reply })
+            .send(ProjectRequest::IncomingCalls {
+                item,
+                limits,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -2534,10 +2544,15 @@ impl ProjectHandle {
     pub async fn outgoing_calls(
         &self,
         item: serde_json::Value,
+        limits: SemanticResultLimits,
     ) -> Result<OutgoingCallsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::OutgoingCalls { item, reply })
+            .send(ProjectRequest::OutgoingCalls {
+                item,
+                limits,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3979,6 +3994,7 @@ impl ProjectRuntime {
                 check.source_position.line.saturating_add(1),
                 check.source_position.character.saturating_add(1),
                 true,
+                SemanticResultLimits::default(),
             )
             .await;
         let source_module_present = source_symbols.is_ok_and(|result| {
@@ -4141,10 +4157,11 @@ impl ProjectRuntime {
         line: u32,
         character: u32,
         include_declaration: bool,
+        limits: SemanticResultLimits,
     ) -> Result<ReferencesResult, String> {
         let mut result = self
             .translator
-            .handle_references(file_path, line, character, include_declaration)
+            .handle_references(file_path, line, character, include_declaration, limits)
             .await
             .map_err(|error| error.to_string())?;
         for group in &mut result.groups {
@@ -4441,18 +4458,50 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    async fn incoming_calls(&self, item: serde_json::Value) -> Result<IncomingCallsResult, String> {
-        self.translator
-            .handle_incoming_calls(item)
+    async fn incoming_calls(
+        &mut self,
+        item: serde_json::Value,
+        limits: SemanticResultLimits,
+    ) -> Result<IncomingCallsResult, String> {
+        let mut result = self
+            .translator
+            .handle_incoming_calls(item, limits)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        for call in &mut result.calls {
+            let item = &mut call.from;
+            item.symbol_handle = item.source.as_ref().and_then(|source| {
+                self.source_handle(
+                    source,
+                    item.selection_range.start.line,
+                    item.selection_range.start.character,
+                )
+            });
+        }
+        Ok(result)
     }
 
-    async fn outgoing_calls(&self, item: serde_json::Value) -> Result<OutgoingCallsResult, String> {
-        self.translator
-            .handle_outgoing_calls(item)
+    async fn outgoing_calls(
+        &mut self,
+        item: serde_json::Value,
+        limits: SemanticResultLimits,
+    ) -> Result<OutgoingCallsResult, String> {
+        let mut result = self
+            .translator
+            .handle_outgoing_calls(item, limits)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        for call in &mut result.calls {
+            let item = &mut call.to;
+            item.symbol_handle = item.source.as_ref().and_then(|source| {
+                self.source_handle(
+                    source,
+                    item.selection_range.start.line,
+                    item.selection_range.start.character,
+                )
+            });
+        }
+        Ok(result)
     }
 
     async fn signature_help(
@@ -5249,11 +5298,12 @@ async fn handle_project_request(
             line,
             character,
             include_declaration,
+            limits,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .references(file_path, line, character, include_declaration)
+                    .references(file_path, line, character, include_declaration, limits)
                     .await,
             );
         }
@@ -5455,11 +5505,19 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::IncomingCalls { item, reply } => {
-            let _ = reply.send(runtime.incoming_calls(item).await);
+        ProjectRequest::IncomingCalls {
+            item,
+            limits,
+            reply,
+        } => {
+            let _ = reply.send(runtime.incoming_calls(item, limits).await);
         }
-        ProjectRequest::OutgoingCalls { item, reply } => {
-            let _ = reply.send(runtime.outgoing_calls(item).await);
+        ProjectRequest::OutgoingCalls {
+            item,
+            limits,
+            reply,
+        } => {
+            let _ = reply.send(runtime.outgoing_calls(item, limits).await);
         }
         ProjectRequest::SignatureHelp {
             file_path,
@@ -8757,7 +8815,13 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle
-            .references(file.display().to_string(), 0, 0, false)
+            .references(
+                file.display().to_string(),
+                0,
+                0,
+                false,
+                SemanticResultLimits::default(),
+            )
             .await;
 
         assert!(matches!(

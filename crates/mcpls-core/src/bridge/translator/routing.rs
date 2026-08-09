@@ -1073,7 +1073,9 @@ mod tests {
             }
         });
 
-        let result = translator.handle_incoming_calls(item).await;
+        let result = translator
+            .handle_incoming_calls(item, crate::bridge::SemanticResultLimits::default())
+            .await;
 
         assert!(matches!(
             result,
@@ -1112,7 +1114,9 @@ mod tests {
             }
         });
 
-        let result = translator.handle_outgoing_calls(item).await;
+        let result = translator
+            .handle_outgoing_calls(item, crate::bridge::SemanticResultLimits::default())
+            .await;
 
         assert!(matches!(
             result,
@@ -1267,7 +1271,13 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_references(path.to_string_lossy().to_string(), 1, 1, false)
+            .handle_references(
+                path.to_string_lossy().to_string(),
+                1,
+                1,
+                false,
+                crate::bridge::SemanticResultLimits::default(),
+            )
             .await;
 
         assert!(matches!(

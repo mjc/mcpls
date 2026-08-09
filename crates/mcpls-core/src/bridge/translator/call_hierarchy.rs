@@ -9,8 +9,8 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    CallHierarchyItemResult, CallHierarchyPrepareResult, IncomingCall, IncomingCallsResult,
-    NavigationKind, OutgoingCall, OutgoingCallsResult,
+    CallHierarchyItemResult, CallHierarchyPrepareResult, CallSite, IncomingCall,
+    IncomingCallsResult, NavigationKind, OutgoingCall, OutgoingCallsResult, SemanticResultLimits,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::MAX_POSITION_VALUE;
@@ -200,6 +200,7 @@ impl Translator {
     pub async fn handle_incoming_calls(
         &self,
         item: serde_json::Value,
+        limits: SemanticResultLimits,
     ) -> Result<IncomingCallsResult> {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
@@ -236,20 +237,42 @@ impl Translator {
             .await?;
 
         // Pre-allocate and build result
-        let lsp_calls = response.unwrap_or_default();
-        let mut calls = Vec::with_capacity(lsp_calls.len());
+        let mut lsp_calls = response.unwrap_or_default();
+        stable_sort_incoming_calls(&mut lsp_calls, &self.workspace_roots);
+        let total_calls = lsp_calls.len();
+        let total_call_sites = lsp_calls.iter().map(|call| call.from_ranges.len()).sum();
+        let mut calls = Vec::with_capacity(total_calls.min(limits.total));
         let mut source_budget = super::source_context::SourceBudget::default();
+        let mut per_file = std::collections::HashMap::<String, usize>::new();
 
         for call in lsp_calls {
+            if calls.len() >= limits.total {
+                break;
+            }
             // Per the LSP spec, `fromRanges` are ranges within the *caller's*
             // document (`call.from.uri`), not the queried item's document.
             let from_uri = call.from.uri.clone();
-            let from_ranges = {
-                let mut ranges = Vec::with_capacity(call.from_ranges.len());
-                for range in call.from_ranges {
-                    ranges.push(ctx.normalize_range(&from_uri, range).await);
+            let file_key = from_uri.to_string();
+            let count = per_file.entry(file_key).or_default();
+            if *count >= limits.per_file {
+                continue;
+            }
+            *count += 1;
+            let call_sites = {
+                let mut sites = Vec::with_capacity(call.from_ranges.len().min(limits.per_symbol));
+                for range in call.from_ranges.into_iter().take(limits.per_symbol) {
+                    let range = ctx.normalize_range(&from_uri, range).await;
+                    let source = ctx
+                        .source_context(
+                            &self.workspace_roots,
+                            &from_uri,
+                            range.clone(),
+                            &mut source_budget,
+                        )
+                        .await;
+                    sites.push(CallSite { range, source });
                 }
-                ranges
+                sites
             };
 
             calls.push(IncomingCall {
@@ -260,11 +283,25 @@ impl Translator {
                     &mut source_budget,
                 )
                 .await,
-                from_ranges,
+                call_sites,
             });
         }
 
-        Ok(IncomingCallsResult { calls })
+        let returned_calls = calls.len();
+        let returned_call_sites = calls.iter().map(|call| call.call_sites.len()).sum();
+        Ok(IncomingCallsResult {
+            provider: "standard_lsp".to_owned(),
+            calls,
+            total_calls,
+            returned_calls,
+            total_call_sites,
+            returned_call_sites,
+            omitted_groups: total_calls.saturating_sub(returned_calls),
+            truncated: source_budget.truncated()
+                || returned_calls < total_calls
+                || returned_call_sites < total_call_sites,
+            limits,
+        })
     }
 
     /// Handle outgoing calls request.
@@ -276,6 +313,7 @@ impl Translator {
     pub async fn handle_outgoing_calls(
         &self,
         item: serde_json::Value,
+        limits: SemanticResultLimits,
     ) -> Result<OutgoingCallsResult> {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
@@ -312,17 +350,39 @@ impl Translator {
             .await?;
 
         // Pre-allocate and build result
-        let lsp_calls = response.unwrap_or_default();
-        let mut calls = Vec::with_capacity(lsp_calls.len());
+        let mut lsp_calls = response.unwrap_or_default();
+        stable_sort_outgoing_calls(&mut lsp_calls, &self.workspace_roots);
+        let total_calls = lsp_calls.len();
+        let total_call_sites = lsp_calls.iter().map(|call| call.from_ranges.len()).sum();
+        let mut calls = Vec::with_capacity(total_calls.min(limits.total));
         let mut source_budget = super::source_context::SourceBudget::default();
+        let mut per_file = std::collections::HashMap::<String, usize>::new();
 
         for call in lsp_calls {
-            let from_ranges = {
-                let mut ranges = Vec::with_capacity(call.from_ranges.len());
-                for range in call.from_ranges {
-                    ranges.push(ctx.normalize_range(&source_uri, range).await);
+            if calls.len() >= limits.total {
+                break;
+            }
+            let file_key = call.to.uri.to_string();
+            let count = per_file.entry(file_key).or_default();
+            if *count >= limits.per_file {
+                continue;
+            }
+            *count += 1;
+            let call_sites = {
+                let mut sites = Vec::with_capacity(call.from_ranges.len().min(limits.per_symbol));
+                for range in call.from_ranges.into_iter().take(limits.per_symbol) {
+                    let range = ctx.normalize_range(&source_uri, range).await;
+                    let source = ctx
+                        .source_context(
+                            &self.workspace_roots,
+                            &source_uri,
+                            range.clone(),
+                            &mut source_budget,
+                        )
+                        .await;
+                    sites.push(CallSite { range, source });
                 }
-                ranges
+                sites
             };
 
             calls.push(OutgoingCall {
@@ -333,12 +393,61 @@ impl Translator {
                     &mut source_budget,
                 )
                 .await,
-                from_ranges,
+                call_sites,
             });
         }
 
-        Ok(OutgoingCallsResult { calls })
+        let returned_calls = calls.len();
+        let returned_call_sites = calls.iter().map(|call| call.call_sites.len()).sum();
+        Ok(OutgoingCallsResult {
+            provider: "standard_lsp".to_owned(),
+            calls,
+            total_calls,
+            returned_calls,
+            total_call_sites,
+            returned_call_sites,
+            omitted_groups: total_calls.saturating_sub(returned_calls),
+            truncated: source_budget.truncated()
+                || returned_calls < total_calls
+                || returned_call_sites < total_call_sites,
+            limits,
+        })
     }
+}
+
+fn source_order(uri: &lsp_types::Uri, roots: &[std::path::PathBuf]) -> u8 {
+    let Some(path) = crate::bridge::state::uri_to_path(uri) else {
+        return 2;
+    };
+    if !roots.iter().any(|root| path.starts_with(root)) {
+        return 2;
+    }
+    let text = path.to_string_lossy();
+    u8::from(text.contains("/tests/") || text.ends_with("_test.rs"))
+}
+
+fn stable_sort_incoming_calls(
+    calls: &mut [CallHierarchyIncomingCall],
+    roots: &[std::path::PathBuf],
+) {
+    calls.sort_by(|left, right| {
+        source_order(&left.from.uri, roots)
+            .cmp(&source_order(&right.from.uri, roots))
+            .then_with(|| left.from.uri.as_str().cmp(right.from.uri.as_str()))
+            .then_with(|| left.from.range.start.line.cmp(&right.from.range.start.line))
+    });
+}
+
+fn stable_sort_outgoing_calls(
+    calls: &mut [CallHierarchyOutgoingCall],
+    roots: &[std::path::PathBuf],
+) {
+    calls.sort_by(|left, right| {
+        source_order(&left.to.uri, roots)
+            .cmp(&source_order(&right.to.uri, roots))
+            .then_with(|| left.to.uri.as_str().cmp(right.to.uri.as_str()))
+            .then_with(|| left.to.range.start.line.cmp(&right.to.range.start.line))
+    });
 }
 
 #[cfg(test)]
@@ -354,6 +463,14 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    fn assert_source_available(source: &super::super::dto::SourceContext) {
+        assert!(matches!(
+            source,
+            super::super::dto::SourceContext::Available(_)
+        ));
+    }
+
     use crate::bridge::translator::dto::{Position2D, Range};
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
@@ -390,7 +507,9 @@ mod tests {
     async fn test_handle_incoming_calls_invalid_json() {
         let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
-        let result = translator.handle_incoming_calls(invalid_item).await;
+        let result = translator
+            .handle_incoming_calls(invalid_item, SemanticResultLimits::default())
+            .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
@@ -398,7 +517,9 @@ mod tests {
     async fn test_handle_outgoing_calls_invalid_json() {
         let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
-        let result = translator.handle_outgoing_calls(invalid_item).await;
+        let result = translator
+            .handle_outgoing_calls(invalid_item, SemanticResultLimits::default())
+            .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
 
@@ -511,7 +632,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_incoming_calls(item, SemanticResultLimits::default())
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -550,7 +675,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.calls.len(), 1);
-        let from_range = &result.calls[0].from_ranges[0];
+        assert_source_available(&result.calls[0].call_sites[0].source);
+        let from_range = &result.calls[0].call_sites[0].range;
         assert_eq!(
             from_range.end.character, 3,
             "fromRanges must convert against the caller's own file (\"aöb\"), not the queried \
@@ -620,7 +746,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(async move { translator.handle_outgoing_calls(item).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_outgoing_calls(item, SemanticResultLimits::default())
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -659,7 +789,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.calls.len(), 1);
-        let from_range = &result.calls[0].from_ranges[0];
+        assert_source_available(&result.calls[0].call_sites[0].source);
+        let from_range = &result.calls[0].call_sites[0].range;
         assert_eq!(
             from_range.end.character, 3,
             "fromRanges must convert against the queried item's own file (\"aöb\"), not the \

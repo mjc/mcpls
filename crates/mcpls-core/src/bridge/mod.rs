@@ -29,10 +29,10 @@ pub use translator::{
     DocumentSymbolOptions, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
     IncomingCallsResult, InlayHintsResult, Location, LocationsResult, OutgoingCallsResult,
     Position2D, ProjectActivation, ProviderSynchronization, Range, ReferencesResult, RenameResult,
-    SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, SourceContext, SupportedWorkspaceEdit, Symbol,
-    SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
-    WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
+    SemanticDiscoveryKind, SemanticDiscoveryResult, SemanticResultLimits, ServerCapability,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SourceContext,
+    SupportedWorkspaceEdit, Symbol, SymbolHandle, TextEdit, Translator, TranslatorTemplate,
+    WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
     convert_code_action_or_command,
 };
 

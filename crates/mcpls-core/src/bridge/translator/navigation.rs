@@ -9,8 +9,9 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    DefinitionResult, HoverResult, Location, LocationsResult, NavigationKind, Position2D, Range,
-    ReferenceGroup, ReferenceRole, ReferenceUse, ReferencesResult,
+    DefinitionResult, DocumentSymbolOptions, HoverResult, Location, LocationsResult,
+    NavigationKind, Position2D, Range, ReferenceGroup, ReferenceRole, ReferenceUse,
+    ReferencesResult, SemanticResultLimits, Symbol,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::source_context::SourceBudget;
@@ -228,6 +229,7 @@ impl Translator {
         line: u32,
         character: u32,
         include_declaration: bool,
+        limits: SemanticResultLimits,
     ) -> Result<ReferencesResult> {
         let (server_id, client, uri) = self
             .prepare_gated_document(
@@ -247,7 +249,7 @@ impl Translator {
 
         let params = ReferenceParams {
             text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: lsp_position,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -261,15 +263,63 @@ impl Translator {
             .request("textDocument/references", params, client.request_timeout())
             .await?;
 
-        let locations = response.unwrap_or_default();
+        let mut locations = response.unwrap_or_default();
+        let declaration = if include_declaration {
+            let definition_params = GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: lsp_position,
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            let definitions: Option<lsp_types::GotoDefinitionResponse> = client
+                .request(
+                    "textDocument/definition",
+                    definition_params,
+                    client.request_timeout(),
+                )
+                .await
+                .unwrap_or_default();
+            let declaration = flatten_goto_response(definitions).into_iter().next();
+            if let Some(index) = declaration.as_ref().and_then(|declaration| {
+                locations
+                    .iter()
+                    .position(|location| location == declaration)
+            }) {
+                locations.remove(index);
+            }
+            declaration
+        } else {
+            None
+        };
 
-        let total_references = locations.len();
-        let mut result_locations = Vec::with_capacity(total_references);
+        let total_references = locations.len() + usize::from(declaration.is_some());
+        let mut result_locations = Vec::with_capacity(locations.len());
         let mut budget = SourceBudget::default();
+        let declaration = if let Some(location) = declaration {
+            Some(ReferenceUse {
+                location: ctx
+                    .location(&self.workspace_roots, location, &mut budget)
+                    .await,
+                role: ReferenceRole::Declaration,
+            })
+        } else {
+            None
+        };
         for loc in locations {
             result_locations.push(ctx.location(&self.workspace_roots, loc, &mut budget).await);
         }
-        let result = group_references(result_locations, &self.workspace_roots, budget.truncated());
+        let enclosing_symbols = self.reference_symbols(&result_locations).await;
+        let result = group_references(
+            result_locations,
+            declaration,
+            total_references,
+            &self.workspace_roots,
+            &enclosing_symbols,
+            limits,
+            budget.truncated(),
+        );
 
         Ok(result)
     }
@@ -406,18 +456,51 @@ impl Translator {
     }
 }
 
+impl Translator {
+    async fn reference_symbols(
+        &self,
+        locations: &[Location],
+    ) -> std::collections::HashMap<String, Vec<Symbol>> {
+        let paths = locations
+            .iter()
+            .filter_map(|location| location.path.as_ref())
+            .filter(|path| {
+                self.workspace_roots
+                    .iter()
+                    .any(|root| std::path::Path::new(path.as_str()).starts_with(root))
+            })
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let requests = paths.into_iter().map(|path| async move {
+            let result = self
+                .handle_document_symbols(path.clone(), DocumentSymbolOptions::internal_tree())
+                .await;
+            (path, result)
+        });
+        futures::future::join_all(requests)
+            .await
+            .into_iter()
+            .filter_map(|(path, result)| result.ok().map(|result| (path, result.symbols)))
+            .collect()
+    }
+}
+
 fn group_references(
     mut locations: Vec<Location>,
+    declaration: Option<ReferenceUse>,
+    total_references: usize,
     workspace_roots: &[std::path::PathBuf],
+    enclosing_symbols: &std::collections::HashMap<String, Vec<Symbol>>,
+    limits: SemanticResultLimits,
     source_truncated: bool,
 ) -> ReferencesResult {
     locations.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
+        reference_source_order(left, workspace_roots)
+            .cmp(&reference_source_order(right, workspace_roots))
+            .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.range.start.line.cmp(&right.range.start.line))
             .then_with(|| left.range.start.character.cmp(&right.range.start.character))
     });
-    let total_references = locations.len();
     let mut groups: Vec<ReferenceGroup> = Vec::new();
     for location in locations {
         let path = location.path.as_deref().unwrap_or(&location.uri);
@@ -428,30 +511,93 @@ fn group_references(
                 || path.to_owned(),
                 |path| path.to_string_lossy().into_owned(),
             );
+        let enclosing_symbol = location
+            .path
+            .as_ref()
+            .and_then(|path| enclosing_symbols.get(path))
+            .and_then(|symbols| smallest_enclosing_symbol(symbols, &location.range.start));
         let reference = ReferenceUse {
             location,
             role: ReferenceRole::Unknown,
         };
-        if let Some(group) = groups
-            .last_mut()
-            .filter(|group| group.project_relative_path == project_relative_path)
-        {
+        if let Some(group) = groups.last_mut().filter(|group| {
+            group.project_relative_path == project_relative_path
+                && group.enclosing_symbol == enclosing_symbol
+        }) {
             group.references.push(reference);
         } else {
             groups.push(ReferenceGroup {
                 project_relative_path,
-                enclosing_symbol: None,
+                enclosing_symbol,
                 references: vec![reference],
             });
         }
     }
+    let total_groups = groups.len();
+    let declaration = declaration.filter(|_| limits.total > 0);
+    let mut returned_references = usize::from(declaration.is_some());
+    let mut per_file = std::collections::HashMap::<String, usize>::new();
+    groups.retain_mut(|group| {
+        let file_count = per_file
+            .entry(group.project_relative_path.clone())
+            .or_default();
+        if *file_count >= limits.per_file || returned_references >= limits.total {
+            return false;
+        }
+        let available = limits
+            .total
+            .saturating_sub(returned_references)
+            .min(limits.per_file.saturating_sub(*file_count))
+            .min(limits.per_symbol);
+        group.references.truncate(available);
+        *file_count += group.references.len();
+        returned_references += group.references.len();
+        !group.references.is_empty()
+    });
+    let returned_groups = groups.len();
+    let omitted_groups = total_groups.saturating_sub(returned_groups);
     ReferencesResult {
         provider: "standard_lsp".to_owned(),
         groups,
+        declaration,
         total_references,
-        returned_references: total_references,
-        truncated: source_truncated,
+        returned_references,
+        total_groups,
+        returned_groups,
+        omitted_groups,
+        limits,
+        truncated: source_truncated || returned_references < total_references,
     }
+}
+
+fn reference_source_order(location: &Location, roots: &[std::path::PathBuf]) -> u8 {
+    let Some(path) = location.path.as_deref().map(std::path::Path::new) else {
+        return 2;
+    };
+    if !roots.iter().any(|root| path.starts_with(root)) {
+        return 2;
+    }
+    let text = path.to_string_lossy();
+    u8::from(text.contains("/tests/") || text.ends_with("_test.rs"))
+}
+
+fn smallest_enclosing_symbol(symbols: &[Symbol], position: &Position2D) -> Option<String> {
+    smallest_enclosing_symbol_at(symbols, (position.line, position.character))
+}
+
+fn smallest_enclosing_symbol_at(symbols: &[Symbol], position: (u32, u32)) -> Option<String> {
+    symbols.iter().find_map(|symbol| {
+        let start = (symbol.range.start.line, symbol.range.start.character);
+        let end = (symbol.range.end.line, symbol.range.end.character);
+        if position < start || position > end {
+            return None;
+        }
+        symbol
+            .children
+            .as_deref()
+            .and_then(|children| smallest_enclosing_symbol_at(children, position))
+            .or_else(|| Some(symbol.name.clone()))
+    })
 }
 
 #[cfg(test)]
@@ -530,7 +676,11 @@ mod tests {
                 unavailable_location("/workspace/src/lib.rs", 2),
                 unavailable_location("/workspace/src/lib.rs", 4),
             ],
+            None,
+            2,
             &[std::path::PathBuf::from("/workspace")],
+            &std::collections::HashMap::new(),
+            SemanticResultLimits::default(),
             false,
         );
 
@@ -541,6 +691,144 @@ mod tests {
         assert_eq!(
             value["groups"][0]["references"].as_array().unwrap().len(),
             2
+        );
+    }
+
+    #[test]
+    fn references_apply_per_symbol_limit() {
+        let result = group_references(
+            vec![
+                unavailable_location("/workspace/src/lib.rs", 2),
+                unavailable_location("/workspace/src/lib.rs", 4),
+                unavailable_location("/workspace/src/lib.rs", 6),
+            ],
+            None,
+            3,
+            &[std::path::PathBuf::from("/workspace")],
+            &std::collections::HashMap::new(),
+            SemanticResultLimits {
+                total: 10,
+                per_file: 1,
+                per_symbol: 1,
+            },
+            false,
+        );
+
+        assert_eq!(result.total_references, 3);
+        assert_eq!(result.returned_references, 1);
+        assert_eq!(result.groups[0].references.len(), 1);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn references_apply_total_and_per_file_limits() {
+        let roots = [std::path::PathBuf::from("/workspace")];
+        let locations = || {
+            vec![
+                unavailable_location("/workspace/src/a.rs", 2),
+                unavailable_location("/workspace/src/a.rs", 4),
+                unavailable_location("/workspace/src/b.rs", 2),
+            ]
+        };
+        let total_limited = group_references(
+            locations(),
+            None,
+            3,
+            &roots,
+            &std::collections::HashMap::new(),
+            SemanticResultLimits {
+                total: 1,
+                per_file: 10,
+                per_symbol: 10,
+            },
+            false,
+        );
+        let file_limited = group_references(
+            locations(),
+            None,
+            3,
+            &roots,
+            &std::collections::HashMap::new(),
+            SemanticResultLimits {
+                total: 10,
+                per_file: 1,
+                per_symbol: 10,
+            },
+            false,
+        );
+
+        assert_eq!(total_limited.returned_references, 1);
+        assert_eq!(file_limited.returned_references, 2);
+        assert!(total_limited.truncated && file_limited.truncated);
+    }
+
+    #[test]
+    fn references_group_same_line_uses_by_enclosing_symbol() {
+        let mut first = unavailable_location("/workspace/src/lib.rs", 4);
+        first.range.start.character = 3;
+        let mut second = unavailable_location("/workspace/src/lib.rs", 4);
+        second.range.start.character = 9;
+        let symbol = Symbol {
+            name: "caller".to_owned(),
+            kind: "Function".to_owned(),
+            range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 1,
+                },
+                end: Position2D {
+                    line: 8,
+                    character: 1,
+                },
+            },
+            selection_range: Range {
+                start: Position2D {
+                    line: 1,
+                    character: 4,
+                },
+                end: Position2D {
+                    line: 1,
+                    character: 10,
+                },
+            },
+            symbol_handle: None,
+            container_name: None,
+            match_class: None,
+            score: None,
+            source: None,
+            is_private: false,
+            is_test: false,
+            children: None,
+        };
+        let symbols =
+            std::collections::HashMap::from([("/workspace/src/lib.rs".to_owned(), vec![symbol])]);
+
+        let result = group_references(
+            vec![second, first],
+            None,
+            2,
+            &[std::path::PathBuf::from("/workspace")],
+            &symbols,
+            SemanticResultLimits::default(),
+            false,
+        );
+
+        assert_eq!(result.groups[0].enclosing_symbol.as_deref(), Some("caller"));
+        assert_eq!(
+            result.groups[0].references[0]
+                .location
+                .range
+                .start
+                .character,
+            3
+        );
+        assert_eq!(
+            result.groups[0].references[1]
+                .location
+                .range
+                .start
+                .character,
+            9
         );
     }
 }

@@ -187,10 +187,21 @@ pub struct ReferencesResult {
     pub provider: String,
     /// References grouped by project-relative file.
     pub groups: Vec<ReferenceGroup>,
+    /// Declaration location, returned once and excluded from use groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<ReferenceUse>,
     /// Number of references reported by the language server.
     pub total_references: usize,
     /// Number of references returned after response budgets.
     pub returned_references: usize,
+    /// Number of file/symbol groups before limits.
+    pub total_groups: usize,
+    /// Number of file/symbol groups returned.
+    pub returned_groups: usize,
+    /// Number of complete groups omitted by limits.
+    pub omitted_groups: usize,
+    /// Limits applied to this result.
+    pub limits: SemanticResultLimits,
     /// Whether response budgets omitted source or references.
     pub truncated: bool,
 }
@@ -220,8 +231,46 @@ pub struct ReferenceUse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceRole {
+    /// Definition or declaration, identified by a language-server definition result.
+    Declaration,
     /// The language server did not provide enough information to classify it.
     Unknown,
+}
+
+/// Shared bounds for reference and call-hierarchy results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SemanticResultLimits {
+    /// Maximum references or call groups returned overall.
+    #[serde(default = "default_semantic_total_limit")]
+    pub total: usize,
+    /// Maximum groups returned from one file.
+    #[serde(default = "default_semantic_per_file_limit")]
+    pub per_file: usize,
+    /// Maximum references or call sites returned for one symbol.
+    #[serde(default = "default_semantic_per_symbol_limit")]
+    pub per_symbol: usize,
+}
+
+const fn default_semantic_total_limit() -> usize {
+    200
+}
+
+const fn default_semantic_per_file_limit() -> usize {
+    50
+}
+
+const fn default_semantic_per_symbol_limit() -> usize {
+    25
+}
+
+impl Default for SemanticResultLimits {
+    fn default() -> Self {
+        Self {
+            total: default_semantic_total_limit(),
+            per_file: default_semantic_per_file_limit(),
+            per_symbol: default_semantic_per_symbol_limit(),
+        }
+    }
 }
 
 /// Diagnostic severity.
@@ -639,14 +688,39 @@ pub struct IncomingCall {
     /// The item that calls the current item.
     pub from: CallHierarchyItemResult,
     /// Ranges where the call occurs.
-    pub from_ranges: Vec<Range>,
+    pub call_sites: Vec<CallSite>,
+}
+
+/// One bounded call site in a caller's source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallSite {
+    /// Highlighted call expression range.
+    pub range: Range,
+    /// Bounded source surrounding the call.
+    pub source: SourceContext,
 }
 
 /// Result of incoming calls request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingCallsResult {
+    /// Stable protocol provider identity.
+    pub provider: String,
     /// List of incoming calls.
     pub calls: Vec<IncomingCall>,
+    /// Complete call-group count before limits.
+    pub total_calls: usize,
+    /// Returned call-group count.
+    pub returned_calls: usize,
+    /// Complete call-site count before limits.
+    pub total_call_sites: usize,
+    /// Returned call-site count.
+    pub returned_call_sites: usize,
+    /// Groups omitted by limits.
+    pub omitted_groups: usize,
+    /// Whether any item or source budget truncated the result.
+    pub truncated: bool,
+    /// Limits applied to this result.
+    pub limits: SemanticResultLimits,
 }
 
 /// An outgoing call (callee from the current item).
@@ -655,14 +729,30 @@ pub struct OutgoingCall {
     /// The item being called.
     pub to: CallHierarchyItemResult,
     /// Ranges where the call occurs.
-    pub from_ranges: Vec<Range>,
+    pub call_sites: Vec<CallSite>,
 }
 
 /// Result of outgoing calls request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutgoingCallsResult {
+    /// Stable protocol provider identity.
+    pub provider: String,
     /// List of outgoing calls.
     pub calls: Vec<OutgoingCall>,
+    /// Complete call-group count before limits.
+    pub total_calls: usize,
+    /// Returned call-group count.
+    pub returned_calls: usize,
+    /// Complete call-site count before limits.
+    pub total_call_sites: usize,
+    /// Returned call-site count.
+    pub returned_call_sites: usize,
+    /// Groups omitted by limits.
+    pub omitted_groups: usize,
+    /// Whether any item or source budget truncated the result.
+    pub truncated: bool,
+    /// Limits applied to this result.
+    pub limits: SemanticResultLimits,
 }
 
 /// Result of server logs request.

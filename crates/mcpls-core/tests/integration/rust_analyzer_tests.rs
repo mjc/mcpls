@@ -123,8 +123,7 @@ async fn wait_for_indexing_ready(
 
         match hover_result {
             Ok(result) => {
-                let text = serde_json::to_string(&result).unwrap_or_default();
-                if text.contains("fn add") && text.contains("i32") {
+                if result.contents.contains("fn add") && result.contents.contains("i32") {
                     consecutive += 1;
                     if consecutive >= required_consecutive {
                         return;
@@ -339,6 +338,7 @@ async fn test_references_create_repo_function() {
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let functions_file = workspace_path.join("src/functions.rs");
+    let (line, character) = find_position(&functions_file, "create_repo");
 
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
@@ -348,9 +348,10 @@ async fn test_references_create_repo_function() {
         Duration::from_secs(10),
         translator.lock().await.handle_references(
             functions_file.to_string_lossy().to_string(),
-            7,
-            12,   // Position on "create_repo"
+            line,
+            character,
             true, // Include declaration
+            mcpls_core::bridge::SemanticResultLimits::default(),
         ),
     )
     .await;
@@ -370,6 +371,7 @@ async fn test_references_create_repo_function() {
         refs_json.returned_references > 0,
         "Should find at least one reference (the definition)"
     );
+    assert!(refs_json.declaration.is_some());
 }
 
 #[tokio::test]
@@ -383,6 +385,7 @@ async fn test_references_user_struct() {
     let translator = setup_rust_analyzer().await;
     let workspace_path = rust_workspace_path();
     let lib_file = workspace_path.join("src/lib.rs");
+    let (line, character) = find_position(&lib_file, "User {");
 
     wait_for_indexing_ready(&translator, &rust_workspace_path(), Duration::from_secs(30)).await;
 
@@ -392,9 +395,10 @@ async fn test_references_user_struct() {
         Duration::from_secs(10),
         translator.lock().await.handle_references(
             lib_file.to_string_lossy().to_string(),
-            18,
-            15, // Position on "User"
+            line,
+            character,
             true,
+            mcpls_core::bridge::SemanticResultLimits::default(),
         ),
     )
     .await;
@@ -410,6 +414,13 @@ async fn test_references_user_struct() {
         refs_json.returned_references >= 2,
         "Should find multiple references to User struct, got: {}",
         refs_json.returned_references
+    );
+    assert!(refs_json.declaration.is_some());
+    assert!(
+        refs_json
+            .groups
+            .iter()
+            .any(|group| group.enclosing_symbol.is_some())
     );
 }
 

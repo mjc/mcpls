@@ -469,7 +469,15 @@ impl McplsServer {
     async fn call_hierarchy_target(
         &self,
         params: CallHierarchyCallsParams,
-    ) -> Result<(ProjectHandle, serde_json::Value), McpError> {
+    ) -> Result<
+        (
+            ProjectHandle,
+            serde_json::Value,
+            crate::bridge::SemanticResultLimits,
+        ),
+        McpError,
+    > {
+        let limits = params.limits;
         if params.symbol_handle.is_some() {
             let (actor, file_path, line, character) = self
                 .semantic_target(params.project_id, params.symbol_handle, String::new(), 0, 0)
@@ -488,7 +496,7 @@ impl McplsServer {
                     )
                 })?;
             return serde_json::to_value(item)
-                .map(|item| (actor, item))
+                .map(|item| (actor, item, limits))
                 .map_err(|error| McpError::internal_error(error.to_string(), None));
         }
         let item = params.item.ok_or_else(|| {
@@ -500,7 +508,7 @@ impl McplsServer {
             .required_actor_for_path(&path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        Ok((actor, item))
+        Ok((actor, item, limits))
     }
     async fn daemon_snapshot(&self) -> DaemonSnapshot {
         let projects = self.context.project_registry.status_snapshot().await;
@@ -1422,7 +1430,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "All references to symbol at position. Returns locations across workspace where symbol is used."
+        description = "References grouped by project-relative file and enclosing symbol, with one declaration, bounded source frames, counts, and truncation metadata."
     )]
     async fn get_references(
         &self,
@@ -1433,13 +1441,14 @@ impl McplsServer {
             project_id,
             symbol_handle,
             include_declaration,
+            limits,
         }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
         let result = actor
-            .references(file_path, line, character, include_declaration)
+            .references(file_path, line, character, include_declaration, limits)
             .await
             .map_err(|error| error.to_string());
 
@@ -1765,15 +1774,15 @@ impl McplsServer {
 
     /// Get incoming calls (callers).
     #[tool(
-        description = "Functions calling the specified item. Takes call hierarchy item, returns all callers."
+        description = "Functions calling the specified item, with caller declarations and bounded source for every returned call site."
     )]
     async fn get_incoming_calls(
         &self,
         Parameters(params): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let (actor, item) = self.call_hierarchy_target(params).await?;
+        let (actor, item, limits) = self.call_hierarchy_target(params).await?;
         let result = actor
-            .incoming_calls(item)
+            .incoming_calls(item, limits)
             .await
             .map_err(|error| error.to_string());
 
@@ -1782,15 +1791,15 @@ impl McplsServer {
 
     /// Get outgoing calls (callees).
     #[tool(
-        description = "Functions called by the specified item. Takes call hierarchy item, returns all callees."
+        description = "Functions called by the specified item, with callee declarations and bounded source for every returned call site."
     )]
     async fn get_outgoing_calls(
         &self,
         Parameters(params): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let (actor, item) = self.call_hierarchy_target(params).await?;
+        let (actor, item, limits) = self.call_hierarchy_target(params).await?;
         let result = actor
-            .outgoing_calls(item)
+            .outgoing_calls(item, limits)
             .await
             .map_err(|error| error.to_string());
 
@@ -5121,6 +5130,7 @@ while True:
                 project_id: None,
                 symbol_handle: None,
                 include_declaration: false,
+                limits: crate::bridge::SemanticResultLimits::default(),
             }))
             .await;
 
@@ -5506,6 +5516,7 @@ while True:
             project_id: None,
             symbol_handle: None,
             include_declaration: false,
+            limits: crate::bridge::SemanticResultLimits::default(),
         });
 
         let result = server.get_references(params).await;
@@ -5640,6 +5651,7 @@ while True:
             item: Some(item),
             project_id: None,
             symbol_handle: None,
+            limits: crate::bridge::SemanticResultLimits::default(),
         });
         let result = server.get_incoming_calls(params).await;
         assert!(result.is_err());
@@ -5665,6 +5677,7 @@ while True:
             item: Some(item),
             project_id: None,
             symbol_handle: None,
+            limits: crate::bridge::SemanticResultLimits::default(),
         });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
@@ -5699,6 +5712,7 @@ while True:
                 item: Some(item),
                 project_id: None,
                 symbol_handle: None,
+                limits: crate::bridge::SemanticResultLimits::default(),
             }))
             .await;
         let error = result.unwrap_err().to_string();
@@ -5734,6 +5748,7 @@ while True:
                 item: Some(item),
                 project_id: None,
                 symbol_handle: None,
+                limits: crate::bridge::SemanticResultLimits::default(),
             }))
             .await;
         let error = result.unwrap_err().to_string();
