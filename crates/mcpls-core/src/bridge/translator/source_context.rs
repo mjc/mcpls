@@ -324,6 +324,7 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let uri = tracker.open(path.clone(), "initial\n".to_owned()).unwrap();
         assert_eq!(tracker.update(&path, "dirty λ\n".to_owned()), Some(2));
+        tokio::fs::remove_file(&path).await.unwrap();
 
         let source = resolve_source_context(
             &tracker,
