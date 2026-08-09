@@ -30,7 +30,7 @@ Gungraun cannot describe latency or retained memory in an external
 rust-analyzer process. On Linux, run:
 
 ```sh
-nix develop --command python3 benchmarks/rust_analyzer_memory.py \
+nix develop --command cargo run -p mcpls-bench --bin rust-analyzer-memory -- \
   --profile mcpls \
   --root "$PWD" \
   --output target/benchmarks/rust-analyzer-memory.json
@@ -100,7 +100,7 @@ keeps an incomplete or fabricated local checkout from being reported as the
 acceptance matrix. Run it against the live MCPLS daemon with its PID:
 
 ```sh
-python3 benchmarks/mcpls_residency.py \
+cargo run -p mcpls-bench --bin mcpls-residency -- \
   --manifest target/benchmarks/mcpls-residency.json \
   --pid "$(systemctl --user show mcpls.service -p MainPID --value)" \
   --activation-timeout 180 \
