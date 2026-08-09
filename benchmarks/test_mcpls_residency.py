@@ -17,6 +17,7 @@ from mcpls_residency import (
     process_summary,
     rust_analyzer_count,
     validate_registered_groups,
+    validate_process_snapshot,
     wait_until_ready,
 )
 
@@ -159,6 +160,12 @@ class RegistrationTests(unittest.TestCase):
 
 
 class ResultTests(unittest.TestCase):
+    def test_rejects_a_rust_group_without_a_rust_analyzer_process(self):
+        with self.assertRaisesRegex(RuntimeError, "no rust-analyzer process"):
+            validate_process_snapshot(
+                {"rust_analyzer_count": 0}, active_group_count=1, max_active_groups=1
+            )
+
     def test_counts_rust_analyzer_processes_in_a_process_name_sample(self):
         self.assertEqual(
             rust_analyzer_count(
