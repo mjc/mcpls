@@ -59,7 +59,8 @@ pub struct SupportedWorkspaceEdit {
     pub edit: Option<WorkspaceEdit>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
 /// Semantic discovery operation requested from the active Rust analyzer.
 pub enum SemanticDiscoveryKind {
     /// Standard declaration lookup.
@@ -91,6 +92,8 @@ pub struct SemanticDiscoveryResult {
     pub supported: bool,
     /// Stable name of the protocol provider.
     pub provider: String,
+    /// Semantic relationship represented by location results.
+    pub kind: SemanticDiscoveryKind,
     /// Locations returned by declaration or module discovery.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
@@ -108,10 +111,11 @@ pub struct SemanticDiscoveryResult {
 }
 
 impl SemanticDiscoveryResult {
-    fn empty(supported: bool, provider: &str) -> Self {
+    fn empty(supported: bool, provider: &str, kind: SemanticDiscoveryKind) -> Self {
         Self {
             supported,
             provider: provider.to_string(),
+            kind,
             locations: Vec::new(),
             selection_ranges: Vec::new(),
             macro_expansion: None,
@@ -1037,7 +1041,7 @@ impl Translator {
             decision
         };
         if !supported {
-            return Ok(SemanticDiscoveryResult::empty(false, provider));
+            return Ok(SemanticDiscoveryResult::empty(false, provider, kind));
         }
         let ctx = self.encoding_ctx(&id);
         let position = ctx.to_lsp(&uri, line, character).await;
@@ -1046,7 +1050,7 @@ impl Translator {
             position,
         };
         let timeout = client.request_timeout();
-        let mut result = SemanticDiscoveryResult::empty(true, provider);
+        let mut result = SemanticDiscoveryResult::empty(true, provider, kind);
         match kind {
             SemanticDiscoveryKind::Declaration => {
                 let response: Option<lsp_types::GotoDefinitionResponse> = client
@@ -1060,8 +1064,13 @@ impl Translator {
                         timeout,
                     )
                     .await?;
-                (result.locations, result.truncated) =
-                    bounded_locations(response, &ctx, &self.workspace_roots).await;
+                (result.locations, result.truncated) = super::navigation::bounded_locations(
+                    response,
+                    &ctx,
+                    &self.workspace_roots,
+                    MAX_DISCOVERY_ITEMS,
+                )
+                .await;
             }
             SemanticDiscoveryKind::ParentModule | SemanticDiscoveryKind::ChildModules => {
                 let method = if matches!(kind, SemanticDiscoveryKind::ParentModule) {
@@ -1071,8 +1080,13 @@ impl Translator {
                 };
                 let response: Option<lsp_types::GotoDefinitionResponse> =
                     client.request(method, position_params, timeout).await?;
-                (result.locations, result.truncated) =
-                    bounded_locations(response, &ctx, &self.workspace_roots).await;
+                (result.locations, result.truncated) = super::navigation::bounded_locations(
+                    response,
+                    &ctx,
+                    &self.workspace_roots,
+                    MAX_DISCOVERY_ITEMS,
+                )
+                .await;
             }
             SemanticDiscoveryKind::MacroExpansion => {
                 if let Some(mut expansion) = client
@@ -1222,32 +1236,6 @@ fn experimental_enabled(capabilities: &lsp_types::ServerCapabilities, key: &str)
             .and_then(|value| value.get(key)),
         None | Some(serde_json::Value::Null | serde_json::Value::Bool(false))
     )
-}
-
-async fn bounded_locations(
-    response: Option<lsp_types::GotoDefinitionResponse>,
-    ctx: &super::encoding_ctx::EncodingCtx,
-    workspace_roots: &[PathBuf],
-) -> (Vec<Location>, bool) {
-    let values = match response {
-        None => Vec::new(),
-        Some(lsp_types::GotoDefinitionResponse::Scalar(location)) => vec![location],
-        Some(lsp_types::GotoDefinitionResponse::Array(locations)) => locations,
-        Some(lsp_types::GotoDefinitionResponse::Link(links)) => links
-            .into_iter()
-            .map(|link| lsp_types::Location {
-                uri: link.target_uri,
-                range: link.target_selection_range,
-            })
-            .collect(),
-    };
-    let truncated = values.len() > MAX_DISCOVERY_ITEMS;
-    let mut locations = Vec::new();
-    let mut budget = super::source_context::SourceBudget::default();
-    for location in values.into_iter().take(MAX_DISCOVERY_ITEMS) {
-        locations.push(ctx.location(workspace_roots, location, &mut budget).await);
-    }
-    (locations, truncated)
 }
 
 fn bounded_json_values(values: Vec<serde_json::Value>) -> (Vec<serde_json::Value>, bool) {

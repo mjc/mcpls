@@ -8,19 +8,46 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{DefinitionResult, HoverResult, Location, LocationsResult, ReferencesResult};
+use super::dto::{
+    DefinitionResult, HoverResult, Location, LocationsResult, NavigationKind, Position2D, Range,
+    ReferencesResult,
+};
 use super::encoding_ctx::EncodingCtx;
 use super::source_context::SourceBudget;
 use crate::config::ToolKind;
 use crate::error::Result;
 
-/// Normalize a `GotoDefinitionResponse` into a flat list of MCP `Location` values.
-async fn goto_response_to_locations(
+const MAX_NAVIGATION_TARGETS: usize = 64;
+
+/// Normalize a `GotoDefinitionResponse` into bounded MCP `Location` values.
+pub(super) async fn bounded_locations(
     response: Option<lsp_types::GotoDefinitionResponse>,
     ctx: &EncodingCtx,
     workspace_roots: &[std::path::PathBuf],
-) -> Vec<Location> {
-    let lsp_locs: Vec<lsp_types::Location> = match response {
+    max_targets: usize,
+) -> (Vec<Location>, bool) {
+    let (lsp_locs, truncated_items) = bounded_targets(flatten_goto_response(response), max_targets);
+    let mut locations = Vec::with_capacity(lsp_locs.len());
+    let mut budget = SourceBudget::default();
+    for loc in lsp_locs {
+        locations.push(ctx.location(workspace_roots, loc, &mut budget).await);
+    }
+    (locations, truncated_items || budget.truncated())
+}
+
+fn bounded_targets(
+    mut locations: Vec<lsp_types::Location>,
+    max_targets: usize,
+) -> (Vec<lsp_types::Location>, bool) {
+    let truncated = locations.len() > max_targets;
+    locations.truncate(max_targets);
+    (locations, truncated)
+}
+
+fn flatten_goto_response(
+    response: Option<lsp_types::GotoDefinitionResponse>,
+) -> Vec<lsp_types::Location> {
+    match response {
         Some(lsp_types::GotoDefinitionResponse::Scalar(loc)) => vec![loc],
         Some(lsp_types::GotoDefinitionResponse::Array(locs)) => locs,
         Some(lsp_types::GotoDefinitionResponse::Link(links)) => links
@@ -31,14 +58,7 @@ async fn goto_response_to_locations(
             })
             .collect(),
         None => vec![],
-    };
-
-    let mut locations = Vec::with_capacity(lsp_locs.len());
-    let mut budget = SourceBudget::default();
-    for loc in lsp_locs {
-        locations.push(ctx.location(workspace_roots, loc, &mut budget).await);
     }
-    locations
 }
 
 fn extract_hover_contents(contents: HoverContents) -> String {
@@ -101,24 +121,38 @@ impl Translator {
             .request("textDocument/hover", params, client.request_timeout())
             .await?;
 
-        let result = match response {
+        let (contents, range) = match response {
             Some(hover) => {
                 let contents = extract_hover_contents(hover.contents);
                 let range = match hover.range {
                     Some(r) => Some(ctx.normalize_range(&response_uri, r).await),
                     None => None,
                 };
-                HoverResult {
-                    contents,
-                    range,
-                    symbol_handle: None,
-                }
+                (contents, range)
             }
-            None => HoverResult {
-                contents: "No hover information available".to_string(),
-                range: None,
-                symbol_handle: None,
-            },
+            None => ("No hover information available".to_string(), None),
+        };
+        let source_range = range.clone().unwrap_or(Range {
+            start: Position2D { line, character },
+            end: Position2D { line, character },
+        });
+        let mut budget = SourceBudget::default();
+        let source = ctx
+            .source_context(
+                &self.workspace_roots,
+                &response_uri,
+                source_range,
+                &mut budget,
+            )
+            .await;
+        let result = HoverResult {
+            provider: "standard_lsp".to_owned(),
+            kind: NavigationKind::Hover,
+            contents,
+            range,
+            source,
+            truncated: budget.truncated(),
+            symbol_handle: None,
         };
 
         Ok(result)
@@ -165,8 +199,18 @@ impl Translator {
             .request("textDocument/definition", params, client.request_timeout())
             .await?;
 
+        let (locations, truncated) = bounded_locations(
+            response,
+            &ctx,
+            &self.workspace_roots,
+            MAX_NAVIGATION_TARGETS,
+        )
+        .await;
         let result = DefinitionResult {
-            locations: goto_response_to_locations(response, &ctx, &self.workspace_roots).await,
+            provider: "standard_lsp".to_owned(),
+            kind: NavigationKind::Definition,
+            locations,
+            truncated,
         };
 
         Ok(result)
@@ -281,8 +325,18 @@ impl Translator {
             )
             .await?;
 
+        let (locations, truncated) = bounded_locations(
+            response,
+            &ctx,
+            &self.workspace_roots,
+            MAX_NAVIGATION_TARGETS,
+        )
+        .await;
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response, &ctx, &self.workspace_roots).await,
+            provider: "standard_lsp".to_owned(),
+            kind: NavigationKind::Implementation,
+            locations,
+            truncated,
         })
     }
 
@@ -337,8 +391,18 @@ impl Translator {
             )
             .await?;
 
+        let (locations, truncated) = bounded_locations(
+            response,
+            &ctx,
+            &self.workspace_roots,
+            MAX_NAVIGATION_TARGETS,
+        )
+        .await;
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response, &ctx, &self.workspace_roots).await,
+            provider: "standard_lsp".to_owned(),
+            kind: NavigationKind::TypeDefinition,
+            locations,
+            truncated,
         })
     }
 }
@@ -376,5 +440,24 @@ mod tests {
         let contents = lsp_types::HoverContents::Markup(markup);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "# Documentation");
+    }
+
+    #[test]
+    fn navigation_target_limit_is_explicit_for_multiple_definitions() {
+        let uri: lsp_types::Uri = "file:///workspace/lib.rs".parse().unwrap();
+        let location = lsp_types::Location {
+            uri,
+            range: lsp_types::Range::default(),
+        };
+        let locations =
+            flatten_goto_response(Some(lsp_types::GotoDefinitionResponse::Array(vec![
+                location;
+                MAX_NAVIGATION_TARGETS
+                    + 1
+            ])));
+        let (locations, truncated) = bounded_targets(locations, MAX_NAVIGATION_TARGETS);
+
+        assert_eq!(locations.len(), MAX_NAVIGATION_TARGETS);
+        assert!(truncated);
     }
 }

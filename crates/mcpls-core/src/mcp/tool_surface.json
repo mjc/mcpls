@@ -166,7 +166,7 @@
   {
     "name": "get_definition",
     "title": "Go to Definition",
-    "description": "Definition location of symbol at position. Returns file path, line, and character where declared.",
+    "description": "Bounded definition targets with provider identity, source frames, symbol handles, and explicit truncation state.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -275,7 +275,7 @@
   {
     "name": "get_hover",
     "title": "Hover",
-    "description": "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols.",
+    "description": "Type, documentation, provider identity, snapshot-bound symbol handle, and bounded source frame at a position.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -547,7 +547,7 @@
   {
     "name": "go_to_implementation",
     "title": "Go to Implementation",
-    "description": "Implementation locations of trait method or interface member at position.",
+    "description": "Bounded implementation targets with provider identity, source frames, symbol handles, and explicit truncation state.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -585,7 +585,7 @@
   {
     "name": "go_to_type_definition",
     "title": "Go to Type Definition",
-    "description": "Type definition location of expression at position. Distinct from go-to-definition for variable bindings.",
+    "description": "Bounded type-definition targets with provider identity, source frames, symbol handles, and explicit truncation state.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -623,7 +623,7 @@
   {
     "name": "prepare_call_hierarchy",
     "title": "Prepare Call Hierarchy",
-    "description": "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis.",
+    "description": "Prepare bounded call-hierarchy targets with provider identity, source frames, and symbol handles for follow-up analysis.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

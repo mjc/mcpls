@@ -14,13 +14,21 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 #[derive(Debug)]
 pub(super) struct SourceBudget {
     remaining_bytes: usize,
+    truncated: bool,
 }
 
 impl Default for SourceBudget {
     fn default() -> Self {
         Self {
             remaining_bytes: MAX_RESPONSE_BYTES,
+            truncated: false,
         }
+    }
+}
+
+impl SourceBudget {
+    pub(super) const fn truncated(&self) -> bool {
+        self.truncated
     }
 }
 
@@ -70,6 +78,7 @@ pub(super) async fn resolve_source_context_with_max_lines(
         });
     };
     if budget.remaining_bytes == 0 {
+        budget.truncated = true;
         return unavailable(SourceUnavailableReason::ResponseBudgetExhausted);
     }
 
@@ -122,6 +131,8 @@ pub(super) async fn resolve_source_context_with_max_lines(
     let canonical_uri =
         path_to_uri(&canonical_path).map_or_else(|_| uri.to_string(), |uri| uri.to_string());
 
+    let truncated = start > 0 || returned_lines < selected.len() || end < total_lines;
+    budget.truncated |= truncated;
     SourceContext::Available(SourceFrame {
         path: canonical_path.to_string_lossy().into_owned(),
         uri: canonical_uri,
@@ -135,7 +146,7 @@ pub(super) async fn resolve_source_context_with_max_lines(
         total_lines,
         returned_bytes,
         total_bytes,
-        truncated: start > 0 || returned_lines < selected.len() || end < total_lines,
+        truncated,
     })
 }
 
@@ -233,6 +244,7 @@ impl EncodingCtx {
             .source_context(workspace_roots, &location.uri, range.clone(), budget)
             .await;
         Location {
+            path: uri_to_path(&location.uri).map(|path| path.to_string_lossy().into_owned()),
             uri: location.uri.to_string(),
             range,
             source,
@@ -403,7 +415,10 @@ mod tests {
         tokio::fs::write(&path, "x\n").await.unwrap();
         let uri = path_to_uri(&path).unwrap();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let mut budget = SourceBudget { remaining_bytes: 8 };
+        let mut budget = SourceBudget {
+            remaining_bytes: 8,
+            truncated: false,
+        };
         let source = resolve_source_context(
             &tracker,
             &[workspace.path().into()],

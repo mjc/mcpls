@@ -10,12 +10,14 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{
     CallHierarchyItemResult, CallHierarchyPrepareResult, IncomingCall, IncomingCallsResult,
-    OutgoingCall, OutgoingCallsResult,
+    NavigationKind, OutgoingCall, OutgoingCallsResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::MAX_POSITION_VALUE;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
+
+const MAX_PREPARED_ITEMS: usize = 64;
 
 /// Whether a server's capabilities advertise `callHierarchyProvider` support.
 ///
@@ -105,6 +107,8 @@ async fn convert_call_hierarchy_item(
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0),
         detail: item.detail,
+        path: crate::bridge::state::uri_to_path(&item.uri)
+            .map(|path| path.to_string_lossy().into_owned()),
         uri: item.uri.to_string(),
         range,
         selection_range,
@@ -169,16 +173,22 @@ impl Translator {
 
         // Pre-allocate and build result
         let lsp_items = response.unwrap_or_default();
-        let mut items = Vec::with_capacity(lsp_items.len());
+        let truncated_items = lsp_items.len() > MAX_PREPARED_ITEMS;
+        let mut items = Vec::with_capacity(lsp_items.len().min(MAX_PREPARED_ITEMS));
         let mut source_budget = super::source_context::SourceBudget::default();
-        for item in lsp_items {
+        for item in lsp_items.into_iter().take(MAX_PREPARED_ITEMS) {
             items.push(
                 convert_call_hierarchy_item(item, &ctx, &self.workspace_roots, &mut source_budget)
                     .await,
             );
         }
 
-        Ok(CallHierarchyPrepareResult { items })
+        Ok(CallHierarchyPrepareResult {
+            provider: "standard_lsp".to_owned(),
+            kind: NavigationKind::CallHierarchy,
+            truncated: truncated_items || source_budget.truncated(),
+            items,
+        })
     }
 
     /// Handle incoming calls request.
@@ -471,6 +481,7 @@ mod tests {
             kind: 12,
             detail: None,
             uri: queried_uri,
+            path: None,
             range: Range {
                 start: Position2D {
                     line: 1,
@@ -579,6 +590,7 @@ mod tests {
             kind: 12,
             detail: None,
             uri: queried_uri,
+            path: None,
             range: Range {
                 start: Position2D {
                     line: 1,

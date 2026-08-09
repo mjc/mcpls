@@ -49,6 +49,9 @@ pub struct Range {
 /// Location in a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Location {
+    /// Human-readable filesystem path for file-backed targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// URI of the document.
     pub uri: String,
     /// Range within the document.
@@ -122,13 +125,43 @@ pub enum SourceUnavailableReason {
     ResponseBudgetExhausted,
 }
 
+/// Semantic relationship represented by a navigation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationKind {
+    /// Hover data for the selected symbol.
+    Hover,
+    /// The symbol's definition.
+    Definition,
+    /// A declaration distinct from its definition.
+    Declaration,
+    /// The definition of the selected value's type.
+    TypeDefinition,
+    /// An implementation of the selected trait or interface member.
+    Implementation,
+    /// A parent Rust module.
+    ParentModule,
+    /// A child Rust module.
+    ChildModule,
+    /// A callable accepted by call-hierarchy preparation.
+    CallHierarchy,
+}
+
 /// Result of a hover request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoverResult {
+    /// Stable protocol provider identity.
+    pub provider: String,
+    /// Relationship represented by this result.
+    pub kind: NavigationKind,
     /// Hover contents as markdown string.
     pub contents: String,
     /// Optional range the hover applies to.
     pub range: Option<Range>,
+    /// Bounded source surrounding the hovered target.
+    pub source: SourceContext,
+    /// Whether the source preview was shortened by a response budget.
+    pub truncated: bool,
     /// Snapshot-bound target for coordinate-free semantic follow-ups.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_handle: Option<SymbolHandle>,
@@ -137,8 +170,14 @@ pub struct HoverResult {
 /// Result of a definition request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionResult {
+    /// Stable protocol provider identity.
+    pub provider: String,
+    /// Relationship represented by the returned targets.
+    pub kind: NavigationKind,
     /// Locations of the definition.
     pub locations: Vec<Location>,
+    /// Whether item or response budgets omitted target data.
+    pub truncated: bool,
 }
 
 /// Result of a references request.
@@ -520,6 +559,9 @@ pub struct CallHierarchyItemResult {
     pub detail: Option<String>,
     /// URI of the document.
     pub uri: String,
+    /// Human-readable filesystem path for file-backed targets.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// Range of the symbol.
     pub range: Range,
     /// Selection range (identifier location).
@@ -544,8 +586,14 @@ pub struct CallHierarchyItemResult {
 /// Result of call hierarchy prepare request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallHierarchyPrepareResult {
+    /// Stable protocol provider identity.
+    pub provider: String,
+    /// Relationship represented by the returned items.
+    pub kind: NavigationKind,
     /// List of callable items at the position.
     pub items: Vec<CallHierarchyItemResult>,
+    /// Whether item or response budgets omitted target data.
+    pub truncated: bool,
 }
 
 /// An incoming call (caller of the current item).
@@ -632,8 +680,14 @@ pub struct SignatureHelpResult {
 /// Result of a go-to-implementation or go-to-type-definition request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationsResult {
+    /// Stable protocol provider identity.
+    pub provider: String,
+    /// Relationship represented by the returned targets.
+    pub kind: NavigationKind,
     /// Locations found.
     pub locations: Vec<Location>,
+    /// Whether item or response budgets omitted target data.
+    pub truncated: bool,
 }
 
 /// A single inlay hint entry.

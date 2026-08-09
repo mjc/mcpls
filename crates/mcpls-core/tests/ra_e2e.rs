@@ -318,7 +318,15 @@ fn wait_until_ready(client: &mut McpClient, lib_rs: &Path) {
                 let is_err = r["result"]["isError"].as_bool().unwrap_or(false);
                 let text = assertions::content_text(r);
                 // Require both "fn add" and "i32" to confirm type-checking is done.
-                if text.contains("fn add") && text.contains("i32") {
+                let hover_is_ready =
+                    serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .is_some_and(|value| {
+                            value["contents"].as_str().is_some_and(|contents| {
+                                contents.contains("fn add") && contents.contains("i32")
+                            })
+                        });
+                if hover_is_ready {
                     consecutive += 1;
                     if consecutive >= required_consecutive {
                         println!("[ra_e2e] rust-analyzer is ready");
@@ -391,6 +399,15 @@ fn sc_get_hover(client: &mut McpClient, workspace: &Path) -> Result<(), String> 
     if !hover_text.contains("i32") {
         return Err(format!("hover text missing 'i32': {hover_text}"));
     }
+    if inner["provider"] != "standard_lsp"
+        || inner["kind"] != "hover"
+        || inner["source"]["status"] != "available"
+        || inner["source"]["path"].as_str().is_none()
+        || inner["truncated"].as_bool().is_none()
+        || inner["symbol_handle"].as_str().is_none()
+    {
+        return Err(format!("hover omitted model-ready target context: {inner}"));
+    }
     Ok(())
 }
 
@@ -425,6 +442,17 @@ fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     if !uri.ends_with("/src/lib.rs") {
         return Err(format!(
             "definition URI does not end with '/src/lib.rs': {uri}"
+        ));
+    }
+    if inner["provider"] != "standard_lsp"
+        || inner["kind"] != "definition"
+        || inner["truncated"].as_bool().is_none()
+        || locs[0]["path"].as_str().is_none()
+        || locs[0]["source"]["status"] != "available"
+        || locs[0]["symbol_handle"].as_str().is_none()
+    {
+        return Err(format!(
+            "definition omitted model-ready target context: {inner}"
         ));
     }
     Ok(())
@@ -961,6 +989,16 @@ fn prepare_call_hierarchy_item(client: &mut McpClient, workspace: &Path) -> Resu
 
     if items.is_empty() {
         return Err("prepare_call_hierarchy returned no items".to_owned());
+    }
+    if inner["provider"] != "standard_lsp"
+        || inner["kind"] != "call_hierarchy"
+        || items[0]["path"].as_str().is_none()
+        || items[0]["source"]["status"] != "available"
+        || items[0]["symbol_handle"].as_str().is_none()
+    {
+        return Err(format!(
+            "call-hierarchy preparation omitted target context: {inner}"
+        ));
     }
 
     let name = items[0]["name"].as_str().unwrap_or("");
@@ -1814,6 +1852,17 @@ fn sc_semantic_discovery(client: &mut McpClient, workspace: &Path) -> Result<(),
             "declaration lookup was not capability-gated: {declaration}"
         ));
     }
+    if declaration["kind"] != "declaration"
+        || declaration["locations"][0]["path"].as_str().is_none()
+        || declaration["locations"][0]["source"]["status"] != "available"
+        || declaration["locations"][0]["symbol_handle"]
+            .as_str()
+            .is_none()
+    {
+        return Err(format!(
+            "declaration omitted model-ready target context: {declaration}"
+        ));
+    }
     let declaration_line = declaration["locations"][0]["range"]["start"]["line"]
         .as_u64()
         .ok_or_else(|| format!("declaration lookup returned no location: {declaration}"))?;
@@ -1855,6 +1904,7 @@ fn sc_semantic_discovery(client: &mut McpClient, workspace: &Path) -> Result<(),
         }),
     )?;
     if parent["supported"] != true
+        || parent["kind"] != "parent_module"
         || !parent["locations"].as_array().is_some_and(|locations| {
             locations.iter().any(|location| {
                 location["uri"]
@@ -1878,6 +1928,7 @@ fn sc_semantic_discovery(client: &mut McpClient, workspace: &Path) -> Result<(),
         }),
     )?;
     if children["supported"] != true
+        || children["kind"] != "child_modules"
         || !children["locations"].as_array().is_some_and(|locations| {
             locations.iter().any(|location| {
                 location["uri"]

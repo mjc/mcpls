@@ -3477,20 +3477,33 @@ impl ProjectRuntime {
         self.generation == generation
     }
 
-    fn attach_location_handle(&mut self, location: &mut crate::bridge::Location) {
-        let SourceContext::Available(frame) = &location.source else {
-            return;
+    fn source_handle(
+        &mut self,
+        source: &SourceContext,
+        line: u32,
+        character: u32,
+    ) -> Option<SymbolHandle> {
+        let SourceContext::Available(frame) = source else {
+            return None;
         };
         let snapshot = frame.document_version.map_or_else(
             || SourceSnapshot::Hash(frame.content_hash.clone()),
             SourceSnapshot::Version,
         );
-        location.symbol_handle = Some(self.symbol_handles.insert(StoredSymbolTarget::new(
+        Some(self.symbol_handles.insert(StoredSymbolTarget::new(
             PathBuf::from(&frame.path),
+            line,
+            character,
+            snapshot,
+        )))
+    }
+
+    fn attach_location_handle(&mut self, location: &mut crate::bridge::Location) {
+        location.symbol_handle = self.source_handle(
+            &location.source,
             location.range.start.line,
             location.range.start.character,
-            snapshot,
-        )));
+        );
     }
 
     fn attach_location_handles<'a>(
@@ -3524,23 +3537,6 @@ impl ProjectRuntime {
             "stale_symbol_handle: source changed; rerun symbol discovery to refresh the handle"
                 .to_owned()
         })
-    }
-
-    async fn new_symbol_handle(
-        &mut self,
-        file_path: &str,
-        line: u32,
-        character: u32,
-    ) -> Result<SymbolHandle, String> {
-        let (path, version, hash, _) = self
-            .translator
-            .source_snapshot(Path::new(file_path))
-            .await
-            .map_err(|error| error.to_string())?;
-        let snapshot = version.map_or(SourceSnapshot::Hash(hash), SourceSnapshot::Version);
-        Ok(self
-            .symbol_handles
-            .insert(StoredSymbolTarget::new(path, line, character, snapshot)))
     }
 
     fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
@@ -4117,7 +4113,10 @@ impl ProjectRuntime {
             .handle_hover(file_path.clone(), line, character)
             .await
             .map_err(|error| error.to_string())?;
-        result.symbol_handle = Some(self.new_symbol_handle(&file_path, line, character).await?);
+        let target = result.range.as_ref().map_or((line, character), |range| {
+            (range.start.line, range.start.character)
+        });
+        result.symbol_handle = self.source_handle(&result.source, target.0, target.1);
         Ok(result)
     }
 
@@ -4427,19 +4426,13 @@ impl ProjectRuntime {
             .await
             .map_err(|error| error.to_string())?;
         for item in &mut result.items {
-            let Some(SourceContext::Available(frame)) = item.source.as_ref() else {
-                continue;
-            };
-            let snapshot = frame.document_version.map_or_else(
-                || SourceSnapshot::Hash(frame.content_hash.clone()),
-                SourceSnapshot::Version,
-            );
-            item.symbol_handle = Some(self.symbol_handles.insert(StoredSymbolTarget::new(
-                PathBuf::from(&frame.path),
-                item.selection_range.start.line,
-                item.selection_range.start.character,
-                snapshot,
-            )));
+            item.symbol_handle = item.source.as_ref().and_then(|source| {
+                self.source_handle(
+                    source,
+                    item.selection_range.start.line,
+                    item.selection_range.start.character,
+                )
+            });
         }
         Ok(result)
     }

@@ -86,11 +86,20 @@ JSON object with hover information:
 
 ```json
 {
+  "provider": "standard_lsp",
+  "kind": "hover",
   "contents": "```rust\nstruct User {\n    id: u64,\n    name: String,\n}\n```\n\nUser information structure.",
   "range": {
     "start": { "line": 10, "character": 5 },
     "end": { "line": 10, "character": 9 }
-  }
+  },
+  "source": {
+    "status": "available",
+    "path": "/absolute/path/to/file.rs",
+    "text": "   9 | /// User information.\n  10 | struct User {\n"
+  },
+  "truncated": true,
+  "symbol_handle": "opaque-snapshot-bound-id"
 }
 ```
 
@@ -140,18 +149,23 @@ Jump to the definition of a symbol at a specific position.
 
 ### Returns
 
-Array of definition locations:
+Bounded definition result:
 
 ```json
-[
-  {
+{
+  "provider": "standard_lsp",
+  "kind": "definition",
+  "locations": [{
     "uri": "file:///absolute/path/to/definition.rs",
     "range": {
       "start": { "line": 5, "character": 0 },
       "end": { "line": 5, "character": 14 }
-    }
-  }
-]
+    },
+    "source": { "status": "available", "text": "   5 | pub fn charge() {\n" },
+    "symbol_handle": "opaque-snapshot-bound-id"
+  }],
+  "truncated": false
+}
 ```
 
 ### Example Use Cases
@@ -172,8 +186,9 @@ Claude: [Uses get_definition] The User struct is defined in src/models/user.rs:
 ### Notes
 
 - May return multiple locations for symbols with multiple definitions
-- Returns empty array if no definition found
+- Returns an empty `locations` array if no definition is found
 - Works across file boundaries
+- Each target reports why source is unavailable; per-item and response budgets are explicit through `source.truncated`, `source.reason`, and result `truncated`
 
 ---
 
@@ -754,7 +769,7 @@ Prepare call hierarchy at a position to get callable items.
 
 ### Returns
 
-Array of call hierarchy items that can be used with `get_incoming_calls` or `get_outgoing_calls`.
+A bounded object with `provider`, `kind`, `items`, and `truncated`. Each item includes a source frame and symbol handle and can be passed to `get_incoming_calls` or `get_outgoing_calls`.
 
 ---
 
@@ -998,19 +1013,7 @@ Jump to all implementations of a trait, interface, or abstract method.
 
 ### Returns
 
-Array of locations where the symbol is implemented:
-
-```json
-[
-  {
-    "uri": "file:///src/handlers/api_handler.rs",
-    "range": {
-      "start": { "line": 12, "character": 0 },
-      "end": { "line": 12, "character": 28 }
-    }
-  }
-]
-```
+The same bounded object shape as [get_definition](#get_definition), with `kind: "implementation"`.
 
 ### Example Use Cases
 
@@ -1046,7 +1049,7 @@ Jump to the type definition of the value under the cursor (e.g. follow a typedef
 
 ### Returns
 
-Array of type definition locations (same shape as [get_definition](#get_definition)).
+The same bounded object shape as [get_definition](#get_definition), with `kind: "type_definition"`.
 
 ### Notes
 

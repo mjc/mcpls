@@ -1280,7 +1280,7 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(
-        description = "Type and documentation info at position. Returns signatures, docs, and inferred types for symbols."
+        description = "Type, documentation, provider identity, snapshot-bound symbol handle, and bounded source frame at a position."
     )]
     async fn get_hover(
         &self,
@@ -1309,7 +1309,7 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = "Definition location of symbol at position. Returns file path, line, and character where declared."
+        description = "Bounded definition targets with provider identity, source frames, symbol handles, and explicit truncation state."
     )]
     async fn get_definition(
         &self,
@@ -1338,7 +1338,7 @@ impl McplsServer {
 
     /// Get the declaration location, distinct from a symbol's definition.
     #[tool(
-        description = "Project-scoped standard LSP declaration lookup. Returns supported=false when the active server does not advertise textDocument/declaration."
+        description = "Project-scoped declaration targets with bounded source frames and symbol handles. Returns supported=false when unavailable."
     )]
     async fn get_declaration(
         &self,
@@ -1350,7 +1350,7 @@ impl McplsServer {
 
     /// Locate the Rust module containing a position.
     #[tool(
-        description = "Project-scoped rust-analyzer parent-module navigation as read-only location data. Returns supported=false when unavailable."
+        description = "Project-scoped rust-analyzer parent-module target with a bounded source frame and symbol handle. Returns supported=false when unavailable."
     )]
     async fn get_parent_module(
         &self,
@@ -1362,7 +1362,7 @@ impl McplsServer {
 
     /// Locate child Rust modules declared at a position.
     #[tool(
-        description = "Project-scoped rust-analyzer child-module navigation as bounded read-only location data. Returns supported=false when unavailable."
+        description = "Project-scoped rust-analyzer child-module targets with bounded source frames and symbol handles. Returns supported=false when unavailable."
     )]
     async fn get_child_modules(
         &self,
@@ -1736,7 +1736,7 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = "Prepare call hierarchy at position. Returns callable items for incoming/outgoing call analysis."
+        description = "Prepare bounded call-hierarchy targets with provider identity, source frames, and symbol handles for follow-up analysis."
     )]
     async fn prepare_call_hierarchy(
         &self,
@@ -1915,7 +1915,7 @@ impl McplsServer {
 
     /// Go to implementation locations.
     #[tool(
-        description = "Implementation locations of trait method or interface member at position."
+        description = "Bounded implementation targets with provider identity, source frames, symbol handles, and explicit truncation state."
     )]
     async fn go_to_implementation(
         &self,
@@ -1944,7 +1944,7 @@ impl McplsServer {
 
     /// Go to type definition location.
     #[tool(
-        description = "Type definition location of expression at position. Distinct from go-to-definition for variable bindings."
+        description = "Bounded type-definition targets with provider identity, source frames, symbol handles, and explicit truncation state."
     )]
     async fn go_to_type_definition(
         &self,
