@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Built-in Nix and Linux/macOS Swift language-server profiles** — add marker-gated `nixd` and `sourcekit-lsp` defaults on platforms supported by the Swift toolchain; add Nix to the default extension map so ast-grep fallback recognizes `.nix` files.
+
 ## [0.3.9] - 2026-08-05
 
 ### Added

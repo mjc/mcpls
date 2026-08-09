@@ -121,7 +121,7 @@ This is a preference, not a restriction: per the LSP spec, UTF-16 is a mandatory
 ### `workspace.language_extensions`
 
 **Type**: Array of `LanguageExtensionMapping` objects
-**Default**: 30 built-in language mappings (see below)
+**Default**: 31 built-in language mappings (see below)
 
 Custom file extension to language ID mappings. Allows you to:
 - Add support for specialized file types
@@ -149,7 +149,7 @@ language_id = "python"
 
 #### Default Language Mappings
 
-mcpls includes 30 language mappings by default:
+mcpls includes 31 language mappings by default:
 
 | Language | Extensions | Language ID |
 |----------|-----------|-------------|
@@ -166,6 +166,7 @@ mcpls includes 30 language mappings by default:
 | Ruby | rb | ruby |
 | PHP | php | php |
 | Swift | swift | swift |
+| Nix | nix | nix |
 | Kotlin | kt, kts | kotlin |
 | Scala | scala, sc | scala |
 | Zig | zig | zig |
@@ -203,7 +204,7 @@ extensions = ["py", "pyi"]
 language_id = "python"
 ```
 
-This reduces memory usage compared to loading all 30 default mappings.
+This reduces memory usage compared to loading all 31 default mappings.
 
 ### `workspace.max_documents`
 

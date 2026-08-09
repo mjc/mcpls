@@ -384,6 +384,41 @@ impl LspServerConfig {
             ["build.zig", "build.zig.zon"],
         )
     }
+
+    /// Create a default configuration for nixd.
+    #[must_use]
+    pub fn nixd() -> Self {
+        Self::builtin(
+            "nix",
+            "nixd",
+            &[],
+            &["**/*.nix"],
+            [
+                "flake.nix",
+                "shell.nix",
+                "default.nix",
+                "configuration.nix",
+                "home.nix",
+            ],
+        )
+    }
+
+    /// Create a default configuration for sourcekit-lsp on Linux and macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[must_use]
+    pub fn sourcekit_lsp() -> Self {
+        Self::builtin(
+            "swift",
+            "sourcekit-lsp",
+            &[],
+            &["**/*.swift"],
+            [
+                "Package.swift",
+                "project.pbxproj",
+                "contents.xcworkspacedata",
+            ],
+        )
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +465,35 @@ mod tests {
         assert_eq!(config.file_patterns, vec!["**/*.ts", "**/*.tsx"]);
         assert!(config.initialization_options.is_none());
         assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_nixd_defaults() {
+        let config = LspServerConfig::nixd();
+
+        assert_eq!(config.language_id, "nix");
+        assert_eq!(config.command, "nixd");
+        assert!(config.args.is_empty());
+        assert_eq!(config.file_patterns, vec!["**/*.nix"]);
+        assert!(config.heuristics.is_some());
+        let markers = &config.heuristics.unwrap().project_markers;
+        assert!(markers.contains(&"flake.nix".to_string()));
+        assert!(markers.contains(&"configuration.nix".to_string()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_sourcekit_lsp_defaults() {
+        let config = LspServerConfig::sourcekit_lsp();
+
+        assert_eq!(config.language_id, "swift");
+        assert_eq!(config.command, "sourcekit-lsp");
+        assert!(config.args.is_empty());
+        assert_eq!(config.file_patterns, vec!["**/*.swift"]);
+        assert!(config.heuristics.is_some());
+        let markers = &config.heuristics.unwrap().project_markers;
+        assert!(markers.contains(&"Package.swift".to_string()));
+        assert!(markers.contains(&"project.pbxproj".to_string()));
     }
 
     #[test]

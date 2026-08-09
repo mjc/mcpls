@@ -212,6 +212,8 @@ mcpls uses smart heuristics to spawn only relevant language servers. Each server
 | Go | gopls | `go.mod`, `go.sum` |
 | C/C++ | clangd | `CMakeLists.txt`, `compile_commands.json`, `Makefile` |
 | Zig | zls | `build.zig`, `build.zig.zon` |
+| Nix | nixd | `flake.nix`, `shell.nix`, `default.nix`, `configuration.nix`, `home.nix` |
+| Swift (Linux/macOS) | sourcekit-lsp | `Package.swift`, `project.pbxproj`, `contents.xcworkspacedata` |
 
 > [!TIP]
 > Heuristics use OR logic — if ANY marker exists, the server spawns.

@@ -489,6 +489,10 @@ fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
             language_id: "swift".to_string(),
         },
         LanguageExtensionMapping {
+            extensions: vec!["nix".to_string()],
+            language_id: "nix".to_string(),
+        },
+        LanguageExtensionMapping {
             extensions: vec!["kt".to_string(), "kts".to_string()],
             language_id: "kotlin".to_string(),
         },
@@ -940,6 +944,9 @@ impl Default for ServerConfig {
                 LspServerConfig::gopls(),
                 LspServerConfig::clangd(),
                 LspServerConfig::zls(),
+                LspServerConfig::nixd(),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                LspServerConfig::sourcekit_lsp(),
             ],
             daemon: DaemonConfig::default(),
             project_config_ignored: false,
@@ -959,13 +966,23 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
-        assert_eq!(config.lsp_servers.len(), 6);
+        assert_eq!(
+            config.lsp_servers.len(),
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                8
+            } else {
+                7
+            }
+        );
         assert_eq!(config.lsp_servers[0].language_id, "rust");
         assert_eq!(config.lsp_servers[1].language_id, "python");
         assert_eq!(config.lsp_servers[2].language_id, "typescript");
         assert_eq!(config.lsp_servers[3].language_id, "go");
         assert_eq!(config.lsp_servers[4].language_id, "cpp");
         assert_eq!(config.lsp_servers[5].language_id, "zig");
+        assert_eq!(config.lsp_servers[6].language_id, "nix");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(config.lsp_servers[7].language_id, "swift");
         assert_eq!(config.workspace.position_encodings, vec!["utf-8", "utf-16"]);
     }
 
@@ -1517,7 +1534,7 @@ mod tests {
         assert!(workspace.roots.is_empty());
         assert_eq!(workspace.position_encodings, vec!["utf-8", "utf-16"]);
         assert!(!workspace.language_extensions.is_empty());
-        assert_eq!(workspace.language_extensions.len(), 30);
+        assert_eq!(workspace.language_extensions.len(), 31);
         assert_eq!(workspace.heuristics_max_depth, DEFAULT_HEURISTICS_MAX_DEPTH);
     }
 
@@ -1842,6 +1859,10 @@ mod tests {
             Some("python".to_string())
         );
         assert_eq!(
+            workspace.get_language_for_extension("nix"),
+            Some("nix".to_string())
+        );
+        assert_eq!(
             workspace.get_language_for_extension("cpp"),
             Some("cpp".to_string())
         );
@@ -1857,8 +1878,15 @@ mod tests {
         assert!(config_path.exists());
 
         let loaded_config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(loaded_config.workspace.language_extensions.len(), 30);
-        assert_eq!(loaded_config.lsp_servers.len(), 6);
+        assert_eq!(loaded_config.workspace.language_extensions.len(), 31);
+        assert_eq!(
+            loaded_config.lsp_servers.len(),
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                8
+            } else {
+                7
+            }
+        );
         assert_eq!(loaded_config.lsp_servers[0].language_id, "rust");
     }
 
@@ -1866,8 +1894,15 @@ mod tests {
     fn test_load_returns_default_config() {
         // When called directly, default() should return config with all language extensions
         let config = ServerConfig::default();
-        assert_eq!(config.workspace.language_extensions.len(), 30);
-        assert_eq!(config.lsp_servers.len(), 6);
+        assert_eq!(config.workspace.language_extensions.len(), 31);
+        assert_eq!(
+            config.lsp_servers.len(),
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                8
+            } else {
+                7
+            }
+        );
         assert_eq!(config.lsp_servers[0].language_id, "rust");
     }
 
