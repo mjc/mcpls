@@ -1,0 +1,32 @@
+[package]
+name = "mcpls-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcpls-residency"
+path = "src/bin/mcpls-residency.rs"
+
+[[bin]]
+name = "rust-analyzer-memory"
+path = "src/bin/rust-analyzer-memory.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1254,6 +1254,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcpls-bench"
+version = "0.3.9"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "mcpls-core"
 version = "0.3.9"
 dependencies = [
