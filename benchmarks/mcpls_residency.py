@@ -181,14 +181,26 @@ class McpClient:
 def descendants(pid):
     pending = [pid]
     result = []
+    seen = set()
     while pending:
         current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
         result.append(current)
         try:
-            children = pathlib.Path(f"/proc/{current}/task/{current}/children").read_text()
-            pending.extend(int(child) for child in children.split())
-        except (FileNotFoundError, ProcessLookupError):
-            pass
+            task_dir = pathlib.Path(f"/proc/{current}/task")
+            task_ids = [task.name for task in task_dir.iterdir()]
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        for task_id in task_ids:
+            try:
+                children = pathlib.Path(
+                    f"/proc/{current}/task/{task_id}/children"
+                ).read_text()
+                pending.extend(int(child) for child in children.split())
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                continue
     return result
 
 

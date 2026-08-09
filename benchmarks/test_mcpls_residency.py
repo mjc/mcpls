@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -179,6 +180,20 @@ class ResultTests(unittest.TestCase):
 
         self.assertGreaterEqual(summary["process_count"], 1)
         self.assertTrue(summary["process_names"])
+
+    def test_process_summary_finds_a_child_started_by_a_non_leader_thread(self):
+        child = []
+
+        def start_child():
+            child.append(subprocess.Popen(["sleep", "5"]))
+
+        thread = threading.Thread(target=start_child)
+        thread.start()
+        thread.join()
+        self.addCleanup(child[0].terminate)
+        self.addCleanup(child[0].wait)
+
+        self.assertIn("sleep", process_summary(os.getpid())["process_names"])
 
     def test_counts_symbols_in_the_mcp_result_object(self):
         class Client:
