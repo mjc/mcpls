@@ -651,6 +651,42 @@ fn sc_get_document_symbols(client: &mut McpClient, workspace: &Path) -> Result<(
             return Err(format!("symbol '{expected}' not found in document symbols"));
         }
     }
+    if inner["filters"]["max_depth"] != 1
+        || inner["returned"].as_u64().is_none()
+        || inner["total"].as_u64().is_none()
+        || !inner["truncated"].is_boolean()
+        || syms.iter().any(|symbol| symbol["children"].is_array())
+        || syms.iter().any(|symbol| {
+            symbol["source"]["status"] != "available" || !symbol["symbol_handle"].is_string()
+        })
+    {
+        return Err(format!("compact outline contract is incomplete: {inner}"));
+    }
+
+    let private = client
+        .call_tool(
+            "get_document_symbols",
+            &json!({
+                "file_path": lib.to_string_lossy(),
+                "query": "fmt",
+                "match_mode": "exact",
+                "max_depth": 4,
+                "include_private": true
+            }),
+        )
+        .map_err(|e| format!("private outline query failed: {e}"))?;
+    let private: Value = serde_json::from_str(&assertions::assert_tool_ok(&private))
+        .map_err(|e| format!("bad private outline JSON: {e}"))?;
+    let private_symbols = private["symbols"]
+        .as_array()
+        .ok_or_else(|| format!("private outline has no symbols: {private}"))?;
+    if private["returned"] != 1
+        || !private_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "fmt" || symbol.to_string().contains("\"fmt\""))
+    {
+        return Err(format!("private exact outline did not find fmt: {private}"));
+    }
     Ok(())
 }
 

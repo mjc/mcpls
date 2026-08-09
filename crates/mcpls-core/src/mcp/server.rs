@@ -1537,7 +1537,7 @@ impl McplsServer {
 
     /// Get all symbols in a document.
     #[tool(
-        description = "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations."
+        description = "Bounded semantic outline for one file. Supports name/kind queries, hierarchy depth, private/test controls, declaration frames, optional bodies, and reusable symbol handles."
     )]
     async fn get_document_symbols(
         &self,

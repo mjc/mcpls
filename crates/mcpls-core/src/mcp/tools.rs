@@ -161,7 +161,7 @@ pub struct CompletionsParams {
 
 /// Parameters for the `get_document_symbols` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting all symbols in a document.")]
+#[schemars(description = "Parameters for a bounded, queryable document semantic outline.")]
 pub struct DocumentSymbolsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
@@ -693,5 +693,22 @@ mod tests {
         assert!(!required.iter().any(|field| field == "file_path"));
         assert!(!required.iter().any(|field| field == "line"));
         assert!(!required.iter().any(|field| field == "character"));
+    }
+
+    #[test]
+    fn document_outline_options_are_flattened_into_the_tool_schema() {
+        let params: DocumentSymbolsParams = serde_json::from_value(serde_json::json!({
+            "file_path": "/tmp/lib.rs",
+            "query": "run",
+            "match_mode": "exact",
+            "include_private": true
+        }))
+        .unwrap();
+        assert_eq!(params.options.query.as_deref(), Some("run"));
+
+        let schema = serde_json::to_value(schemars::schema_for!(DocumentSymbolsParams)).unwrap();
+        assert!(schema["properties"]["query"].is_object());
+        assert!(schema["properties"]["include_bodies"].is_object());
+        assert!(schema["properties"]["options"].is_null());
     }
 }

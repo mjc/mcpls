@@ -228,13 +228,36 @@
   {
     "name": "get_document_symbols",
     "title": "Document Symbols",
-    "description": "Symbols in a file. Returns hierarchical outline with functions, classes, structs, and locations.",
+    "description": "Bounded semantic outline for one file. Supports name/kind queries, hierarchy depth, private/test controls, declaration frames, optional bodies, and reusable symbol handles.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
+        },
+        "include_bodies": { "default": false, "type": "boolean" },
+        "include_private": { "default": false, "type": "boolean" },
+        "include_tests": { "default": false, "type": "boolean" },
+        "kind_filter": { "type": ["string", "null"] },
+        "limit": {
+          "default": 100,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "match_mode": {
+          "default": "fuzzy",
+          "enum": ["exact", "prefix", "fuzzy"],
+          "type": "string"
+        },
+        "max_depth": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "query": {
+          "type": ["string", "null"]
         }
       },
       "required": [

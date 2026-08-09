@@ -489,23 +489,39 @@ Claude: [Uses get_completions] You can use:
 
 ## get_document_symbols
 
-Get an outline of all symbols in a document.
+Get a compact semantic outline, or query a bounded portion of one document.
 
 ### Parameters
 
 ```json
 {
-  "file_path": "/absolute/path/to/file.rs"
+  "file_path": "/absolute/path/to/file.rs",
+  "query": "process",
+  "match_mode": "exact",
+  "kind_filter": "Method",
+  "max_depth": 4,
+  "limit": 25,
+  "include_tests": false,
+  "include_private": true,
+  "include_bodies": false
 }
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
+| `query` | string | No | Symbol-name query; omit for a compact top-level outline |
+| `match_mode` | `exact`, `prefix`, or `fuzzy` | No | Exact-first matching mode; fuzzy is the default |
+| `kind_filter` | string | No | Restrict matched declarations by symbol kind |
+| `max_depth` | integer | No | Hierarchy depth, 1-16; defaults to 1 without a query |
+| `limit` | integer | No | Maximum matched declarations, up to 1000 |
+| `include_tests` | boolean | No | Include test modules and test declarations |
+| `include_private` | boolean | No | Include non-public declarations |
+| `include_bodies` | boolean | No | Include bounded bodies instead of declaration headers only |
 
 ### Returns
 
-Hierarchical array of symbols:
+Returns `total`, `returned`, `truncated`, the applied filters, the project-relative path, and a deterministic symbol tree. Matched symbols include their container, bounded declaration source, and snapshot-bound handle.
 
 ```json
 [

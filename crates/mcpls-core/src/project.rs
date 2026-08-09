@@ -3340,29 +3340,22 @@ struct SymbolHandleStore {
 fn attach_document_symbol_handles(
     store: &mut SymbolHandleStore,
     symbols: &mut [crate::bridge::Symbol],
-    path: &Path,
-    snapshot: &SourceSnapshot,
-    lines: &[&str],
 ) {
     for symbol in symbols {
-        let start = symbol.selection_range.start.line;
-        let end = symbol.selection_range.end.line;
-        let (line, character) = (start..=end)
-            .find_map(|line| {
-                let text = lines.get(line.saturating_sub(1) as usize)?;
-                let byte = text.find(&symbol.name)?;
-                let character = u32::try_from(text[..byte].encode_utf16().count() + 1).ok()?;
-                Some((line, character))
-            })
-            .unwrap_or((start, symbol.selection_range.start.character));
-        symbol.symbol_handle = Some(store.insert(StoredSymbolTarget::new(
-            path.to_path_buf(),
-            line,
-            character,
-            snapshot.clone(),
-        )));
+        if let Some(SourceContext::Available(frame)) = &symbol.source {
+            let snapshot = frame.document_version.map_or_else(
+                || SourceSnapshot::Hash(frame.content_hash.clone()),
+                SourceSnapshot::Version,
+            );
+            symbol.symbol_handle = Some(store.insert(StoredSymbolTarget::new(
+                PathBuf::from(&frame.path),
+                symbol.selection_range.start.line,
+                symbol.selection_range.start.character,
+                snapshot,
+            )));
+        }
         if let Some(children) = &mut symbol.children {
-            attach_document_symbol_handles(store, children, path, snapshot, lines);
+            attach_document_symbol_handles(store, children);
         }
     }
 }
@@ -4224,23 +4217,10 @@ impl ProjectRuntime {
     ) -> Result<DocumentSymbolsResult, String> {
         let mut result = self
             .translator
-            .handle_document_symbols(file_path.clone(), options)
+            .handle_document_symbols(file_path, options)
             .await
             .map_err(|error| error.to_string())?;
-        let (path, version, hash, content) = self
-            .translator
-            .source_snapshot(Path::new(&file_path))
-            .await
-            .map_err(|error| error.to_string())?;
-        let snapshot = version.map_or(SourceSnapshot::Hash(hash), SourceSnapshot::Version);
-        let lines = content.lines().collect::<Vec<_>>();
-        attach_document_symbol_handles(
-            &mut self.symbol_handles,
-            &mut result.symbols,
-            &path,
-            &snapshot,
-            &lines,
-        );
+        attach_document_symbol_handles(&mut self.symbol_handles, &mut result.symbols);
         Ok(result)
     }
 

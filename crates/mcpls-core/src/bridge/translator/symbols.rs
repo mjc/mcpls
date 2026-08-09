@@ -244,10 +244,14 @@ fn filter_document_symbol(
     state: &mut DocumentSymbolFilterState,
 ) -> Option<Symbol> {
     let excluded_test = symbol.is_test && !options.include_tests;
-    if depth > max_depth || excluded_test {
+    let compact_flat_child =
+        options.query.is_none() && parent.is_none() && symbol.container_name.is_some();
+    if depth > max_depth || excluded_test || compact_flat_child {
         return None;
     }
-    symbol.container_name = parent.map(str::to_owned);
+    if let Some(parent) = parent {
+        symbol.container_name = Some(parent.to_owned());
+    }
     let children = symbol.children.take().unwrap_or_default();
     let mut retained_children = Vec::new();
     for child in children {
@@ -306,13 +310,15 @@ fn apply_document_symbol_options(
             filter_document_symbol(symbol, options, None, 1, max_depth, &mut state)
         })
         .collect();
+    let mut filters = options.clone();
+    filters.max_depth = Some(max_depth);
     DocumentSymbolsResult {
         symbols,
         project_relative_path: None,
         total: state.total,
         returned: state.returned,
         truncated: state.returned < state.total,
-        filters: options.clone(),
+        filters,
     }
 }
 
@@ -328,6 +334,23 @@ fn outline_source_budget_exhausted(symbols: &[Symbol]) -> bool {
             .as_deref()
             .is_some_and(outline_source_budget_exhausted)
     })
+}
+
+fn sort_document_symbols(symbols: &mut [Symbol]) {
+    for symbol in symbols.iter_mut() {
+        if let Some(children) = &mut symbol.children {
+            sort_document_symbols(children);
+        }
+    }
+    symbols.sort_by(|left, right| {
+        left.range
+            .start
+            .line
+            .cmp(&right.range.start.line)
+            .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
 }
 
 fn declaration_frame(
@@ -575,6 +598,7 @@ impl Translator {
             .source_snapshot(std::path::Path::new(&file_path))
             .await?;
         let lines = content.lines().collect::<Vec<_>>();
+        sort_document_symbols(&mut symbols);
         let mut budget = super::source_context::SourceBudget::default();
         DocumentSymbolEnrichment {
             ctx: &ctx,
@@ -881,6 +905,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flat_document_outline_preserves_containers_and_omits_nested_items_by_default() {
+        let mut field = outline_symbol("value", "Field", None);
+        field.container_name = Some("Café".to_owned());
+        let symbols = vec![field, outline_symbol("Café", "Struct", None)];
+
+        let compact =
+            apply_document_symbol_options(symbols.clone(), &DocumentSymbolOptions::default());
+        assert_eq!(compact.symbols.len(), 1);
+        assert_eq!(compact.symbols[0].name, "Café");
+
+        let queried = apply_document_symbol_options(
+            symbols,
+            &DocumentSymbolOptions {
+                query: Some("value".to_owned()),
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                include_private: true,
+                ..DocumentSymbolOptions::default()
+            },
+        );
+        assert_eq!(queried.symbols[0].container_name.as_deref(), Some("Café"));
+    }
+
+    #[test]
+    fn compact_outline_does_not_serialize_large_nested_modules() {
+        let fields = (0..500)
+            .map(|index| outline_symbol(&format!("field_{index}"), "Field", None))
+            .collect();
+        let result = apply_document_symbol_options(
+            vec![outline_symbol("Large", "Struct", Some(fields))],
+            &DocumentSymbolOptions::default(),
+        );
+
+        assert!(serde_json::to_vec(&result).unwrap().len() < 2_048);
+        assert!(result.symbols[0].children.is_none());
+    }
+
+    #[test]
+    fn document_outline_uses_exact_prefix_and_fuzzy_modes() {
+        let symbols = vec![
+            outline_symbol("run", "Method", None),
+            outline_symbol("runner", "Method", None),
+            outline_symbol("render_node", "Method", None),
+        ];
+        for (mode, query, expected) in [
+            (WorkspaceSymbolMatchMode::Exact, "run", 1),
+            (WorkspaceSymbolMatchMode::Prefix, "run", 2),
+            (WorkspaceSymbolMatchMode::Fuzzy, "rn", 3),
+        ] {
+            let result = apply_document_symbol_options(
+                symbols.clone(),
+                &DocumentSymbolOptions {
+                    query: Some(query.to_owned()),
+                    match_mode: mode,
+                    include_private: true,
+                    ..DocumentSymbolOptions::default()
+                },
+            );
+            assert_eq!(result.total, expected);
+        }
+    }
+
+    #[test]
+    fn document_outline_order_is_stable_recursively() {
+        let mut late = outline_symbol("late", "Function", None);
+        late.range.start.line = 3;
+        let mut early_child = outline_symbol("early_child", "Method", None);
+        early_child.range.start.line = 1;
+        let mut late_child = outline_symbol("late_child", "Method", None);
+        late_child.range.start.line = 2;
+        let mut early = outline_symbol("early", "Struct", Some(vec![late_child, early_child]));
+        early.range.start.line = 1;
+        let mut symbols = vec![late, early];
+
+        sort_document_symbols(&mut symbols);
+
+        assert_eq!(symbols[0].name, "early");
+        assert_eq!(symbols[0].children.as_ref().unwrap()[0].name, "early_child");
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn nested_document_outline_is_compact_and_expands_private_tests_and_bodies_on_request() {
@@ -1001,6 +1105,8 @@ mod tests {
             panic!("method should include source");
         };
         assert!(frame.text.contains("let body = 1"));
+        assert!(frame.returned_lines <= 12);
+        assert!(frame.truncated);
     }
 
     #[test]
