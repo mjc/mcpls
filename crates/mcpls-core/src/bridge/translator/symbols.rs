@@ -18,20 +18,10 @@ async fn convert_workspace_symbol(
     roots: &[std::path::PathBuf],
     budget: &mut super::source_context::SourceBudget,
 ) -> WorkspaceSymbol {
-    let range = ctx
-        .normalize_range(&symbol.location.uri, symbol.location.range)
-        .await;
-    let source = ctx
-        .source_context(roots, &symbol.location.uri, range.clone(), budget)
-        .await;
     WorkspaceSymbol {
         name: symbol.name,
         kind: format!("{:?}", symbol.kind),
-        location: Location {
-            uri: symbol.location.uri.to_string(),
-            range,
-            source,
-        },
+        location: ctx.location(roots, symbol.location, budget).await,
         container_name: symbol.container_name,
     }
 }

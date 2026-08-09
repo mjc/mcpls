@@ -88,9 +88,14 @@ async fn call_hierarchy_item_to_lsp(
 async fn convert_call_hierarchy_item(
     item: CallHierarchyItem,
     ctx: &EncodingCtx,
+    workspace_roots: &[std::path::PathBuf],
+    budget: &mut super::source_context::SourceBudget,
 ) -> CallHierarchyItemResult {
     let range = ctx.normalize_range(&item.uri, item.range).await;
     let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
+    let source = ctx
+        .source_context(workspace_roots, &item.uri, selection_range.clone(), budget)
+        .await;
 
     CallHierarchyItemResult {
         name: item.name,
@@ -103,6 +108,7 @@ async fn convert_call_hierarchy_item(
         uri: item.uri.to_string(),
         range,
         selection_range,
+        source: Some(source),
         data: item.data,
     }
 }
@@ -163,8 +169,12 @@ impl Translator {
         // Pre-allocate and build result
         let lsp_items = response.unwrap_or_default();
         let mut items = Vec::with_capacity(lsp_items.len());
+        let mut source_budget = super::source_context::SourceBudget::default();
         for item in lsp_items {
-            items.push(convert_call_hierarchy_item(item, &ctx).await);
+            items.push(
+                convert_call_hierarchy_item(item, &ctx, &self.workspace_roots, &mut source_budget)
+                    .await,
+            );
         }
 
         Ok(CallHierarchyPrepareResult { items })
@@ -217,6 +227,7 @@ impl Translator {
         // Pre-allocate and build result
         let lsp_calls = response.unwrap_or_default();
         let mut calls = Vec::with_capacity(lsp_calls.len());
+        let mut source_budget = super::source_context::SourceBudget::default();
 
         for call in lsp_calls {
             // Per the LSP spec, `fromRanges` are ranges within the *caller's*
@@ -231,7 +242,13 @@ impl Translator {
             };
 
             calls.push(IncomingCall {
-                from: convert_call_hierarchy_item(call.from, &ctx).await,
+                from: convert_call_hierarchy_item(
+                    call.from,
+                    &ctx,
+                    &self.workspace_roots,
+                    &mut source_budget,
+                )
+                .await,
                 from_ranges,
             });
         }
@@ -286,6 +303,7 @@ impl Translator {
         // Pre-allocate and build result
         let lsp_calls = response.unwrap_or_default();
         let mut calls = Vec::with_capacity(lsp_calls.len());
+        let mut source_budget = super::source_context::SourceBudget::default();
 
         for call in lsp_calls {
             let from_ranges = {
@@ -297,7 +315,13 @@ impl Translator {
             };
 
             calls.push(OutgoingCall {
-                to: convert_call_hierarchy_item(call.to, &ctx).await,
+                to: convert_call_hierarchy_item(
+                    call.to,
+                    &ctx,
+                    &self.workspace_roots,
+                    &mut source_budget,
+                )
+                .await,
                 from_ranges,
             });
         }
@@ -397,7 +421,13 @@ mod tests {
             },
             data: None,
         };
-        let result = convert_call_hierarchy_item(item, &test_ctx()).await;
+        let result = convert_call_hierarchy_item(
+            item,
+            &test_ctx(),
+            &[],
+            &mut crate::bridge::translator::source_context::SourceBudget::default(),
+        )
+        .await;
         // SymbolKind::FUNCTION is LSP integer 12
         assert_eq!(result.kind, 12u32);
         assert_eq!(result.name, "my_fn");
@@ -460,6 +490,7 @@ mod tests {
                     character: 4,
                 },
             },
+            source: None,
             data: None,
         };
 
@@ -566,6 +597,7 @@ mod tests {
                     character: 4,
                 },
             },
+            source: None,
             data: None,
         };
 

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::dto::{Range, SourceContext, SourceFrame, SourceUnavailableReason};
+use super::dto::{Location, Range, SourceContext, SourceFrame, SourceUnavailableReason};
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::DocumentTracker;
 use crate::bridge::state::{path_to_uri, uri_to_path};
@@ -37,7 +37,7 @@ pub(super) async fn resolve_source_context(
     };
     let document = tracker.get(&path);
     let canonical_path = if document.is_some() {
-        lexical_authorized_path(&path, workspace_roots, approved_source_roots)
+        snapshot_authorized_path(&path, workspace_roots, approved_source_roots)
     } else {
         canonical_authorized_path(&path, workspace_roots, approved_source_roots)
     };
@@ -130,17 +130,17 @@ fn canonical_authorized_path(
     authorized(&path, roots, approved).then_some(path)
 }
 
-fn lexical_authorized_path(
+fn snapshot_authorized_path(
     path: &Path,
     roots: &[PathBuf],
     approved: &[PathBuf],
 ) -> Option<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        return None;
-    };
-    authorized(&absolute, roots, approved).then_some(absolute)
+    if path.exists() {
+        return canonical_authorized_path(path, roots, approved);
+    }
+    let parent = dunce::canonicalize(path.parent()?).ok()?;
+    let canonical = parent.join(path.file_name()?);
+    authorized(&canonical, roots, approved).then_some(canonical)
 }
 
 fn authorized(path: &Path, roots: &[PathBuf], approved: &[PathBuf]) -> bool {
@@ -164,6 +164,23 @@ impl EncodingCtx {
         budget: &mut SourceBudget,
     ) -> SourceContext {
         resolve_source_context(&self.tracker, workspace_roots, &[], uri, range, budget).await
+    }
+
+    pub(super) async fn location(
+        &self,
+        workspace_roots: &[PathBuf],
+        location: lsp_types::Location,
+        budget: &mut SourceBudget,
+    ) -> Location {
+        let range = self.normalize_range(&location.uri, location.range).await;
+        let source = self
+            .source_context(workspace_roots, &location.uri, range.clone(), budget)
+            .await;
+        Location {
+            uri: location.uri.to_string(),
+            range,
+            source,
+        }
     }
 }
 
@@ -297,5 +314,58 @@ mod tests {
                 reason: SourceUnavailableReason::ResponseBudgetExhausted
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn tracked_dirty_snapshot_wins_over_disk_and_carries_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("dirty.rs");
+        tokio::fs::write(&path, "disk\n").await.unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let uri = tracker.open(path.clone(), "initial\n".to_owned()).unwrap();
+        assert_eq!(tracker.update(&path, "dirty λ\n".to_owned()), Some(2));
+
+        let source = resolve_source_context(
+            &tracker,
+            &[root.path().into()],
+            &[],
+            &uri,
+            range(1),
+            &mut SourceBudget::default(),
+        )
+        .await;
+        let SourceContext::Available(frame) = source else {
+            panic!("source unavailable")
+        };
+        assert!(frame.text.contains("dirty λ"));
+        assert!(!frame.text.contains("disk"));
+        assert_eq!(frame.document_version, Some(2));
+    }
+
+    #[tokio::test]
+    async fn truncation_never_splits_utf8_and_reports_exact_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wide.rs");
+        let content = format!("{}\nsecond\n", "λ".repeat(MAX_FRAME_BYTES));
+        tokio::fs::write(&path, &content).await.unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let uri = path_to_uri(&path).unwrap();
+        let source = resolve_source_context(
+            &tracker,
+            &[root.path().into()],
+            &[],
+            &uri,
+            range(1),
+            &mut SourceBudget::default(),
+        )
+        .await;
+        let SourceContext::Available(frame) = source else {
+            panic!("source unavailable")
+        };
+        assert!(frame.truncated);
+        assert_eq!(frame.returned_bytes, frame.text.len());
+        assert_eq!(frame.returned_lines, frame.text.lines().count());
+        assert_eq!(frame.total_lines, 2);
+        assert!(frame.total_bytes > frame.returned_bytes);
     }
 }

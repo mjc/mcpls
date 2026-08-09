@@ -329,6 +329,9 @@ pub struct CallHierarchyItemResult {
     /// it as `lsp_types::CallHierarchyItem` (camelCase).
     #[serde(rename = "selectionRange")]
     pub selection_range: Range,
+    /// Bounded source text for the callable item.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceContext>,
     /// Opaque data to pass to incoming/outgoing calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,

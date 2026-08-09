@@ -10,7 +10,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{DefinitionResult, HoverResult, Location, LocationsResult, ReferencesResult};
 use super::encoding_ctx::EncodingCtx;
-use super::source_context::{SourceBudget, resolve_source_context};
+use super::source_context::SourceBudget;
 use crate::config::ToolKind;
 use crate::error::Result;
 
@@ -36,21 +36,7 @@ async fn goto_response_to_locations(
     let mut locations = Vec::with_capacity(lsp_locs.len());
     let mut budget = SourceBudget::default();
     for loc in lsp_locs {
-        let range = ctx.normalize_range(&loc.uri, loc.range).await;
-        let source = resolve_source_context(
-            &ctx.tracker,
-            workspace_roots,
-            &[],
-            &loc.uri,
-            range.clone(),
-            &mut budget,
-        )
-        .await;
-        locations.push(Location {
-            uri: loc.uri.to_string(),
-            range,
-            source,
-        });
+        locations.push(ctx.location(workspace_roots, loc, &mut budget).await);
     }
     locations
 }
@@ -231,21 +217,7 @@ impl Translator {
         let mut result_locations = Vec::with_capacity(locations.len());
         let mut budget = SourceBudget::default();
         for loc in locations {
-            let range = ctx.normalize_range(&loc.uri, loc.range).await;
-            let source = resolve_source_context(
-                &ctx.tracker,
-                &self.workspace_roots,
-                &[],
-                &loc.uri,
-                range.clone(),
-                &mut budget,
-            )
-            .await;
-            result_locations.push(Location {
-                uri: loc.uri.to_string(),
-                range,
-                source,
-            });
+            result_locations.push(ctx.location(&self.workspace_roots, loc, &mut budget).await);
         }
         let result = ReferencesResult {
             locations: result_locations,
