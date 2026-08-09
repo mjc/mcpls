@@ -642,27 +642,33 @@ Claude: [Uses format_document] The file needs formatting changes:
 
 ## workspace_symbol_search
 
-Search for symbols across the entire workspace by name or pattern.
+Search registered-project symbols with exact-first ranking and bounded declaration source.
 
 ### Parameters
 
 ```json
 {
+  "project_id": "default",
   "query": "User",
   "kind_filter": null,
+  "match_mode": "fuzzy",
+  "scope": "project",
   "limit": 100
 }
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `project_id` | string | Yes | Registered project to search |
 | `query` | string | Yes | Search query for symbol names |
 | `kind_filter` | string | No | Filter by kind (function, class, etc.) |
+| `match_mode` | `exact`, `prefix`, or `fuzzy` | No | Matching boundary; fuzzy is exact-first and is the default |
+| `scope` | `project` or `all` | No | Project-only by default; `all` opts into dependencies/external symbols |
 | `limit` | integer | No | Maximum results (default: 100) |
 
 ### Returns
 
-Array of matching symbols with locations.
+Returns `total`, `returned`, and `truncated` metadata plus stably ranked symbols. Each symbol reports its match class and score, kind, container, project-relative path, local/external origin, bounded source frame, and an opaque handle for coordinate-free follow-up tools.
 
 ### Example Use Cases
 

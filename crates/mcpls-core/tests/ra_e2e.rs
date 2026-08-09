@@ -708,7 +708,12 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
         let resp = client
             .call_tool(
                 "workspace_symbol_search",
-                &json!({ "project_id": "default", "query": "add" }),
+                &json!({
+                    "project_id": "default",
+                    "query": "add",
+                    "match_mode": "exact",
+                    "scope": "project"
+                }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
 
@@ -720,15 +725,21 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
             .or_else(|| inner.as_array())
             .ok_or_else(|| format!("expected symbols array, got {inner}"))?;
 
-        if !syms.is_empty() {
-            let found = syms
-                .iter()
-                .any(|s| s["name"].as_str().unwrap_or("").contains("add"));
-            if found {
+        if let Some(symbol) = syms.iter().find(|symbol| symbol["name"] == "add") {
+            let contract_is_complete = symbol["match_class"] == "exact"
+                && symbol["score"] == 100
+                && symbol["origin"] == "project_local"
+                && symbol["project_relative_path"] == "src/lib.rs"
+                && symbol["location"]["source"]["status"] == "available"
+                && symbol["location"]["symbol_handle"].is_string()
+                && inner["total"].as_u64().is_some()
+                && inner["returned"].as_u64().is_some()
+                && inner["truncated"].is_boolean();
+            if contract_is_complete && syms.iter().all(|symbol| symbol["name"] == "add") {
                 return Ok(());
             }
             return Err(format!(
-                "no symbol named 'add' in workspace_symbol_search results: {syms:?}"
+                "workspace_symbol_search returned an incomplete exact-first contract: {inner}"
             ));
         }
 

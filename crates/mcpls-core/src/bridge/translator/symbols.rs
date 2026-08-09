@@ -63,23 +63,31 @@ fn rank_workspace_symbol_names<'a, const N: usize>(
     matches
 }
 
-async fn convert_workspace_symbol(
-    symbol: lsp_types::SymbolInformation,
+struct WorkspaceSymbolCandidate {
+    name: String,
+    kind: String,
+    location: lsp_types::Location,
+    container_name: Option<String>,
     match_class: WorkspaceSymbolMatch,
+    origin: WorkspaceSymbolOrigin,
+    project_relative_path: Option<String>,
+}
+
+async fn convert_workspace_symbol(
+    symbol: WorkspaceSymbolCandidate,
     ctx: &EncodingCtx,
     roots: &[std::path::PathBuf],
     budget: &mut super::source_context::SourceBudget,
 ) -> WorkspaceSymbol {
-    let (origin, project_relative_path) = workspace_symbol_origin(&symbol.location.uri, roots);
     WorkspaceSymbol {
         name: symbol.name,
-        kind: format!("{:?}", symbol.kind),
+        kind: symbol.kind,
         location: ctx.location(roots, symbol.location, budget).await,
         container_name: symbol.container_name,
-        match_class,
-        score: match_class.score(),
-        project_relative_path,
-        origin,
+        match_class: symbol.match_class,
+        score: symbol.match_class.score(),
+        project_relative_path: symbol.project_relative_path,
+        origin: symbol.origin,
     }
 }
 
@@ -100,16 +108,18 @@ fn workspace_symbol_origin(
     }
 }
 
-fn finish_workspace_symbols(
-    mut symbols: Vec<WorkspaceSymbol>,
+async fn finish_workspace_symbols(
+    mut candidates: Vec<WorkspaceSymbolCandidate>,
     limit: usize,
+    ctx: &EncodingCtx,
+    roots: &[std::path::PathBuf],
 ) -> WorkspaceSymbolResult {
-    symbols.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         left.match_class
             .cmp(&right.match_class)
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.project_relative_path.cmp(&right.project_relative_path))
-            .then_with(|| left.location.uri.cmp(&right.location.uri))
+            .then_with(|| left.location.uri.as_str().cmp(right.location.uri.as_str()))
             .then_with(|| {
                 left.location
                     .range
@@ -125,8 +135,13 @@ fn finish_workspace_symbols(
                     .cmp(&right.location.range.start.character)
             })
     });
-    let total = symbols.len();
-    symbols.truncate(limit);
+    let total = candidates.len();
+    candidates.truncate(limit);
+    let mut budget = super::source_context::SourceBudget::default();
+    let mut symbols = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        symbols.push(convert_workspace_symbol(candidate, ctx, roots, &mut budget).await);
+    }
     WorkspaceSymbolResult {
         returned: symbols.len(),
         truncated: symbols.len() < total,
@@ -136,8 +151,13 @@ fn finish_workspace_symbols(
 }
 
 /// Validate parameters for `handle_workspace_symbol`.
-fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
+fn validate_workspace_symbol_params(
+    query: &str,
+    kind_filter: Option<&str>,
+    limit: u32,
+) -> Result<()> {
     const MAX_QUERY_LENGTH: usize = 1000;
+    const MAX_RESULTS: u32 = 1_000;
     const VALID_SYMBOL_KINDS: &[&str] = &[
         "File",
         "Module",
@@ -171,6 +191,11 @@ fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> R
         return Err(Error::InvalidToolParams(format!(
             "Query too long: {} bytes (max {MAX_QUERY_LENGTH})",
             query.len()
+        )));
+    }
+    if limit > MAX_RESULTS {
+        return Err(Error::InvalidToolParams(format!(
+            "Result limit too large: {limit} (max {MAX_RESULTS})"
         )));
     }
 
@@ -314,7 +339,7 @@ impl Translator {
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
     ) -> Result<WorkspaceSymbolResult> {
-        validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
+        validate_workspace_symbol_params(&query, kind_filter.as_deref(), limit)?;
         if limit == 0 {
             return Ok(WorkspaceSymbolResult {
                 symbols: Vec::new(),
@@ -401,34 +426,35 @@ impl Translator {
         };
 
         let ctx = self.encoding_ctx(&server_id);
-        let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
-        let mut source_budget = super::source_context::SourceBudget::default();
+        let mut candidates = Vec::new();
         for sym in response.unwrap_or_default() {
             let Some(match_class) = workspace_symbol_match(&sym.name, &query, match_mode) else {
                 continue;
             };
-            let (origin, _) = workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
+            let (origin, project_relative_path) =
+                workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
             if scope == WorkspaceSymbolScope::Project && origin == WorkspaceSymbolOrigin::External {
                 continue;
             }
-            symbols.push(
-                convert_workspace_symbol(
-                    sym,
-                    match_class,
-                    &ctx,
-                    &self.workspace_roots,
-                    &mut source_budget,
-                )
-                .await,
-            );
+            let kind = format!("{:?}", sym.kind);
+            if kind_filter
+                .as_deref()
+                .is_some_and(|filter| !kind.eq_ignore_ascii_case(filter))
+            {
+                continue;
+            }
+            candidates.push(WorkspaceSymbolCandidate {
+                name: sym.name,
+                kind,
+                location: sym.location,
+                container_name: sym.container_name,
+                match_class,
+                origin,
+                project_relative_path,
+            });
         }
 
-        // Apply kind filter if specified
-        if let Some(kind) = kind_filter {
-            symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
-        }
-
-        Ok(finish_workspace_symbols(symbols, limit as usize))
+        Ok(finish_workspace_symbols(candidates, limit as usize, &ctx, &self.workspace_roots).await)
     }
 
     async fn ast_grep_workspace_symbols(
@@ -456,8 +482,7 @@ impl Translator {
             encoding: crate::bridge::encoding::PositionEncoding::Utf8,
             tracker: self.document_tracker.clone(),
         };
-        let mut budget = super::source_context::SourceBudget::default();
-        let mut symbols = Vec::new();
+        let mut candidates = Vec::new();
         for symbol in matches {
             let Some(kind) = ast_grep_symbol_kind(&symbol.kind) else {
                 continue;
@@ -475,30 +500,20 @@ impl Translator {
                 start: lsp_types::Position::new(symbol.start_line, symbol.start_character),
                 end: lsp_types::Position::new(symbol.end_line, symbol.end_character),
             };
-            symbols.push(WorkspaceSymbol {
+            let location = lsp_types::Location { uri, range };
+            let (origin, project_relative_path) =
+                workspace_symbol_origin(&location.uri, &self.workspace_roots);
+            candidates.push(WorkspaceSymbolCandidate {
                 name: symbol.name,
                 kind: kind.to_string(),
-                location: ctx
-                    .location(
-                        &self.workspace_roots,
-                        lsp_types::Location { uri, range },
-                        &mut budget,
-                    )
-                    .await,
+                location,
                 container_name: None,
                 match_class,
-                score: match_class.score(),
-                project_relative_path: self.workspace_roots.iter().find_map(|root| {
-                    symbol
-                        .path
-                        .strip_prefix(root)
-                        .ok()
-                        .map(|path| path.to_string_lossy().into_owned())
-                }),
-                origin: WorkspaceSymbolOrigin::ProjectLocal,
+                project_relative_path,
+                origin,
             });
         }
-        finish_workspace_symbols(symbols, limit)
+        finish_workspace_symbols(candidates, limit, &ctx, &self.workspace_roots).await
     }
 }
 
@@ -543,6 +558,24 @@ mod tests {
                 ("other_target", WorkspaceSymbolMatch::Fuzzy),
             ]
         );
+    }
+
+    #[test]
+    fn workspace_symbol_match_modes_have_explicit_boundaries() {
+        let names = ["target", "Target", "target_extra", "other_target"];
+        assert_eq!(
+            rank_workspace_symbol_names(names, "target", WorkspaceSymbolMatchMode::Exact).len(),
+            2
+        );
+        assert_eq!(
+            rank_workspace_symbol_names(names, "target", WorkspaceSymbolMatchMode::Prefix).len(),
+            3
+        );
+        assert_eq!(
+            rank_workspace_symbol_names(names, "target", WorkspaceSymbolMatchMode::Fuzzy).len(),
+            4
+        );
+        assert_eq!(WorkspaceSymbolMatch::Exact.score(), 100);
     }
     use std::fs;
     use std::time::Duration;
@@ -631,6 +664,100 @@ mod tests {
             crate::bridge::SourceContext::Available(_)
         ));
         assert!(result.symbols[0].location.symbol_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_workspace_symbols_rank_before_source_budget_and_require_external_opt_in() {
+        let dir = TempDir::new().unwrap();
+        let exact_path = dir.path().join("exact.rs");
+        fs::write(&exact_path, "fn target() {}\n").unwrap();
+        let external = TempDir::new().unwrap();
+        let external_path = external.path().join("external.rs");
+        fs::write(&external_path, "fn target() {}\n").unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, capabilities);
+
+        let mut response = Vec::new();
+        for index in 0..9 {
+            let path = dir.path().join(format!("fuzzy-{index}.rs"));
+            fs::write(&path, format!("fn t{index}arget() {{}}\n")).unwrap();
+            response.push(serde_json::json!({
+                "name": format!("t{index}arget"),
+                "kind": 12,
+                "location": {
+                    "uri": path_to_uri(&path).unwrap().to_string(),
+                    "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 11 } }
+                }
+            }));
+        }
+        response.push(serde_json::json!({
+            "name": "target",
+            "kind": 12,
+            "location": {
+                "uri": path_to_uri(&exact_path).unwrap().to_string(),
+                "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 9 } }
+            }
+        }));
+        response.push(serde_json::json!({
+            "name": "target",
+            "kind": 12,
+            "location": {
+                "uri": path_to_uri(&external_path).unwrap().to_string(),
+                "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 9 } }
+            }
+        }));
+
+        let responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            for _ in 0..2 {
+                let request = read_framed_message(&mut wire).await;
+                write_response(
+                    &mut server.read_half_stdin,
+                    &request["id"],
+                    serde_json::Value::Array(response.clone()),
+                )
+                .await;
+            }
+        });
+
+        let project = translator
+            .handle_workspace_symbol(
+                "target".to_owned(),
+                None,
+                1,
+                WorkspaceSymbolMatchMode::Fuzzy,
+                WorkspaceSymbolScope::Project,
+            )
+            .await
+            .unwrap();
+        assert_eq!((project.total, project.returned), (10, 1));
+        assert_eq!(project.symbols[0].name, "target");
+        assert!(matches!(
+            project.symbols[0].location.source,
+            crate::bridge::SourceContext::Available(_)
+        ));
+
+        let all = translator
+            .handle_workspace_symbol(
+                "target".to_owned(),
+                None,
+                20,
+                WorkspaceSymbolMatchMode::Exact,
+                WorkspaceSymbolScope::All,
+            )
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(all.total, 2);
+        assert!(
+            all.symbols
+                .iter()
+                .any(|symbol| symbol.origin == WorkspaceSymbolOrigin::External)
+        );
     }
 
     /// #242/S4 regression: a server is configured and still spawning (large

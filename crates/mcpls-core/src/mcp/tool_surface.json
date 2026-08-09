@@ -681,7 +681,7 @@
   {
     "name": "workspace_symbol_search",
     "title": "Workspace Symbol Search",
-    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search.",
+    "description": "Search project symbols with exact-first ranking, bounded source frames, and reusable symbol handles. Match mode defaults to fuzzy; external/dependency symbols require scope=all.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -699,12 +699,29 @@
           "minimum": 0,
           "type": "integer"
         },
+        "match_mode": {
+          "default": "fuzzy",
+          "description": "Name matching behavior; defaults to exact-first fuzzy search.",
+          "enum": ["exact", "prefix", "fuzzy"],
+          "type": "string"
+        },
+        "project_id": {
+          "description": "Registered project identifier whose workspace should be searched.",
+          "type": "string"
+        },
         "query": {
           "description": "Search query for symbol names (supports partial matching).",
+          "type": "string"
+        },
+        "scope": {
+          "default": "project",
+          "description": "Source scope; dependencies and external symbols require explicit `all`.",
+          "enum": ["project", "all"],
           "type": "string"
         }
       },
       "required": [
+        "project_id",
         "query"
       ],
       "type": "object"

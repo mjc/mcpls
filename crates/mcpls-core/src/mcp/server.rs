@@ -1589,7 +1589,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search workspace symbols by name. Supports partial matching and fuzzy search."
+        description = "Search project symbols with exact-first ranking, bounded source frames, and reusable symbol handles. Match mode defaults to fuzzy; external/dependency symbols require scope=all."
     )]
     async fn workspace_symbol_search(
         &self,
