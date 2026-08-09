@@ -10,7 +10,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, NavigationKind, Position2D, Range,
-    ReferencesResult,
+    ReferenceGroup, ReferenceRole, ReferenceUse, ReferencesResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::source_context::SourceBudget;
@@ -263,14 +263,13 @@ impl Translator {
 
         let locations = response.unwrap_or_default();
 
-        let mut result_locations = Vec::with_capacity(locations.len());
+        let total_references = locations.len();
+        let mut result_locations = Vec::with_capacity(total_references);
         let mut budget = SourceBudget::default();
         for loc in locations {
             result_locations.push(ctx.location(&self.workspace_roots, loc, &mut budget).await);
         }
-        let result = ReferencesResult {
-            locations: result_locations,
-        };
+        let result = group_references(result_locations, &self.workspace_roots, budget.truncated());
 
         Ok(result)
     }
@@ -407,10 +406,73 @@ impl Translator {
     }
 }
 
+fn group_references(
+    mut locations: Vec<Location>,
+    workspace_roots: &[std::path::PathBuf],
+    source_truncated: bool,
+) -> ReferencesResult {
+    locations.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+            .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+    });
+    let total_references = locations.len();
+    let mut groups: Vec<ReferenceGroup> = Vec::new();
+    for location in locations {
+        let path = location.path.as_deref().unwrap_or(&location.uri);
+        let project_relative_path = workspace_roots
+            .iter()
+            .find_map(|root| std::path::Path::new(path).strip_prefix(root).ok())
+            .map_or_else(
+                || path.to_owned(),
+                |path| path.to_string_lossy().into_owned(),
+            );
+        let reference = ReferenceUse {
+            location,
+            role: ReferenceRole::Unknown,
+        };
+        if let Some(group) = groups
+            .last_mut()
+            .filter(|group| group.project_relative_path == project_relative_path)
+        {
+            group.references.push(reference);
+        } else {
+            groups.push(ReferenceGroup {
+                project_relative_path,
+                enclosing_symbol: None,
+                references: vec![reference],
+            });
+        }
+    }
+    ReferencesResult {
+        provider: "standard_lsp".to_owned(),
+        groups,
+        total_references,
+        returned_references: total_references,
+        truncated: source_truncated,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn unavailable_location(path: &str, line: u32) -> Location {
+        Location {
+            path: Some(path.to_owned()),
+            uri: format!("file://{path}"),
+            range: Range {
+                start: Position2D { line, character: 1 },
+                end: Position2D { line, character: 2 },
+            },
+            source: super::super::dto::SourceContext::Unavailable {
+                reason: super::super::dto::SourceUnavailableReason::NotFound,
+            },
+            symbol_handle: None,
+        }
+    }
 
     #[test]
     fn test_extract_hover_contents_string() {
@@ -459,5 +521,26 @@ mod tests {
 
         assert_eq!(locations.len(), MAX_NAVIGATION_TARGETS);
         assert!(truncated);
+    }
+
+    #[test]
+    fn references_serialize_grouped_file_counts() {
+        let result = group_references(
+            vec![
+                unavailable_location("/workspace/src/lib.rs", 2),
+                unavailable_location("/workspace/src/lib.rs", 4),
+            ],
+            &[std::path::PathBuf::from("/workspace")],
+            false,
+        );
+
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["total_references"], 2);
+        assert_eq!(value["returned_references"], 2);
+        assert_eq!(value["groups"][0]["project_relative_path"], "src/lib.rs");
+        assert_eq!(
+            value["groups"][0]["references"].as_array().unwrap().len(),
+            2
+        );
     }
 }

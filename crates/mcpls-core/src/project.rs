@@ -4147,7 +4147,11 @@ impl ProjectRuntime {
             .handle_references(file_path, line, character, include_declaration)
             .await
             .map_err(|error| error.to_string())?;
-        self.attach_location_handles(&mut result.locations);
+        for group in &mut result.groups {
+            for reference in &mut group.references {
+                self.attach_location_handle(&mut reference.location);
+            }
+        }
         Ok(result)
     }
 

@@ -183,8 +183,45 @@ pub struct DefinitionResult {
 /// Result of a references request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferencesResult {
-    /// Locations of all references.
-    pub locations: Vec<Location>,
+    /// Stable protocol provider identity.
+    pub provider: String,
+    /// References grouped by project-relative file.
+    pub groups: Vec<ReferenceGroup>,
+    /// Number of references reported by the language server.
+    pub total_references: usize,
+    /// Number of references returned after response budgets.
+    pub returned_references: usize,
+    /// Whether response budgets omitted source or references.
+    pub truncated: bool,
+}
+
+/// References returned from one source file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceGroup {
+    /// Project-relative path, or the absolute path for external sources.
+    pub project_relative_path: String,
+    /// Enclosing symbol when the language server can determine one safely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_symbol: Option<String>,
+    /// References within the group, in source order.
+    pub references: Vec<ReferenceUse>,
+}
+
+/// One source use of the referenced symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceUse {
+    /// Bounded location and highlighted source frame for the use.
+    pub location: Location,
+    /// Semantic role, reported conservatively when unavailable from the server.
+    pub role: ReferenceRole,
+}
+
+/// Safely known role of a reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceRole {
+    /// The language server did not provide enough information to classify it.
+    Unknown,
 }
 
 /// Diagnostic severity.
