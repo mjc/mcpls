@@ -3,7 +3,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::{SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope};
+use crate::bridge::{
+    DocumentSymbolOptions, SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope,
+};
 
 /// Parameters for the `get_hover` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -164,6 +166,9 @@ pub struct DocumentSymbolsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
+    /// Optional query, filters, hierarchy bounds, and body controls.
+    #[serde(flatten)]
+    pub options: DocumentSymbolOptions,
 }
 
 /// Parameters for the `format_document` tool.

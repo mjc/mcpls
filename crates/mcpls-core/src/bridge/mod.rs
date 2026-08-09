@@ -26,9 +26,9 @@ pub use state::{
 pub use translator::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
     DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges,
-    DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
-    InlayHintsResult, Location, LocationsResult, OutgoingCallsResult, Position2D,
-    ProjectActivation, ProviderSynchronization, Range, ReferencesResult, RenameResult,
+    DocumentSymbolOptions, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    IncomingCallsResult, InlayHintsResult, Location, LocationsResult, OutgoingCallsResult,
+    Position2D, ProjectActivation, ProviderSynchronization, Range, ReferencesResult, RenameResult,
     SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, SourceContext, SupportedWorkspaceEdit, Symbol,
     SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,

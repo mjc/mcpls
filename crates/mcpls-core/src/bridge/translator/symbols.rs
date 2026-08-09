@@ -7,8 +7,8 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    DocumentSymbolsResult, Symbol, WorkspaceSymbol, WorkspaceSymbolMatch, WorkspaceSymbolMatchMode,
-    WorkspaceSymbolOrigin, WorkspaceSymbolResult, WorkspaceSymbolScope,
+    DocumentSymbolOptions, DocumentSymbolsResult, Symbol, WorkspaceSymbol, WorkspaceSymbolMatch,
+    WorkspaceSymbolMatchMode, WorkspaceSymbolOrigin, WorkspaceSymbolResult, WorkspaceSymbolScope,
 };
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::{ast_grep, lock_std, path_to_uri, uri_to_path};
@@ -212,6 +212,243 @@ fn validate_workspace_symbol_params(
     Ok(())
 }
 
+fn validate_document_symbol_options(options: &DocumentSymbolOptions) -> Result<()> {
+    validate_workspace_symbol_params(
+        options.query.as_deref().unwrap_or_default(),
+        options.kind_filter.as_deref(),
+        options.limit,
+    )?;
+    if options
+        .max_depth
+        .is_some_and(|depth| depth == 0 || depth > 16)
+    {
+        return Err(Error::InvalidToolParams(
+            "max_depth must be between 1 and 16".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+struct DocumentSymbolFilterState {
+    total: usize,
+    returned: usize,
+    limit: usize,
+}
+
+fn filter_document_symbol(
+    mut symbol: Symbol,
+    options: &DocumentSymbolOptions,
+    parent: Option<&str>,
+    depth: u32,
+    max_depth: u32,
+    state: &mut DocumentSymbolFilterState,
+) -> Option<Symbol> {
+    let excluded_test = symbol.is_test && !options.include_tests;
+    if depth > max_depth || excluded_test {
+        return None;
+    }
+    symbol.container_name = parent.map(str::to_owned);
+    let children = symbol.children.take().unwrap_or_default();
+    let mut retained_children = Vec::new();
+    for child in children {
+        if let Some(child) = filter_document_symbol(
+            child,
+            options,
+            Some(&symbol.name),
+            depth + 1,
+            max_depth,
+            state,
+        ) {
+            retained_children.push(child);
+        }
+    }
+    symbol.children = (!retained_children.is_empty()).then_some(retained_children);
+
+    let match_class = options
+        .query
+        .as_deref()
+        .and_then(|query| workspace_symbol_match(&symbol.name, query, options.match_mode));
+    let name_matches = options.query.is_none() || match_class.is_some();
+    let kind_matches = options
+        .kind_filter
+        .as_deref()
+        .is_none_or(|kind| symbol.kind.eq_ignore_ascii_case(kind));
+    let visibility_matches = options.include_private || !symbol.is_private;
+    let matches = name_matches && kind_matches && visibility_matches;
+    if matches {
+        state.total += 1;
+    }
+    let retain_match = matches && state.returned < state.limit;
+    if retain_match {
+        state.returned += 1;
+        symbol.match_class = match_class;
+        symbol.score = match_class.map(WorkspaceSymbolMatch::score);
+    }
+    (retain_match || symbol.children.is_some()).then_some(symbol)
+}
+
+fn apply_document_symbol_options(
+    symbols: Vec<Symbol>,
+    options: &DocumentSymbolOptions,
+) -> DocumentSymbolsResult {
+    let max_depth = options
+        .max_depth
+        .unwrap_or_else(|| if options.query.is_some() { 16 } else { 1 })
+        .min(16);
+    let mut state = DocumentSymbolFilterState {
+        total: 0,
+        returned: 0,
+        limit: options.limit.min(1_000) as usize,
+    };
+    let symbols = symbols
+        .into_iter()
+        .filter_map(|symbol| {
+            filter_document_symbol(symbol, options, None, 1, max_depth, &mut state)
+        })
+        .collect();
+    DocumentSymbolsResult {
+        symbols,
+        project_relative_path: None,
+        total: state.total,
+        returned: state.returned,
+        truncated: state.returned < state.total,
+        filters: options.clone(),
+    }
+}
+
+fn outline_source_budget_exhausted(symbols: &[Symbol]) -> bool {
+    symbols.iter().any(|symbol| {
+        matches!(
+            symbol.source.as_ref(),
+            Some(super::dto::SourceContext::Unavailable {
+                reason: super::dto::SourceUnavailableReason::ResponseBudgetExhausted
+            })
+        ) || symbol
+            .children
+            .as_deref()
+            .is_some_and(outline_source_budget_exhausted)
+    })
+}
+
+fn declaration_frame(
+    symbol: &Symbol,
+    lines: &[&str],
+) -> (super::dto::Range, usize, bool, bool, super::dto::Position2D) {
+    let range_start = symbol.range.start.line.saturating_sub(1) as usize;
+    let range_end = symbol.range.end.line.saturating_sub(1) as usize;
+    let (declaration, character) = lines
+        .iter()
+        .enumerate()
+        .skip(range_start)
+        .take(range_end.saturating_sub(range_start) + 1)
+        .find_map(|(line, text)| {
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                return None;
+            }
+            let byte = text.find(&symbol.name)?;
+            let character = u32::try_from(text[..byte].encode_utf16().count() + 1).ok()?;
+            Some((line, character))
+        })
+        .unwrap_or_else(|| {
+            (
+                symbol.selection_range.start.line.saturating_sub(1) as usize,
+                symbol.selection_range.start.character,
+            )
+        });
+    let mut start = declaration.min(lines.len());
+    while start > 0 {
+        let previous = lines[start - 1].trim();
+        if previous.starts_with("///")
+            || previous.starts_with("//!")
+            || previous.starts_with("#[")
+            || previous.is_empty()
+        {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let declaration_text = lines.get(declaration).map_or("", |line| line.trim());
+    let is_private = !declaration_text.starts_with("pub ") && !declaration_text.starts_with("pub(");
+    let is_test = symbol.name == "tests"
+        || lines
+            .get(start..=declaration.min(lines.len().saturating_sub(1)))
+            .unwrap_or_default()
+            .iter()
+            .any(|line| line.contains("#[test]") || line.contains("cfg(test)"));
+    let header_end = lines
+        .iter()
+        .enumerate()
+        .skip(declaration)
+        .take(12)
+        .find_map(|(index, line)| (line.contains('{') || line.contains(';')).then_some(index))
+        .unwrap_or(declaration);
+    let max_lines = header_end.saturating_sub(start) + 1;
+    let mut range = symbol.range.clone();
+    range.start.line = u32::try_from(start + 1).unwrap_or(u32::MAX);
+    range.start.character = 1;
+    (
+        range,
+        max_lines,
+        is_private,
+        is_test,
+        super::dto::Position2D {
+            line: u32::try_from(declaration + 1).unwrap_or(u32::MAX),
+            character,
+        },
+    )
+}
+
+struct DocumentSymbolEnrichment<'a> {
+    ctx: &'a EncodingCtx,
+    uri: &'a lsp_types::Uri,
+    roots: &'a [std::path::PathBuf],
+    lines: &'a [&'a str],
+    options: &'a DocumentSymbolOptions,
+}
+
+impl DocumentSymbolEnrichment<'_> {
+    fn enrich<'a>(
+        &'a self,
+        symbols: &'a mut [Symbol],
+        budget: &'a mut super::source_context::SourceBudget,
+        inherited_test: bool,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for symbol in symbols {
+                let (range, header_lines, is_private, is_test, selection_start) =
+                    declaration_frame(symbol, self.lines);
+                symbol.selection_range.start = selection_start.clone();
+                symbol.selection_range.end = super::dto::Position2D {
+                    line: selection_start.line,
+                    character: selection_start.character.saturating_add(
+                        u32::try_from(symbol.name.encode_utf16().count()).unwrap_or(0),
+                    ),
+                };
+                symbol.is_private = is_private;
+                symbol.is_test = inherited_test || is_test;
+                let max_lines = if self.options.include_bodies {
+                    12
+                } else {
+                    header_lines
+                };
+                let mut source = self
+                    .ctx
+                    .source_context_with_max_lines(self.roots, self.uri, range, budget, max_lines)
+                    .await;
+                if let super::dto::SourceContext::Available(frame) = &mut source {
+                    frame.highlighted_range = symbol.selection_range.clone();
+                }
+                symbol.source = Some(source);
+                if let Some(children) = &mut symbol.children {
+                    self.enrich(children, budget, symbol.is_test).await;
+                }
+            }
+        })
+    }
+}
+
 /// Convert LSP document symbol to MCP symbol. `uri` is the queried
 /// document's own URI: nested `DocumentSymbol` entries have no URI of their
 /// own, since `textDocument/documentSymbol` is always scoped to one file.
@@ -243,6 +480,12 @@ fn convert_document_symbol<'a>(
             range,
             selection_range,
             symbol_handle: None,
+            container_name: None,
+            match_class: None,
+            score: None,
+            source: None,
+            is_private: false,
+            is_test: false,
             children,
         }
     })
@@ -258,7 +501,9 @@ impl Translator {
     pub async fn handle_document_symbols(
         &self,
         file_path: String,
+        options: DocumentSymbolOptions,
     ) -> Result<DocumentSymbolsResult> {
+        validate_document_symbol_options(&options)?;
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -289,7 +534,7 @@ impl Translator {
             )
             .await?;
 
-        let symbols = match response {
+        let mut symbols = match response {
             Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => {
                 let mut result = Vec::with_capacity(symbols.len());
                 for sym in symbols {
@@ -305,6 +550,12 @@ impl Translator {
                         range,
                         selection_range,
                         symbol_handle: None,
+                        container_name: sym.container_name,
+                        match_class: None,
+                        score: None,
+                        source: None,
+                        is_private: false,
+                        is_test: false,
                         children: None,
                     });
                 }
@@ -320,7 +571,28 @@ impl Translator {
             None => vec![],
         };
 
-        Ok(DocumentSymbolsResult { symbols })
+        let (path, _, _, content) = self
+            .source_snapshot(std::path::Path::new(&file_path))
+            .await?;
+        let lines = content.lines().collect::<Vec<_>>();
+        let mut budget = super::source_context::SourceBudget::default();
+        DocumentSymbolEnrichment {
+            ctx: &ctx,
+            uri: &response_uri,
+            roots: &self.workspace_roots,
+            lines: &lines,
+            options: &options,
+        }
+        .enrich(&mut symbols, &mut budget, false)
+        .await;
+        let mut result = apply_document_symbol_options(symbols, &options);
+        result.truncated |= outline_source_budget_exhausted(&result.symbols);
+        result.project_relative_path = self.workspace_roots.iter().find_map(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        });
+        Ok(result)
     }
 
     /// Handle workspace symbol search.
@@ -539,6 +811,197 @@ fn ast_grep_symbol_kind(symbol_type: &str) -> Option<&'static str> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+
+    fn outline_symbol(name: &str, kind: &str, children: Option<Vec<Symbol>>) -> Symbol {
+        let range = crate::bridge::Range {
+            start: crate::bridge::Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: crate::bridge::Position2D {
+                line: 2,
+                character: 1,
+            },
+        };
+        Symbol {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            range: range.clone(),
+            selection_range: range,
+            symbol_handle: None,
+            container_name: None,
+            match_class: None,
+            score: None,
+            source: None,
+            is_private: false,
+            is_test: name == "tests",
+            children,
+        }
+    }
+
+    #[test]
+    fn document_outline_query_preserves_parents_and_bounds_duplicate_matches() {
+        let symbols = vec![
+            outline_symbol(
+                "Worker",
+                "Struct",
+                Some(vec![
+                    outline_symbol("run", "Method", None),
+                    outline_symbol("run", "Method", None),
+                ]),
+            ),
+            outline_symbol(
+                "tests",
+                "Module",
+                Some(vec![outline_symbol("run", "Function", None)]),
+            ),
+        ];
+        let options = DocumentSymbolOptions {
+            query: Some("run".to_owned()),
+            match_mode: WorkspaceSymbolMatchMode::Exact,
+            max_depth: Some(4),
+            limit: 1,
+            include_private: true,
+            ..DocumentSymbolOptions::default()
+        };
+
+        let result = apply_document_symbol_options(symbols, &options);
+
+        assert_eq!(
+            (result.total, result.returned, result.truncated),
+            (2, 1, true)
+        );
+        assert_eq!(result.symbols[0].name, "Worker");
+        assert_eq!(result.symbols[0].children.as_ref().unwrap()[0].name, "run");
+        assert_eq!(
+            result.symbols[0].children.as_ref().unwrap()[0]
+                .container_name
+                .as_deref(),
+            Some("Worker")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn nested_document_outline_is_compact_and_expands_private_tests_and_bodies_on_request() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ünicode.rs");
+        fs::write(
+            &path,
+            "/// Café docs\npub struct Café {\n    value: i32,\n}\n\nimpl Café {\n    fn duplicate(&self) {\n        let body = 1;\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn duplicate() {}\n}\n",
+        )
+        .unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, capabilities);
+        let response = serde_json::json!([
+            {
+                "name": "Café", "kind": 23,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 3, "character": 1 } },
+                "selectionRange": { "start": { "line": 1, "character": 11 }, "end": { "line": 1, "character": 15 } }
+            },
+            {
+                "name": "Café", "detail": "impl", "kind": 5,
+                "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 9, "character": 1 } },
+                "selectionRange": { "start": { "line": 5, "character": 5 }, "end": { "line": 5, "character": 9 } },
+                "children": [{
+                    "name": "duplicate", "kind": 6,
+                    "range": { "start": { "line": 6, "character": 4 }, "end": { "line": 8, "character": 5 } },
+                    "selectionRange": { "start": { "line": 6, "character": 7 }, "end": { "line": 6, "character": 16 } }
+                }]
+            },
+            {
+                "name": "tests", "kind": 2,
+                "range": { "start": { "line": 11, "character": 0 }, "end": { "line": 15, "character": 1 } },
+                "selectionRange": { "start": { "line": 12, "character": 4 }, "end": { "line": 12, "character": 9 } },
+                "children": [{
+                    "name": "duplicate", "kind": 12,
+                    "range": { "start": { "line": 13, "character": 4 }, "end": { "line": 14, "character": 21 } },
+                    "selectionRange": { "start": { "line": 14, "character": 7 }, "end": { "line": 14, "character": 16 } }
+                }]
+            }
+        ]);
+        let _: lsp_types::DocumentSymbolResponse =
+            serde_json::from_value(response.clone()).unwrap();
+        let responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let mut replies = 0;
+            while replies < 3 {
+                let request = read_framed_message(&mut wire).await;
+                if request["id"].is_null() {
+                    continue;
+                }
+                write_response(
+                    &mut server.read_half_stdin,
+                    &request["id"],
+                    response.clone(),
+                )
+                .await;
+                replies += 1;
+            }
+        });
+
+        let compact = translator
+            .handle_document_symbols(path.display().to_string(), DocumentSymbolOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((compact.total, compact.returned), (1, 1));
+        assert_eq!(compact.symbols[0].name, "Café");
+        let Some(crate::bridge::SourceContext::Available(frame)) = &compact.symbols[0].source
+        else {
+            panic!("public declaration should include source");
+        };
+        assert!(frame.text.contains("Café docs"));
+        assert!(!frame.text.contains("value: i32"));
+
+        let private = translator
+            .handle_document_symbols(
+                path.display().to_string(),
+                DocumentSymbolOptions {
+                    query: Some("duplicate".to_owned()),
+                    match_mode: WorkspaceSymbolMatchMode::Exact,
+                    max_depth: Some(4),
+                    include_private: true,
+                    ..DocumentSymbolOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((private.total, private.returned), (1, 1));
+        assert_eq!(
+            private.symbols[0].children.as_ref().unwrap()[0].name,
+            "duplicate"
+        );
+
+        let with_tests_and_bodies = translator
+            .handle_document_symbols(
+                path.display().to_string(),
+                DocumentSymbolOptions {
+                    query: Some("duplicate".to_owned()),
+                    match_mode: WorkspaceSymbolMatchMode::Exact,
+                    max_depth: Some(4),
+                    include_private: true,
+                    include_tests: true,
+                    include_bodies: true,
+                    ..DocumentSymbolOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(
+            (with_tests_and_bodies.total, with_tests_and_bodies.returned),
+            (2, 2)
+        );
+        let impl_method = with_tests_and_bodies.symbols[0].children.as_ref().unwrap();
+        let Some(crate::bridge::SourceContext::Available(frame)) = &impl_method[0].source else {
+            panic!("method should include source");
+        };
+        assert!(frame.text.contains("let body = 1"));
+    }
 
     #[test]
     fn workspace_symbol_ranking_is_exact_first_and_stable() {

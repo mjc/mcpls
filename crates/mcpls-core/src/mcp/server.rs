@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::bridge::DocumentSymbolOptions;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
@@ -1539,7 +1541,7 @@ impl McplsServer {
     )]
     async fn get_document_symbols(
         &self,
-        Parameters(DocumentSymbolsParams { file_path }): Parameters<DocumentSymbolsParams>,
+        Parameters(DocumentSymbolsParams { file_path, options }): Parameters<DocumentSymbolsParams>,
     ) -> Result<String, McpError> {
         let actor = self
             .context
@@ -1547,7 +1549,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .document_symbols(file_path)
+            .document_symbols(file_path, options)
             .await
             .map_err(|error| error.to_string());
 
@@ -2581,6 +2583,7 @@ finally:
     fn document_symbols_params(path: &std::path::Path) -> Parameters<DocumentSymbolsParams> {
         Parameters(DocumentSymbolsParams {
             file_path: path.display().to_string(),
+            options: DocumentSymbolOptions::default(),
         })
     }
 
@@ -3966,6 +3969,7 @@ while True:
             server
                 .get_document_symbols(Parameters(DocumentSymbolsParams {
                     file_path: path.display().to_string(),
+                    options: DocumentSymbolOptions::default(),
                 }))
                 .await
                 .unwrap();
@@ -5231,6 +5235,7 @@ while True:
         let result = server
             .get_document_symbols(Parameters(DocumentSymbolsParams {
                 file_path: file_path.display().to_string(),
+                options: DocumentSymbolOptions::default(),
             }))
             .await;
 
@@ -5551,6 +5556,7 @@ while True:
         let server = create_test_server();
         let params = Parameters(DocumentSymbolsParams {
             file_path: "/test/file.rs".to_string(),
+            options: DocumentSymbolOptions::default(),
         });
 
         let result = server.get_document_symbols(params).await;

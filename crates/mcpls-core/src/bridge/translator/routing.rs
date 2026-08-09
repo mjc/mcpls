@@ -1333,7 +1333,10 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_document_symbols(path.to_string_lossy().to_string())
+            .handle_document_symbols(
+                path.to_string_lossy().to_string(),
+                crate::bridge::DocumentSymbolOptions::default(),
+            )
             .await;
 
         assert!(matches!(

@@ -16,12 +16,12 @@ use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
-    DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, IncomingCallsResult, InlayHintsResult, LocationsResult,
-    LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation,
-    ProviderSynchronization, ReferencesResult, RenameResult, SemanticDiscoveryKind,
-    SemanticDiscoveryResult, ServerCapability, ServerLogsResult, ServerMessage,
-    ServerMessagesResult, SignatureHelpResult, SourceContext, StructuralMatch,
+    DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
+    DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
+    InlayHintsResult, LocationsResult, LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding,
+    ProjectActivation, ProviderSynchronization, ReferencesResult, RenameResult,
+    SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
+    ServerMessage, ServerMessagesResult, SignatureHelpResult, SourceContext, StructuralMatch,
     StructuralSearchResult, SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate,
     WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
     path_to_uri, uri_to_path,
@@ -1440,6 +1440,7 @@ enum ProjectRequest {
     },
     DocumentSymbols {
         file_path: String,
+        options: DocumentSymbolOptions,
         reply: oneshot::Sender<Result<DocumentSymbolsResult, String>>,
     },
     FormatDocument {
@@ -2198,10 +2199,15 @@ impl ProjectHandle {
     pub async fn document_symbols(
         &self,
         file_path: String,
+        options: DocumentSymbolOptions,
     ) -> Result<DocumentSymbolsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::DocumentSymbols { file_path, reply })
+            .send(ProjectRequest::DocumentSymbols {
+                file_path,
+                options,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3748,7 +3754,10 @@ impl ProjectRuntime {
         }
         let Ok(symbols) = self
             .translator
-            .handle_document_symbols(source_path.display().to_string())
+            .handle_document_symbols(
+                source_path.display().to_string(),
+                DocumentSymbolOptions::internal_tree(),
+            )
             .await
         else {
             return Ok((VerificationStatus::StructuralUnverified, module_position));
@@ -3954,11 +3963,17 @@ impl ProjectRuntime {
         }
         let source_symbols = self
             .translator
-            .handle_document_symbols(check.source_path.display().to_string())
+            .handle_document_symbols(
+                check.source_path.display().to_string(),
+                DocumentSymbolOptions::internal_tree(),
+            )
             .await;
         let destination_symbols = self
             .translator
-            .handle_document_symbols(check.destination_path.display().to_string())
+            .handle_document_symbols(
+                check.destination_path.display().to_string(),
+                DocumentSymbolOptions::internal_tree(),
+            )
             .await;
         let source_diagnostics = self
             .translator
@@ -4205,10 +4220,11 @@ impl ProjectRuntime {
     async fn document_symbols(
         &mut self,
         file_path: String,
+        options: DocumentSymbolOptions,
     ) -> Result<DocumentSymbolsResult, String> {
         let mut result = self
             .translator
-            .handle_document_symbols(file_path.clone())
+            .handle_document_symbols(file_path.clone(), options)
             .await
             .map_err(|error| error.to_string())?;
         let (path, version, hash, content) = self
@@ -5308,8 +5324,12 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::DocumentSymbols { file_path, reply } => {
-            let _ = reply.send(runtime.document_symbols(file_path).await);
+        ProjectRequest::DocumentSymbols {
+            file_path,
+            options,
+            reply,
+        } => {
+            let _ = reply.send(runtime.document_symbols(file_path, options).await);
         }
         ProjectRequest::FormatDocument {
             file_path,
@@ -8852,7 +8872,9 @@ mod tests {
         let canonical_root = CanonicalRoot::new(root.path()).unwrap();
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
-        let result = handle.document_symbols(file.display().to_string()).await;
+        let result = handle
+            .document_symbols(file.display().to_string(), DocumentSymbolOptions::default())
+            .await;
 
         assert!(matches!(
             result,
@@ -9547,7 +9569,10 @@ while True:
             .await
             .unwrap();
         let result = actor
-            .document_symbols(root.path().join("src/main.rs").display().to_string())
+            .document_symbols(
+                root.path().join("src/main.rs").display().to_string(),
+                DocumentSymbolOptions::default(),
+            )
             .await;
 
         assert!(matches!(

@@ -241,9 +241,86 @@ pub struct Symbol {
     /// Snapshot-bound target for coordinate-free semantic follow-ups.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_handle: Option<SymbolHandle>,
+    /// Parent symbol name when this is a nested declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    /// How this symbol matched an outline query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_class: Option<WorkspaceSymbolMatch>,
+    /// Stable query score derived from `match_class`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<u8>,
+    /// Bounded declaration source attached after filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceContext>,
+    /// Internal visibility classifier used by outline filters.
+    #[serde(skip)]
+    pub(crate) is_private: bool,
+    /// Internal test classifier used by outline filters.
+    #[serde(skip)]
+    pub(crate) is_test: bool,
     /// Child symbols.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<Self>>,
+}
+
+/// Query and output bounds for a document semantic outline.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DocumentSymbolOptions {
+    /// Optional symbol-name query.
+    pub query: Option<String>,
+    /// Exact, prefix, or exact-first fuzzy matching.
+    #[serde(default)]
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Optional symbol-kind filter.
+    pub kind_filter: Option<String>,
+    /// Maximum hierarchy depth; defaults to one for compact no-query outlines.
+    pub max_depth: Option<u32>,
+    /// Maximum matched declarations returned.
+    #[serde(default = "default_document_symbol_limit")]
+    pub limit: u32,
+    /// Include test modules and test declarations.
+    #[serde(default)]
+    pub include_tests: bool,
+    /// Include declarations detected as private.
+    #[serde(default)]
+    pub include_private: bool,
+    /// Include bounded declaration bodies instead of headers only.
+    #[serde(default)]
+    pub include_bodies: bool,
+}
+
+const fn default_document_symbol_limit() -> u32 {
+    100
+}
+
+impl Default for DocumentSymbolOptions {
+    fn default() -> Self {
+        Self {
+            query: None,
+            match_mode: WorkspaceSymbolMatchMode::default(),
+            kind_filter: None,
+            max_depth: None,
+            limit: default_document_symbol_limit(),
+            include_tests: false,
+            include_private: false,
+            include_bodies: false,
+        }
+    }
+}
+
+impl DocumentSymbolOptions {
+    /// Full bounded tree used by internal refactor validation.
+    #[must_use]
+    pub(crate) fn internal_tree() -> Self {
+        Self {
+            max_depth: Some(16),
+            limit: 1_000,
+            include_tests: true,
+            include_private: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Result of a document symbols request.
@@ -251,6 +328,16 @@ pub struct Symbol {
 pub struct DocumentSymbolsResult {
     /// List of symbols in the document.
     pub symbols: Vec<Symbol>,
+    /// Path relative to the owning project root.
+    pub project_relative_path: Option<String>,
+    /// Matching declarations before the result limit.
+    pub total: usize,
+    /// Matching declarations returned.
+    pub returned: usize,
+    /// Whether result or source budgets shortened the response.
+    pub truncated: bool,
+    /// Filters and bounds applied to this outline.
+    pub filters: DocumentSymbolOptions,
 }
 
 /// Result of a format document request.

@@ -526,10 +526,10 @@ async fn test_document_symbols() {
     // Get document symbols from lib.rs
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_document_symbols(lib_file.to_string_lossy().to_string()),
+        translator.lock().await.handle_document_symbols(
+            lib_file.to_string_lossy().to_string(),
+            mcpls_core::bridge::DocumentSymbolOptions::default(),
+        ),
     )
     .await;
 
@@ -583,10 +583,10 @@ async fn test_document_symbols_types_file() {
     // Get document symbols from types.rs
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_document_symbols(types_file.to_string_lossy().to_string()),
+        translator.lock().await.handle_document_symbols(
+            types_file.to_string_lossy().to_string(),
+            mcpls_core::bridge::DocumentSymbolOptions::default(),
+        ),
     )
     .await;
 

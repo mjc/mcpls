@@ -32,6 +32,27 @@ pub(super) async fn resolve_source_context(
     range: Range,
     budget: &mut SourceBudget,
 ) -> SourceContext {
+    resolve_source_context_with_max_lines(
+        tracker,
+        workspace_roots,
+        approved_source_roots,
+        uri,
+        range,
+        budget,
+        MAX_FRAME_LINES,
+    )
+    .await
+}
+
+pub(super) async fn resolve_source_context_with_max_lines(
+    tracker: &DocumentTracker,
+    workspace_roots: &[PathBuf],
+    approved_source_roots: &[PathBuf],
+    uri: &lsp_types::Uri,
+    range: Range,
+    budget: &mut SourceBudget,
+    max_lines: usize,
+) -> SourceContext {
     let Some(path) = uri_to_path(uri) else {
         return unavailable(SourceUnavailableReason::NonFileUri);
     };
@@ -72,7 +93,7 @@ pub(super) async fn resolve_source_context(
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
     let start = range.start.line.saturating_sub(1) as usize;
-    let end = (start + MAX_FRAME_LINES).min(total_lines);
+    let end = (start + max_lines.min(MAX_FRAME_LINES)).min(total_lines);
     let selected = &lines[start.min(total_lines)..end];
     let total_bytes = lines
         .iter()
@@ -164,6 +185,26 @@ impl EncodingCtx {
         budget: &mut SourceBudget,
     ) -> SourceContext {
         resolve_source_context(&self.tracker, workspace_roots, &[], uri, range, budget).await
+    }
+
+    pub(super) async fn source_context_with_max_lines(
+        &self,
+        workspace_roots: &[PathBuf],
+        uri: &lsp_types::Uri,
+        range: Range,
+        budget: &mut SourceBudget,
+        max_lines: usize,
+    ) -> SourceContext {
+        resolve_source_context_with_max_lines(
+            &self.tracker,
+            workspace_roots,
+            &[],
+            uri,
+            range,
+            budget,
+            max_lines,
+        )
+        .await
     }
 
     pub(super) async fn location(
