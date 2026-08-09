@@ -92,7 +92,8 @@ pub(super) async fn resolve_source_context_with_max_lines(
 
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
-    let start = range.start.line.saturating_sub(1) as usize;
+    let target = range.start.line.saturating_sub(1) as usize;
+    let start = declaration_context_start(&lines, target.min(total_lines));
     let end = (start + max_lines.min(MAX_FRAME_LINES)).min(total_lines);
     let selected = &lines[start.min(total_lines)..end];
     let total_bytes = lines
@@ -136,6 +137,20 @@ pub(super) async fn resolve_source_context_with_max_lines(
         total_bytes,
         truncated: start > 0 || returned_lines < selected.len() || end < total_lines,
     })
+}
+
+fn declaration_context_start(lines: &[&str], target: usize) -> usize {
+    let mut start = target;
+    while let Some(previous) = start.checked_sub(1).and_then(|index| lines.get(index)) {
+        let previous = previous.trim_start();
+        if previous.starts_with("///") || previous.starts_with("//! ") || previous.starts_with("#[")
+        {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    start
 }
 
 const fn unavailable(reason: SourceUnavailableReason) -> SourceContext {
@@ -302,6 +317,43 @@ mod tests {
             dunce::canonicalize(path).unwrap().to_string_lossy()
         );
         assert!(!frame.content_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_frame_includes_declaration_docs_header_and_body() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        tokio::fs::write(
+            &path,
+            "//! module docs\n\n/// First line.\n/// Second line.\n#[must_use]\npub fn answer() -> u32 {\n    42\n}\n",
+        )
+        .await
+        .unwrap();
+        let uri = path_to_uri(&path).unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+
+        let source = resolve_source_context(
+            &tracker,
+            &[root.path().into()],
+            &[],
+            &uri,
+            range(6),
+            &mut SourceBudget::default(),
+        )
+        .await;
+
+        let SourceContext::Available(frame) = source else {
+            panic!("source unavailable")
+        };
+        assert!(frame.text.contains("3 | /// First line."), "{}", frame.text);
+        assert!(
+            frame.text.contains("4 | /// Second line."),
+            "{}",
+            frame.text
+        );
+        assert!(frame.text.contains("5 | #[must_use]"), "{}", frame.text);
+        assert!(frame.text.contains("6 | pub fn answer()"), "{}", frame.text);
+        assert!(frame.text.contains("7 |     42"), "{}", frame.text);
     }
 
     #[tokio::test]
