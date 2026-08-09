@@ -4810,7 +4810,7 @@ while True:
             })),
         )
         .await
-        .expect("activation must be bounded")
+        .unwrap()
         .unwrap();
         let activated: serde_json::Value = serde_json::from_str(&activated).unwrap();
         let symbols = server
@@ -4823,6 +4823,13 @@ while True:
             .await
             .unwrap();
         let symbols: serde_json::Value = serde_json::from_str(&symbols).unwrap();
+        let repeated = server
+            .project_activate(Parameters(ProjectIdParams {
+                project_id: "fallback-only".to_string(),
+            }))
+            .await
+            .unwrap();
+        let repeated: serde_json::Value = serde_json::from_str(&repeated).unwrap();
         let hover_error = server
             .get_hover(Parameters(HoverParams {
                 file_path: root.path().join("main.rs").display().to_string(),
@@ -4836,6 +4843,7 @@ while True:
         assert_eq!(activated["status"], "Degraded");
         assert_eq!(activated["active_language_servers"], serde_json::json!([]));
         assert_eq!(symbols["symbols"][0]["name"], "fallback_symbol");
+        assert_eq!(repeated["generation"], activated["generation"]);
         assert!(
             hover_error.contains("no LSP server configured for language:"),
             "{hover_error}"

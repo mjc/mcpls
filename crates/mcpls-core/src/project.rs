@@ -3330,10 +3330,17 @@ impl ProjectRuntime {
     }
 
     fn activation_is_reusable(&self, status: ProjectStatus, roots: &[PathBuf]) -> bool {
-        matches!(
-            status,
-            ProjectStatus::Starting | ProjectStatus::Ready | ProjectStatus::Degraded
-        ) && self.has_active_workspace_roots(roots)
+        match status {
+            ProjectStatus::Starting | ProjectStatus::Ready => {
+                self.has_active_workspace_roots(roots)
+            }
+            ProjectStatus::Degraded => self.translator.has_workspace_roots(roots),
+            ProjectStatus::Restarting
+            | ProjectStatus::Dormant
+            | ProjectStatus::Stopping
+            | ProjectStatus::Stopped
+            | ProjectStatus::Failed => false,
+        }
     }
 
     fn begin_automatic_restart(&mut self) -> Option<AutomaticRestartAttempt> {
@@ -4332,7 +4339,20 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn add_workspace_root(&mut self, root: PathBuf) -> Result<ProjectActivation, String> {
+    async fn add_workspace_root(
+        &mut self,
+        root: PathBuf,
+        status: ProjectStatus,
+    ) -> Result<ProjectActivation, String> {
+        if status == ProjectStatus::Degraded
+            && !self.has_active_workspace_roots(self.translator.workspace_roots())
+        {
+            let mut roots = self.translator.workspace_roots().to_vec();
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+            return self.activate_workspace_roots(roots).await;
+        }
         self.translator
             .add_workspace_root(root)
             .await
@@ -4660,7 +4680,7 @@ async fn run_project_actor(
         let resumes_runtime = request.resumes_rust_runtime();
         if residency.is_some()
             && resumes_runtime
-            && !runtime.has_active_workspace_roots(runtime.translator.workspace_roots())
+            && !runtime.activation_is_reusable(state.status, runtime.translator.workspace_roots())
         {
             resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
         }
@@ -4784,7 +4804,9 @@ const fn activation_status(health: ActivationHealth, initializing: bool) -> Proj
     } else {
         match health {
             ActivationHealth::Ready => ProjectStatus::Ready,
-            ActivationHealth::Degraded => ProjectStatus::Degraded,
+            ActivationHealth::Degraded | ActivationHealth::StructuralOnly => {
+                ProjectStatus::Degraded
+            }
         }
     }
 }
@@ -5205,10 +5227,11 @@ async fn handle_project_request(
             let _ = reply.send(runtime.validate_path(&file_path));
         }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
+            let previous_status = state.status;
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Restarting);
-            match runtime.add_workspace_root(root).await {
+            match runtime.add_workspace_root(root, previous_status).await {
                 Ok(notification_receivers) => {
                     mark_project_started(
                         notification_receivers,
@@ -9122,6 +9145,25 @@ while True:
         );
         let restarted = actor.restart().await.unwrap();
         assert_eq!(restarted.workspace_roots(), state.workspace_roots());
+    }
+
+    #[tokio::test]
+    async fn structural_only_actor_reevaluates_lsp_when_linked_root_is_added() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        fs::write(second.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = "/definitely/missing/mcpls-language-server".to_string();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![first.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], Some(1));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        let initial = actor.activate(first.path().to_path_buf()).await.unwrap();
+        let added = actor.add_workspace_root(second.path().to_path_buf()).await;
+
+        assert_eq!(initial.status(), ProjectStatus::Degraded);
+        assert!(matches!(added, Err(ProjectActorError::Operation(_))));
     }
 
     #[tokio::test]

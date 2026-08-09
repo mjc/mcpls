@@ -26,8 +26,10 @@ use crate::lsp::{
 pub enum ActivationHealth {
     /// Every applicable language server initialized successfully.
     Ready,
-    /// The project is usable but is not fully backed by language servers.
+    /// At least one applicable language server failed while another started.
     Degraded,
+    /// No configured language server applies; structural tools remain usable.
+    StructuralOnly,
 }
 
 /// Language-server handles produced by one project activation.
@@ -40,6 +42,10 @@ pub struct ProjectActivation {
 impl ProjectActivation {
     pub(crate) const fn ready() -> Self {
         Self::new(Vec::new(), ActivationHealth::Ready)
+    }
+
+    pub(crate) const fn structural_only() -> Self {
+        Self::new(Vec::new(), ActivationHealth::StructuralOnly)
     }
 
     pub(crate) const fn new(
@@ -234,7 +240,7 @@ impl Translator {
         let registered_roots = lock_std(&self.project_lsp_roots);
         let configs = lock_std(&self.project_lsp_configs);
         !clients.is_empty()
-            && same_workspace_roots(&self.workspace_roots, roots)
+            && self.has_workspace_roots(roots)
             && clients.keys().all(|id| {
                 configs
                     .iter()
@@ -247,6 +253,12 @@ impl Translator {
                         )
                     })
             })
+    }
+
+    /// Return whether this translator owns exactly these logical project roots.
+    #[must_use]
+    pub(crate) fn has_workspace_roots(&self, roots: &[PathBuf]) -> bool {
+        same_workspace_roots(&self.workspace_roots, roots)
     }
 
     /// Return negotiated capabilities for active language servers.
@@ -389,10 +401,7 @@ impl Translator {
             self.clear_expected_servers();
             self.actor_notification_cache.set_diagnostics_route_count(0);
             self.set_workspace_roots(roots);
-            return Ok(ProjectActivation::new(
-                Vec::new(),
-                ActivationHealth::Degraded,
-            ));
+            return Ok(ProjectActivation::structural_only());
         }
 
         let pending = configs
