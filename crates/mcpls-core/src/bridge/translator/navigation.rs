@@ -577,6 +577,12 @@ fn reference_source_order(location: &Location, roots: &[std::path::PathBuf]) -> 
     if !roots.iter().any(|root| path.starts_with(root)) {
         return 2;
     }
+    if path
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some("target" | "generated")))
+    {
+        return 2;
+    }
     let text = path.to_string_lossy();
     u8::from(text.contains("/tests/") || text.ends_with("_test.rs"))
 }
@@ -617,6 +623,33 @@ mod tests {
                 reason: super::super::dto::SourceUnavailableReason::NotFound,
             },
             symbol_handle: None,
+        }
+    }
+
+    fn symbol(name: &str, start: u32, end: u32, children: Option<Vec<Symbol>>) -> Symbol {
+        let range = Range {
+            start: Position2D {
+                line: start,
+                character: 1,
+            },
+            end: Position2D {
+                line: end,
+                character: 1,
+            },
+        };
+        Symbol {
+            name: name.to_owned(),
+            kind: "Function".to_owned(),
+            selection_range: range.clone(),
+            range,
+            symbol_handle: None,
+            container_name: None,
+            match_class: None,
+            score: None,
+            source: None,
+            is_private: false,
+            is_test: false,
+            children,
         }
     }
 
@@ -688,6 +721,7 @@ mod tests {
         assert_eq!(value["total_references"], 2);
         assert_eq!(value["returned_references"], 2);
         assert_eq!(value["groups"][0]["project_relative_path"], "src/lib.rs");
+        assert_eq!(value["groups"][0]["references"][0]["role"], "unknown");
         assert_eq!(
             value["groups"][0]["references"].as_array().unwrap().len(),
             2
@@ -768,38 +802,12 @@ mod tests {
         first.range.start.character = 3;
         let mut second = unavailable_location("/workspace/src/lib.rs", 4);
         second.range.start.character = 9;
-        let symbol = Symbol {
-            name: "caller".to_owned(),
-            kind: "Function".to_owned(),
-            range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 8,
-                    character: 1,
-                },
-            },
-            selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 4,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 10,
-                },
-            },
-            symbol_handle: None,
-            container_name: None,
-            match_class: None,
-            score: None,
-            source: None,
-            is_private: false,
-            is_test: false,
-            children: None,
-        };
+        let symbol = symbol(
+            "impl Trait for Type",
+            1,
+            8,
+            Some(vec![symbol("caller", 2, 7, None)]),
+        );
         let symbols =
             std::collections::HashMap::from([("/workspace/src/lib.rs".to_owned(), vec![symbol])]);
 
@@ -829,6 +837,39 @@ mod tests {
                 .start
                 .character,
             9
+        );
+    }
+
+    #[test]
+    fn references_order_production_before_tests_generated_and_external() {
+        let result = group_references(
+            vec![
+                unavailable_location("/outside/dependency.rs", 1),
+                unavailable_location("/workspace/target/generated.rs", 1),
+                unavailable_location("/workspace/tests/use.rs", 1),
+                unavailable_location("/workspace/src/lib.rs", 1),
+            ],
+            None,
+            4,
+            &[std::path::PathBuf::from("/workspace")],
+            &std::collections::HashMap::new(),
+            SemanticResultLimits::default(),
+            false,
+        );
+        let paths = result
+            .groups
+            .iter()
+            .map(|group| group.project_relative_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            [
+                "src/lib.rs",
+                "tests/use.rs",
+                "/outside/dependency.rs",
+                "target/generated.rs"
+            ]
         );
     }
 }

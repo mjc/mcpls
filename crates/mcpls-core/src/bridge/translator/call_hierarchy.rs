@@ -422,6 +422,12 @@ fn source_order(uri: &lsp_types::Uri, roots: &[std::path::PathBuf]) -> u8 {
     if !roots.iter().any(|root| path.starts_with(root)) {
         return 2;
     }
+    if path
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some("target" | "generated")))
+    {
+        return 2;
+    }
     let text = path.to_string_lossy();
     u8::from(text.contains("/tests/") || text.ends_with("_test.rs"))
 }
@@ -469,6 +475,31 @@ mod tests {
             source,
             super::super::dto::SourceContext::Available(_)
         ));
+    }
+
+    fn call_item(name: &str, uri: String) -> CallHierarchyItemResult {
+        let range = Range {
+            start: Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: Position2D {
+                line: 1,
+                character: 4,
+            },
+        };
+        CallHierarchyItemResult {
+            name: name.to_owned(),
+            kind: 12,
+            detail: None,
+            uri,
+            path: None,
+            selection_range: range.clone(),
+            range,
+            source: None,
+            symbol_handle: None,
+            data: None,
+        }
     }
 
     use crate::bridge::translator::dto::{Position2D, Range};
@@ -597,36 +628,7 @@ mod tests {
         fs::write(&caller_path, "aöb").unwrap();
         let caller_uri = Url::from_file_path(&caller_path).unwrap().to_string();
 
-        let item = CallHierarchyItemResult {
-            name: "queried_fn".to_string(),
-            kind: 12,
-            detail: None,
-            uri: queried_uri,
-            path: None,
-            range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
-            },
-            selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
-            },
-            source: None,
-            symbol_handle: None,
-            data: None,
-        };
+        let item = call_item("queried_fn", queried_uri);
 
         let translator = Arc::new(translator);
         let handle = {
@@ -663,6 +665,9 @@ mod tests {
                 "fromRanges": [{
                     "start": {"line": 0, "character": 0},
                     "end": {"line": 0, "character": 3}
+                }, {
+                    "start": {"line": 0, "character": 1},
+                    "end": {"line": 0, "character": 2}
                 }]
             }]),
         )
@@ -675,6 +680,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].call_sites.len(), 2);
         assert_source_available(&result.calls[0].call_sites[0].source);
         let from_range = &result.calls[0].call_sites[0].range;
         assert_eq!(
@@ -711,36 +717,7 @@ mod tests {
         fs::write(&callee_path, "abc").unwrap();
         let callee_uri = Url::from_file_path(&callee_path).unwrap().to_string();
 
-        let item = CallHierarchyItemResult {
-            name: "queried_fn".to_string(),
-            kind: 12,
-            detail: None,
-            uri: queried_uri,
-            path: None,
-            range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
-            },
-            selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
-            },
-            source: None,
-            symbol_handle: None,
-            data: None,
-        };
+        let item = call_item("queried_fn", queried_uri);
 
         let translator = Arc::new(translator);
         let handle = {
