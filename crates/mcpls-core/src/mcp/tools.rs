@@ -3,19 +3,28 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::SymbolHandle;
+
 /// Parameters for the `get_hover` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting hover information at a position in a file.")]
 pub struct HoverParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
+    #[serde(default)]
     pub file_path: String,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
+    #[serde(default)]
     pub line: u32,
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
+    #[serde(default)]
     pub character: u32,
+    /// Project owning `symbol_handle` when coordinates are omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Parameters for the `get_definition` tool.
@@ -24,13 +33,20 @@ pub struct HoverParams {
 pub struct DefinitionParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
+    #[serde(default)]
     pub file_path: String,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
+    #[serde(default)]
     pub line: u32,
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
+    #[serde(default)]
     pub character: u32,
+    /// Project owning `symbol_handle` when coordinates are omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Project-scoped position for read-only semantic discovery.
@@ -39,11 +55,16 @@ pub struct SemanticPositionParams {
     /// Registered project that owns the file.
     pub project_id: String,
     /// Absolute path within that project.
+    #[serde(default)]
     pub file_path: String,
     /// One-based line number.
+    #[serde(default)]
     pub line: u32,
     /// One-based character offset in the active server's negotiated encoding.
+    #[serde(default)]
     pub character: u32,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Parameters for the `get_references` tool.
@@ -52,13 +73,20 @@ pub struct SemanticPositionParams {
 pub struct ReferencesParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
+    #[serde(default)]
     pub file_path: String,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
+    #[serde(default)]
     pub line: u32,
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
+    #[serde(default)]
     pub character: u32,
+    /// Project owning `symbol_handle` when coordinates are omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
     /// Whether to include the declaration in the results.
     #[schemars(description = "Whether to include the declaration in the results.")]
     #[serde(default)]
@@ -393,13 +421,20 @@ pub struct CodeActionApplyParams {
 pub struct CallHierarchyPrepareParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
+    #[serde(default)]
     pub file_path: String,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
+    #[serde(default)]
     pub line: u32,
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
+    #[serde(default)]
     pub character: u32,
+    /// Project owning `symbol_handle` when coordinates are omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
@@ -410,7 +445,11 @@ pub struct CallHierarchyPrepareParams {
 pub struct CallHierarchyCallsParams {
     /// The call hierarchy item to get calls for (from prepare response).
     #[schemars(description = "The call hierarchy item to get calls for (from prepare response).")]
-    pub item: serde_json::Value,
+    pub item: Option<serde_json::Value>,
+    /// Project owning `symbol_handle` when `item` is omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Parameters for the `get_cached_diagnostics` tool.
@@ -500,13 +539,20 @@ pub struct SignatureHelpParams {
 pub struct GoToImplementationParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
+    #[serde(default)]
     pub file_path: String,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
+    #[serde(default)]
     pub line: u32,
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
+    #[serde(default)]
     pub character: u32,
+    /// Project owning `symbol_handle` when coordinates are omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Parameters for the `go_to_type_definition` tool.
@@ -515,13 +561,20 @@ pub struct GoToImplementationParams {
 pub struct GoToTypeDefinitionParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
+    #[serde(default)]
     pub file_path: String,
     /// Line number (1-based).
     #[schemars(description = "Line number (1-based).")]
+    #[serde(default)]
     pub line: u32,
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
+    #[serde(default)]
     pub character: u32,
+    /// Project owning `symbol_handle` when coordinates are omitted.
+    pub project_id: Option<String>,
+    /// Snapshot-bound handle returned by a prior semantic result.
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Parameters for the `get_inlay_hints` tool.
@@ -603,3 +656,31 @@ pub struct ProjectListParams {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List resource subscriptions owned by this MCP session.")]
 pub struct SubscriptionListParams {}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_params_accept_a_handle_without_coordinates() {
+        let handle = SymbolHandle::new();
+        let params: ReferencesParams = serde_json::from_value(serde_json::json!({
+            "project_id": "project",
+            "symbol_handle": handle,
+        }))
+        .unwrap();
+        assert!(params.file_path.is_empty());
+        assert_eq!(params.line, 0);
+        assert_eq!(params.character, 0);
+    }
+
+    #[test]
+    fn semantic_param_schema_does_not_require_coordinates() {
+        let schema = serde_json::to_value(schemars::schema_for!(ReferencesParams)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.iter().any(|field| field == "file_path"));
+        assert!(!required.iter().any(|field| field == "line"));
+        assert!(!required.iter().any(|field| field == "character"));
+    }
+}

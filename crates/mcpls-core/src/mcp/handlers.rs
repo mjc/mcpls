@@ -137,6 +137,25 @@ impl HandlerContext {
         self.project_registry.actor_for_path(path).await
     }
 
+    /// Resolve a handle through every actor group owned by an explicit project.
+    pub(crate) async fn resolve_symbol_handle(
+        &self,
+        id: &crate::project::ProjectId,
+        handle: crate::bridge::SymbolHandle,
+    ) -> Result<(ProjectHandle, crate::project::ResolvedSymbolTarget), String> {
+        self.project_registry
+            .resolve_symbol_handle(id, handle)
+            .await
+    }
+
+    /// Return the primary actor for an explicit registered project.
+    pub(crate) async fn required_actor_for_project(
+        &self,
+        id: &crate::project::ProjectId,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.project_registry.actor(id).await
+    }
+
     /// Return the owning project identity and actor for a path.
     pub async fn required_project_for_path(
         &self,

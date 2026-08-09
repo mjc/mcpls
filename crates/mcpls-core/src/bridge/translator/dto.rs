@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Opaque project-actor-owned reference to a symbol at one source snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct SymbolHandle(String);
 

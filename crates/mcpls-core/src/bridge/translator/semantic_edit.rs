@@ -1060,7 +1060,8 @@ impl Translator {
                         timeout,
                     )
                     .await?;
-                (result.locations, result.truncated) = bounded_locations(response);
+                (result.locations, result.truncated) =
+                    bounded_locations(response, &ctx, &self.workspace_roots).await;
             }
             SemanticDiscoveryKind::ParentModule | SemanticDiscoveryKind::ChildModules => {
                 let method = if matches!(kind, SemanticDiscoveryKind::ParentModule) {
@@ -1070,7 +1071,8 @@ impl Translator {
                 };
                 let response: Option<lsp_types::GotoDefinitionResponse> =
                     client.request(method, position_params, timeout).await?;
-                (result.locations, result.truncated) = bounded_locations(response);
+                (result.locations, result.truncated) =
+                    bounded_locations(response, &ctx, &self.workspace_roots).await;
             }
             SemanticDiscoveryKind::MacroExpansion => {
                 if let Some(mut expansion) = client
@@ -1222,7 +1224,11 @@ fn experimental_enabled(capabilities: &lsp_types::ServerCapabilities, key: &str)
     )
 }
 
-fn bounded_locations(response: Option<lsp_types::GotoDefinitionResponse>) -> (Vec<Location>, bool) {
+async fn bounded_locations(
+    response: Option<lsp_types::GotoDefinitionResponse>,
+    ctx: &super::encoding_ctx::EncodingCtx,
+    workspace_roots: &[PathBuf],
+) -> (Vec<Location>, bool) {
     let values = match response {
         None => Vec::new(),
         Some(lsp_types::GotoDefinitionResponse::Scalar(location)) => vec![location],
@@ -1236,21 +1242,12 @@ fn bounded_locations(response: Option<lsp_types::GotoDefinitionResponse>) -> (Ve
             .collect(),
     };
     let truncated = values.len() > MAX_DISCOVERY_ITEMS;
-    (
-        values
-            .into_iter()
-            .take(MAX_DISCOVERY_ITEMS)
-            .map(|location| Location {
-                uri: location.uri.to_string(),
-                range: normalize_range(location.range),
-                source: super::SourceContext::Unavailable {
-                    reason: super::SourceUnavailableReason::Unreadable,
-                },
-                symbol_handle: None,
-            })
-            .collect(),
-        truncated,
-    )
+    let mut locations = Vec::new();
+    let mut budget = super::source_context::SourceBudget::default();
+    for location in values.into_iter().take(MAX_DISCOVERY_ITEMS) {
+        locations.push(ctx.location(workspace_roots, location, &mut budget).await);
+    }
+    (locations, truncated)
 }
 
 fn bounded_json_values(values: Vec<serde_json::Value>) -> (Vec<serde_json::Value>, bool) {

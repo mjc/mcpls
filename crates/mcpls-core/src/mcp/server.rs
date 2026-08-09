@@ -39,6 +39,7 @@ use crate::bridge::Translator;
 use crate::bridge::resources::make_uri;
 use crate::bridge::{
     PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SupportedWorkspaceEdit,
+    SymbolHandle,
 };
 use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
@@ -409,6 +410,96 @@ impl Clone for McplsServer {
 
 #[tool_router]
 impl McplsServer {
+    async fn semantic_target(
+        &self,
+        project_id: Option<String>,
+        symbol_handle: Option<SymbolHandle>,
+        file_path: String,
+        line: u32,
+        character: u32,
+    ) -> Result<(ProjectHandle, String, u32, u32), McpError> {
+        if let Some(symbol_handle) = symbol_handle {
+            let project_id = project_id.ok_or_else(|| {
+                McpError::invalid_params(
+                    "project_id is required with symbol_handle".to_owned(),
+                    None,
+                )
+            })?;
+            let id = parse_project_id(project_id)?;
+            let (actor, target) = self
+                .context
+                .resolve_symbol_handle(&id, symbol_handle)
+                .await
+                .map_err(|error| {
+                    let message = error;
+                    let code = if message.contains("stale_symbol_handle") {
+                        "stale_symbol_handle"
+                    } else {
+                        "invalid_symbol_handle"
+                    };
+                    McpError::invalid_params(
+                        message,
+                        Some(serde_json::json!({
+                            "code": code,
+                            "refresh": "rerun symbol discovery and use the new handle"
+                        })),
+                    )
+                })?;
+            return Ok((actor, target.file_path, target.line, target.character));
+        }
+        if file_path.is_empty() {
+            return Err(McpError::invalid_params(
+                "file_path, line, and character or project_id and symbol_handle are required"
+                    .to_owned(),
+                None,
+            ));
+        }
+        let actor = if let Some(project_id) = project_id {
+            let id = parse_project_id(project_id)?;
+            self.context.required_actor_for_project(&id).await
+        } else {
+            self.context.required_actor_for_path(&file_path).await
+        }
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        Ok((actor, file_path, line, character))
+    }
+
+    async fn call_hierarchy_target(
+        &self,
+        params: CallHierarchyCallsParams,
+    ) -> Result<(ProjectHandle, serde_json::Value), McpError> {
+        if params.symbol_handle.is_some() {
+            let (actor, file_path, line, character) = self
+                .semantic_target(params.project_id, params.symbol_handle, String::new(), 0, 0)
+                .await?;
+            let item = actor
+                .prepare_call_hierarchy(file_path, line, character)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+                .items
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "symbol handle does not resolve to a callable item".to_owned(),
+                        None,
+                    )
+                })?;
+            return serde_json::to_value(item)
+                .map(|item| (actor, item))
+                .map_err(|error| McpError::internal_error(error.to_string(), None));
+        }
+        let item = params.item.ok_or_else(|| {
+            McpError::invalid_params("item or project_id and symbol_handle are required", None)
+        })?;
+        let path = call_hierarchy_item_path(&item)?;
+        let actor = self
+            .context
+            .required_actor_for_path(&path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        Ok((actor, item))
+    }
     async fn daemon_snapshot(&self) -> DaemonSnapshot {
         let projects = self.context.project_registry.status_snapshot().await;
         DaemonSnapshot {
@@ -564,15 +655,17 @@ impl McplsServer {
         params: SemanticPositionParams,
         kind: SemanticDiscoveryKind,
     ) -> Result<String, McpError> {
-        let id = parse_project_id(params.project_id)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(
+                Some(params.project_id),
+                params.symbol_handle,
+                params.file_path,
+                params.line,
+                params.character,
+            )
+            .await?;
         let result = actor
-            .semantic_discovery(params.file_path, params.line, params.character, kind)
+            .semantic_discovery(file_path, line, character, kind)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         encode_json(&result)
@@ -1193,13 +1286,13 @@ impl McplsServer {
             file_path,
             line,
             character,
+            project_id,
+            symbol_handle,
         }): Parameters<HoverParams>,
     ) -> Result<String, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(project_id, symbol_handle, file_path, line, character)
+            .await?;
         let result = actor
             .hover(file_path, line, character)
             .await
@@ -1222,13 +1315,13 @@ impl McplsServer {
             file_path,
             line,
             character,
+            project_id,
+            symbol_handle,
         }): Parameters<DefinitionParams>,
     ) -> Result<String, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(project_id, symbol_handle, file_path, line, character)
+            .await?;
         let result = actor
             .definition(file_path, line, character)
             .await
@@ -1335,14 +1428,14 @@ impl McplsServer {
             file_path,
             line,
             character,
+            project_id,
+            symbol_handle,
             include_declaration,
         }): Parameters<ReferencesParams>,
     ) -> Result<String, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(project_id, symbol_handle, file_path, line, character)
+            .await?;
         let result = actor
             .references(file_path, line, character, include_declaration)
             .await
@@ -1647,13 +1740,13 @@ impl McplsServer {
             file_path,
             line,
             character,
+            project_id,
+            symbol_handle,
         }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<String, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(project_id, symbol_handle, file_path, line, character)
+            .await?;
         let result = actor
             .prepare_call_hierarchy(file_path, line, character)
             .await
@@ -1672,14 +1765,9 @@ impl McplsServer {
     )]
     async fn get_incoming_calls(
         &self,
-        Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
+        Parameters(params): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let path = call_hierarchy_item_path(&item)?;
-        let actor = self
-            .context
-            .required_actor_for_path(&path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, item) = self.call_hierarchy_target(params).await?;
         let result = actor
             .incoming_calls(item)
             .await
@@ -1694,14 +1782,9 @@ impl McplsServer {
     )]
     async fn get_outgoing_calls(
         &self,
-        Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
+        Parameters(params): Parameters<CallHierarchyCallsParams>,
     ) -> Result<String, McpError> {
-        let path = call_hierarchy_item_path(&item)?;
-        let actor = self
-            .context
-            .required_actor_for_path(&path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, item) = self.call_hierarchy_target(params).await?;
         let result = actor
             .outgoing_calls(item)
             .await
@@ -1836,13 +1919,13 @@ impl McplsServer {
             file_path,
             line,
             character,
+            project_id,
+            symbol_handle,
         }): Parameters<GoToImplementationParams>,
     ) -> Result<String, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(project_id, symbol_handle, file_path, line, character)
+            .await?;
         let result = actor
             .go_to_implementation(file_path, line, character)
             .await
@@ -1865,13 +1948,13 @@ impl McplsServer {
             file_path,
             line,
             character,
+            project_id,
+            symbol_handle,
         }): Parameters<GoToTypeDefinitionParams>,
     ) -> Result<String, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let (actor, file_path, line, character) = self
+            .semantic_target(project_id, symbol_handle, file_path, line, character)
+            .await?;
         let result = actor
             .go_to_type_definition(file_path, line, character)
             .await
@@ -4315,6 +4398,7 @@ while True:
             file_path: renamed.display().to_string(),
             line: 1,
             character: 1,
+            symbol_handle: None,
         };
         let declaration: serde_json::Value = serde_json::from_str(
             &server
@@ -4553,6 +4637,7 @@ while True:
             file_path: source.display().to_string(),
             line: 1,
             character: 1,
+            symbol_handle: None,
         };
         for response in [
             server
@@ -4594,6 +4679,7 @@ while True:
                 file_path: outside_source.display().to_string(),
                 line: 1,
                 character: 1,
+                symbol_handle: None,
             }))
             .await
             .unwrap_err()
@@ -4823,6 +4909,21 @@ while True:
             .await
             .unwrap();
         let symbols: serde_json::Value = serde_json::from_str(&symbols).unwrap();
+        let handle: SymbolHandle =
+            serde_json::from_value(symbols["symbols"][0]["location"]["symbol_handle"].clone())
+                .unwrap();
+        let handle_error = server
+            .for_session()
+            .get_hover(Parameters(HoverParams {
+                file_path: String::new(),
+                line: 0,
+                character: 0,
+                project_id: Some("fallback-only".to_owned()),
+                symbol_handle: Some(handle),
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
         let repeated = server
             .project_activate(Parameters(ProjectIdParams {
                 project_id: "fallback-only".to_string(),
@@ -4835,6 +4936,8 @@ while True:
                 file_path: root.path().join("main.rs").display().to_string(),
                 line: 1,
                 character: 1,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await
             .unwrap_err()
@@ -4843,6 +4946,10 @@ while True:
         assert_eq!(activated["status"], "Degraded");
         assert_eq!(activated["active_language_servers"], serde_json::json!([]));
         assert_eq!(symbols["symbols"][0]["name"], "fallback_symbol");
+        assert!(
+            handle_error.contains("no LSP server configured"),
+            "{handle_error}"
+        );
         assert_eq!(repeated["generation"], activated["generation"]);
         assert!(
             hover_error.contains("no LSP server configured for language:"),
@@ -4878,6 +4985,8 @@ while True:
             file_path: "/nonexistent/file.rs".to_string(),
             line: 1,
             character: 1,
+            project_id: None,
+            symbol_handle: None,
         });
 
         // This should return an error (no LSP server configured)
@@ -4896,6 +5005,8 @@ while True:
                 file_path: file.display().to_string(),
                 line: 1,
                 character: 1,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await
             .unwrap_err()
@@ -4925,6 +5036,8 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 0,
                 character: 0,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await;
 
@@ -4954,6 +5067,8 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 0,
                 character: 0,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await;
 
@@ -4983,6 +5098,8 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 0,
                 character: 0,
+                project_id: None,
+                symbol_handle: None,
                 include_declaration: false,
             }))
             .await;
@@ -5188,6 +5305,8 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 1,
                 character: 5,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await;
 
@@ -5276,6 +5395,8 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 1,
                 character: 5,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await;
 
@@ -5304,6 +5425,8 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 1,
                 character: 5,
+                project_id: None,
+                symbol_handle: None,
             }))
             .await;
 
@@ -5344,6 +5467,8 @@ while True:
             file_path: "/test/file.rs".to_string(),
             line: 10,
             character: 5,
+            project_id: None,
+            symbol_handle: None,
         });
 
         let result = server.get_definition(params).await;
@@ -5357,6 +5482,8 @@ while True:
             file_path: "/test/file.rs".to_string(),
             line: 10,
             character: 5,
+            project_id: None,
+            symbol_handle: None,
             include_declaration: false,
         });
 
@@ -5462,6 +5589,8 @@ while True:
             file_path: "/test/file.rs".to_string(),
             line: 10,
             character: 5,
+            project_id: None,
+            symbol_handle: None,
         });
         let result = server.prepare_call_hierarchy(params).await;
         assert!(result.is_err());
@@ -5483,7 +5612,11 @@ while True:
                 "end": {"line": 0, "character": 10}
             }
         });
-        let params = Parameters(CallHierarchyCallsParams { item });
+        let params = Parameters(CallHierarchyCallsParams {
+            item: Some(item),
+            project_id: None,
+            symbol_handle: None,
+        });
         let result = server.get_incoming_calls(params).await;
         assert!(result.is_err());
     }
@@ -5504,7 +5637,11 @@ while True:
                 "end": {"line": 0, "character": 10}
             }
         });
-        let params = Parameters(CallHierarchyCallsParams { item });
+        let params = Parameters(CallHierarchyCallsParams {
+            item: Some(item),
+            project_id: None,
+            symbol_handle: None,
+        });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
     }
@@ -5534,7 +5671,11 @@ while True:
         });
 
         let result = server
-            .get_incoming_calls(Parameters(CallHierarchyCallsParams { item }))
+            .get_incoming_calls(Parameters(CallHierarchyCallsParams {
+                item: Some(item),
+                project_id: None,
+                symbol_handle: None,
+            }))
             .await;
         let error = result.unwrap_err().to_string();
         assert!(!error.contains("outside workspace"), "{error}");
@@ -5565,7 +5706,11 @@ while True:
         });
 
         let result = server
-            .get_outgoing_calls(Parameters(CallHierarchyCallsParams { item }))
+            .get_outgoing_calls(Parameters(CallHierarchyCallsParams {
+                item: Some(item),
+                project_id: None,
+                symbol_handle: None,
+            }))
             .await;
         let error = result.unwrap_err().to_string();
         assert!(!error.contains("outside workspace"), "{error}");
@@ -5790,6 +5935,8 @@ while True:
             file_path: "/test/file.rs".to_string(),
             line: 10,
             character: 5,
+            project_id: None,
+            symbol_handle: None,
         });
 
         let result = server.go_to_implementation(params).await;
@@ -5803,6 +5950,8 @@ while True:
             file_path: "/test/file.rs".to_string(),
             line: 10,
             character: 5,
+            project_id: None,
+            symbol_handle: None,
         });
 
         let result = server.go_to_type_definition(params).await;

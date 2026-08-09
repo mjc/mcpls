@@ -1358,6 +1358,14 @@ pub(crate) struct PathRenamePreview {
     pub(crate) semantic_edit_count: usize,
 }
 
+/// Coordinate target recovered from an actor-owned snapshot handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSymbolTarget {
+    pub(crate) file_path: String,
+    pub(crate) line: u32,
+    pub(crate) character: u32,
+}
+
 enum ProjectRequest {
     Resident {
         request: Box<Self>,
@@ -1400,10 +1408,9 @@ enum ProjectRequest {
         include_declaration: bool,
         reply: oneshot::Sender<Result<ReferencesResult, String>>,
     },
-    ReferencesByHandle {
+    ResolveSymbolHandle {
         symbol_handle: SymbolHandle,
-        include_declaration: bool,
-        reply: oneshot::Sender<Result<ReferencesResult, String>>,
+        reply: oneshot::Sender<Result<ResolvedSymbolTarget, String>>,
     },
     Diagnostics {
         file_path: String,
@@ -1659,7 +1666,7 @@ impl ProjectRequest {
                 | Self::Hover { .. }
                 | Self::Definition { .. }
                 | Self::References { .. }
-                | Self::ReferencesByHandle { .. }
+                | Self::ResolveSymbolHandle { .. }
                 | Self::Diagnostics { .. }
                 | Self::Rename { .. }
                 | Self::RenameWorkspaceEdit { .. }
@@ -1727,9 +1734,8 @@ impl ProjectRequest {
         match self {
             Self::Hover { reply, .. } => reject!(reply),
             Self::Definition { reply, .. } => reject!(reply),
-            Self::References { reply, .. } | Self::ReferencesByHandle { reply, .. } => {
-                reject!(reply)
-            }
+            Self::References { reply, .. } => reject!(reply),
+            Self::ResolveSymbolHandle { reply, .. } => reject!(reply),
             Self::Diagnostics { reply, .. } => reject!(reply),
             Self::Rename { reply, .. } => reject!(reply),
             Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
@@ -1772,9 +1778,8 @@ impl ProjectRequest {
             }
             Self::Hover { reply, .. } => reply.is_closed(),
             Self::Definition { reply, .. } => reply.is_closed(),
-            Self::References { reply, .. } | Self::ReferencesByHandle { reply, .. } => {
-                reply.is_closed()
-            }
+            Self::References { reply, .. } => reply.is_closed(),
+            Self::ResolveSymbolHandle { reply, .. } => reply.is_closed(),
             Self::Diagnostics { reply, .. } | Self::CachedDiagnostics { reply, .. } => {
                 reply.is_closed()
             }
@@ -2052,16 +2057,14 @@ impl ProjectHandle {
     ///
     /// Returns a typed operation error when the handle is unknown, expired,
     /// belongs to another project actor, or its source snapshot is stale.
-    pub async fn references_by_handle(
+    pub(crate) async fn resolve_symbol_handle(
         &self,
         symbol_handle: SymbolHandle,
-        include_declaration: bool,
-    ) -> Result<ReferencesResult, ProjectActorError> {
+    ) -> Result<ResolvedSymbolTarget, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::ReferencesByHandle {
+            .send(ProjectRequest::ResolveSymbolHandle {
                 symbol_handle,
-                include_declaration,
                 reply,
             })
             .await
@@ -3321,6 +3324,36 @@ struct SymbolHandleStore {
     max_entries: usize,
 }
 
+fn attach_document_symbol_handles(
+    store: &mut SymbolHandleStore,
+    symbols: &mut [crate::bridge::Symbol],
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    lines: &[&str],
+) {
+    for symbol in symbols {
+        let start = symbol.selection_range.start.line;
+        let end = symbol.selection_range.end.line;
+        let (line, character) = (start..=end)
+            .find_map(|line| {
+                let text = lines.get(line.saturating_sub(1) as usize)?;
+                let byte = text.find(&symbol.name)?;
+                let character = u32::try_from(text[..byte].encode_utf16().count() + 1).ok()?;
+                Some((line, character))
+            })
+            .unwrap_or((start, symbol.selection_range.start.character));
+        symbol.symbol_handle = Some(store.insert(StoredSymbolTarget::new(
+            path.to_path_buf(),
+            line,
+            character,
+            snapshot.clone(),
+        )));
+        if let Some(children) = &mut symbol.children {
+            attach_document_symbol_handles(store, children, path, snapshot, lines);
+        }
+    }
+}
+
 impl SymbolHandleStore {
     fn new() -> Self {
         Self {
@@ -3357,7 +3390,7 @@ impl SymbolHandleStore {
     fn resolve(&mut self, handle: &SymbolHandle) -> Result<StoredSymbolTarget, String> {
         self.prune();
         self.entries.get(handle).cloned().ok_or_else(|| {
-            "symbol handle is missing, forged, or expired; rerun symbol discovery to refresh it"
+            "invalid_symbol_handle: handle is missing, forged, expired, or belongs to another project; rerun symbol discovery"
                 .to_owned()
         })
     }
@@ -3468,7 +3501,7 @@ impl ProjectRuntime {
         handle: &SymbolHandle,
     ) -> Result<StoredSymbolTarget, String> {
         let target = self.symbol_handles.resolve(handle)?;
-        let (version, hash) = self
+        let (_, version, hash, _) = self
             .translator
             .source_snapshot(&target.file_path)
             .await
@@ -3485,6 +3518,23 @@ impl ProjectRuntime {
             "stale_symbol_handle: source changed; rerun symbol discovery to refresh the handle"
                 .to_owned()
         })
+    }
+
+    async fn new_symbol_handle(
+        &mut self,
+        file_path: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<SymbolHandle, String> {
+        let (path, version, hash, _) = self
+            .translator
+            .source_snapshot(Path::new(file_path))
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = version.map_or(SourceSnapshot::Hash(hash), SourceSnapshot::Version);
+        Ok(self
+            .symbol_handles
+            .insert(StoredSymbolTarget::new(path, line, character, snapshot)))
     }
 
     fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
@@ -4042,15 +4092,18 @@ impl ProjectRuntime {
     }
 
     async fn hover(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<HoverResult, String> {
-        self.translator
-            .handle_hover(file_path, line, character)
+        let mut result = self
+            .translator
+            .handle_hover(file_path.clone(), line, character)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        result.symbol_handle = Some(self.new_symbol_handle(&file_path, line, character).await?);
+        Ok(result)
     }
 
     async fn definition(
@@ -4084,19 +4137,16 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    async fn references_by_handle(
+    async fn resolve_symbol_handle(
         &mut self,
         symbol_handle: SymbolHandle,
-        include_declaration: bool,
-    ) -> Result<ReferencesResult, String> {
+    ) -> Result<ResolvedSymbolTarget, String> {
         let target = self.resolve_symbol_target(&symbol_handle).await?;
-        self.references(
-            target.file_path.to_string_lossy().into_owned(),
-            target.line,
-            target.character,
-            include_declaration,
-        )
-        .await
+        Ok(ResolvedSymbolTarget {
+            file_path: target.file_path.to_string_lossy().into_owned(),
+            line: target.line,
+            character: target.character,
+        })
     }
 
     async fn diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult, String> {
@@ -4145,11 +4195,30 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn document_symbols(&self, file_path: String) -> Result<DocumentSymbolsResult, String> {
-        self.translator
-            .handle_document_symbols(file_path)
+    async fn document_symbols(
+        &mut self,
+        file_path: String,
+    ) -> Result<DocumentSymbolsResult, String> {
+        let mut result = self
+            .translator
+            .handle_document_symbols(file_path.clone())
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let (path, version, hash, content) = self
+            .translator
+            .source_snapshot(Path::new(&file_path))
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = version.map_or(SourceSnapshot::Hash(hash), SourceSnapshot::Version);
+        let lines = content.lines().collect::<Vec<_>>();
+        attach_document_symbol_handles(
+            &mut self.symbol_handles,
+            &mut result.symbols,
+            &path,
+            &snapshot,
+            &lines,
+        );
+        Ok(result)
     }
 
     async fn format_document(
@@ -4204,16 +4273,19 @@ impl ProjectRuntime {
     }
 
     async fn semantic_discovery(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
         kind: SemanticDiscoveryKind,
     ) -> Result<SemanticDiscoveryResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .request_semantic_discovery(file_path, line, character, kind)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(&mut result.locations);
+        Ok(result)
     }
 
     async fn workspace_symbol(
@@ -5183,16 +5255,11 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::ReferencesByHandle {
+        ProjectRequest::ResolveSymbolHandle {
             symbol_handle,
-            include_declaration,
             reply,
         } => {
-            let _ = reply.send(
-                runtime
-                    .references_by_handle(symbol_handle, include_declaration)
-                    .await,
-            );
+            let _ = reply.send(runtime.resolve_symbol_handle(symbol_handle).await);
         }
         ProjectRequest::Diagnostics { file_path, reply } => {
             let _ = reply.send(runtime.diagnostics(file_path).await);
@@ -7404,6 +7471,29 @@ impl ProjectRegistry {
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
+    pub(crate) async fn resolve_symbol_handle(
+        &self,
+        id: &ProjectId,
+        handle: SymbolHandle,
+    ) -> Result<(ProjectHandle, ResolvedSymbolTarget), String> {
+        let actors = self
+            .actors_for_project(id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for actor in actors {
+            match actor.resolve_symbol_handle(handle.clone()).await {
+                Ok(target) => return Ok((actor, target)),
+                Err(error) => {
+                    let error = error.to_string();
+                    if !error.starts_with("invalid_symbol_handle") {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err("invalid_symbol_handle: unknown or forged handle; rerun symbol discovery".to_owned())
+    }
+
     /// Return the number of actor groups backing one logical project.
     ///
     /// Compatible linked roots share one group and therefore one language
@@ -7452,7 +7542,10 @@ impl ProjectRegistry {
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
-    async fn actor(&self, id: &ProjectId) -> Result<ProjectHandle, ProjectRegistryError> {
+    pub(crate) async fn actor(
+        &self,
+        id: &ProjectId,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
         self.projects
             .read()
             .await
@@ -7790,6 +7883,84 @@ mod tests {
         assert!(store.resolve(&first).is_err());
         assert_eq!(store.resolve(&second).unwrap().line, 3);
         assert!(store.resolve(&SymbolHandle::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_handle_survives_handle_clones_and_rejects_stale_source() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn handle_target() {}\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        let result = actor
+            .workspace_symbol("handle_target".to_owned(), None, 10)
+            .await
+            .unwrap();
+        let Some(handle) = result.symbols[0].location.symbol_handle.clone() else {
+            panic!("workspace symbol should carry a handle");
+        };
+        let target = actor
+            .clone()
+            .resolve_symbol_handle(handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(target.file_path, source.display().to_string());
+        let other_actor = spawn_project_actor_with_translator(4, Translator::new());
+        let isolation_error = other_actor
+            .resolve_symbol_handle(handle.clone())
+            .await
+            .unwrap_err();
+        assert!(isolation_error.to_string().contains("forged"));
+
+        fs::write(&source, "fn moved_target() {}\n").unwrap();
+        let error = actor.resolve_symbol_handle(handle).await.unwrap_err();
+        assert!(error.to_string().contains("stale_symbol_handle"));
+    }
+
+    #[test]
+    fn symbol_handle_store_expires_entries() {
+        let mut store = SymbolHandleStore {
+            entries: HashMap::new(),
+            ttl: Duration::ZERO,
+            max_entries: 1,
+        };
+        let handle = store.insert(StoredSymbolTarget::new(
+            PathBuf::from("lib.rs"),
+            1,
+            1,
+            SourceSnapshot::Version(1),
+        ));
+        assert!(store.resolve(&handle).is_err());
+    }
+
+    #[tokio::test]
+    async fn symbol_handle_rejects_a_new_dirty_document_version() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("dirty.rs");
+        fs::write(&source, "fn before() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker()
+            .open(source.clone(), "fn before() {}\n".to_owned())
+            .unwrap();
+        let mut runtime = ProjectRuntime::new(translator);
+        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
+            source.clone(),
+            1,
+            4,
+            SourceSnapshot::Version(1),
+        ));
+        runtime
+            .translator
+            .document_tracker()
+            .update(&source, "fn after() {}\n".to_owned());
+
+        let error = runtime.resolve_symbol_target(&handle).await.unwrap_err();
+        assert!(error.contains("stale_symbol_handle"));
     }
 
     #[test]

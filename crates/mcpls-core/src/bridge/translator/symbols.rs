@@ -6,7 +6,7 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
+use super::dto::{DocumentSymbolsResult, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::{ast_grep, lock_std, path_to_uri};
 use crate::config::ToolKind;
@@ -314,39 +314,45 @@ impl Translator {
         kind_filter: Option<&str>,
         limit: usize,
     ) -> Vec<WorkspaceSymbol> {
-        ast_grep::search(&self.workspace_roots, languages, query, kind_filter, limit)
-            .await
-            .into_iter()
-            .filter_map(|symbol| {
-                let kind = ast_grep_symbol_kind(&symbol.kind)?;
-                let uri = path_to_uri(&symbol.path).ok()?;
-                kind_filter
-                    .is_none_or(|filter| kind.eq_ignore_ascii_case(filter))
-                    .then_some(WorkspaceSymbol {
-                        name: symbol.name,
-                        kind: kind.to_string(),
-                        location: Location {
-                            uri: uri.to_string(),
-                            range: super::Range {
-                                start: super::Position2D {
-                                    line: symbol.start_line + 1,
-                                    character: symbol.start_character + 1,
-                                },
-                                end: super::Position2D {
-                                    line: symbol.end_line + 1,
-                                    character: symbol.end_character + 1,
-                                },
-                            },
-                            source: super::SourceContext::Unavailable {
-                                reason: super::SourceUnavailableReason::Unreadable,
-                            },
-                            symbol_handle: None,
-                        },
-                        container_name: None,
-                    })
-            })
-            .take(limit)
-            .collect()
+        let matches =
+            ast_grep::search(&self.workspace_roots, languages, query, kind_filter, limit).await;
+        let ctx = EncodingCtx {
+            encoding: crate::bridge::encoding::PositionEncoding::Utf8,
+            tracker: self.document_tracker.clone(),
+        };
+        let mut budget = super::source_context::SourceBudget::default();
+        let mut symbols = Vec::new();
+        for symbol in matches {
+            let Some(kind) = ast_grep_symbol_kind(&symbol.kind) else {
+                continue;
+            };
+            if kind_filter.is_some_and(|filter| !kind.eq_ignore_ascii_case(filter)) {
+                continue;
+            }
+            let Ok(uri) = path_to_uri(&symbol.path) else {
+                continue;
+            };
+            let range = lsp_types::Range {
+                start: lsp_types::Position::new(symbol.start_line, symbol.start_character),
+                end: lsp_types::Position::new(symbol.end_line, symbol.end_character),
+            };
+            symbols.push(WorkspaceSymbol {
+                name: symbol.name,
+                kind: kind.to_string(),
+                location: ctx
+                    .location(
+                        &self.workspace_roots,
+                        lsp_types::Location { uri, range },
+                        &mut budget,
+                    )
+                    .await,
+                container_name: None,
+            });
+            if symbols.len() == limit {
+                break;
+            }
+        }
+        symbols
     }
 }
 

@@ -189,16 +189,20 @@ impl super::Translator {
     pub(crate) async fn source_snapshot(
         &self,
         path: &Path,
-    ) -> crate::error::Result<(Option<i32>, String)> {
+    ) -> crate::error::Result<(PathBuf, Option<i32>, String, String)> {
         let path = self.validate_path(path)?;
         if let Some(document) = self.document_tracker.get(&path) {
+            let content = document.content().to_owned();
             return Ok((
+                path,
                 Some(document.version()),
-                format!("{:x}", Sha256::digest(document.content().as_bytes())),
+                format!("{:x}", Sha256::digest(content.as_bytes())),
+                content,
             ));
         }
-        let content = tokio::fs::read(&path).await?;
-        Ok((None, format!("{:x}", Sha256::digest(content))))
+        let content = tokio::fs::read_to_string(&path).await?;
+        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        Ok((path, None, hash, content))
     }
 }
 

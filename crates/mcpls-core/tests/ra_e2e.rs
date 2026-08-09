@@ -741,6 +741,92 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
     }
 }
 
+fn sc_symbol_handle_follow_ups(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let search = client
+        .call_tool(
+            "workspace_symbol_search",
+            &json!({ "project_id": "default", "query": "add" }),
+        )
+        .map_err(|error| format!("workspace search failed: {error}"))?;
+    let search: Value = serde_json::from_str(&assertions::assert_tool_ok(&search))
+        .map_err(|error| format!("bad workspace search JSON: {error}"))?;
+    let symbol = search["symbols"]
+        .as_array()
+        .and_then(|symbols| symbols.iter().find(|symbol| symbol["name"] == "add"))
+        .ok_or_else(|| format!("workspace search did not return add: {search}"))?;
+    let handle = symbol["location"]["symbol_handle"]
+        .as_str()
+        .ok_or_else(|| format!("workspace symbol has no handle: {symbol}"))?;
+
+    let hover = client
+        .call_tool(
+            "get_hover",
+            &json!({ "project_id": "default", "symbol_handle": handle }),
+        )
+        .map_err(|error| format!("handle hover failed: {error}"))?;
+    let hover: Value = serde_json::from_str(&assertions::assert_tool_ok(&hover))
+        .map_err(|error| format!("bad hover JSON: {error}"))?;
+    if !hover["contents"].to_string().contains("add") {
+        return Err(format!("handle hover did not describe add: {hover}"));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let references = client
+            .call_tool(
+                "get_references",
+                &json!({
+                    "project_id": "default",
+                    "symbol_handle": handle,
+                    "include_declaration": true,
+                }),
+            )
+            .map_err(|error| format!("handle references failed: {error}"))?;
+        let references: Value = serde_json::from_str(&assertions::assert_tool_ok(&references))
+            .map_err(|error| format!("bad references JSON: {error}"))?;
+        if references["locations"].as_array().map_or(0, Vec::len) >= 2 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("handle references were incomplete: {references}"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let outline = client
+        .call_tool(
+            "get_document_symbols",
+            &json!({ "file_path": workspace.join("src/lib.rs").to_string_lossy() }),
+        )
+        .map_err(|error| format!("document outline failed: {error}"))?;
+    let outline: Value = serde_json::from_str(&assertions::assert_tool_ok(&outline))
+        .map_err(|error| format!("bad document outline JSON: {error}"))?;
+    let outline_symbol = outline["symbols"]
+        .as_array()
+        .and_then(|symbols| symbols.iter().find(|symbol| symbol["name"] == "add"))
+        .ok_or_else(|| format!("document outline add has no handle: {outline}"))?;
+    let outline_handle = outline_symbol["symbol_handle"]
+        .as_str()
+        .ok_or_else(|| format!("document outline add has no handle: {outline_symbol}"))?;
+    let outline_hover = client
+        .call_tool(
+            "get_hover",
+            &json!({ "project_id": "default", "symbol_handle": outline_handle }),
+        )
+        .map_err(|error| format!("outline handle hover failed: {error}"))?;
+    let outline_hover: Value = serde_json::from_str(&assertions::assert_tool_ok(&outline_hover))
+        .map_err(|error| format!("bad outline hover JSON: {error}"))?;
+    outline_hover["contents"]
+        .to_string()
+        .contains("add")
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "outline handle hover did not describe add: symbol={outline_symbol}, hover={outline_hover}"
+            )
+        })
+}
+
 /// Tool 10: `get_code_actions` — "Implement missing members" on an empty trait impl.
 ///
 /// Quickfix-style code actions require rust-analyzer to receive the diagnostic
@@ -2248,6 +2334,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_document_symbols),
         sub_case!(sc_format_document),
         sub_case!(sc_workspace_symbol_search),
+        sub_case!(sc_symbol_handle_follow_ups),
         sub_case!(sc_get_code_actions),
         sub_case!(sc_prepare_call_hierarchy),
         sub_case!(sc_get_incoming_calls),
