@@ -120,4 +120,7 @@ configured active-group limit is observed. Registrations are removed in a
 `finally` cleanup block. The manifest must be assembled from existing
 worktrees; do not manufacture repeated paths to make the matrix pass. A
 switch also fails if the sampled process tree contains more `rust-analyzer`
-processes than the configured active-group limit.
+processes than the configured active-group limit, or if an active Rust group
+has no sampled `rust-analyzer` process. The latter rejects fallback-only
+results: the benchmark must measure a resident analyzer, not merely a
+successful lexical or degraded response.

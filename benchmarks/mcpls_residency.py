@@ -286,6 +286,24 @@ def validate_registered_groups(client, project_ids):
     return states
 
 
+def validate_process_snapshot(processes, active_group_count, max_active_groups):
+    """Reject snapshots that cannot prove the measured Rust groups are resident."""
+    if active_group_count > max_active_groups:
+        raise RuntimeError(
+            f"resident group limit exceeded: {active_group_count} active groups"
+        )
+
+    analyzer_count = processes["rust_analyzer_count"]
+    if analyzer_count > max_active_groups:
+        raise RuntimeError(
+            f"rust-analyzer process limit exceeded: {analyzer_count} processes"
+        )
+    if active_group_count and analyzer_count == 0:
+        raise RuntimeError(
+            "active Rust group has no rust-analyzer process in the sampled tree"
+        )
+
+
 def active_group_ids(client, project_ids):
     active = []
     for project_id in project_ids:
@@ -345,16 +363,12 @@ def run(args):
             result = first_result(client, project_id, args.query)
             state = client.tool("project_status", {"project_id": project_id})
             active_projects = active_group_ids(client, project_ids)
-            if len(active_projects) > args.max_active_groups:
-                raise RuntimeError(
-                    f"resident group limit exceeded: {len(active_projects)} active groups"
-                )
             snapshot = resource_snapshot(args.pid)
-            analyzer_count = snapshot["processes"]["rust_analyzer_count"]
-            if analyzer_count > args.max_active_groups:
-                raise RuntimeError(
-                    f"rust-analyzer process limit exceeded: {analyzer_count} processes"
-                )
+            validate_process_snapshot(
+                snapshot["processes"],
+                active_group_count=len(active_projects),
+                max_active_groups=args.max_active_groups,
+            )
             report["switches"].append(
                 {
                     "project_id": project_id,
