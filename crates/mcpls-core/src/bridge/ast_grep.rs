@@ -308,7 +308,7 @@ pub async fn search(
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Vec<Symbol> {
-    if query.is_empty() || limit == 0 {
+    if limit == 0 {
         return Vec::new();
     }
 

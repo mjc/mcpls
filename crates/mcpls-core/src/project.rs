@@ -23,7 +23,8 @@ use crate::bridge::{
     SemanticDiscoveryResult, ServerCapability, ServerLogsResult, ServerMessage,
     ServerMessagesResult, SignatureHelpResult, SourceContext, StructuralMatch,
     StructuralSearchResult, SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate,
-    WillRenameFilesResult, WorkspaceSymbolResult, path_to_uri, uri_to_path,
+    WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
+    path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1479,6 +1480,8 @@ enum ProjectRequest {
         query: String,
         kind_filter: Option<String>,
         limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
     CodeActions {
@@ -2348,6 +2351,8 @@ impl ProjectHandle {
         query: String,
         kind_filter: Option<String>,
         limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
     ) -> Result<WorkspaceSymbolResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2355,6 +2360,8 @@ impl ProjectHandle {
                 query,
                 kind_filter,
                 limit,
+                match_mode,
+                scope,
                 reply,
             })
             .await
@@ -4293,10 +4300,12 @@ impl ProjectRuntime {
         query: String,
         kind_filter: Option<String>,
         limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
     ) -> Result<WorkspaceSymbolResult, String> {
         let mut result = self
             .translator
-            .handle_workspace_symbol(query, kind_filter, limit)
+            .handle_workspace_symbol(query, kind_filter, limit, match_mode, scope)
             .await
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
@@ -5370,9 +5379,15 @@ async fn handle_project_request(
             query,
             kind_filter,
             limit,
+            match_mode,
+            scope,
             reply,
         } => {
-            let _ = reply.send(runtime.workspace_symbol(query, kind_filter, limit).await);
+            let _ = reply.send(
+                runtime
+                    .workspace_symbol(query, kind_filter, limit, match_mode, scope)
+                    .await,
+            );
         }
         ProjectRequest::CodeActions {
             file_path,
@@ -7896,7 +7911,13 @@ mod tests {
         let actor = spawn_project_actor_with_translator(4, translator);
 
         let result = actor
-            .workspace_symbol("handle_target".to_owned(), None, 10)
+            .workspace_symbol(
+                "handle_target".to_owned(),
+                None,
+                10,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
             .await
             .unwrap();
         let Some(handle) = result.symbols[0].location.symbol_handle.clone() else {

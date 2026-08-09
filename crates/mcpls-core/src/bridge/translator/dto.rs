@@ -272,6 +272,80 @@ pub struct WorkspaceSymbol {
     /// Optional container name (parent scope).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    /// How the name matched the query.
+    pub match_class: WorkspaceSymbolMatch,
+    /// Stable score derived from `match_class`; larger is better.
+    pub score: u8,
+    /// Path relative to the registered project root, when project-local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_relative_path: Option<String>,
+    /// Whether the symbol belongs to the registered project or external source.
+    pub origin: WorkspaceSymbolOrigin,
+}
+
+/// Requested workspace-symbol name matching behavior.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSymbolMatchMode {
+    /// Return only exact case-sensitive or case-insensitive names.
+    Exact,
+    /// Return exact and prefix matches.
+    Prefix,
+    /// Return exact, prefix, and fuzzy matches, ranked in that order.
+    #[default]
+    Fuzzy,
+}
+
+/// How a workspace-symbol name matched the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSymbolMatch {
+    /// Exact case-sensitive name.
+    Exact,
+    /// Exact name ignoring case.
+    ExactCaseInsensitive,
+    /// Name starts with the query, ignoring case.
+    Prefix,
+    /// Query characters occur in order in the name.
+    Fuzzy,
+}
+
+impl WorkspaceSymbolMatch {
+    /// Stable score used for result ordering and exposed to clients.
+    #[must_use]
+    pub const fn score(self) -> u8 {
+        match self {
+            Self::Exact => 100,
+            Self::ExactCaseInsensitive => 90,
+            Self::Prefix => 70,
+            Self::Fuzzy => 50,
+        }
+    }
+}
+
+/// Requested workspace-symbol source scope.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSymbolScope {
+    /// Only symbols under a registered project root.
+    #[default]
+    Project,
+    /// Include dependency and other external symbols returned by the language server.
+    All,
+}
+
+/// Workspace-symbol ownership relative to the registered project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSymbolOrigin {
+    /// Symbol source is under a registered project root.
+    ProjectLocal,
+    /// Symbol source is outside every registered project root.
+    External,
 }
 
 /// Result of workspace symbol search.
@@ -279,6 +353,12 @@ pub struct WorkspaceSymbol {
 pub struct WorkspaceSymbolResult {
     /// List of symbols found.
     pub symbols: Vec<WorkspaceSymbol>,
+    /// Number of matching symbols before the item budget.
+    pub total: usize,
+    /// Number of symbols in this response.
+    pub returned: usize,
+    /// Whether the item budget omitted matching symbols.
+    pub truncated: bool,
 }
 
 /// A single code action.

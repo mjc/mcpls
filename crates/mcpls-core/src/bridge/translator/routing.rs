@@ -1359,7 +1359,13 @@ mod tests {
         fs::write(&path, "fn fallback_main() {}").unwrap();
 
         let result = translator
-            .handle_workspace_symbol("main".to_string(), None, 100)
+            .handle_workspace_symbol(
+                "main".to_string(),
+                None,
+                100,
+                crate::bridge::WorkspaceSymbolMatchMode::default(),
+                crate::bridge::WorkspaceSymbolScope::default(),
+            )
             .await
             .unwrap();
 

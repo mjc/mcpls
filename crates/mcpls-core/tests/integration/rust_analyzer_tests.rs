@@ -797,10 +797,13 @@ async fn test_workspace_symbol_search_basic() {
     // Search for "User" struct
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_workspace_symbol("User".to_string(), None, 100),
+        translator.lock().await.handle_workspace_symbol(
+            "User".to_string(),
+            None,
+            100,
+            mcpls_core::bridge::WorkspaceSymbolMatchMode::default(),
+            mcpls_core::bridge::WorkspaceSymbolScope::default(),
+        ),
     )
     .await;
 
@@ -846,6 +849,8 @@ async fn test_workspace_symbol_search_with_kind_filter() {
             String::new(), // Empty query to get all symbols
             Some("Struct".to_string()),
             100,
+            mcpls_core::bridge::WorkspaceSymbolMatchMode::default(),
+            mcpls_core::bridge::WorkspaceSymbolScope::default(),
         ),
     )
     .await;
@@ -881,10 +886,13 @@ async fn test_workspace_symbol_search_max_results() {
     // Search with very low limit
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_workspace_symbol(String::new(), None, 5),
+        translator.lock().await.handle_workspace_symbol(
+            String::new(),
+            None,
+            5,
+            mcpls_core::bridge::WorkspaceSymbolMatchMode::default(),
+            mcpls_core::bridge::WorkspaceSymbolScope::default(),
+        ),
     )
     .await;
 
@@ -919,6 +927,8 @@ async fn test_workspace_symbol_search_function() {
             "create".to_string(),
             Some("Function".to_string()),
             100,
+            mcpls_core::bridge::WorkspaceSymbolMatchMode::default(),
+            mcpls_core::bridge::WorkspaceSymbolScope::default(),
         ),
     )
     .await;

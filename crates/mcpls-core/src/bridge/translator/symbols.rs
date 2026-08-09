@@ -6,23 +6,132 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{DocumentSymbolsResult, Symbol, WorkspaceSymbol, WorkspaceSymbolResult};
+use super::dto::{
+    DocumentSymbolsResult, Symbol, WorkspaceSymbol, WorkspaceSymbolMatch, WorkspaceSymbolMatchMode,
+    WorkspaceSymbolOrigin, WorkspaceSymbolResult, WorkspaceSymbolScope,
+};
 use super::encoding_ctx::EncodingCtx;
-use crate::bridge::{ast_grep, lock_std, path_to_uri};
+use crate::bridge::{ast_grep, lock_std, path_to_uri, uri_to_path};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
+fn workspace_symbol_match(
+    name: &str,
+    query: &str,
+    mode: WorkspaceSymbolMatchMode,
+) -> Option<WorkspaceSymbolMatch> {
+    let fuzzy = || {
+        let mut name = name.chars();
+        query.chars().all(|needle| {
+            name.by_ref()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&needle))
+        })
+    };
+    let class = if name == query {
+        WorkspaceSymbolMatch::Exact
+    } else if name.eq_ignore_ascii_case(query) {
+        WorkspaceSymbolMatch::ExactCaseInsensitive
+    } else if name
+        .get(..query.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+    {
+        WorkspaceSymbolMatch::Prefix
+    } else if fuzzy() {
+        WorkspaceSymbolMatch::Fuzzy
+    } else {
+        return None;
+    };
+    match mode {
+        WorkspaceSymbolMatchMode::Exact => class <= WorkspaceSymbolMatch::ExactCaseInsensitive,
+        WorkspaceSymbolMatchMode::Prefix => class <= WorkspaceSymbolMatch::Prefix,
+        WorkspaceSymbolMatchMode::Fuzzy => true,
+    }
+    .then_some(class)
+}
+
+#[cfg(test)]
+fn rank_workspace_symbol_names<'a, const N: usize>(
+    names: [&'a str; N],
+    query: &str,
+    mode: WorkspaceSymbolMatchMode,
+) -> Vec<(&'a str, WorkspaceSymbolMatch)> {
+    let mut matches = names
+        .into_iter()
+        .filter_map(|name| workspace_symbol_match(name, query, mode).map(|class| (name, class)))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(_, class)| *class);
+    matches
+}
+
 async fn convert_workspace_symbol(
     symbol: lsp_types::SymbolInformation,
+    match_class: WorkspaceSymbolMatch,
     ctx: &EncodingCtx,
     roots: &[std::path::PathBuf],
     budget: &mut super::source_context::SourceBudget,
 ) -> WorkspaceSymbol {
+    let (origin, project_relative_path) = workspace_symbol_origin(&symbol.location.uri, roots);
     WorkspaceSymbol {
         name: symbol.name,
         kind: format!("{:?}", symbol.kind),
         location: ctx.location(roots, symbol.location, budget).await,
         container_name: symbol.container_name,
+        match_class,
+        score: match_class.score(),
+        project_relative_path,
+        origin,
+    }
+}
+
+fn workspace_symbol_origin(
+    uri: &lsp_types::Uri,
+    roots: &[std::path::PathBuf],
+) -> (WorkspaceSymbolOrigin, Option<String>) {
+    let relative = uri_to_path(uri).and_then(|path| {
+        roots
+            .iter()
+            .find_map(|root| path.strip_prefix(root).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+    });
+    if relative.is_some() {
+        (WorkspaceSymbolOrigin::ProjectLocal, relative)
+    } else {
+        (WorkspaceSymbolOrigin::External, None)
+    }
+}
+
+fn finish_workspace_symbols(
+    mut symbols: Vec<WorkspaceSymbol>,
+    limit: usize,
+) -> WorkspaceSymbolResult {
+    symbols.sort_by(|left, right| {
+        left.match_class
+            .cmp(&right.match_class)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.project_relative_path.cmp(&right.project_relative_path))
+            .then_with(|| left.location.uri.cmp(&right.location.uri))
+            .then_with(|| {
+                left.location
+                    .range
+                    .start
+                    .line
+                    .cmp(&right.location.range.start.line)
+            })
+            .then_with(|| {
+                left.location
+                    .range
+                    .start
+                    .character
+                    .cmp(&right.location.range.start.character)
+            })
+    });
+    let total = symbols.len();
+    symbols.truncate(limit);
+    WorkspaceSymbolResult {
+        returned: symbols.len(),
+        truncated: symbols.len() < total,
+        total,
+        symbols,
     }
 }
 
@@ -196,16 +305,22 @@ impl Translator {
     /// Returns an error when the request parameters are invalid. Missing,
     /// initializing, unsupported, or failed LSP servers use the bounded
     /// in-process AST fallback.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
     ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref())?;
         if limit == 0 {
             return Ok(WorkspaceSymbolResult {
                 symbols: Vec::new(),
+                total: 0,
+                returned: 0,
+                truncated: false,
             });
         }
 
@@ -217,16 +332,15 @@ impl Translator {
                 .collect::<Vec<_>>();
             languages.sort_unstable();
             languages.dedup();
-            Ok(WorkspaceSymbolResult {
-                symbols: self
-                    .ast_grep_workspace_symbols(
-                        &languages,
-                        &query,
-                        kind_filter.as_deref(),
-                        limit as usize,
-                    )
-                    .await,
-            })
+            Ok(self
+                .ast_grep_workspace_symbols(
+                    &languages,
+                    &query,
+                    kind_filter.as_deref(),
+                    limit as usize,
+                    match_mode,
+                )
+                .await)
         };
 
         // Workspace search has no document, so it resolves via `resolve_any`
@@ -290,9 +404,22 @@ impl Translator {
         let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
         let mut source_budget = super::source_context::SourceBudget::default();
         for sym in response.unwrap_or_default() {
+            let Some(match_class) = workspace_symbol_match(&sym.name, &query, match_mode) else {
+                continue;
+            };
+            let (origin, _) = workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
+            if scope == WorkspaceSymbolScope::Project && origin == WorkspaceSymbolOrigin::External {
+                continue;
+            }
             symbols.push(
-                convert_workspace_symbol(sym, &ctx, &self.workspace_roots, &mut source_budget)
-                    .await,
+                convert_workspace_symbol(
+                    sym,
+                    match_class,
+                    &ctx,
+                    &self.workspace_roots,
+                    &mut source_budget,
+                )
+                .await,
             );
         }
 
@@ -301,10 +428,7 @@ impl Translator {
             symbols.retain(|s| s.kind.eq_ignore_ascii_case(&kind));
         }
 
-        // Limit results
-        symbols.truncate(limit as usize);
-
-        Ok(WorkspaceSymbolResult { symbols })
+        Ok(finish_workspace_symbols(symbols, limit as usize))
     }
 
     async fn ast_grep_workspace_symbols(
@@ -313,9 +437,21 @@ impl Translator {
         query: &str,
         kind_filter: Option<&str>,
         limit: usize,
-    ) -> Vec<WorkspaceSymbol> {
-        let matches =
-            ast_grep::search(&self.workspace_roots, languages, query, kind_filter, limit).await;
+        match_mode: WorkspaceSymbolMatchMode,
+    ) -> WorkspaceSymbolResult {
+        let candidate_query = query
+            .chars()
+            .next()
+            .map(|character| character.to_string())
+            .unwrap_or_default();
+        let matches = ast_grep::search(
+            &self.workspace_roots,
+            languages,
+            &candidate_query,
+            kind_filter,
+            4_096,
+        )
+        .await;
         let ctx = EncodingCtx {
             encoding: crate::bridge::encoding::PositionEncoding::Utf8,
             tracker: self.document_tracker.clone(),
@@ -329,6 +465,9 @@ impl Translator {
             if kind_filter.is_some_and(|filter| !kind.eq_ignore_ascii_case(filter)) {
                 continue;
             }
+            let Some(match_class) = workspace_symbol_match(&symbol.name, query, match_mode) else {
+                continue;
+            };
             let Ok(uri) = path_to_uri(&symbol.path) else {
                 continue;
             };
@@ -347,12 +486,19 @@ impl Translator {
                     )
                     .await,
                 container_name: None,
+                match_class,
+                score: match_class.score(),
+                project_relative_path: self.workspace_roots.iter().find_map(|root| {
+                    symbol
+                        .path
+                        .strip_prefix(root)
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                }),
+                origin: WorkspaceSymbolOrigin::ProjectLocal,
             });
-            if symbols.len() == limit {
-                break;
-            }
         }
-        symbols
+        finish_workspace_symbols(symbols, limit)
     }
 }
 
@@ -378,6 +524,26 @@ fn ast_grep_symbol_kind(symbol_type: &str) -> Option<&'static str> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn workspace_symbol_ranking_is_exact_first_and_stable() {
+        let ranked = rank_workspace_symbol_names(
+            ["target_extra", "Target", "other_target", "target", "target"],
+            "target",
+            WorkspaceSymbolMatchMode::Fuzzy,
+        );
+
+        assert_eq!(
+            ranked,
+            [
+                ("target", WorkspaceSymbolMatch::Exact),
+                ("target", WorkspaceSymbolMatch::Exact),
+                ("Target", WorkspaceSymbolMatch::ExactCaseInsensitive),
+                ("target_extra", WorkspaceSymbolMatch::Prefix),
+                ("other_target", WorkspaceSymbolMatch::Fuzzy),
+            ]
+        );
+    }
     use std::fs;
     use std::time::Duration;
 
@@ -403,11 +569,68 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let translator = fallback_translator(&dir);
         let result = translator
-            .handle_workspace_symbol("fallback_target".to_string(), None, 100)
+            .handle_workspace_symbol(
+                "fallback_target".to_string(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
             .await
             .unwrap();
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(result.symbols[0].name, "fallback_target");
+    }
+
+    #[tokio::test]
+    async fn fallback_workspace_symbols_are_ranked_source_bearing_and_bounded() {
+        let dir = TempDir::new().unwrap();
+        let unicode = dir.path().join("ünicode");
+        fs::create_dir(&unicode).unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "fn target() {}\nfn target_extra() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            unicode.join("b.rs"),
+            "fn target() {}\nfn Target() {}\nfn other_target() {}\n",
+        )
+        .unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let result = translator
+            .handle_workspace_symbol(
+                "target".to_owned(),
+                Some("Function".to_owned()),
+                2,
+                WorkspaceSymbolMatchMode::Fuzzy,
+                WorkspaceSymbolScope::Project,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (result.total, result.returned, result.truncated),
+            (5, 2, true)
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .all(|symbol| symbol.match_class == WorkspaceSymbolMatch::Exact)
+        );
+        assert_eq!(
+            result.symbols[0].project_relative_path.as_deref(),
+            Some("a.rs")
+        );
+        assert!(matches!(
+            result.symbols[0].location.source,
+            crate::bridge::SourceContext::Available(_)
+        ));
+        assert!(result.symbols[0].location.symbol_handle.is_none());
     }
 
     /// #242/S4 regression: a server is configured and still spawning (large
@@ -422,7 +645,13 @@ mod tests {
         translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
 
         let result = translator
-            .handle_workspace_symbol("fallback_target".to_string(), None, 100)
+            .handle_workspace_symbol(
+                "fallback_target".to_string(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
             .await
             .unwrap();
         assert_eq!(result.symbols[0].name, "fallback_target");
@@ -457,7 +686,13 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(2),
-            translator.handle_workspace_symbol("fallback_target".to_string(), None, 100),
+            translator.handle_workspace_symbol(
+                "fallback_target".to_string(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            ),
         )
         .await
         .expect("handler call should not hang")
@@ -491,7 +726,13 @@ mod tests {
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
 
         let result = translator
-            .handle_workspace_symbol("fallback_target".to_string(), None, 100)
+            .handle_workspace_symbol(
+                "fallback_target".to_string(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
             .await
             .unwrap();
         assert_eq!(result.symbols[0].name, "fallback_target");

@@ -32,7 +32,8 @@ pub use translator::{
     SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, SourceContext, SupportedWorkspaceEdit, Symbol,
     SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
-    WorkspaceSymbolResult, convert_code_action_or_command,
+    WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
+    convert_code_action_or_command,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

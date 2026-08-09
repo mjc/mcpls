@@ -1597,6 +1597,8 @@ impl McplsServer {
             project_id,
             query,
             kind_filter,
+            match_mode,
+            scope,
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<String, McpError> {
@@ -1608,7 +1610,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .workspace_symbol(query, kind_filter, limit)
+            .workspace_symbol(query, kind_filter, limit, match_mode, scope)
             .await
             .map_err(|error| error.to_string());
 
@@ -2656,6 +2658,8 @@ finally:
                 project_id: "dormant".to_string(),
                 query: "fixture".to_string(),
                 kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
             }))
             .await
@@ -2667,6 +2671,8 @@ finally:
                 project_id: "dormant".to_string(),
                 query: "fixture".to_string(),
                 kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
             }))
             .await
@@ -2698,12 +2704,16 @@ finally:
                 project_id: first_id.as_str().to_string(),
                 query: "fixture".to_string(),
                 kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
             })),
             server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: second_id.as_str().to_string(),
                 query: "fixture".to_string(),
                 kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
             })),
         );
@@ -2807,6 +2817,8 @@ finally:
                     project_id: second_id.as_str().to_string(),
                     query: "fixture".to_string(),
                     kind_filter: None,
+                    match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                    scope: crate::bridge::WorkspaceSymbolScope::default(),
                     limit: 20,
                 }))
                 .await
@@ -3164,6 +3176,8 @@ finally:
                 project_id: "activation-fallback".to_string(),
                 query: "fixture_symbol".to_string(),
                 kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
             }))
             .await
@@ -4904,6 +4918,8 @@ while True:
                 project_id: "fallback-only".to_string(),
                 query: "fallback_symbol".to_string(),
                 kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
             }))
             .await
@@ -5561,6 +5577,8 @@ while True:
             project_id: "missing".to_string(),
             query: "User".to_string(),
             kind_filter: None,
+            match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+            scope: crate::bridge::WorkspaceSymbolScope::default(),
             limit: 100,
         });
         let result = server.workspace_symbol_search(params).await;

@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::SymbolHandle;
+use crate::bridge::{SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope};
 
 /// Parameters for the `get_hover` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -334,6 +334,12 @@ pub struct WorkspaceSymbolParams {
     #[schemars(description = "Optional filter by symbol kind (function, class, variable, etc.).")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_filter: Option<String>,
+    /// Name matching behavior; defaults to exact-first fuzzy search.
+    #[serde(default)]
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Source scope; dependencies and external symbols require explicit `all`.
+    #[serde(default)]
+    pub scope: WorkspaceSymbolScope,
     /// Maximum results to return (default: 100).
     #[schemars(description = "Maximum results to return (default: 100).")]
     #[serde(default = "default_max_results")]
