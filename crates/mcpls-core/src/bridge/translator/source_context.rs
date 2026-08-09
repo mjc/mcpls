@@ -74,10 +74,10 @@ pub(super) async fn resolve_source_context(
     let start = range.start.line.saturating_sub(1) as usize;
     let end = (start + MAX_FRAME_LINES).min(total_lines);
     let selected = &lines[start.min(total_lines)..end];
-    let total_bytes = selected
+    let total_bytes = lines
         .iter()
         .enumerate()
-        .map(|(offset, line)| numbered_line_bytes(start + offset + 1, line))
+        .map(|(offset, line)| numbered_line_bytes(offset + 1, line))
         .sum();
     let byte_limit = MAX_FRAME_BYTES.min(budget.remaining_bytes);
     let mut text = String::new();
@@ -113,7 +113,7 @@ pub(super) async fn resolve_source_context(
         total_lines,
         returned_bytes,
         total_bytes,
-        truncated: returned_lines < selected.len() || end < total_lines,
+        truncated: start > 0 || returned_lines < selected.len() || end < total_lines,
     })
 }
 
