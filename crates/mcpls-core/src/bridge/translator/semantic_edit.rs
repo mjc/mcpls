@@ -1246,6 +1246,7 @@ fn bounded_locations(response: Option<lsp_types::GotoDefinitionResponse>) -> (Ve
                 source: super::SourceContext::Unavailable {
                     reason: super::SourceUnavailableReason::Unreadable,
                 },
+                symbol_handle: None,
             })
             .collect(),
         truncated,

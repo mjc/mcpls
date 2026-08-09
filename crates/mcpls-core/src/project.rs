@@ -21,9 +21,9 @@ use crate::bridge::{
     LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation,
     ProviderSynchronization, ReferencesResult, RenameResult, SemanticDiscoveryKind,
     SemanticDiscoveryResult, ServerCapability, ServerLogsResult, ServerMessage,
-    ServerMessagesResult, SignatureHelpResult, StructuralMatch, StructuralSearchResult,
-    SupportedWorkspaceEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
-    WorkspaceSymbolResult, path_to_uri, uri_to_path,
+    ServerMessagesResult, SignatureHelpResult, SourceContext, StructuralMatch,
+    StructuralSearchResult, SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate,
+    WillRenameFilesResult, WorkspaceSymbolResult, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1400,6 +1400,11 @@ enum ProjectRequest {
         include_declaration: bool,
         reply: oneshot::Sender<Result<ReferencesResult, String>>,
     },
+    ReferencesByHandle {
+        symbol_handle: SymbolHandle,
+        include_declaration: bool,
+        reply: oneshot::Sender<Result<ReferencesResult, String>>,
+    },
     Diagnostics {
         file_path: String,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
@@ -1654,6 +1659,7 @@ impl ProjectRequest {
                 | Self::Hover { .. }
                 | Self::Definition { .. }
                 | Self::References { .. }
+                | Self::ReferencesByHandle { .. }
                 | Self::Diagnostics { .. }
                 | Self::Rename { .. }
                 | Self::RenameWorkspaceEdit { .. }
@@ -1721,7 +1727,9 @@ impl ProjectRequest {
         match self {
             Self::Hover { reply, .. } => reject!(reply),
             Self::Definition { reply, .. } => reject!(reply),
-            Self::References { reply, .. } => reject!(reply),
+            Self::References { reply, .. } | Self::ReferencesByHandle { reply, .. } => {
+                reject!(reply)
+            }
             Self::Diagnostics { reply, .. } => reject!(reply),
             Self::Rename { reply, .. } => reject!(reply),
             Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
@@ -1764,7 +1772,9 @@ impl ProjectRequest {
             }
             Self::Hover { reply, .. } => reply.is_closed(),
             Self::Definition { reply, .. } => reply.is_closed(),
-            Self::References { reply, .. } => reply.is_closed(),
+            Self::References { reply, .. } | Self::ReferencesByHandle { reply, .. } => {
+                reply.is_closed()
+            }
             Self::Diagnostics { reply, .. } | Self::CachedDiagnostics { reply, .. } => {
                 reply.is_closed()
             }
@@ -2025,6 +2035,32 @@ impl ProjectHandle {
                 file_path,
                 line,
                 character,
+                include_declaration,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Resolve a snapshot-bound symbol handle and find its references.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed operation error when the handle is unknown, expired,
+    /// belongs to another project actor, or its source snapshot is stale.
+    pub async fn references_by_handle(
+        &self,
+        symbol_handle: SymbolHandle,
+        include_declaration: bool,
+    ) -> Result<ReferencesResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReferencesByHandle {
+                symbol_handle,
                 include_declaration,
                 reply,
             })
@@ -3073,6 +3109,7 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
+    symbol_handles: SymbolHandleStore,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -3251,6 +3288,81 @@ struct CodeActionStore {
     max_entries: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceSnapshot {
+    Version(i32),
+    Hash(String),
+}
+
+#[derive(Debug, Clone)]
+struct StoredSymbolTarget {
+    file_path: PathBuf,
+    line: u32,
+    character: u32,
+    snapshot: SourceSnapshot,
+    created_at: Instant,
+}
+
+impl StoredSymbolTarget {
+    fn new(file_path: PathBuf, line: u32, character: u32, snapshot: SourceSnapshot) -> Self {
+        Self {
+            file_path,
+            line,
+            character,
+            snapshot,
+            created_at: Instant::now(),
+        }
+    }
+}
+
+struct SymbolHandleStore {
+    entries: HashMap<SymbolHandle, StoredSymbolTarget>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl SymbolHandleStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(15 * 60),
+            max_entries: 1024,
+        }
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, target| now.duration_since(target.created_at) < self.ttl);
+    }
+
+    fn insert(&mut self, target: StoredSymbolTarget) -> SymbolHandle {
+        self.prune();
+        while self.entries.len() >= self.max_entries {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, target)| target.created_at)
+                .map(|(handle, _)| handle.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        let handle = SymbolHandle::new();
+        self.entries.insert(handle.clone(), target);
+        handle
+    }
+
+    fn resolve(&mut self, handle: &SymbolHandle) -> Result<StoredSymbolTarget, String> {
+        self.prune();
+        self.entries.get(handle).cloned().ok_or_else(|| {
+            "symbol handle is missing, forged, or expired; rerun symbol discovery to refresh it"
+                .to_owned()
+        })
+    }
+}
+
 impl CodeActionStore {
     fn new() -> Self {
         Self {
@@ -3307,6 +3419,7 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             edit_safety,
             code_actions: CodeActionStore::new(),
+            symbol_handles: SymbolHandleStore::new(),
             inline_module_checks: HashMap::new(),
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -3323,6 +3436,55 @@ impl ProjectRuntime {
 
     const fn owns_generation(&self, generation: u64) -> bool {
         self.generation == generation
+    }
+
+    fn attach_location_handle(&mut self, location: &mut crate::bridge::Location) {
+        let SourceContext::Available(frame) = &location.source else {
+            return;
+        };
+        let snapshot = frame.document_version.map_or_else(
+            || SourceSnapshot::Hash(frame.content_hash.clone()),
+            SourceSnapshot::Version,
+        );
+        location.symbol_handle = Some(self.symbol_handles.insert(StoredSymbolTarget::new(
+            PathBuf::from(&frame.path),
+            location.range.start.line,
+            location.range.start.character,
+            snapshot,
+        )));
+    }
+
+    fn attach_location_handles<'a>(
+        &mut self,
+        locations: impl IntoIterator<Item = &'a mut crate::bridge::Location>,
+    ) {
+        locations
+            .into_iter()
+            .for_each(|location| self.attach_location_handle(location));
+    }
+
+    async fn resolve_symbol_target(
+        &mut self,
+        handle: &SymbolHandle,
+    ) -> Result<StoredSymbolTarget, String> {
+        let target = self.symbol_handles.resolve(handle)?;
+        let (version, hash) = self
+            .translator
+            .source_snapshot(&target.file_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "stale_symbol_handle: source is unavailable; rerun symbol discovery: {error}"
+                )
+            })?;
+        let current = match &target.snapshot {
+            SourceSnapshot::Version(expected) => version == Some(*expected),
+            SourceSnapshot::Hash(expected) => hash == *expected,
+        };
+        current.then_some(target).ok_or_else(|| {
+            "stale_symbol_handle: source changed; rerun symbol discovery to refresh the handle"
+                .to_owned()
+        })
     }
 
     fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
@@ -3892,28 +4054,49 @@ impl ProjectRuntime {
     }
 
     async fn definition(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<DefinitionResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_definition(file_path, line, character)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(&mut result.locations);
+        Ok(result)
     }
 
     async fn references(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
         include_declaration: bool,
     ) -> Result<ReferencesResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_references(file_path, line, character, include_declaration)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(&mut result.locations);
+        Ok(result)
+    }
+
+    async fn references_by_handle(
+        &mut self,
+        symbol_handle: SymbolHandle,
+        include_declaration: bool,
+    ) -> Result<ReferencesResult, String> {
+        let target = self.resolve_symbol_target(&symbol_handle).await?;
+        self.references(
+            target.file_path.to_string_lossy().into_owned(),
+            target.line,
+            target.character,
+            include_declaration,
+        )
+        .await
     }
 
     async fn diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult, String> {
@@ -4034,15 +4217,18 @@ impl ProjectRuntime {
     }
 
     async fn workspace_symbol(
-        &self,
+        &mut self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
     ) -> Result<WorkspaceSymbolResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_workspace_symbol(query, kind_filter, limit)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
+        Ok(result)
     }
 
     async fn code_actions(
@@ -4153,15 +4339,32 @@ impl ProjectRuntime {
     }
 
     async fn prepare_call_hierarchy(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<CallHierarchyPrepareResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_call_hierarchy_prepare(file_path, line, character)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        for item in &mut result.items {
+            let Some(SourceContext::Available(frame)) = item.source.as_ref() else {
+                continue;
+            };
+            let snapshot = frame.document_version.map_or_else(
+                || SourceSnapshot::Hash(frame.content_hash.clone()),
+                SourceSnapshot::Version,
+            );
+            item.symbol_handle = Some(self.symbol_handles.insert(StoredSymbolTarget::new(
+                PathBuf::from(&frame.path),
+                item.selection_range.start.line,
+                item.selection_range.start.character,
+                snapshot,
+            )));
+        }
+        Ok(result)
     }
 
     async fn incoming_calls(&self, item: serde_json::Value) -> Result<IncomingCallsResult, String> {
@@ -4211,27 +4414,33 @@ impl ProjectRuntime {
     }
 
     async fn go_to_implementation(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<LocationsResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_implementation(file_path, line, character)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(&mut result.locations);
+        Ok(result)
     }
 
     async fn go_to_type_definition(
-        &self,
+        &mut self,
         file_path: String,
         line: u32,
         character: u32,
     ) -> Result<LocationsResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_type_definition(file_path, line, character)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(&mut result.locations);
+        Ok(result)
     }
 
     fn cached_diagnostics(&self, file_path: &str) -> Result<DiagnosticsResult, String> {
@@ -4971,6 +5180,17 @@ async fn handle_project_request(
             let _ = reply.send(
                 runtime
                     .references(file_path, line, character, include_declaration)
+                    .await,
+            );
+        }
+        ProjectRequest::ReferencesByHandle {
+            symbol_handle,
+            include_declaration,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .references_by_handle(symbol_handle, include_declaration)
                     .await,
             );
         }
@@ -7545,6 +7765,31 @@ mod tests {
         assert!(store.take(&first).is_err());
         assert!(store.take(&second).is_ok());
         assert!(store.take(&second).is_err());
+    }
+
+    #[test]
+    fn symbol_handle_store_is_bounded_and_rejects_forged_handles() {
+        let mut store = SymbolHandleStore {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(60),
+            max_entries: 1,
+        };
+        let first = store.insert(StoredSymbolTarget::new(
+            PathBuf::from("first.rs"),
+            1,
+            2,
+            SourceSnapshot::Version(1),
+        ));
+        let second = store.insert(StoredSymbolTarget::new(
+            PathBuf::from("second.rs"),
+            3,
+            4,
+            SourceSnapshot::Hash("abc".to_owned()),
+        ));
+
+        assert!(store.resolve(&first).is_err());
+        assert_eq!(store.resolve(&second).unwrap().line, 3);
+        assert!(store.resolve(&SymbolHandle::new()).is_err());
     }
 
     #[test]

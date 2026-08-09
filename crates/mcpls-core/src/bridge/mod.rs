@@ -30,9 +30,9 @@ pub use translator::{
     InlayHintsResult, Location, LocationsResult, OutgoingCallsResult, Position2D,
     ProjectActivation, ProviderSynchronization, Range, ReferencesResult, RenameResult,
     SemanticDiscoveryKind, SemanticDiscoveryResult, ServerCapability, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, SupportedWorkspaceEdit, Symbol, TextEdit,
-    Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolResult,
-    convert_code_action_or_command,
+    ServerMessagesResult, SignatureHelpResult, SourceContext, SupportedWorkspaceEdit, Symbol,
+    SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolResult, convert_code_action_or_command,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

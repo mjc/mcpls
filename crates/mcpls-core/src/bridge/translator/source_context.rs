@@ -180,7 +180,25 @@ impl EncodingCtx {
             uri: location.uri.to_string(),
             range,
             source,
+            symbol_handle: None,
         }
+    }
+}
+
+impl super::Translator {
+    pub(crate) async fn source_snapshot(
+        &self,
+        path: &Path,
+    ) -> crate::error::Result<(Option<i32>, String)> {
+        let path = self.validate_path(path)?;
+        if let Some(document) = self.document_tracker.get(&path) {
+            return Ok((
+                Some(document.version()),
+                format!("{:x}", Sha256::digest(document.content().as_bytes())),
+            ));
+        }
+        let content = tokio::fs::read(&path).await?;
+        Ok((None, format!("{:x}", Sha256::digest(content))))
     }
 }
 

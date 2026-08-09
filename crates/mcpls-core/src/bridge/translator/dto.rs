@@ -3,6 +3,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Opaque project-actor-owned reference to a symbol at one source snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SymbolHandle(String);
+
+impl SymbolHandle {
+    /// Create a new unguessable handle.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+impl Default for SymbolHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for SymbolHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Position in a document (1-based for MCP).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position2D {
@@ -30,6 +55,9 @@ pub struct Location {
     pub range: Range,
     /// Bounded source text for this location, or a stable reason it is unavailable.
     pub source: SourceContext,
+    /// Snapshot-bound target for coordinate-free semantic follow-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Source context attached to a semantic result location.
@@ -101,6 +129,9 @@ pub struct HoverResult {
     pub contents: String,
     /// Optional range the hover applies to.
     pub range: Option<Range>,
+    /// Snapshot-bound target for coordinate-free semantic follow-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<SymbolHandle>,
 }
 
 /// Result of a definition request.
@@ -207,6 +238,9 @@ pub struct Symbol {
     pub range: Range,
     /// Selection range (identifier location).
     pub selection_range: Range,
+    /// Snapshot-bound target for coordinate-free semantic follow-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<SymbolHandle>,
     /// Child symbols.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<Self>>,
@@ -332,6 +366,9 @@ pub struct CallHierarchyItemResult {
     /// Bounded source text for the callable item.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceContext>,
+    /// Snapshot-bound target for coordinate-free semantic follow-ups.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<SymbolHandle>,
     /// Opaque data to pass to incoming/outgoing calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,

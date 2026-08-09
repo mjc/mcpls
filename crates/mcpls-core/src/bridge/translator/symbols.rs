@@ -108,6 +108,7 @@ fn convert_document_symbol<'a>(
             kind: format!("{:?}", symbol.kind),
             range,
             selection_range,
+            symbol_handle: None,
             children,
         }
     })
@@ -169,6 +170,7 @@ impl Translator {
                         kind: format!("{:?}", sym.kind),
                         range,
                         selection_range,
+                        symbol_handle: None,
                         children: None,
                     });
                 }
@@ -338,6 +340,7 @@ impl Translator {
                             source: super::SourceContext::Unavailable {
                                 reason: super::SourceUnavailableReason::Unreadable,
                             },
+                            symbol_handle: None,
                         },
                         container_name: None,
                     })

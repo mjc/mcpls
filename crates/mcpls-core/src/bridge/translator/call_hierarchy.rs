@@ -109,6 +109,7 @@ async fn convert_call_hierarchy_item(
         range,
         selection_range,
         source: Some(source),
+        symbol_handle: None,
         data: item.data,
     }
 }
@@ -491,6 +492,7 @@ mod tests {
                 },
             },
             source: None,
+            symbol_handle: None,
             data: None,
         };
 
@@ -598,6 +600,7 @@ mod tests {
                 },
             },
             source: None,
+            symbol_handle: None,
             data: None,
         };
 

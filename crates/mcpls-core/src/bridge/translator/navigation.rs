@@ -108,11 +108,16 @@ impl Translator {
                     Some(r) => Some(ctx.normalize_range(&response_uri, r).await),
                     None => None,
                 };
-                HoverResult { contents, range }
+                HoverResult {
+                    contents,
+                    range,
+                    symbol_handle: None,
+                }
             }
             None => HoverResult {
                 contents: "No hover information available".to_string(),
                 range: None,
+                symbol_handle: None,
             },
         };
 
