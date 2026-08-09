@@ -28,6 +28,70 @@ pub struct Location {
     pub uri: String,
     /// Range within the document.
     pub range: Range,
+    /// Bounded source text for this location, or a stable reason it is unavailable.
+    pub source: SourceContext,
+}
+
+/// Source context attached to a semantic result location.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SourceContext {
+    /// The source was safely resolved.
+    Available(SourceFrame),
+    /// The source could not be safely resolved.
+    Unavailable {
+        /// Stable machine-readable reason.
+        reason: SourceUnavailableReason,
+    },
+}
+
+/// A bounded, line-numbered source excerpt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFrame {
+    /// Canonical filesystem path.
+    pub path: String,
+    /// Canonical file URI.
+    pub uri: String,
+    /// Normalized 1-based result range.
+    pub range: Range,
+    /// Range highlighted by consumers; currently identical to `range`.
+    pub highlighted_range: Range,
+    /// Line-numbered source text.
+    pub text: String,
+    /// Language identifier when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+    /// Open-document version, when the frame came from actor-owned state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
+    /// SHA-256 of the exact content used for this frame.
+    pub content_hash: String,
+    /// Number of source lines returned.
+    pub returned_lines: usize,
+    /// Number of source lines in the resolved snapshot.
+    pub total_lines: usize,
+    /// Number of source bytes returned.
+    pub returned_bytes: usize,
+    /// Number of source bytes available in the selected line window.
+    pub total_bytes: usize,
+    /// Whether a line or byte budget shortened the frame.
+    pub truncated: bool,
+}
+
+/// Stable reasons source text is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceUnavailableReason {
+    /// The LSP returned a URI other than `file:`.
+    NonFileUri,
+    /// The path is outside registered workspace and approved source roots.
+    OutsideApprovedRoots,
+    /// The tracked or on-disk source no longer exists.
+    NotFound,
+    /// The source could not be read as UTF-8 text.
+    Unreadable,
+    /// The response-wide source budget was exhausted.
+    ResponseBudgetExhausted,
 }
 
 /// Result of a hover request.

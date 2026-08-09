@@ -1243,6 +1243,9 @@ fn bounded_locations(response: Option<lsp_types::GotoDefinitionResponse>) -> (Ve
             .map(|location| Location {
                 uri: location.uri.to_string(),
                 range: normalize_range(location.range),
+                source: super::SourceContext::Unavailable {
+                    reason: super::SourceUnavailableReason::Unreadable,
+                },
             })
             .collect(),
         truncated,

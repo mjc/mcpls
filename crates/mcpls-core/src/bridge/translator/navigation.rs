@@ -10,6 +10,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{DefinitionResult, HoverResult, Location, LocationsResult, ReferencesResult};
 use super::encoding_ctx::EncodingCtx;
+use super::source_context::{SourceBudget, resolve_source_context};
 use crate::config::ToolKind;
 use crate::error::Result;
 
@@ -17,6 +18,7 @@ use crate::error::Result;
 async fn goto_response_to_locations(
     response: Option<lsp_types::GotoDefinitionResponse>,
     ctx: &EncodingCtx,
+    workspace_roots: &[std::path::PathBuf],
 ) -> Vec<Location> {
     let lsp_locs: Vec<lsp_types::Location> = match response {
         Some(lsp_types::GotoDefinitionResponse::Scalar(loc)) => vec![loc],
@@ -32,10 +34,22 @@ async fn goto_response_to_locations(
     };
 
     let mut locations = Vec::with_capacity(lsp_locs.len());
+    let mut budget = SourceBudget::default();
     for loc in lsp_locs {
+        let range = ctx.normalize_range(&loc.uri, loc.range).await;
+        let source = resolve_source_context(
+            &ctx.tracker,
+            workspace_roots,
+            &[],
+            &loc.uri,
+            range.clone(),
+            &mut budget,
+        )
+        .await;
         locations.push(Location {
             uri: loc.uri.to_string(),
-            range: ctx.normalize_range(&loc.uri, loc.range).await,
+            range,
+            source,
         });
     }
     locations
@@ -161,7 +175,7 @@ impl Translator {
             .await?;
 
         let result = DefinitionResult {
-            locations: goto_response_to_locations(response, &ctx).await,
+            locations: goto_response_to_locations(response, &ctx, &self.workspace_roots).await,
         };
 
         Ok(result)
@@ -215,10 +229,22 @@ impl Translator {
         let locations = response.unwrap_or_default();
 
         let mut result_locations = Vec::with_capacity(locations.len());
+        let mut budget = SourceBudget::default();
         for loc in locations {
+            let range = ctx.normalize_range(&loc.uri, loc.range).await;
+            let source = resolve_source_context(
+                &ctx.tracker,
+                &self.workspace_roots,
+                &[],
+                &loc.uri,
+                range.clone(),
+                &mut budget,
+            )
+            .await;
             result_locations.push(Location {
                 uri: loc.uri.to_string(),
-                range: ctx.normalize_range(&loc.uri, loc.range).await,
+                range,
+                source,
             });
         }
         let result = ReferencesResult {
@@ -279,7 +305,7 @@ impl Translator {
             .await?;
 
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response, &ctx).await,
+            locations: goto_response_to_locations(response, &ctx, &self.workspace_roots).await,
         })
     }
 
@@ -335,7 +361,7 @@ impl Translator {
             .await?;
 
         Ok(LocationsResult {
-            locations: goto_response_to_locations(response, &ctx).await,
+            locations: goto_response_to_locations(response, &ctx, &self.workspace_roots).await,
         })
     }
 }

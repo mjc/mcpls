@@ -34,6 +34,7 @@ mod navigation;
 mod respawn;
 mod routing;
 mod semantic_edit;
+mod source_context;
 mod symbols;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

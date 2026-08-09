@@ -12,6 +12,30 @@ use crate::bridge::{ast_grep, lock_std, path_to_uri};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
+async fn convert_workspace_symbol(
+    symbol: lsp_types::SymbolInformation,
+    ctx: &EncodingCtx,
+    roots: &[std::path::PathBuf],
+    budget: &mut super::source_context::SourceBudget,
+) -> WorkspaceSymbol {
+    let range = ctx
+        .normalize_range(&symbol.location.uri, symbol.location.range)
+        .await;
+    let source = ctx
+        .source_context(roots, &symbol.location.uri, range.clone(), budget)
+        .await;
+    WorkspaceSymbol {
+        name: symbol.name,
+        kind: format!("{:?}", symbol.kind),
+        location: Location {
+            uri: symbol.location.uri.to_string(),
+            range,
+            source,
+        },
+        container_name: symbol.container_name,
+    }
+}
+
 /// Validate parameters for `handle_workspace_symbol`.
 fn validate_workspace_symbol_params(query: &str, kind_filter: Option<&str>) -> Result<()> {
     const MAX_QUERY_LENGTH: usize = 1000;
@@ -272,19 +296,12 @@ impl Translator {
 
         let ctx = self.encoding_ctx(&server_id);
         let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
+        let mut source_budget = super::source_context::SourceBudget::default();
         for sym in response.unwrap_or_default() {
-            let range = ctx
-                .normalize_range(&sym.location.uri, sym.location.range)
-                .await;
-            symbols.push(WorkspaceSymbol {
-                name: sym.name,
-                kind: format!("{:?}", sym.kind),
-                location: Location {
-                    uri: sym.location.uri.to_string(),
-                    range,
-                },
-                container_name: sym.container_name,
-            });
+            symbols.push(
+                convert_workspace_symbol(sym, &ctx, &self.workspace_roots, &mut source_budget)
+                    .await,
+            );
         }
 
         // Apply kind filter if specified
@@ -327,6 +344,9 @@ impl Translator {
                                     line: symbol.end_line + 1,
                                     character: symbol.end_character + 1,
                                 },
+                            },
+                            source: super::SourceContext::Unavailable {
+                                reason: super::SourceUnavailableReason::Unreadable,
                             },
                         },
                         container_name: None,
