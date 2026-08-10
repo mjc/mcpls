@@ -19,13 +19,14 @@ use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
     DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
-    InlayHintsResult, LocationsResult, LogEntry, LogLevel, OutgoingCallsResult, PositionEncoding,
-    ProjectActivation, ProviderSynchronization, ReferencesResult, RenameResult,
-    SemanticDiscoveryKind, SemanticDiscoveryResult, SemanticResultLimits, ServerCapability,
-    ServerLogsResult, ServerMessage, ServerMessagesResult, SignatureHelpResult, SourceContext,
-    StructuralMatch, StructuralSearchResult, SupportedWorkspaceEdit, SymbolHandle, Translator,
-    TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult,
-    WorkspaceSymbolScope, path_to_uri, uri_to_path,
+    InlayHintsResult, InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry,
+    LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
+    ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
+    SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
+    SignatureHelpResult, SourceContext, StructuralMatch, StructuralSearchResult,
+    SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri,
+    uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1488,6 +1489,10 @@ enum ProjectRequest {
         scope: WorkspaceSymbolScope,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
+    InspectSymbol {
+        request: InspectSymbolRequest,
+        reply: oneshot::Sender<Result<InspectSymbolResult, String>>,
+    },
     CodeActions {
         file_path: String,
         start_line: u32,
@@ -1688,6 +1693,7 @@ impl ProjectRequest {
                 | Self::MoveItemWorkspaceEdit { .. }
                 | Self::SemanticDiscovery { .. }
                 | Self::WorkspaceSymbol { .. }
+                | Self::InspectSymbol { .. }
                 | Self::CodeActions { .. }
                 | Self::CodeActionList { .. }
                 | Self::PrepareCallHierarchy { .. }
@@ -1804,6 +1810,7 @@ impl ProjectRequest {
             Self::DocumentSymbols { reply, .. } => reply.is_closed(),
             Self::FormatDocument { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
+            Self::InspectSymbol { reply, .. } => reply.is_closed(),
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reply.is_closed()
             }
@@ -2396,6 +2403,27 @@ impl ProjectHandle {
                 scope,
                 reply,
             })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Resolve and inspect one symbol in a single actor-owned snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, the caller cancels, or symbol
+    /// resolution fails.
+    pub async fn inspect_symbol(
+        &self,
+        request: InspectSymbolRequest,
+    ) -> Result<InspectSymbolResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::InspectSymbol { request, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -4414,6 +4442,396 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    // One linear actor operation intentionally makes the snapshot boundary visible.
+    #[allow(clippy::too_many_lines)]
+    async fn inspect_symbol(
+        &mut self,
+        request: InspectSymbolRequest,
+    ) -> Result<InspectSymbolResult, String> {
+        use crate::bridge::{
+            InspectCalls, InspectSection, InspectSymbolResolution, InspectSymbolSectionKind,
+            InspectSymbolSections,
+        };
+
+        let (resolution, target) = if let Some(handle) = request.symbol_handle.clone() {
+            let target = self.resolve_symbol_target(&handle).await?;
+            (
+                InspectSymbolResolution::Selected {
+                    symbol: None,
+                    symbol_handle: Some(handle),
+                },
+                Some((
+                    target.file_path.to_string_lossy().into_owned(),
+                    target.line,
+                    target.character,
+                    None,
+                )),
+            )
+        } else {
+            let query = request
+                .query
+                .as_ref()
+                .filter(|query| !query.is_empty())
+                .ok_or_else(|| "query or symbol_handle is required".to_owned())?;
+            let mut result = if let Some(path) = request.path.as_ref() {
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.translator
+                        .workspace_roots()
+                        .first()
+                        .ok_or_else(|| "project has no workspace root".to_owned())?
+                        .join(path)
+                };
+                let outline = self
+                    .document_symbols(
+                        path.display().to_string(),
+                        DocumentSymbolOptions {
+                            query: Some(query.clone()),
+                            match_mode: WorkspaceSymbolMatchMode::Exact,
+                            kind_filter: request.kind.clone(),
+                            limit: request.candidate_limit,
+                            include_tests: true,
+                            include_private: true,
+                            include_bodies: true,
+                            ..DocumentSymbolOptions::default()
+                        },
+                    )
+                    .await?;
+                let uri = path_to_uri(&path)
+                    .map_err(|error| error.to_string())?
+                    .to_string();
+                let symbols = outline
+                    .symbols
+                    .into_iter()
+                    .map(|symbol| crate::bridge::translator::WorkspaceSymbol {
+                        name: symbol.name,
+                        kind: symbol.kind,
+                        location: crate::bridge::Location {
+                            path: Some(path.display().to_string()),
+                            uri: uri.clone(),
+                            range: symbol.range,
+                            source: symbol.source.unwrap_or(crate::bridge::SourceContext::Unavailable {
+                                reason: crate::bridge::translator::SourceUnavailableReason::NotFound,
+                            }),
+                            symbol_handle: symbol.symbol_handle,
+                        },
+                        container_name: symbol.container_name,
+                        match_class: symbol.match_class.unwrap_or(
+                            crate::bridge::translator::WorkspaceSymbolMatch::Exact,
+                        ),
+                        score: symbol.score.unwrap_or(100),
+                        project_relative_path: outline.project_relative_path.clone(),
+                        origin: crate::bridge::translator::WorkspaceSymbolOrigin::ProjectLocal,
+                    })
+                    .collect::<Vec<_>>();
+                WorkspaceSymbolResult {
+                    total: outline.total,
+                    returned: symbols.len(),
+                    truncated: outline.truncated,
+                    symbols,
+                }
+            } else {
+                self.workspace_symbol(
+                    query.clone(),
+                    request.kind.clone(),
+                    request.candidate_limit,
+                    WorkspaceSymbolMatchMode::Exact,
+                    WorkspaceSymbolScope::Project,
+                )
+                .await?
+            };
+            result.symbols.retain(|symbol| {
+                request.container.as_ref().is_none_or(|container| {
+                    symbol.container_name.as_deref() == Some(container.as_str())
+                })
+            });
+            match result.symbols.len() {
+                0 => (InspectSymbolResolution::NotFound, None),
+                1 => {
+                    let symbol = result.symbols.remove(0);
+                    let symbol_range = symbol.location.range.clone();
+                    let target = if let Some(handle) = symbol.location.symbol_handle.as_ref() {
+                        let stored = self.resolve_symbol_target(handle).await?;
+                        Some((
+                            stored.file_path.to_string_lossy().into_owned(),
+                            stored.line,
+                            stored.character,
+                            Some(symbol_range),
+                        ))
+                    } else {
+                        symbol.location.path.clone().map(|path| {
+                            (
+                                path,
+                                symbol.location.range.start.line,
+                                symbol.location.range.start.character,
+                                Some(symbol_range),
+                            )
+                        })
+                    };
+                    (
+                        InspectSymbolResolution::Selected {
+                            symbol_handle: symbol.location.symbol_handle.clone(),
+                            symbol: Some(Box::new(symbol)),
+                        },
+                        target,
+                    )
+                }
+                _ => (
+                    InspectSymbolResolution::Ambiguous {
+                        candidates: result.symbols,
+                    },
+                    None,
+                ),
+            }
+        };
+
+        let mut sections = InspectSymbolSections::default();
+        let Some((file_path, line, character, symbol_range)) = target else {
+            let mut result = InspectSymbolResult {
+                resolution,
+                sections,
+                budget: request.budget,
+                returned_bytes: 0,
+                truncated: false,
+            };
+            while serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len())
+                > result.budget.max_bytes
+            {
+                let InspectSymbolResolution::Ambiguous { candidates } = &mut result.resolution
+                else {
+                    break;
+                };
+                if candidates.len() <= 1 || candidates.pop().is_none() {
+                    break;
+                }
+                result.truncated = true;
+            }
+            result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+            return Ok(result);
+        };
+        let limits = SemanticResultLimits {
+            total: request.budget.max_items,
+            per_file: request.budget.max_items,
+            per_symbol: request.budget.max_items,
+        };
+
+        if request.wants(InspectSymbolSectionKind::Declaration)
+            || request.wants(InspectSymbolSectionKind::Hover)
+        {
+            match self.hover(file_path.clone(), line, character).await {
+                Ok(hover) => {
+                    if request.wants(InspectSymbolSectionKind::Declaration) {
+                        sections.declaration = InspectSection::available(
+                            hover.provider.clone(),
+                            1,
+                            1,
+                            hover.truncated,
+                            hover.source.clone(),
+                        );
+                    }
+                    if request.wants(InspectSymbolSectionKind::Hover) {
+                        sections.hover = InspectSection::available(
+                            hover.provider.clone(),
+                            1,
+                            1,
+                            hover.truncated,
+                            hover,
+                        );
+                    }
+                }
+                Err(error) => {
+                    if request.wants(InspectSymbolSectionKind::Declaration) {
+                        sections.declaration = InspectSection::unavailable(error.clone());
+                    }
+                    if request.wants(InspectSymbolSectionKind::Hover) {
+                        sections.hover = InspectSection::unavailable(error);
+                    }
+                }
+            }
+        }
+        if request.wants(InspectSymbolSectionKind::Definitions) {
+            sections.definitions = match self.definition(file_path.clone(), line, character).await {
+                Ok(result) => InspectSection::available(
+                    result.provider.clone(),
+                    result.locations.len(),
+                    result.locations.len(),
+                    result.truncated,
+                    result,
+                ),
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        if request.wants(InspectSymbolSectionKind::Implementations) {
+            sections.implementations = match self
+                .go_to_implementation(file_path.clone(), line, character)
+                .await
+            {
+                Ok(result) => InspectSection::available(
+                    result.provider.clone(),
+                    result.locations.len(),
+                    result.locations.len(),
+                    result.truncated,
+                    result,
+                ),
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        if request.wants(InspectSymbolSectionKind::References) {
+            sections.references = match self
+                .references(file_path.clone(), line, character, true, limits)
+                .await
+            {
+                Ok(result) => InspectSection::available(
+                    result.provider.clone(),
+                    result.total_references,
+                    result.returned_references,
+                    result.truncated,
+                    result,
+                ),
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        if request.wants(InspectSymbolSectionKind::Calls) {
+            sections.calls = match self
+                .prepare_call_hierarchy(file_path.clone(), line, character)
+                .await
+            {
+                Ok(prepared) if prepared.items.is_empty() => {
+                    InspectSection::unsupported(prepared.provider, "symbol is not callable")
+                }
+                Ok(prepared) => {
+                    let provider = prepared.provider.clone();
+                    let item = serde_json::to_value(&prepared.items[0])
+                        .map_err(|error| error.to_string())?;
+                    match (
+                        self.incoming_calls(item.clone(), limits).await,
+                        self.outgoing_calls(item, limits).await,
+                    ) {
+                        (Ok(incoming), Ok(outgoing)) => {
+                            let total = incoming.total_calls + outgoing.total_calls;
+                            let returned = incoming.returned_calls + outgoing.returned_calls;
+                            let truncated = incoming.truncated || outgoing.truncated;
+                            InspectSection::available(
+                                provider,
+                                total,
+                                returned,
+                                truncated,
+                                InspectCalls { incoming, outgoing },
+                            )
+                        }
+                        (Err(error), _) | (_, Err(error)) => InspectSection::unavailable(error),
+                    }
+                }
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        for (kind, section) in [
+            (InspectSymbolSectionKind::Tests, &mut sections.tests),
+            (InspectSymbolSectionKind::Runnables, &mut sections.runnables),
+        ] {
+            if !request.wants(kind) {
+                continue;
+            }
+            let discovery_kind = if kind == InspectSymbolSectionKind::Tests {
+                SemanticDiscoveryKind::RelatedTests
+            } else {
+                SemanticDiscoveryKind::Runnables
+            };
+            *section = match self
+                .semantic_discovery(file_path.clone(), line, character, discovery_kind)
+                .await
+            {
+                Ok(result) if !result.supported => InspectSection::unsupported(
+                    result.provider,
+                    "provider does not support section",
+                ),
+                Ok(result) => InspectSection::available(
+                    result.provider.clone(),
+                    result.runnables.len(),
+                    result.runnables.len(),
+                    result.truncated,
+                    result,
+                ),
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        if request.wants(InspectSymbolSectionKind::Diagnostics) {
+            let options = DiagnosticOptions {
+                item_limit: request.budget.max_items,
+                byte_limit: request.budget.max_bytes,
+                ..DiagnosticOptions::default()
+            };
+            sections.diagnostics = match self.cached_diagnostics(&file_path, options).await {
+                Ok(mut result) => {
+                    result.diagnostics.retain(|diagnostic| {
+                        symbol_range
+                            .as_ref()
+                            .map_or(diagnostic.range.start.line == line, |range| {
+                                diagnostic.range.start.line <= range.end.line
+                                    && diagnostic.range.end.line >= range.start.line
+                            })
+                    });
+                    let relevant = result.diagnostics.len();
+                    result.total_diagnostics = relevant;
+                    result.returned_diagnostics = relevant;
+                    result.total_groups = relevant;
+                    result.returned_groups = relevant;
+                    result.omitted_groups = 0;
+                    InspectSection::available(
+                        "lsp/diagnostics",
+                        relevant,
+                        relevant,
+                        result.truncated,
+                        result,
+                    )
+                }
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+
+        let mut result = InspectSymbolResult {
+            resolution,
+            sections,
+            budget: request.budget,
+            returned_bytes: 0,
+            truncated: false,
+        };
+        macro_rules! drop_section_if_over_budget {
+            ($field:ident) => {
+                if serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len())
+                    > result.budget.max_bytes
+                    && result.sections.$field.completeness
+                        != crate::bridge::InspectSectionCompleteness::NotRequested
+                {
+                    result.sections.$field =
+                        InspectSection::unavailable("total_response_budget_exhausted");
+                    result.truncated = true;
+                }
+            };
+        }
+        drop_section_if_over_budget!(runnables);
+        drop_section_if_over_budget!(hover);
+        drop_section_if_over_budget!(definitions);
+        drop_section_if_over_budget!(diagnostics);
+        drop_section_if_over_budget!(tests);
+        drop_section_if_over_budget!(references);
+        drop_section_if_over_budget!(calls);
+        drop_section_if_over_budget!(implementations);
+        drop_section_if_over_budget!(declaration);
+        if serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len())
+            > result.budget.max_bytes
+            && let InspectSymbolResolution::Selected { symbol, .. } = &mut result.resolution
+        {
+            *symbol = None;
+            result.truncated = true;
+        }
+        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        Ok(result)
+    }
+
     async fn code_actions(
         &self,
         file_path: String,
@@ -5530,6 +5948,16 @@ async fn handle_project_request(
                     .workspace_symbol(query, kind_filter, limit, match_mode, scope)
                     .await,
             );
+        }
+        ProjectRequest::InspectSymbol { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.inspect_symbol(request) => result,
+            };
+            let _ = reply.send(result);
         }
         ProjectRequest::CodeActions {
             file_path,
@@ -8054,6 +8482,27 @@ mod tests {
         assert!(store.resolve(&SymbolHandle::new()).is_err());
     }
 
+    #[test]
+    fn cancelled_inspect_symbol_request_is_discarded_before_actor_work() {
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        let request = ProjectRequest::InspectSymbol {
+            request: InspectSymbolRequest {
+                symbol_handle: None,
+                query: Some("cancelled".to_owned()),
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            },
+            reply,
+        };
+
+        assert!(request.is_cancelled());
+    }
+
     #[tokio::test]
     async fn workspace_symbol_handle_survives_handle_clones_and_rejects_stale_source() {
         let root = TempDir::new().unwrap();
@@ -8093,6 +8542,90 @@ mod tests {
         fs::write(&source, "fn moved_target() {}\n").unwrap();
         let error = actor.resolve_symbol_handle(handle).await.unwrap_err();
         assert!(error.to_string().contains("stale_symbol_handle"));
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_runs_as_one_actor_request_and_honors_section_selection() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn inspected() {}\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let actor = spawn_project_actor_with_translator(4, translator);
+        let mut symbols = actor
+            .workspace_symbol(
+                "inspected".to_owned(),
+                None,
+                10,
+                WorkspaceSymbolMatchMode::Exact,
+                WorkspaceSymbolScope::Project,
+            )
+            .await
+            .unwrap()
+            .symbols;
+        let symbol = symbols.remove(0);
+        let result = actor
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: symbol.location.symbol_handle,
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 10,
+                sections: vec![crate::bridge::InspectSymbolSectionKind::References],
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 4_096,
+                    max_items: 3,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.resolution,
+            crate::bridge::InspectSymbolResolution::Selected { .. }
+        ));
+        assert_eq!(
+            result.sections.declaration.completeness,
+            crate::bridge::InspectSectionCompleteness::NotRequested
+        );
+        assert_eq!(result.sections.references.returned, 0);
+        assert!(result.returned_bytes <= result.budget.max_bytes);
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_returns_source_bearing_candidates_for_duplicate_names() {
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("one.rs"), "fn duplicate() -> u8 { 1 }\n").unwrap();
+        fs::write(root.path().join("two.rs"), "fn duplicate() -> u8 { 2 }\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let actor = spawn_project_actor_with_translator(4, translator);
+        let result = actor
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: None,
+                query: Some("duplicate".to_owned()),
+                kind: Some("function".to_owned()),
+                path: None,
+                container: None,
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            })
+            .await
+            .unwrap();
+
+        let crate::bridge::InspectSymbolResolution::Ambiguous { candidates } = result.resolution
+        else {
+            panic!("duplicate symbols must remain ambiguous");
+        };
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|candidate| matches!(
+            candidate.location.source,
+            crate::bridge::SourceContext::Available(_)
+        )));
     }
 
     #[test]
@@ -8136,6 +8669,46 @@ mod tests {
 
         let error = runtime.resolve_symbol_target(&handle).await.unwrap_err();
         assert!(error.contains("stale_symbol_handle"));
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_accepts_a_handle_bound_to_the_current_dirty_version() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("dirty.rs");
+        fs::write(&source, "fn disk_name() {}\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker()
+            .open(source, "fn dirty_name() {}\n".to_owned())
+            .unwrap();
+        let mut runtime = ProjectRuntime::new(translator);
+        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
+            root.path().join("dirty.rs"),
+            1,
+            4,
+            SourceSnapshot::Version(1),
+        ));
+
+        let result = runtime
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: Some(handle),
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 10,
+                sections: vec![crate::bridge::InspectSymbolSectionKind::Diagnostics],
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.resolution,
+            crate::bridge::InspectSymbolResolution::Selected { .. }
+        ));
     }
 
     #[test]

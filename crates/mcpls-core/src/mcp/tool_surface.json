@@ -9473,6 +9473,41 @@
     "description": "Resolve a project symbol exactly and return a bounded source-bearing inspection bundle. Ambiguous names return candidates instead of choosing silently.",
     "inputSchema": {
       "$defs": {
+        "InspectSymbolBudget": {
+          "description": "Cross-section bounds for a symbol inspection response.",
+          "properties": {
+            "max_bytes": {
+              "default": 65536,
+              "description": "Maximum serialized response bytes.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_items": {
+              "default": 20,
+              "description": "Maximum items requested from each collection-producing provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "InspectSymbolSectionKind": {
+          "description": "Selectable sections of a high-level symbol inspection bundle.",
+          "enum": [
+            "declaration",
+            "hover",
+            "definitions",
+            "implementations",
+            "references",
+            "calls",
+            "tests",
+            "runnables",
+            "diagnostics"
+          ],
+          "type": "string"
+        },
         "SymbolHandle": {
           "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
           "type": "string"
@@ -9480,6 +9515,14 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "budget": {
+          "$ref": "#/$defs/InspectSymbolBudget",
+          "default": {
+            "max_bytes": 65536,
+            "max_items": 20
+          },
+          "description": "Total response and per-provider item bounds."
+        },
         "candidate_limit": {
           "default": 10,
           "description": "Maximum candidates returned for ambiguous queries.",
@@ -9519,6 +9562,14 @@
             "null"
           ]
         },
+        "sections": {
+          "default": [],
+          "description": "Sections to include; empty uses the model-oriented defaults.",
+          "items": {
+            "$ref": "#/$defs/InspectSymbolSectionKind"
+          },
+          "type": "array"
+        },
         "symbol_handle": {
           "anyOf": [
             {
@@ -9538,7 +9589,961 @@
     },
     "outputSchema": {
       "$defs": {
+        "CallHierarchyItemResult": {
+          "description": "A call hierarchy item.",
+          "properties": {
+            "data": {
+              "description": "Opaque data to pass to incoming/outgoing calls."
+            },
+            "detail": {
+              "description": "More detail for this item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "LSP numeric symbol kind (e.g. 12 for Function).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range of the symbol."
+            },
+            "selectionRange": {
+              "$ref": "#/$defs/Range",
+              "description": "Selection range (identifier location).\n\nSerialized as `selectionRange` (camelCase) so that the value returned by\n`prepare_call_hierarchy` round-trips correctly when the MCP client passes\nit back to `get_incoming_calls` / `get_outgoing_calls`, which deserialize\nit as `lsp_types::CallHierarchyItem` (camelCase)."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "uri",
+            "range",
+            "selectionRange"
+          ],
+          "type": "object"
+        },
+        "CallSite": {
+          "description": "One bounded call site in a caller's source.",
+          "properties": {
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Highlighted call expression range."
+            },
+            "source": {
+              "$ref": "#/$defs/SourceContext",
+              "description": "Bounded source surrounding the call."
+            }
+          },
+          "required": [
+            "range",
+            "source"
+          ],
+          "type": "object"
+        },
+        "DefinitionResult": {
+          "description": "Result of a definition request.",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/NavigationKind",
+              "description": "Relationship represented by the returned targets."
+            },
+            "locations": {
+              "description": "Locations of the definition.",
+              "items": {
+                "$ref": "#/$defs/Location"
+              },
+              "type": "array"
+            },
+            "provider": {
+              "description": "Stable protocol provider identity.",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "Whether item or response budgets omitted target data.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "kind",
+            "locations",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "Diagnostic": {
+          "description": "A single diagnostic.",
+          "properties": {
+            "code": {
+              "description": "Optional diagnostic code.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "code_description": {
+              "description": "Documentation URI associated with the diagnostic code.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "data": {
+              "description": "Language-server-specific payload after secret redaction."
+            },
+            "fix_handles": {
+              "description": "Actor-owned code-action handles accepted by the preview flow.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "message": {
+              "description": "Diagnostic message.",
+              "type": "string"
+            },
+            "occurrence_count": {
+              "description": "Number of identical diagnostics represented by this group.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "occurrences": {
+              "description": "Exact additional locations represented by this group when requested.",
+              "items": {
+                "$ref": "#/$defs/Location"
+              },
+              "type": "array"
+            },
+            "path": {
+              "description": "Canonical filesystem path when the diagnostic is file-backed.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project_relative_path": {
+              "description": "Path relative to the owning project root.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range where the diagnostic applies."
+            },
+            "related_information": {
+              "description": "Related diagnostics with their own authorized source frames.",
+              "items": {
+                "$ref": "#/$defs/DiagnosticRelatedInformation"
+              },
+              "type": "array"
+            },
+            "severity": {
+              "$ref": "#/$defs/DiagnosticSeverity",
+              "description": "Severity of the diagnostic."
+            },
+            "source": {
+              "description": "Language-server subsystem that produced the diagnostic.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source_frame": {
+              "$ref": "#/$defs/SourceContext",
+              "description": "Bounded source surrounding the highlighted range."
+            },
+            "tags": {
+              "description": "Standard LSP diagnostic tags.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "range",
+            "severity",
+            "message",
+            "uri",
+            "source_frame",
+            "occurrence_count",
+            "fix_handles"
+          ],
+          "type": "object"
+        },
+        "DiagnosticOptions": {
+          "description": "Filters and explicit response bounds for diagnostics.",
+          "properties": {
+            "byte_limit": {
+              "default": 32768,
+              "description": "Maximum source-frame bytes across the response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "codes": {
+              "default": [],
+              "description": "Diagnostic codes to retain; empty keeps every code.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "include_generated": {
+              "default": true,
+              "description": "Include diagnostics under generated output paths.",
+              "type": "boolean"
+            },
+            "include_inactive": {
+              "default": true,
+              "description": "Include diagnostics explicitly identified as inactive code.",
+              "type": "boolean"
+            },
+            "item_limit": {
+              "default": 100,
+              "description": "Maximum diagnostic groups returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "preserve_locations": {
+              "default": false,
+              "description": "Preserve every exact location within collapsed groups.",
+              "type": "boolean"
+            },
+            "severities": {
+              "default": [],
+              "description": "Severities to retain; empty keeps every severity.",
+              "items": {
+                "$ref": "#/$defs/DiagnosticSeverity"
+              },
+              "type": "array"
+            },
+            "sources": {
+              "default": [],
+              "description": "LSP source names to retain; empty keeps every source.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "DiagnosticRelatedInformation": {
+          "description": "A related diagnostic location and its bounded source.",
+          "properties": {
+            "location": {
+              "$ref": "#/$defs/Location",
+              "description": "Related source location."
+            },
+            "message": {
+              "description": "Relationship message supplied by the language server.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "location",
+            "message"
+          ],
+          "type": "object"
+        },
+        "DiagnosticSeverity": {
+          "description": "Diagnostic severity.",
+          "oneOf": [
+            {
+              "const": "error",
+              "description": "Error diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "warning",
+              "description": "Warning diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "information",
+              "description": "Informational diagnostic.",
+              "type": "string"
+            },
+            {
+              "const": "hint",
+              "description": "Hint diagnostic.",
+              "type": "string"
+            }
+          ]
+        },
+        "DiagnosticsResult": {
+          "description": "Result of a diagnostics request.",
+          "properties": {
+            "diagnostics": {
+              "description": "List of diagnostics for the document.",
+              "items": {
+                "$ref": "#/$defs/Diagnostic"
+              },
+              "type": "array"
+            },
+            "filters": {
+              "$ref": "#/$defs/DiagnosticOptions",
+              "description": "Filters and bounds applied to this result."
+            },
+            "omitted_groups": {
+              "description": "Complete groups omitted by response limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_diagnostics": {
+              "description": "Diagnostic occurrences represented in the response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_groups": {
+              "description": "Stable groups returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_diagnostics": {
+              "description": "Diagnostics before filtering and grouping.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_groups": {
+              "description": "Stable groups before response limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether filtering or response budgets shortened the result.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "diagnostics",
+            "total_diagnostics",
+            "returned_diagnostics",
+            "total_groups",
+            "returned_groups",
+            "omitted_groups",
+            "truncated",
+            "filters"
+          ],
+          "type": "object"
+        },
+        "HoverResult": {
+          "description": "Result of a hover request.",
+          "properties": {
+            "contents": {
+              "description": "Hover contents as markdown string.",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/NavigationKind",
+              "description": "Relationship represented by this result."
+            },
+            "provider": {
+              "description": "Stable protocol provider identity.",
+              "type": "string"
+            },
+            "range": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional range the hover applies to."
+            },
+            "source": {
+              "$ref": "#/$defs/SourceContext",
+              "description": "Bounded source surrounding the hovered target."
+            },
+            "symbol_handle": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SymbolHandle"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+            },
+            "truncated": {
+              "description": "Whether the source preview was shortened by a response budget.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "kind",
+            "contents",
+            "source",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "IncomingCall": {
+          "description": "An incoming call (caller of the current item).",
+          "properties": {
+            "call_sites": {
+              "description": "Ranges where the call occurs.",
+              "items": {
+                "$ref": "#/$defs/CallSite"
+              },
+              "type": "array"
+            },
+            "from": {
+              "$ref": "#/$defs/CallHierarchyItemResult",
+              "description": "The item that calls the current item."
+            }
+          },
+          "required": [
+            "from",
+            "call_sites"
+          ],
+          "type": "object"
+        },
+        "IncomingCallsResult": {
+          "description": "Result of incoming calls request.",
+          "properties": {
+            "calls": {
+              "description": "List of incoming calls.",
+              "items": {
+                "$ref": "#/$defs/IncomingCall"
+              },
+              "type": "array"
+            },
+            "limits": {
+              "$ref": "#/$defs/SemanticResultLimits",
+              "description": "Limits applied to this result."
+            },
+            "omitted_groups": {
+              "description": "Groups omitted by limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider": {
+              "description": "Stable protocol provider identity.",
+              "type": "string"
+            },
+            "returned_call_sites": {
+              "description": "Returned call-site count.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_calls": {
+              "description": "Returned call-group count.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_call_sites": {
+              "description": "Complete call-site count before limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_calls": {
+              "description": "Complete call-group count before limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether any item or source budget truncated the result.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "calls",
+            "total_calls",
+            "returned_calls",
+            "total_call_sites",
+            "returned_call_sites",
+            "omitted_groups",
+            "truncated",
+            "limits"
+          ],
+          "type": "object"
+        },
+        "InspectCalls": {
+          "description": "Incoming and outgoing call samples returned together.",
+          "properties": {
+            "incoming": {
+              "$ref": "#/$defs/IncomingCallsResult"
+            },
+            "outgoing": {
+              "$ref": "#/$defs/OutgoingCallsResult"
+            }
+          },
+          "required": [
+            "incoming",
+            "outgoing"
+          ],
+          "type": "object"
+        },
+        "InspectSection": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection2": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HoverResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection3": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DefinitionResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection4": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LocationsResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection5": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReferencesResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection6": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InspectCalls"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection7": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticDiscoveryResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSection8": {
+          "description": "One typed inspection section with uniform provenance and bounds metadata.",
+          "properties": {
+            "completeness": {
+              "$ref": "#/$defs/InspectSectionCompleteness"
+            },
+            "data": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DiagnosticsResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "completeness",
+            "total",
+            "returned",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "InspectSectionCompleteness": {
+          "description": "Completeness of one requested inspection section.",
+          "enum": [
+            "complete",
+            "partial",
+            "unsupported",
+            "unavailable",
+            "not_requested"
+          ],
+          "type": "string"
+        },
+        "InspectSymbolBudget": {
+          "description": "Cross-section bounds for a symbol inspection response.",
+          "properties": {
+            "max_bytes": {
+              "default": 65536,
+              "description": "Maximum serialized response bytes.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_items": {
+              "default": 20,
+              "description": "Maximum items requested from each collection-producing provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
         "InspectSymbolResolution": {
+          "description": "Exact resolution outcome for a symbol inspection request.",
           "oneOf": [
             {
               "properties": {
@@ -9606,18 +10611,47 @@
           ]
         },
         "InspectSymbolSections": {
+          "description": "Typed semantic sections returned for one selected symbol.",
           "properties": {
+            "calls": {
+              "$ref": "#/$defs/InspectSection6"
+            },
             "declaration": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SourceContext"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+              "$ref": "#/$defs/InspectSection"
+            },
+            "definitions": {
+              "$ref": "#/$defs/InspectSection3"
+            },
+            "diagnostics": {
+              "$ref": "#/$defs/InspectSection8"
+            },
+            "hover": {
+              "$ref": "#/$defs/InspectSection2"
+            },
+            "implementations": {
+              "$ref": "#/$defs/InspectSection4"
+            },
+            "references": {
+              "$ref": "#/$defs/InspectSection5"
+            },
+            "runnables": {
+              "$ref": "#/$defs/InspectSection7"
+            },
+            "tests": {
+              "$ref": "#/$defs/InspectSection7"
             }
           },
+          "required": [
+            "declaration",
+            "hover",
+            "definitions",
+            "implementations",
+            "references",
+            "calls",
+            "tests",
+            "runnables",
+            "diagnostics"
+          ],
           "type": "object"
         },
         "Location": {
@@ -9661,6 +10695,184 @@
           ],
           "type": "object"
         },
+        "LocationsResult": {
+          "description": "Result of a go-to-implementation or go-to-type-definition request.",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/NavigationKind",
+              "description": "Relationship represented by the returned targets."
+            },
+            "locations": {
+              "description": "Locations found.",
+              "items": {
+                "$ref": "#/$defs/Location"
+              },
+              "type": "array"
+            },
+            "provider": {
+              "description": "Stable protocol provider identity.",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "Whether item or response budgets omitted target data.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "kind",
+            "locations",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "MacroExpansion": {
+          "properties": {
+            "expansion": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "expansion"
+          ],
+          "type": "object"
+        },
+        "NavigationKind": {
+          "description": "Semantic relationship represented by a navigation result.",
+          "oneOf": [
+            {
+              "const": "hover",
+              "description": "Hover data for the selected symbol.",
+              "type": "string"
+            },
+            {
+              "const": "definition",
+              "description": "The symbol's definition.",
+              "type": "string"
+            },
+            {
+              "const": "declaration",
+              "description": "A declaration distinct from its definition.",
+              "type": "string"
+            },
+            {
+              "const": "type_definition",
+              "description": "The definition of the selected value's type.",
+              "type": "string"
+            },
+            {
+              "const": "implementation",
+              "description": "An implementation of the selected trait or interface member.",
+              "type": "string"
+            },
+            {
+              "const": "parent_module",
+              "description": "A parent Rust module.",
+              "type": "string"
+            },
+            {
+              "const": "child_module",
+              "description": "A child Rust module.",
+              "type": "string"
+            },
+            {
+              "const": "call_hierarchy",
+              "description": "A callable accepted by call-hierarchy preparation.",
+              "type": "string"
+            }
+          ]
+        },
+        "OutgoingCall": {
+          "description": "An outgoing call (callee from the current item).",
+          "properties": {
+            "call_sites": {
+              "description": "Ranges where the call occurs.",
+              "items": {
+                "$ref": "#/$defs/CallSite"
+              },
+              "type": "array"
+            },
+            "to": {
+              "$ref": "#/$defs/CallHierarchyItemResult",
+              "description": "The item being called."
+            }
+          },
+          "required": [
+            "to",
+            "call_sites"
+          ],
+          "type": "object"
+        },
+        "OutgoingCallsResult": {
+          "description": "Result of outgoing calls request.",
+          "properties": {
+            "calls": {
+              "description": "List of outgoing calls.",
+              "items": {
+                "$ref": "#/$defs/OutgoingCall"
+              },
+              "type": "array"
+            },
+            "limits": {
+              "$ref": "#/$defs/SemanticResultLimits",
+              "description": "Limits applied to this result."
+            },
+            "omitted_groups": {
+              "description": "Groups omitted by limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider": {
+              "description": "Stable protocol provider identity.",
+              "type": "string"
+            },
+            "returned_call_sites": {
+              "description": "Returned call-site count.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_calls": {
+              "description": "Returned call-group count.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_call_sites": {
+              "description": "Complete call-site count before limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_calls": {
+              "description": "Complete call-group count before limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether any item or source budget truncated the result.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "calls",
+            "total_calls",
+            "returned_calls",
+            "total_call_sites",
+            "returned_call_sites",
+            "omitted_groups",
+            "truncated",
+            "limits"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -9699,6 +10911,272 @@
             "start",
             "end"
           ],
+          "type": "object"
+        },
+        "ReferenceGroup": {
+          "description": "References returned from one source file.",
+          "properties": {
+            "enclosing_symbol": {
+              "description": "Enclosing symbol when the language server can determine one safely.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project_relative_path": {
+              "description": "Project-relative path, or the absolute path for external sources.",
+              "type": "string"
+            },
+            "references": {
+              "description": "References within the group, in source order.",
+              "items": {
+                "$ref": "#/$defs/ReferenceUse"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "project_relative_path",
+            "references"
+          ],
+          "type": "object"
+        },
+        "ReferenceRole": {
+          "description": "Safely known role of a reference.",
+          "oneOf": [
+            {
+              "const": "declaration",
+              "description": "Definition or declaration, identified by a language-server definition result.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "The language server did not provide enough information to classify it.",
+              "type": "string"
+            }
+          ]
+        },
+        "ReferenceUse": {
+          "description": "One source use of the referenced symbol.",
+          "properties": {
+            "location": {
+              "$ref": "#/$defs/Location",
+              "description": "Bounded location and highlighted source frame for the use."
+            },
+            "role": {
+              "$ref": "#/$defs/ReferenceRole",
+              "description": "Semantic role, reported conservatively when unavailable from the server."
+            }
+          },
+          "required": [
+            "location",
+            "role"
+          ],
+          "type": "object"
+        },
+        "ReferencesResult": {
+          "description": "Result of a references request.",
+          "properties": {
+            "declaration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReferenceUse"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Declaration location, returned once and excluded from use groups."
+            },
+            "groups": {
+              "description": "References grouped by project-relative file.",
+              "items": {
+                "$ref": "#/$defs/ReferenceGroup"
+              },
+              "type": "array"
+            },
+            "limits": {
+              "$ref": "#/$defs/SemanticResultLimits",
+              "description": "Limits applied to this result."
+            },
+            "omitted_groups": {
+              "description": "Number of complete groups omitted by limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider": {
+              "description": "Stable protocol provider identity.",
+              "type": "string"
+            },
+            "returned_groups": {
+              "description": "Number of file/symbol groups returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_references": {
+              "description": "Number of references returned after response budgets.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_groups": {
+              "description": "Number of file/symbol groups before limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_references": {
+              "description": "Number of references reported by the language server.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether response budgets omitted source or references.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "provider",
+            "groups",
+            "total_references",
+            "returned_references",
+            "total_groups",
+            "returned_groups",
+            "omitted_groups",
+            "limits",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "SemanticDiscoveryKind": {
+          "description": "Semantic discovery operation requested from the active Rust analyzer.",
+          "oneOf": [
+            {
+              "const": "declaration",
+              "description": "Standard declaration lookup.",
+              "type": "string"
+            },
+            {
+              "const": "parent_module",
+              "description": "rust-analyzer parent-module lookup.",
+              "type": "string"
+            },
+            {
+              "const": "child_modules",
+              "description": "rust-analyzer child-module lookup.",
+              "type": "string"
+            },
+            {
+              "const": "macro_expansion",
+              "description": "rust-analyzer macro expansion.",
+              "type": "string"
+            },
+            {
+              "const": "selection_ranges",
+              "description": "Standard nested selection ranges.",
+              "type": "string"
+            },
+            {
+              "const": "runnables",
+              "description": "rust-analyzer runnable discovery.",
+              "type": "string"
+            },
+            {
+              "const": "related_tests",
+              "description": "rust-analyzer related-test discovery.",
+              "type": "string"
+            }
+          ]
+        },
+        "SemanticDiscoveryResult": {
+          "description": "Bounded result from one semantic discovery operation.",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/SemanticDiscoveryKind",
+              "description": "Semantic relationship represented by location results."
+            },
+            "locations": {
+              "description": "Locations returned by declaration or module discovery.",
+              "items": {
+                "$ref": "#/$defs/Location"
+              },
+              "type": "array"
+            },
+            "macro_expansion": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MacroExpansion"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Expansion returned by macro discovery."
+            },
+            "provider": {
+              "description": "Stable name of the protocol provider.",
+              "type": "string"
+            },
+            "runnables": {
+              "description": "Raw, redacted runnable or related-test payloads.",
+              "items": true,
+              "type": "array"
+            },
+            "selection_ranges": {
+              "description": "Inner-to-outer ranges returned by selection discovery.",
+              "items": {
+                "$ref": "#/$defs/Range"
+              },
+              "type": "array"
+            },
+            "supported": {
+              "description": "Whether the active server supports the operation.",
+              "type": "boolean"
+            },
+            "truncated": {
+              "description": "Whether configured item or byte bounds truncated the response.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "supported",
+            "provider",
+            "kind",
+            "locations",
+            "selection_ranges",
+            "runnables",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "SemanticResultLimits": {
+          "description": "Shared bounds for reference and call-hierarchy results.",
+          "properties": {
+            "per_file": {
+              "default": 50,
+              "description": "Maximum groups returned from one file.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "per_symbol": {
+              "default": 25,
+              "description": "Maximum references or call sites returned for one symbol.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "default": 200,
+              "description": "Maximum references or call groups returned overall.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
           "type": "object"
         },
         "SourceContext": {
@@ -9956,8 +11434,16 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "budget": {
+          "$ref": "#/$defs/InspectSymbolBudget"
+        },
         "resolution": {
           "$ref": "#/$defs/InspectSymbolResolution"
+        },
+        "returned_bytes": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "sections": {
           "$ref": "#/$defs/InspectSymbolSections"
@@ -9969,6 +11455,8 @@
       "required": [
         "resolution",
         "sections",
+        "budget",
+        "returned_bytes",
         "truncated"
       ],
       "type": "object"

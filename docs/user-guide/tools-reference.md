@@ -26,6 +26,7 @@ Tool failures retain MCP's standard JSON-RPC error code and message. Operational
 | [get_completions](#get_completions) | `textDocument/completion` | Code completion suggestions |
 | [get_document_symbols](#get_document_symbols) | `textDocument/documentSymbol` | Document symbol outline |
 | [workspace_symbol_search](#workspace_symbol_search) | `workspace/symbol` | Search symbols across workspace |
+| [inspect_symbol](#inspect_symbol) | Multiple read-only semantic methods | Bounded symbol definition and usage bundle |
 
 ### Diagnostics & Formatting Tools
 
@@ -678,6 +679,12 @@ Claude: [Uses format_document] The file needs formatting changes:
 - Respects `.editorconfig` and formatter configuration files
 
 ---
+
+## inspect_symbol
+
+Resolve one project symbol by snapshot-bound `symbol_handle` or exact `query`. Optional `path`, `kind`, and `container` fields disambiguate duplicate names; unresolved ambiguity returns ranked source-bearing candidates without choosing one.
+
+`sections` selects any of `declaration`, `hover`, `definitions`, `implementations`, `references`, `calls`, `tests`, `runnables`, and `diagnostics`. An empty list requests the model-oriented defaults. `budget.max_bytes` bounds the complete serialized bundle and `budget.max_items` bounds collection-producing providers. Every section reports provider, completeness, total and returned counts, truncation, and an unavailable or unsupported reason. The operation is read-only and never executes runnables or fixes.
 
 ## workspace_symbol_search
 

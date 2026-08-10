@@ -27,13 +27,15 @@ pub use translator::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
     DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentChanges,
     DocumentSymbolOptions, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, Location, LocationsResult, OutgoingCallsResult,
-    Position2D, ProjectActivation, ProviderSynchronization, Range, ReferencesResult, RenameResult,
-    SemanticDiscoveryKind, SemanticDiscoveryResult, SemanticResultLimits, ServerCapability,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SourceContext,
-    SupportedWorkspaceEdit, Symbol, SymbolHandle, TextEdit, Translator, TranslatorTemplate,
-    WillRenameFilesResult, WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
-    convert_code_action_or_command,
+    IncomingCallsResult, InlayHintsResult, InspectCalls, InspectSection,
+    InspectSectionCompleteness, InspectSymbolBudget, InspectSymbolRequest, InspectSymbolResolution,
+    InspectSymbolResult, InspectSymbolSectionKind, InspectSymbolSections, Location,
+    LocationsResult, OutgoingCallsResult, Position2D, ProjectActivation, ProviderSynchronization,
+    Range, ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
+    SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessagesResult,
+    SignatureHelpResult, SourceContext, SupportedWorkspaceEdit, Symbol, SymbolHandle, TextEdit,
+    Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
+    WorkspaceSymbolResult, WorkspaceSymbolScope, convert_code_action_or_command,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

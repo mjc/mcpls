@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    DocumentSymbolOptions, SemanticResultLimits, SymbolHandle, WorkspaceSymbolMatchMode,
-    WorkspaceSymbolScope,
+    DocumentSymbolOptions, InspectSymbolBudget, InspectSymbolSectionKind, SemanticResultLimits,
+    SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope,
 };
 
 /// Parameters for the `get_hover` tool.
@@ -376,6 +376,12 @@ pub struct InspectSymbolParams {
     /// Maximum candidates returned for ambiguous queries.
     #[serde(default = "default_inspect_candidates")]
     pub candidate_limit: u32,
+    /// Sections to include; empty uses the model-oriented defaults.
+    #[serde(default)]
+    pub sections: Vec<InspectSymbolSectionKind>,
+    /// Total response and per-provider item bounds.
+    #[serde(default)]
+    pub budget: InspectSymbolBudget,
 }
 
 const fn default_inspect_candidates() -> u32 {
@@ -747,5 +753,20 @@ mod tests {
         assert!(schema["properties"]["query"].is_object());
         assert!(schema["properties"]["include_bodies"].is_object());
         assert!(schema["properties"]["options"].is_null());
+    }
+
+    #[test]
+    fn inspect_symbol_accepts_section_selection_and_total_budget() {
+        let params: InspectSymbolParams = serde_json::from_value(serde_json::json!({
+            "project_id": "project",
+            "query": "run",
+            "sections": ["declaration", "references", "diagnostics"],
+            "budget": {"max_bytes": 8192, "max_items": 7}
+        }))
+        .unwrap();
+
+        assert_eq!(params.sections.len(), 3);
+        assert_eq!(params.budget.max_bytes, 8192);
+        assert_eq!(params.budget.max_items, 7);
     }
 }

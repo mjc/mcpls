@@ -9,6 +9,19 @@
 pub mod types;
 pub mod functions;
 
+pub use functions::create_repo as reexported_create_repo;
+
+macro_rules! fixture_macro {
+    () => {
+        42
+    };
+}
+
+#[allow(dead_code)]
+fn private_helper() -> i32 {
+    fixture_macro!()
+}
+
 use serde::{Deserialize, Serialize};
 
 /// A sample struct for testing hover and definition.

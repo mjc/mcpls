@@ -734,6 +734,220 @@ pub struct WorkspaceSymbolResult {
     pub truncated: bool,
 }
 
+/// Selectable sections of a high-level symbol inspection bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum InspectSymbolSectionKind {
+    Declaration,
+    Hover,
+    Definitions,
+    Implementations,
+    References,
+    Calls,
+    Tests,
+    Runnables,
+    Diagnostics,
+}
+
+/// Actor-owned inputs for resolving and inspecting one project symbol.
+#[derive(Debug, Clone)]
+#[allow(missing_docs)]
+pub struct InspectSymbolRequest {
+    pub symbol_handle: Option<SymbolHandle>,
+    pub query: Option<String>,
+    pub kind: Option<String>,
+    pub path: Option<String>,
+    pub container: Option<String>,
+    pub candidate_limit: u32,
+    pub sections: Vec<InspectSymbolSectionKind>,
+    pub budget: InspectSymbolBudget,
+}
+
+impl InspectSymbolRequest {
+    /// Return whether the caller selected a section, applying defaults for an empty list.
+    #[must_use]
+    pub fn wants(&self, section: InspectSymbolSectionKind) -> bool {
+        self.sections.is_empty() || self.sections.contains(&section)
+    }
+}
+
+/// Cross-section bounds for a symbol inspection response.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InspectSymbolBudget {
+    /// Maximum serialized response bytes.
+    #[serde(default = "default_inspect_bytes")]
+    pub max_bytes: usize,
+    /// Maximum items requested from each collection-producing provider.
+    #[serde(default = "default_inspect_items")]
+    pub max_items: usize,
+}
+
+impl Default for InspectSymbolBudget {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_inspect_bytes(),
+            max_items: default_inspect_items(),
+        }
+    }
+}
+
+const fn default_inspect_bytes() -> usize {
+    64 * 1024
+}
+
+const fn default_inspect_items() -> usize {
+    20
+}
+
+/// Completeness of one requested inspection section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum InspectSectionCompleteness {
+    Complete,
+    Partial,
+    Unsupported,
+    Unavailable,
+    NotRequested,
+}
+
+/// One typed inspection section with uniform provenance and bounds metadata.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[allow(missing_docs)]
+pub struct InspectSection<T> {
+    pub provider: Option<String>,
+    pub completeness: InspectSectionCompleteness,
+    pub total: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub reason: Option<String>,
+    pub data: Option<T>,
+}
+
+impl<T> InspectSection<T> {
+    /// Build metadata for a section omitted by caller selection.
+    #[must_use]
+    pub const fn not_requested() -> Self {
+        Self {
+            provider: None,
+            completeness: InspectSectionCompleteness::NotRequested,
+            total: 0,
+            returned: 0,
+            truncated: false,
+            reason: None,
+            data: None,
+        }
+    }
+
+    /// Build metadata for a provider failure.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            provider: None,
+            completeness: InspectSectionCompleteness::Unavailable,
+            total: 0,
+            returned: 0,
+            truncated: false,
+            reason: Some(reason.into()),
+            data: None,
+        }
+    }
+
+    /// Build metadata for a provider without the requested capability.
+    #[must_use]
+    pub fn unsupported(provider: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            provider: Some(provider.into()),
+            completeness: InspectSectionCompleteness::Unsupported,
+            total: 0,
+            returned: 0,
+            truncated: false,
+            reason: Some(reason.into()),
+            data: None,
+        }
+    }
+
+    /// Build an available typed section and derive completeness from truncation.
+    #[must_use]
+    pub fn available(
+        provider: impl Into<String>,
+        total: usize,
+        returned: usize,
+        truncated: bool,
+        data: T,
+    ) -> Self {
+        Self {
+            provider: Some(provider.into()),
+            completeness: if truncated {
+                InspectSectionCompleteness::Partial
+            } else {
+                InspectSectionCompleteness::Complete
+            },
+            total,
+            returned,
+            truncated,
+            reason: None,
+            data: Some(data),
+        }
+    }
+}
+
+impl<T> Default for InspectSection<T> {
+    fn default() -> Self {
+        Self::not_requested()
+    }
+}
+
+/// Incoming and outgoing call samples returned together.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[allow(missing_docs)]
+pub struct InspectCalls {
+    pub incoming: IncomingCallsResult,
+    pub outgoing: OutgoingCallsResult,
+}
+
+/// Exact resolution outcome for a symbol inspection request.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "status")]
+#[allow(missing_docs)]
+pub enum InspectSymbolResolution {
+    Selected {
+        symbol: Option<Box<WorkspaceSymbol>>,
+        symbol_handle: Option<SymbolHandle>,
+    },
+    Ambiguous {
+        candidates: Vec<WorkspaceSymbol>,
+    },
+    NotFound,
+}
+
+/// Typed semantic sections returned for one selected symbol.
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
+#[allow(missing_docs)]
+pub struct InspectSymbolSections {
+    pub declaration: InspectSection<SourceContext>,
+    pub hover: InspectSection<HoverResult>,
+    pub definitions: InspectSection<DefinitionResult>,
+    pub implementations: InspectSection<LocationsResult>,
+    pub references: InspectSection<ReferencesResult>,
+    pub calls: InspectSection<InspectCalls>,
+    pub tests: InspectSection<crate::bridge::SemanticDiscoveryResult>,
+    pub runnables: InspectSection<crate::bridge::SemanticDiscoveryResult>,
+    pub diagnostics: InspectSection<DiagnosticsResult>,
+}
+
+/// Bounded, snapshot-coherent answer about one project symbol.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[allow(missing_docs)]
+pub struct InspectSymbolResult {
+    pub resolution: InspectSymbolResolution,
+    pub sections: InspectSymbolSections,
+    pub budget: InspectSymbolBudget,
+    pub returned_bytes: usize,
+    pub truncated: bool,
+}
+
 /// A single code action.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CodeAction {

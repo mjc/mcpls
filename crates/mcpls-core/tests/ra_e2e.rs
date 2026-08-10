@@ -816,6 +816,116 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
     }
 }
 
+/// Resolve one exact fixture symbol with source, hover, and implementation sections.
+fn inspect_exact_symbol(
+    client: &mut McpClient,
+    query: &str,
+    path: Option<&str>,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut arguments = json!({
+            "project_id": "default",
+            "query": query,
+            "sections": ["declaration", "hover", "implementations"],
+            "budget": {"max_bytes": 32768, "max_items": 20}
+        });
+        if let Some(path) = path {
+            arguments["path"] = Value::String(path.to_owned());
+        }
+        let response = client
+            .call_tool("inspect_symbol", &arguments)
+            .map_err(|error| format!("inspect_symbol({query}) failed: {error}"))?;
+        let result: Value = serde_json::from_str(&assertions::assert_tool_ok(&response))
+            .map_err(|error| format!("bad inspect_symbol({query}) JSON: {error}"))?;
+        if result["resolution"]["status"] == "selected" {
+            return Ok(result);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "inspect_symbol({query}) did not resolve exactly: {result}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// High-level bundle: answer what `add` is and how it is used without reading the file.
+fn sc_inspect_symbol(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = client
+            .call_tool(
+                "inspect_symbol",
+                &json!({
+                    "project_id": "default",
+                    "query": "add",
+                    "sections": [
+                        "declaration", "hover", "implementations", "references",
+                        "calls", "tests", "diagnostics"
+                    ],
+                    "budget": {"max_bytes": 65536, "max_items": 20}
+                }),
+            )
+            .map_err(|error| format!("inspect_symbol failed: {error}"))?;
+        let result: Value = serde_json::from_str(&assertions::assert_tool_ok(&response))
+            .map_err(|error| format!("bad inspect_symbol JSON: {error}"))?;
+        let ready = result["resolution"]["status"] == "selected"
+            && result["sections"]["declaration"]["data"]["status"] == "available"
+            && result["sections"]["declaration"]["data"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("pub fn add"))
+            && result["sections"]["hover"]["data"]["contents"]
+                .as_str()
+                .is_some_and(|contents| contents.contains("add"))
+            && result["sections"]["references"]["returned"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && result["sections"]["calls"]["data"]["incoming"]["returned_calls"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && result["sections"]["diagnostics"]["completeness"].is_string()
+            && result["sections"]["tests"]["completeness"].is_string()
+            && result["returned_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes <= 65_536);
+        if ready {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "inspect_symbol did not return a source-bearing usage bundle: {result}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    for (query, path) in [
+        ("Point", Some("src/lib.rs")),
+        ("Greet", Some("src/lib.rs")),
+        ("reexported_create_repo", None),
+        ("private_helper", Some("src/lib.rs")),
+        ("fixture_macro", None),
+    ] {
+        let inspected = inspect_exact_symbol(client, query, path)?;
+        if inspected["sections"]["declaration"]["data"]["status"] != "available" {
+            return Err(format!(
+                "inspect_symbol({query}) lacked declaration source: {inspected}"
+            ));
+        }
+    }
+    let trait_bundle = inspect_exact_symbol(client, "Greet", Some("src/lib.rs"))?;
+    if trait_bundle["sections"]["implementations"]["returned"]
+        .as_u64()
+        .is_none_or(|count| count == 0)
+    {
+        return Err(format!(
+            "inspect_symbol(Greet) lacked its impl: {trait_bundle}"
+        ));
+    }
+    Ok(())
+}
+
 fn sc_symbol_handle_follow_ups(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let search = client
         .call_tool(
@@ -2432,6 +2542,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_document_symbols),
         sub_case!(sc_format_document),
         sub_case!(sc_workspace_symbol_search),
+        sub_case!(sc_inspect_symbol),
         sub_case!(sc_symbol_handle_follow_ups),
         sub_case!(sc_get_code_actions),
         sub_case!(sc_prepare_call_hierarchy),

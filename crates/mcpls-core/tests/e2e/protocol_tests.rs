@@ -76,6 +76,7 @@ fn test_e2e_list_tools() -> Result<()> {
         "get_document_symbols",
         "format_document",
         "workspace_symbol_search",
+        "inspect_symbol",
         "get_code_actions",
         "prepare_call_hierarchy",
         "get_incoming_calls",

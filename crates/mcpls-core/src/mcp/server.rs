@@ -338,31 +338,6 @@ struct SubscriptionListResult {
     subscriptions: Vec<String>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case", tag = "status")]
-enum InspectSymbolResolution {
-    Selected {
-        symbol: Option<Box<crate::bridge::translator::WorkspaceSymbol>>,
-        symbol_handle: Option<SymbolHandle>,
-    },
-    Ambiguous {
-        candidates: Vec<crate::bridge::translator::WorkspaceSymbol>,
-    },
-    NotFound,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-struct InspectSymbolSections {
-    declaration: Option<crate::bridge::SourceContext>,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-struct InspectSymbolResult {
-    resolution: InspectSymbolResolution,
-    sections: InspectSymbolSections,
-    truncated: bool,
-}
-
 fn project_events_json(
     project_id: &ProjectId,
     snapshot: &ProjectEventSnapshot,
@@ -1713,32 +1688,19 @@ impl McplsServer {
     async fn inspect_symbol(
         &self,
         Parameters(params): Parameters<InspectSymbolParams>,
-    ) -> Result<Json<InspectSymbolResult>, McpError> {
-        if let Some(handle) = params.symbol_handle {
-            let retained_handle = handle.clone();
-            let (actor, file_path, line, character) = self
-                .semantic_target(Some(params.project_id), Some(handle), String::new(), 0, 0)
-                .await?;
-            let hover = actor
-                .hover(file_path, line, character)
-                .await
-                .map_err(operation_error)?;
-            return encode_tool_result::<_, std::convert::Infallible>(Ok(InspectSymbolResult {
-                resolution: InspectSymbolResolution::Selected {
-                    symbol: None,
-                    symbol_handle: Some(retained_handle),
-                },
-                sections: InspectSymbolSections {
-                    declaration: Some(hover.source),
-                },
-                truncated: hover.truncated,
-            }));
+    ) -> Result<Json<crate::bridge::InspectSymbolResult>, McpError> {
+        if params.symbol_handle.is_none() && params.query.as_ref().is_none_or(String::is_empty) {
+            return Err(McpError::invalid_params(
+                "query or symbol_handle is required",
+                None,
+            ));
         }
-
-        let query = params
-            .query
-            .filter(|query| !query.is_empty())
-            .ok_or_else(|| McpError::invalid_params("query or symbol_handle is required", None))?;
+        if params.budget.max_bytes < 4_096 || params.budget.max_items == 0 {
+            return Err(McpError::invalid_params(
+                "budget.max_bytes must be at least 4096 and budget.max_items must be positive",
+                None,
+            ));
+        }
         let id = parse_project_id(params.project_id)?;
         let actor = self
             .context
@@ -1747,49 +1709,19 @@ impl McplsServer {
             .await
             .map_err(operation_error)?;
         let result = actor
-            .workspace_symbol(
-                query,
-                params.kind,
-                params.candidate_limit,
-                crate::bridge::WorkspaceSymbolMatchMode::Exact,
-                crate::bridge::WorkspaceSymbolScope::Project,
-            )
-            .await
-            .map_err(operation_error)?;
-        let mut candidates: Vec<_> = result
-            .symbols
-            .into_iter()
-            .filter(|symbol| {
-                params.path.as_ref().is_none_or(|path| {
-                    symbol.project_relative_path.as_deref() == Some(path.as_str())
-                }) && params.container.as_ref().is_none_or(|container| {
-                    symbol.container_name.as_deref() == Some(container.as_str())
-                })
+            .inspect_symbol(crate::bridge::InspectSymbolRequest {
+                symbol_handle: params.symbol_handle,
+                query: params.query,
+                kind: params.kind,
+                path: params.path,
+                container: params.container,
+                candidate_limit: params.candidate_limit,
+                sections: params.sections,
+                budget: params.budget,
             })
-            .collect();
-        let resolution = match candidates.len() {
-            0 => InspectSymbolResolution::NotFound,
-            1 => {
-                let symbol = candidates.remove(0);
-                InspectSymbolResolution::Selected {
-                    symbol_handle: symbol.location.symbol_handle.clone(),
-                    symbol: Some(Box::new(symbol)),
-                }
-            }
-            _ => InspectSymbolResolution::Ambiguous { candidates },
-        };
-        let declaration = match &resolution {
-            InspectSymbolResolution::Selected {
-                symbol: Some(symbol),
-                ..
-            } => Some(symbol.location.source.clone()),
-            _ => None,
-        };
-        encode_tool_result::<_, std::convert::Infallible>(Ok(InspectSymbolResult {
-            resolution,
-            sections: InspectSymbolSections { declaration },
-            truncated: result.truncated,
-        }))
+            .await
+            .map_err(operation_error);
+        encode_tool_result(result)
     }
 
     /// Get code actions for a range.
