@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 
 use crate::bridge::convert_code_action_or_command;
+use crate::bridge::translator::DiagnosticOptions;
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
@@ -1416,6 +1417,7 @@ enum ProjectRequest {
     },
     Diagnostics {
         file_path: String,
+        options: DiagnosticOptions,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
     Rename {
@@ -1555,6 +1557,7 @@ enum ProjectRequest {
     },
     CachedDiagnostics {
         file_path: String,
+        options: DiagnosticOptions,
         reply: oneshot::Sender<Result<DiagnosticsResult, String>>,
     },
     HasCachedDiagnostics {
@@ -2094,9 +2097,27 @@ impl ProjectHandle {
         &self,
         file_path: String,
     ) -> Result<DiagnosticsResult, ProjectActorError> {
+        self.diagnostics_with_options(file_path, DiagnosticOptions::default())
+            .await
+    }
+
+    /// Route a bounded, filtered diagnostics request through the project actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, cancels, or rejects the request.
+    pub async fn diagnostics_with_options(
+        &self,
+        file_path: String,
+        options: DiagnosticOptions,
+    ) -> Result<DiagnosticsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::Diagnostics { file_path, reply })
+            .send(ProjectRequest::Diagnostics {
+                file_path,
+                options,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -2687,9 +2708,27 @@ impl ProjectHandle {
         &self,
         file_path: String,
     ) -> Result<DiagnosticsResult, ProjectActorError> {
+        self.cached_diagnostics_with_options(file_path, DiagnosticOptions::default())
+            .await
+    }
+
+    /// Route bounded, filtered cached diagnostics through this project actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, cancels, or rejects the request.
+    pub async fn cached_diagnostics_with_options(
+        &self,
+        file_path: String,
+        options: DiagnosticOptions,
+    ) -> Result<DiagnosticsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::CachedDiagnostics { file_path, reply })
+            .send(ProjectRequest::CachedDiagnostics {
+                file_path,
+                options,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3981,11 +4020,17 @@ impl ProjectRuntime {
             .await;
         let source_diagnostics = self
             .translator
-            .handle_actor_diagnostics(check.source_path.display().to_string())
+            .handle_actor_diagnostics(
+                check.source_path.display().to_string(),
+                DiagnosticOptions::default(),
+            )
             .await;
         let destination_diagnostics = self
             .translator
-            .handle_actor_diagnostics(check.destination_path.display().to_string())
+            .handle_actor_diagnostics(
+                check.destination_path.display().to_string(),
+                DiagnosticOptions::default(),
+            )
             .await;
         let references = self
             .translator
@@ -4184,11 +4229,52 @@ impl ProjectRuntime {
         })
     }
 
-    async fn diagnostics(&mut self, file_path: String) -> Result<DiagnosticsResult, String> {
-        self.translator
-            .handle_actor_diagnostics(file_path)
+    async fn diagnostics(
+        &mut self,
+        file_path: String,
+        options: DiagnosticOptions,
+    ) -> Result<DiagnosticsResult, String> {
+        let mut result = self
+            .translator
+            .handle_actor_diagnostics(file_path, options)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.attach_diagnostic_fix_handles(&mut result).await;
+        Ok(result)
+    }
+
+    async fn attach_diagnostic_fix_handles(&mut self, result: &mut DiagnosticsResult) {
+        for diagnostic in &mut result.diagnostics {
+            let Some(file_path) = diagnostic.context.path.clone() else {
+                continue;
+            };
+            let Ok(actions) = self
+                .translator
+                .request_code_actions(
+                    file_path.clone(),
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character,
+                    diagnostic.range.end.line,
+                    diagnostic.range.end.character,
+                    Some(lsp_types::CodeActionKind::QUICKFIX.as_str().to_owned()),
+                )
+                .await
+            else {
+                continue;
+            };
+            diagnostic.context.fix_handles = actions
+                .into_iter()
+                .map(|action| {
+                    self.code_actions
+                        .insert(StoredCodeAction {
+                            file_path: file_path.clone(),
+                            action,
+                            created_at: Instant::now(),
+                        })
+                        .to_string()
+                })
+                .collect();
+        }
     }
 
     async fn rename(
@@ -4566,9 +4652,14 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    fn cached_diagnostics(&self, file_path: &str) -> Result<DiagnosticsResult, String> {
+    async fn cached_diagnostics(
+        &self,
+        file_path: &str,
+        options: DiagnosticOptions,
+    ) -> Result<DiagnosticsResult, String> {
         self.translator
-            .handle_cached_diagnostics(file_path)
+            .handle_cached_diagnostics(file_path, options)
+            .await
             .map_err(|error| error.to_string())
     }
 
@@ -5313,8 +5404,12 @@ async fn handle_project_request(
         } => {
             let _ = reply.send(runtime.resolve_symbol_handle(symbol_handle).await);
         }
-        ProjectRequest::Diagnostics { file_path, reply } => {
-            let _ = reply.send(runtime.diagnostics(file_path).await);
+        ProjectRequest::Diagnostics {
+            file_path,
+            options,
+            reply,
+        } => {
+            let _ = reply.send(runtime.diagnostics(file_path, options).await);
         }
         ProjectRequest::Rename {
             file_path,
@@ -5571,8 +5666,12 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::CachedDiagnostics { file_path, reply } => {
-            let _ = reply.send(runtime.cached_diagnostics(&file_path));
+        ProjectRequest::CachedDiagnostics {
+            file_path,
+            options,
+            reply,
+        } => {
+            let _ = reply.send(runtime.cached_diagnostics(&file_path, options).await);
         }
         ProjectRequest::HasCachedDiagnostics { file_path, reply } => {
             let _ = reply.send(runtime.has_cached_diagnostics(&file_path));

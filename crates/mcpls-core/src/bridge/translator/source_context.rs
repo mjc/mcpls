@@ -27,6 +27,13 @@ impl Default for SourceBudget {
 }
 
 impl SourceBudget {
+    pub(super) const fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining_bytes: max_bytes,
+            truncated: false,
+        }
+    }
+
     pub(super) const fn truncated(&self) -> bool {
         self.truncated
     }

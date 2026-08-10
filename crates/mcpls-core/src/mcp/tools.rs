@@ -106,6 +106,9 @@ pub struct DiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
+    /// Filters, grouping behavior, and response bounds.
+    #[serde(flatten)]
+    pub options: crate::bridge::translator::DiagnosticOptions,
 }
 
 /// Parameters for the `rename_symbol` tool.
@@ -479,6 +482,9 @@ pub struct CachedDiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
+    /// Filters, grouping behavior, and response bounds.
+    #[serde(flatten)]
+    pub options: crate::bridge::translator::DiagnosticOptions,
 }
 
 /// Parameters for the `get_server_logs` tool.

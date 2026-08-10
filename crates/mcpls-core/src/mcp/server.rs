@@ -39,6 +39,8 @@ use super::tools::{
 #[cfg(test)]
 use crate::bridge::Translator;
 use crate::bridge::resources::make_uri;
+#[cfg(test)]
+use crate::bridge::translator::DiagnosticOptions;
 use crate::bridge::{
     PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SupportedWorkspaceEdit,
     SymbolHandle,
@@ -1465,7 +1467,7 @@ impl McplsServer {
     )]
     async fn get_diagnostics(
         &self,
-        Parameters(DiagnosticsParams { file_path }): Parameters<DiagnosticsParams>,
+        Parameters(DiagnosticsParams { file_path, options }): Parameters<DiagnosticsParams>,
     ) -> Result<String, McpError> {
         let actor = self
             .context
@@ -1473,7 +1475,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .diagnostics(file_path)
+            .diagnostics_with_options(file_path, options)
             .await
             .map_err(|error| error.to_string());
 
@@ -1812,7 +1814,9 @@ impl McplsServer {
     )]
     async fn get_cached_diagnostics(
         &self,
-        Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
+        Parameters(CachedDiagnosticsParams { file_path, options }): Parameters<
+            CachedDiagnosticsParams,
+        >,
     ) -> Result<String, McpError> {
         let actor = self
             .context
@@ -1820,7 +1824,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .cached_diagnostics(file_path)
+            .cached_diagnostics_with_options(file_path, options)
             .await
             .map_err(|error| error.to_string());
 
@@ -5158,6 +5162,7 @@ while True:
         let result = server
             .get_diagnostics(Parameters(DiagnosticsParams {
                 file_path: file_path.display().to_string(),
+                options: DiagnosticOptions::default(),
             }))
             .await;
 
@@ -5484,11 +5489,14 @@ while True:
         let result = server
             .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
                 file_path: file_path.display().to_string(),
+                options: DiagnosticOptions::default(),
             }))
             .await;
 
         let response = result.unwrap();
-        assert_eq!(response, r#"{"diagnostics":[]}"#);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["diagnostics"], serde_json::json!([]));
+        assert_eq!(response["total_diagnostics"], 0);
     }
 
     #[tokio::test]
@@ -5528,6 +5536,7 @@ while True:
         let server = create_test_server();
         let params = Parameters(DiagnosticsParams {
             file_path: "/test/file.rs".to_string(),
+            options: DiagnosticOptions::default(),
         });
 
         let result = server.get_diagnostics(params).await;
@@ -5769,6 +5778,7 @@ while True:
 
         let params = Parameters(CachedDiagnosticsParams {
             file_path: test_file.to_str().unwrap().to_string(),
+            options: DiagnosticOptions::default(),
         });
 
         let result = server.get_cached_diagnostics(params).await;
@@ -5781,6 +5791,7 @@ while True:
         let server = create_test_server();
         let params = Parameters(CachedDiagnosticsParams {
             file_path: "/nonexistent/file.rs".to_string(),
+            options: DiagnosticOptions::default(),
         });
 
         let result = server.get_cached_diagnostics(params).await;

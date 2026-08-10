@@ -10,8 +10,9 @@ use tokio::sync::Mutex;
 
 use super::Translator;
 use super::dto::{
-    Diagnostic, DiagnosticContext, DiagnosticRelatedInformation, DiagnosticSeverity,
-    DiagnosticsResult, Position2D, Range, ServerLogsResult, ServerMessagesResult,
+    Diagnostic, DiagnosticContext, DiagnosticOptions, DiagnosticRelatedInformation,
+    DiagnosticSeverity, DiagnosticsResult, Location, Position2D, Range, ServerLogsResult,
+    ServerMessagesResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
@@ -44,6 +45,74 @@ fn diagnostic_request_params(text_document: TextDocumentIdentifier) -> Diagnosti
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: PartialResultParams::default(),
     }
+}
+
+fn diagnostic_group_key(
+    diagnostic: &Diagnostic,
+) -> (&str, &DiagnosticSeverity, Option<&str>, Option<&str>, &str) {
+    (
+        diagnostic.context.uri.as_str(),
+        &diagnostic.severity,
+        diagnostic.context.diagnostic_source.as_deref(),
+        diagnostic.code.as_deref(),
+        diagnostic.message.as_str(),
+    )
+}
+
+fn diagnostic_location(diagnostic: &Diagnostic) -> Location {
+    Location {
+        path: diagnostic.context.path.clone(),
+        uri: diagnostic.context.uri.clone(),
+        range: diagnostic.range.clone(),
+        source: diagnostic.context.source_frame.clone(),
+        symbol_handle: None,
+    }
+}
+
+fn diagnostic_matches(diagnostic: &Diagnostic, options: &DiagnosticOptions) -> bool {
+    let selected = |values: &[String], value: Option<&str>| {
+        values.is_empty()
+            || value.is_some_and(|value| {
+                values
+                    .iter()
+                    .any(|selected| selected.eq_ignore_ascii_case(value))
+            })
+    };
+    let generated = diagnostic
+        .context
+        .project_relative_path
+        .as_deref()
+        .is_some_and(|path| {
+            std::path::Path::new(path).components().any(|component| {
+                matches!(component.as_os_str().to_str(), Some("target" | "generated"))
+            })
+        });
+
+    (options.severities.is_empty() || options.severities.contains(&diagnostic.severity))
+        && selected(
+            &options.sources,
+            diagnostic.context.diagnostic_source.as_deref(),
+        )
+        && selected(&options.codes, diagnostic.code.as_deref())
+        && (options.include_inactive || diagnostic.code.as_deref() != Some("inactive-code"))
+        && (options.include_generated || !generated)
+}
+
+fn source_budget_exhausted(diagnostic: &Diagnostic) -> bool {
+    let exhausted = |source: &super::dto::SourceContext| {
+        matches!(
+            source,
+            super::dto::SourceContext::Unavailable {
+                reason: super::dto::SourceUnavailableReason::ResponseBudgetExhausted
+            }
+        )
+    };
+    exhausted(&diagnostic.context.source_frame)
+        || diagnostic
+            .context
+            .related_information
+            .iter()
+            .any(|related| exhausted(&related.location.source))
 }
 
 /// Convert an LSP diagnostic into the MCP-facing `Diagnostic` shape.
@@ -176,6 +245,26 @@ impl Translator {
         file_path: String,
         notification_cache: &Mutex<NotificationCache>,
     ) -> Result<DiagnosticsResult> {
+        self.handle_diagnostics_with_options(
+            file_path,
+            notification_cache,
+            DiagnosticOptions::default(),
+        )
+        .await
+    }
+
+    /// Handle diagnostics with explicit filters and response budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document cannot be routed or both pull and
+    /// cached diagnostics are unavailable.
+    pub async fn handle_diagnostics_with_options(
+        &self,
+        file_path: String,
+        notification_cache: &Mutex<NotificationCache>,
+        options: DiagnosticOptions,
+    ) -> Result<DiagnosticsResult> {
         let (server_id, client, uri) = self
             .prepare_document(&file_path, ToolKind::Diagnostics)
             .await?;
@@ -204,7 +293,7 @@ impl Translator {
                     lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
                 };
                 let mut diagnostics = Vec::with_capacity(items.len());
-                let mut source_budget = SourceBudget::default();
+                let mut source_budget = SourceBudget::new(options.byte_limit);
                 for d in &items {
                     diagnostics.push(
                         diagnostic_to_mcp(
@@ -218,26 +307,33 @@ impl Translator {
                         .await,
                     );
                 }
-                let pull = DiagnosticsResult { diagnostics };
-                Ok(Self::merge_diagnostics(
+                let pull = DiagnosticsResult::raw(diagnostics);
+                let merged = Self::merge_diagnostics_enriched(
                     pull,
                     diag_info.as_ref(),
                     ctx.encoding,
                     &self.document_tracker,
+                    &self.workspace_roots,
+                    &self.redaction_policy,
+                    &mut source_budget,
                 )
-                .await)
+                .await;
+                Ok(Self::finish_diagnostics(merged.diagnostics, options))
             }
             Err(e) => {
-                let cache_only = Self::diagnostics_from_cache_entry(
+                let cache_only = Self::diagnostics_from_cache_entry_enriched(
                     diag_info.as_ref(),
                     ctx.encoding,
                     &self.document_tracker,
+                    &self.workspace_roots,
+                    &self.redaction_policy,
+                    &mut SourceBudget::new(options.byte_limit),
                 )
                 .await;
                 if cache_only.diagnostics.is_empty() {
                     Err(e)
                 } else {
-                    Ok(cache_only)
+                    Ok(Self::finish_diagnostics(cache_only.diagnostics, options))
                 }
             }
         }
@@ -259,6 +355,25 @@ impl Translator {
         encoding: PositionEncoding,
         tracker: &Arc<DocumentTracker>,
     ) -> DiagnosticsResult {
+        Self::diagnostics_from_cache_entry_enriched(
+            diag_info,
+            encoding,
+            tracker,
+            &[],
+            &RedactionPolicy::default(),
+            &mut SourceBudget::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn diagnostics_from_cache_entry_enriched(
+        diag_info: Option<&DiagnosticInfo>,
+        encoding: PositionEncoding,
+        tracker: &Arc<DocumentTracker>,
+        workspace_roots: &[PathBuf],
+        redaction_policy: &RedactionPolicy,
+        source_budget: &mut SourceBudget,
+    ) -> DiagnosticsResult {
         let diagnostics = match diag_info {
             Some(diag_info) => {
                 let ctx = EncodingCtx {
@@ -266,17 +381,15 @@ impl Translator {
                     tracker: tracker.clone(),
                 };
                 let mut result = Vec::with_capacity(diag_info.diagnostics.len());
-                let mut source_budget = SourceBudget::default();
-                let redaction_policy = RedactionPolicy::default();
                 for d in &diag_info.diagnostics {
                     result.push(
                         diagnostic_to_mcp(
                             d,
                             &ctx,
                             &diag_info.uri,
-                            &[],
-                            &redaction_policy,
-                            &mut source_budget,
+                            workspace_roots,
+                            redaction_policy,
+                            source_budget,
                         )
                         .await,
                     );
@@ -286,7 +399,7 @@ impl Translator {
             None => Vec::new(),
         };
 
-        DiagnosticsResult { diagnostics }
+        DiagnosticsResult::raw(diagnostics)
     }
 
     /// Merge push-model diagnostics from the notification cache into a
@@ -326,10 +439,31 @@ impl Translator {
     /// pull-model ones.
     #[must_use]
     pub async fn merge_diagnostics(
+        pull: DiagnosticsResult,
+        diag_info: Option<&DiagnosticInfo>,
+        encoding: PositionEncoding,
+        tracker: &Arc<DocumentTracker>,
+    ) -> DiagnosticsResult {
+        Self::merge_diagnostics_enriched(
+            pull,
+            diag_info,
+            encoding,
+            tracker,
+            &[],
+            &RedactionPolicy::default(),
+            &mut SourceBudget::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn merge_diagnostics_enriched(
         mut pull: DiagnosticsResult,
         diag_info: Option<&DiagnosticInfo>,
         encoding: PositionEncoding,
         tracker: &Arc<DocumentTracker>,
+        workspace_roots: &[PathBuf],
+        redaction_policy: &RedactionPolicy,
+        source_budget: &mut SourceBudget,
     ) -> DiagnosticsResult {
         /// Start-line distance within which same-code, same-severity
         /// diagnostics from the two models are still considered the same
@@ -358,9 +492,16 @@ impl Translator {
             })
         }
 
-        let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker)
-            .await
-            .diagnostics;
+        let cached = Self::diagnostics_from_cache_entry_enriched(
+            diag_info,
+            encoding,
+            tracker,
+            workspace_roots,
+            redaction_policy,
+            source_budget,
+        )
+        .await
+        .diagnostics;
         let new_diagnostics: Vec<_> = cached
             .into_iter()
             .filter(|c| !is_duplicate(&pull.diagnostics, c))
@@ -369,6 +510,64 @@ impl Translator {
         pull.diagnostics
             .sort_by_key(|d| (d.range.start.line, d.range.start.character));
         pull
+    }
+
+    /// Apply stable filtering, grouping, and item limits to enriched diagnostics.
+    #[must_use]
+    pub fn finish_diagnostics(
+        diagnostics: Vec<Diagnostic>,
+        options: DiagnosticOptions,
+    ) -> DiagnosticsResult {
+        let total_diagnostics = diagnostics.len();
+        let byte_truncated = diagnostics.iter().any(source_budget_exhausted);
+        let mut diagnostics: Vec<_> = diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic_matches(diagnostic, &options))
+            .collect();
+        diagnostics.sort_by(|left, right| {
+            diagnostic_group_key(left)
+                .cmp(&diagnostic_group_key(right))
+                .then_with(|| {
+                    (left.range.start.line, left.range.start.character)
+                        .cmp(&(right.range.start.line, right.range.start.character))
+                })
+        });
+
+        let mut groups: Vec<Diagnostic> = Vec::new();
+        for diagnostic in diagnostics {
+            if let Some(group) = groups
+                .last_mut()
+                .filter(|group| diagnostic_group_key(group) == diagnostic_group_key(&diagnostic))
+            {
+                group.context.occurrence_count += 1;
+                if options.preserve_locations {
+                    group
+                        .context
+                        .occurrences
+                        .push(diagnostic_location(&diagnostic));
+                }
+            } else {
+                groups.push(diagnostic);
+            }
+        }
+
+        let total_groups = groups.len();
+        groups.truncate(options.item_limit);
+        let returned_groups = groups.len();
+        let returned_diagnostics = groups
+            .iter()
+            .map(|diagnostic| diagnostic.context.occurrence_count)
+            .sum();
+        DiagnosticsResult {
+            diagnostics: groups,
+            total_diagnostics,
+            returned_diagnostics,
+            total_groups,
+            returned_groups,
+            omitted_groups: total_groups.saturating_sub(returned_groups),
+            truncated: byte_truncated || returned_groups < total_groups,
+            filters: options,
+        }
     }
 
     /// Handle server logs request.
@@ -496,6 +695,69 @@ mod tests {
         assert_eq!(value["source_frame"]["status"], "unavailable");
         assert_eq!(value["occurrence_count"], 1);
         assert_eq!(value["fix_handles"], serde_json::json!([]));
+    }
+
+    fn grouped_diagnostic(line: u32, code: &str, source: &str, path: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position2D { line, character: 1 },
+                end: Position2D { line, character: 2 },
+            },
+            severity: DiagnosticSeverity::Hint,
+            message: "inactive code".to_owned(),
+            code: Some(code.to_owned()),
+            context: DiagnosticContext {
+                path: Some(path.to_owned()),
+                project_relative_path: Some(path.to_owned()),
+                uri: format!("file:///workspace/{path}"),
+                diagnostic_source: Some(source.to_owned()),
+                ..DiagnosticContext::default()
+            },
+        }
+    }
+
+    #[test]
+    fn diagnostics_group_repeated_occurrences_and_preserve_locations() {
+        let diagnostics = vec![
+            grouped_diagnostic(8, "inactive-code", "rust-analyzer", "src/lib.rs"),
+            grouped_diagnostic(3, "inactive-code", "rust-analyzer", "src/lib.rs"),
+        ];
+        let result = Translator::finish_diagnostics(
+            diagnostics,
+            DiagnosticOptions {
+                preserve_locations: true,
+                ..DiagnosticOptions::default()
+            },
+        );
+
+        assert_eq!(result.total_diagnostics, 2);
+        assert_eq!(result.total_groups, 1);
+        assert_eq!(result.returned_diagnostics, 2);
+        assert_eq!(result.diagnostics[0].context.occurrence_count, 2);
+        assert_eq!(result.diagnostics[0].context.occurrences.len(), 1);
+    }
+
+    #[test]
+    fn diagnostics_filters_and_item_limit_report_omissions() {
+        let diagnostics = vec![
+            grouped_diagnostic(1, "inactive-code", "rust-analyzer", "src/lib.rs"),
+            grouped_diagnostic(2, "dead_code", "clippy", "target/out.rs"),
+            grouped_diagnostic(3, "unused", "rustc", "src/main.rs"),
+        ];
+        let result = Translator::finish_diagnostics(
+            diagnostics,
+            DiagnosticOptions {
+                sources: vec!["rustc".to_owned()],
+                item_limit: 0,
+                ..DiagnosticOptions::default()
+            },
+        );
+
+        assert_eq!(result.total_diagnostics, 3);
+        assert_eq!(result.total_groups, 1);
+        assert_eq!(result.returned_groups, 0);
+        assert_eq!(result.omitted_groups, 1);
+        assert!(result.truncated);
     }
 
     #[tokio::test]
@@ -891,9 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
-        let pull = DiagnosticsResult {
-            diagnostics: vec![],
-        };
+        let pull = DiagnosticsResult::raw(vec![]);
         let cache = diag_info(vec![lsp_diag(
             0,
             10,
@@ -938,9 +1198,7 @@ mod tests {
             code: Some("E0308".to_string()),
             context: DiagnosticContext::default(),
         };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-        };
+        let pull = DiagnosticsResult::raw(vec![pull_diag.clone()]);
         let cache = diag_info(vec![lsp_diag(
             0,
             10,
@@ -979,9 +1237,7 @@ mod tests {
             code: None,
             context: DiagnosticContext::default(),
         };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-        };
+        let pull = DiagnosticsResult::raw(vec![pull_diag.clone()]);
 
         let merged =
             Translator::merge_diagnostics(pull, None, PositionEncoding::Utf16, &test_tracker())
@@ -992,9 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
-        let pull = DiagnosticsResult {
-            diagnostics: vec![],
-        };
+        let pull = DiagnosticsResult::raw(vec![]);
         let cache = diag_info(vec![
             lsp_diag(
                 0,
@@ -1053,9 +1307,7 @@ mod tests {
             code: None,
             context: DiagnosticContext::default(),
         };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag],
-        };
+        let pull = DiagnosticsResult::raw(vec![pull_diag]);
         // Same range and severity as the pull diagnostic, but a different
         // message — must be treated as a distinct diagnostic, not a duplicate.
         let cache = diag_info(vec![lsp_diag(
@@ -1102,9 +1354,7 @@ mod tests {
             code: Some("E0046".to_string()),
             context: DiagnosticContext::default(),
         };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-        };
+        let pull = DiagnosticsResult::raw(vec![pull_diag.clone()]);
         // Same code and severity, but a different range and a longer,
         // differently-worded message -- the rustc-rendered push side of the
         // same underlying error.
@@ -1161,9 +1411,7 @@ mod tests {
             code: Some("E0308".to_string()),
             context: DiagnosticContext::default(),
         };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-        };
+        let pull = DiagnosticsResult::raw(vec![pull_diag.clone()]);
         // A second, unrelated E0308 at a completely different location with
         // a completely different message -- a real, distinct diagnostic,
         // not a duplicate of pull_diag.

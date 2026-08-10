@@ -572,9 +572,12 @@ impl Translator {
     pub async fn handle_actor_diagnostics(
         &mut self,
         file_path: String,
+        options: super::DiagnosticOptions,
     ) -> Result<super::DiagnosticsResult> {
         let cache = tokio::sync::Mutex::new(std::mem::take(&mut self.actor_notification_cache));
-        let result = self.handle_diagnostics(file_path, &cache).await;
+        let result = self
+            .handle_diagnostics_with_options(file_path, &cache, options)
+            .await;
         self.actor_notification_cache = cache.into_inner();
         result
     }
@@ -584,51 +587,30 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error for invalid paths or cached diagnostic data.
-    pub fn handle_cached_diagnostics(&self, file_path: &str) -> Result<super::DiagnosticsResult> {
-        use super::{Diagnostic, DiagnosticSeverity, DiagnosticsResult, Position2D, Range};
-
+    pub async fn handle_cached_diagnostics(
+        &self,
+        file_path: &str,
+        options: super::DiagnosticOptions,
+    ) -> Result<super::DiagnosticsResult> {
         let uri = Self::cached_diagnostics_uri(&self.workspace_roots, file_path)?;
-        let diagnostics = self
+        let entry = self.actor_notification_cache.get_diagnostics(&uri);
+        let encoding = self
             .actor_notification_cache
-            .get_diagnostics(&uri)
-            .map_or_else(Vec::new, |entry| {
-                entry
-                    .diagnostics
-                    .iter()
-                    .map(|diagnostic| Diagnostic {
-                        range: Range {
-                            start: Position2D {
-                                line: diagnostic.range.start.line + 1,
-                                character: diagnostic.range.start.character + 1,
-                            },
-                            end: Position2D {
-                                line: diagnostic.range.end.line + 1,
-                                character: diagnostic.range.end.character + 1,
-                            },
-                        },
-                        severity: match diagnostic.severity {
-                            Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-                            Some(lsp_types::DiagnosticSeverity::WARNING) => {
-                                DiagnosticSeverity::Warning
-                            }
-                            Some(lsp_types::DiagnosticSeverity::HINT) => DiagnosticSeverity::Hint,
-                            _ => DiagnosticSeverity::Information,
-                        },
-                        message: diagnostic.message.clone(),
-                        code: diagnostic.code.as_ref().map(|code| match code {
-                            lsp_types::NumberOrString::Number(value) => value.to_string(),
-                            lsp_types::NumberOrString::String(value) => value.clone(),
-                        }),
-                        context: super::DiagnosticContext {
-                            path: crate::bridge::uri_to_path(&entry.uri)
-                                .map(|path| path.to_string_lossy().into_owned()),
-                            uri: entry.uri.to_string(),
-                            ..super::DiagnosticContext::default()
-                        },
-                    })
-                    .collect()
+            .diagnostics_owner(&uri)
+            .map_or(crate::bridge::encoding::PositionEncoding::Utf16, |owner| {
+                self.encoding_ctx(owner).encoding
             });
-        Ok(DiagnosticsResult { diagnostics })
+        let mut budget = super::source_context::SourceBudget::new(options.byte_limit);
+        let result = Self::diagnostics_from_cache_entry_enriched(
+            entry,
+            encoding,
+            &self.document_tracker,
+            &self.workspace_roots,
+            &self.redaction_policy,
+            &mut budget,
+        )
+        .await;
+        Ok(Self::finish_diagnostics(result.diagnostics, options))
     }
 
     /// Return whether actor-owned diagnostics exist for a workspace file.

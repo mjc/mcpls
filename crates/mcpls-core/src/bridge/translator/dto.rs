@@ -274,7 +274,9 @@ impl Default for SemanticResultLimits {
 }
 
 /// Diagnostic severity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
     /// Error diagnostic.
@@ -335,6 +337,9 @@ pub struct DiagnosticContext {
     pub occurrence_count: usize,
     /// Actor-owned code-action handles accepted by the preview flow.
     pub fix_handles: Vec<String>,
+    /// Exact additional locations represented by this group when requested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub occurrences: Vec<Location>,
 }
 
 impl Default for DiagnosticContext {
@@ -353,6 +358,7 @@ impl Default for DiagnosticContext {
             data: None,
             occurrence_count: 1,
             fix_handles: Vec::new(),
+            occurrences: Vec::new(),
         }
     }
 }
@@ -371,6 +377,93 @@ pub struct DiagnosticRelatedInformation {
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
+    /// Diagnostics before filtering and grouping.
+    pub total_diagnostics: usize,
+    /// Diagnostic occurrences represented in the response.
+    pub returned_diagnostics: usize,
+    /// Stable groups before response limits.
+    pub total_groups: usize,
+    /// Stable groups returned.
+    pub returned_groups: usize,
+    /// Complete groups omitted by response limits.
+    pub omitted_groups: usize,
+    /// Whether filtering or response budgets shortened the result.
+    pub truncated: bool,
+    /// Filters and bounds applied to this result.
+    pub filters: DiagnosticOptions,
+}
+
+/// Filters and explicit response bounds for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DiagnosticOptions {
+    /// Severities to retain; empty keeps every severity.
+    #[serde(default)]
+    pub severities: Vec<DiagnosticSeverity>,
+    /// LSP source names to retain; empty keeps every source.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Diagnostic codes to retain; empty keeps every code.
+    #[serde(default)]
+    pub codes: Vec<String>,
+    /// Include diagnostics explicitly identified as inactive code.
+    #[serde(default = "default_true")]
+    pub include_inactive: bool,
+    /// Include diagnostics under generated output paths.
+    #[serde(default = "default_true")]
+    pub include_generated: bool,
+    /// Preserve every exact location within collapsed groups.
+    #[serde(default)]
+    pub preserve_locations: bool,
+    /// Maximum diagnostic groups returned.
+    #[serde(default = "default_diagnostic_item_limit")]
+    pub item_limit: usize,
+    /// Maximum source-frame bytes across the response.
+    #[serde(default = "default_diagnostic_byte_limit")]
+    pub byte_limit: usize,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_diagnostic_item_limit() -> usize {
+    100
+}
+
+const fn default_diagnostic_byte_limit() -> usize {
+    32 * 1024
+}
+
+impl Default for DiagnosticOptions {
+    fn default() -> Self {
+        Self {
+            severities: Vec::new(),
+            sources: Vec::new(),
+            codes: Vec::new(),
+            include_inactive: true,
+            include_generated: true,
+            preserve_locations: false,
+            item_limit: default_diagnostic_item_limit(),
+            byte_limit: default_diagnostic_byte_limit(),
+        }
+    }
+}
+
+impl DiagnosticsResult {
+    /// Build an ungrouped result for internal pull/push merging.
+    pub(crate) fn raw(diagnostics: Vec<Diagnostic>) -> Self {
+        let count = diagnostics.len();
+        Self {
+            diagnostics,
+            total_diagnostics: count,
+            returned_diagnostics: count,
+            total_groups: count,
+            returned_groups: count,
+            omitted_groups: 0,
+            truncated: false,
+            filters: DiagnosticOptions::default(),
+        }
+    }
 }
 
 /// A text edit operation.
