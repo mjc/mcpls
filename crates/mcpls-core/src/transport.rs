@@ -487,6 +487,7 @@ pub(crate) async fn run_http(
     let mut http_cfg = StreamableHttpServerConfig::default();
     http_cfg.cancellation_token = cancel.clone();
     http_cfg.max_request_body_bytes = cfg.max_request_body_bytes;
+    http_cfg.stateless_protocol_metadata_required = true;
 
     let service = StreamableHttpService::new(
         move || Ok::<_, std::io::Error>(mcp_for_factory.clone()),

@@ -156,6 +156,26 @@ impl McpClient {
         Ok(response)
     }
 
+    /// Discover the server without creating a session.
+    #[allow(dead_code)]
+    pub fn discover(&mut self) -> Result<Value> {
+        let id = self.next_id();
+        self.send_request(&inline_request(id, "server/discover", &json!({})))
+    }
+
+    /// Send a self-describing 2026 request without initializing a session.
+    #[allow(dead_code)]
+    pub fn stateless_request(&mut self, method: &str, params: &Value) -> Result<Value> {
+        let id = self.next_id();
+        self.send_request(&inline_request(id, method, params))
+    }
+
+    /// Exchange an arbitrary JSON-RPC request, preserving error responses.
+    #[allow(dead_code)]
+    pub fn raw_request(&mut self, request: &Value) -> Result<Value> {
+        self.exchange(request)
+    }
+
     /// List available MCP tools.
     ///
     /// # Errors
@@ -282,6 +302,28 @@ impl McpClient {
     /// - The response cannot be read or parsed
     /// - The server returns an error response
     fn send_request(&mut self, request: &Value) -> Result<Value> {
+        let response = self.exchange(request)?;
+
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("MCP error: {error:?}");
+        }
+
+        // rmcp 1.8.0+: deserialization failures return isError=true inside a successful
+        // tools/call result instead of a JSON-RPC error (PR #894).
+        if response
+            .get("result")
+            .and_then(|r| r.get("isError"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let content = response["result"]["content"].to_string();
+            anyhow::bail!("MCP tool error (isError=true): {content}");
+        }
+
+        Ok(response)
+    }
+
+    fn exchange(&mut self, request: &Value) -> Result<Value> {
         let request_str = serde_json::to_string(request)?;
         writeln!(self.stdin, "{request_str}")?;
         self.stdin.flush()?;
@@ -302,22 +344,6 @@ impl McpClient {
             }
             self.pending_notifications.push(value);
         };
-
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("MCP error: {error:?}");
-        }
-
-        // rmcp 1.8.0+: deserialization failures return isError=true inside a successful
-        // tools/call result instead of a JSON-RPC error (PR #894).
-        if response
-            .get("result")
-            .and_then(|r| r.get("isError"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let content = response["result"]["content"].to_string();
-            anyhow::bail!("MCP tool error (isError=true): {content}");
-        }
 
         Ok(response)
     }
@@ -365,6 +391,24 @@ impl McpClient {
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.process.try_wait()
     }
+}
+
+#[allow(dead_code)]
+fn inline_request(id: i64, method: &str, params: &Value) -> Value {
+    let mut params = params.as_object().cloned().unwrap_or_default();
+    params.insert(
+        "_meta".to_owned(),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }),
+    );
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params
+    })
 }
 
 impl Drop for McpClient {

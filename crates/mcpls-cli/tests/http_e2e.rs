@@ -61,6 +61,11 @@ impl HttpClient {
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
         let response = self.call_tool_response(name, arguments);
         assert!(response.get("error").is_none(), "tool error: {response}");
+        if response["result"]["structuredContent"].is_object()
+            || response["result"]["structuredContent"].is_array()
+        {
+            return response["result"]["structuredContent"].clone();
+        }
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("tool response has no text: {response}"));
@@ -126,19 +131,28 @@ impl HttpClient {
     }
 
     fn request(&self, payload: &Value) -> Value {
+        self.request_with_headers(payload, "", true)
+    }
+
+    fn request_with_headers(&self, payload: &Value, headers: &str, include_session: bool) -> Value {
         let body = serde_json::to_vec(&payload).unwrap();
         let mut stream = TcpStream::connect(self.address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let session_header = self.session_id.as_deref().map_or(String::new(), |session| {
-            format!("MCP-Session-Id: {session}\r\n")
-        });
+        let session_header = if include_session {
+            self.session_id.as_deref().map_or(String::new(), |session| {
+                format!("MCP-Session-Id: {session}\r\n")
+            })
+        } else {
+            String::new()
+        };
         let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n{}\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n{}{}\r\n",
             self.address,
             body.len(),
             session_header,
+            headers,
         );
         stream.write_all(request.as_bytes()).unwrap();
         stream.write_all(&body).unwrap();
@@ -320,6 +334,7 @@ fn parse_response(bytes: &[u8]) -> Value {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             serde_json::from_slice::<Value>(line).ok()
         })
+        .or_else(|| serde_json::from_slice::<Value>(&decoded).ok())
         .unwrap_or_else(|| json!({}));
     response["_status"] = json!(status);
     if let Some(session_id) = session_id {
@@ -659,6 +674,87 @@ fn project_ids(client: &mut HttpClient) -> Vec<String> {
         .iter()
         .filter_map(|project| project["project_id"].as_str().map(str::to_owned))
         .collect()
+}
+
+#[test]
+fn stateless_http_contract_is_self_describing_and_strict() {
+    let fixture = HttpFixture::new();
+    let daemon = HttpDaemon::spawn(&fixture.config);
+    let client = HttpClient::new(daemon.address);
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let protocol = "MCP-Protocol-Version: 2026-07-28\r\n";
+
+    let discovered = client.request_with_headers(
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": meta}
+        }),
+        &format!("{protocol}Mcp-Method: server/discover\r\n"),
+        false,
+    );
+    assert_eq!(discovered["_status"], 200, "{discovered}");
+    assert_eq!(discovered["result"]["resultType"], "complete");
+    assert_eq!(
+        discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "mcpls"
+    );
+
+    let listed = client.request_with_headers(
+        &json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"_meta": meta}
+        }),
+        &format!("{protocol}Mcp-Method: tools/list\r\n"),
+        false,
+    );
+    assert_eq!(listed["_status"], 200, "{listed}");
+    assert_eq!(listed["result"]["resultType"], "complete");
+
+    let called = client.request_with_headers(
+        &json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "health", "arguments": {}, "_meta": meta}
+        }),
+        &format!("{protocol}Mcp-Method: tools/call\r\nMcp-Name: health\r\n"),
+        false,
+    );
+    assert_eq!(called["_status"], 200, "{called}");
+    assert_eq!(called["result"]["resultType"], "complete");
+
+    for (payload, headers, expected) in [
+        (
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}}),
+            format!("{protocol}Mcp-Method: tools/list\r\n"),
+            "protocolVersion",
+        ),
+        (
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {"_meta": meta}}),
+            protocol.to_owned(),
+            "Mcp-Method",
+        ),
+        (
+            json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "health", "arguments": {}, "_meta": meta}}),
+            format!("{protocol}Mcp-Method: tools/call\r\nMcp-Name: wrong\r\n"),
+            "does not match",
+        ),
+    ] {
+        let response = client.request_with_headers(&payload, &headers, false);
+        assert_eq!(response["_status"], 400, "{response}");
+        assert!(
+            response["error"].to_string().contains(expected),
+            "expected {expected:?} in {response}"
+        );
+    }
+
+    let illegal_session = client.request_with_headers(
+        &json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}}),
+        "MCP-Session-Id: not-a-session\r\n",
+        false,
+    );
+    assert_eq!(illegal_session["_status"], 404, "{illegal_session}");
 }
 
 #[test]

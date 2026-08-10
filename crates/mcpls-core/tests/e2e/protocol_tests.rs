@@ -52,6 +52,72 @@ fn test_e2e_initialize_handshake() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_stateless_discovery_and_tools() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+
+    let discovered = client.discover()?;
+    let result = &discovered["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert!(
+        result["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.contains(&json!("2026-07-28")))
+    );
+    assert!(result["capabilities"]["tools"].is_object());
+    assert_eq!(
+        result["instructions"],
+        include_str!("../../src/mcp/server_instructions.txt").trim_end()
+    );
+    assert_eq!(result["ttlMs"], 0);
+    assert_eq!(result["cacheScope"], "private");
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "mcpls"
+    );
+
+    let listed = client.stateless_request("tools/list", &json!({}))?;
+    assert_eq!(listed["result"]["resultType"], "complete");
+    assert!(listed["result"]["tools"].is_array());
+
+    let called =
+        client.stateless_request("tools/call", &json!({"name": "health", "arguments": {}}))?;
+    assert_eq!(called["result"]["resultType"], "complete");
+    assert!(called["result"]["structuredContent"].is_object());
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_stateless_metadata_errors_and_legacy_shape() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+
+    let response = client.raw_request(&json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "server/discover",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}
+    }))?;
+    assert!(
+        response["error"]
+            .to_string()
+            .contains("Unsupported protocol version")
+    );
+
+    drop(client);
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+    let listed = client.list_tools()?;
+    assert!(listed["result"].get("resultType").is_none());
+
+    Ok(())
+}
+
 /// Test listing all available MCP tools.
 ///
 /// Validates that:
