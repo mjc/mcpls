@@ -13,10 +13,10 @@ use crate::bridge::DocumentSymbolOptions;
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResponse, CallToolResult, ContentBlock, Implementation, ListResourcesResult,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    CacheScope, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListResourcesResult, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
@@ -487,6 +487,24 @@ pub struct McplsServer {
     context: Arc<HandlerContext>,
 }
 
+fn supports_cache_hints(context: &rmcp::service::RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+fn private_resource_result(
+    contents: Vec<ResourceContents>,
+    supports_cache_hints: bool,
+) -> ReadResourceResult {
+    let result = ReadResourceResult::new(contents);
+    if supports_cache_hints {
+        result.with_ttl_ms(0).with_cache_scope(CacheScope::Private)
+    } else {
+        result
+    }
+}
+
 impl Clone for McplsServer {
     fn clone(&self) -> Self {
         self.for_session()
@@ -665,6 +683,7 @@ impl McplsServer {
         &self,
         project_id: ProjectId,
         uri: String,
+        supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
         let identity = self
             .context
@@ -681,7 +700,11 @@ impl McplsServer {
         let json = self
             .project_state_json(&project_id, &identity, &state)
             .await?;
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(json.legacy, uri)]).into())
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json.legacy, uri)],
+            supports_cache_hints,
+        )
+        .into())
     }
 
     async fn read_project_events_resource(
@@ -689,6 +712,7 @@ impl McplsServer {
         project_id: ProjectId,
         cursor: Option<u64>,
         uri: String,
+        supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
         let actor = self
             .context
@@ -698,7 +722,11 @@ impl McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let snapshot = actor.event_snapshot(cursor);
         let json = encode_json(&project_events_json(&project_id, &snapshot))?;
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(json.legacy, uri)]).into())
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json.legacy, uri)],
+            supports_cache_hints,
+        )
+        .into())
     }
 
     async fn preview_project_edit(
@@ -2089,7 +2117,7 @@ impl ServerHandler for McplsServer {
     async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
         // very large single-page responses that may exceed transport buffers).
@@ -2138,25 +2166,36 @@ impl ServerHandler for McplsServer {
                 .with_description(format!("Ordered project events for {project_id}"))
         }));
 
-        Ok(ListResourcesResult::with_all_items(resources))
+        let result = ListResourcesResult::with_all_items(resources);
+        if supports_cache_hints(&context) {
+            Ok(result.with_ttl_ms(0).with_cache_scope(CacheScope::Private))
+        } else {
+            Ok(result)
+        }
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let resource = parse_session_resource_uri(&request.uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let supports_cache_hints = supports_cache_hints(&context);
         let path = match resource {
             SessionResource::ProjectStatus(project_id) => {
                 return self
-                    .read_project_status_resource(project_id, request.uri)
+                    .read_project_status_resource(project_id, request.uri, supports_cache_hints)
                     .await;
             }
             SessionResource::ProjectEvents { project_id, cursor } => {
                 return self
-                    .read_project_events_resource(project_id, cursor, request.uri)
+                    .read_project_events_resource(
+                        project_id,
+                        cursor,
+                        request.uri,
+                        supports_cache_hints,
+                    )
                     .await;
             }
             SessionResource::Diagnostics(path) => path,
@@ -2181,7 +2220,11 @@ impl ServerHandler for McplsServer {
         let json = serde_json::to_string(&diagnostics)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
 
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, request.uri)]).into())
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json, request.uri)],
+            supports_cache_hints,
+        )
+        .into())
     }
 
     async fn subscribe(
@@ -2307,6 +2350,17 @@ mod tests {
     fn server_constructor_does_not_require_a_global_translator() {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let _server = McplsServer::new(subscriptions);
+    }
+
+    #[test]
+    fn resource_cache_hints_are_private_and_protocol_gated() {
+        let modern = serde_json::to_value(private_resource_result(Vec::new(), true)).unwrap();
+        assert_eq!(modern["ttlMs"], 0);
+        assert_eq!(modern["cacheScope"], "private");
+
+        let legacy = serde_json::to_value(private_resource_result(Vec::new(), false)).unwrap();
+        assert!(legacy.get("ttlMs").is_none());
+        assert!(legacy.get("cacheScope").is_none());
     }
 
     #[test]
@@ -3676,6 +3730,7 @@ finally:
                 ProjectId::new("project").unwrap(),
                 None,
                 "mcpls-project-events:///project".to_string(),
+                false,
             )
             .await
             .unwrap();

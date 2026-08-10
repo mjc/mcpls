@@ -79,6 +79,8 @@ fn test_e2e_stateless_discovery_and_tools() -> Result<()> {
 
     let listed = client.stateless_request("tools/list", &json!({}))?;
     assert_eq!(listed["result"]["resultType"], "complete");
+    assert_eq!(listed["result"]["ttlMs"], 0);
+    assert_eq!(listed["result"]["cacheScope"], "public");
     assert!(listed["result"]["tools"].is_array());
 
     let called =
@@ -114,6 +116,11 @@ fn test_e2e_stateless_metadata_errors_and_legacy_shape() -> Result<()> {
     client.initialize()?;
     let listed = client.list_tools()?;
     assert!(listed["result"].get("resultType").is_none());
+    assert!(listed["result"].get("ttlMs").is_none());
+    assert!(listed["result"].get("cacheScope").is_none());
+    let resources = client.list_resources()?;
+    assert!(resources["result"].get("ttlMs").is_none());
+    assert!(resources["result"].get("cacheScope").is_none());
 
     Ok(())
 }

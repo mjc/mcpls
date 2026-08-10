@@ -712,6 +712,8 @@ fn stateless_http_contract_is_self_describing_and_strict() {
     );
     assert_eq!(listed["_status"], 200, "{listed}");
     assert_eq!(listed["result"]["resultType"], "complete");
+    assert_eq!(listed["result"]["ttlMs"], 0);
+    assert_eq!(listed["result"]["cacheScope"], "public");
 
     let called = client.request_with_headers(
         &json!({
@@ -755,6 +757,55 @@ fn stateless_http_contract_is_self_describing_and_strict() {
         false,
     );
     assert_eq!(illegal_session["_status"], 404, "{illegal_session}");
+}
+
+#[test]
+fn stateless_http_resource_cache_hints_are_private_and_stable() {
+    let fixture = HttpFixture::new();
+    let root = fixture.project_root("cache-project");
+    let daemon = HttpDaemon::spawn(&fixture.config);
+    let mut client = HttpClient::new(daemon.address);
+    client.initialize();
+    client.call_tool(
+        "project_add",
+        json!({"project_id": "cache-project", "root": root}),
+    );
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let protocol = "MCP-Protocol-Version: 2026-07-28\r\n";
+    let list_resources = || {
+        client.request_with_headers(
+            &json!({
+                "jsonrpc": "2.0", "id": 8, "method": "resources/list",
+                "params": {"_meta": meta}
+            }),
+            &format!("{protocol}Mcp-Method: resources/list\r\n"),
+            false,
+        )
+    };
+    let resources = list_resources();
+    let resources_again = list_resources();
+    assert_eq!(resources["result"]["ttlMs"], 0);
+    assert_eq!(resources["result"]["cacheScope"], "private");
+    assert_eq!(
+        resources["result"]["resources"],
+        resources_again["result"]["resources"]
+    );
+
+    let status_uri = "mcpls-project-status:///cache-project";
+    let resource = client.request_with_headers(
+        &json!({
+            "jsonrpc": "2.0", "id": 9, "method": "resources/read",
+            "params": {"uri": status_uri, "_meta": meta}
+        }),
+        &format!("{protocol}Mcp-Method: resources/read\r\nMcp-Name: {status_uri}\r\n"),
+        false,
+    );
+    assert_eq!(resource["_status"], 200, "{resource}");
+    assert_eq!(resource["result"]["ttlMs"], 0);
+    assert_eq!(resource["result"]["cacheScope"], "private");
 }
 
 #[test]
