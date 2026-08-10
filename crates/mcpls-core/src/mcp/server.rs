@@ -2273,10 +2273,14 @@ impl ServerHandler for McplsServer {
         server_info.server_info = implementation;
         server_info.instructions = Some(
             concat!(
-                "Universal MCP to LSP bridge. Exposes Language Server Protocol ",
-                "capabilities as MCP tools for semantic code intelligence. ",
-                "Supports hover, definition, references, diagnostics, rename, ",
-                "completions, symbols, and formatting."
+                "Prefer MCPLS semantic results before shell file reads. Start unknown symbols ",
+                "with exact-first workspace_symbol_search; its source frames and symbol_handle ",
+                "are safe inputs to handle-aware follow-ups. Use inspect_symbol for a bounded ",
+                "definition, implementation, references/calls, tests, and diagnostics bundle. ",
+                "Set section and byte/item budget fields explicitly for tighter context. Never ",
+                "silently choose an ambiguous candidate. On stale_symbol_handle, rerun discovery ",
+                "and use the replacement handle. A direct file read is still appropriate for an ",
+                "intentionally uncapped full file or non-source/generated artifacts."
             )
             .to_string(),
         );
@@ -3101,6 +3105,27 @@ finally:
         assert!(info.capabilities.tools.is_some());
         assert_eq!(info.server_info.name, "mcpls");
         assert!(info.instructions.is_some());
+    }
+
+    #[test]
+    fn server_instructions_prefer_source_rich_handle_workflows() {
+        let instructions = create_test_server().get_info().instructions.unwrap();
+
+        for required in [
+            "exact-first",
+            "source frames",
+            "symbol_handle",
+            "inspect_symbol",
+            "budget",
+            "ambiguous",
+            "stale_symbol_handle",
+            "file read",
+        ] {
+            assert!(
+                instructions.contains(required),
+                "initialize instructions omit {required}: {instructions}"
+            );
+        }
     }
 
     #[test]
