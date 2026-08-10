@@ -358,6 +358,30 @@ pub struct WorkspaceSymbolParams {
     pub limit: u32,
 }
 
+/// Parameters for a bounded, project-scoped symbol inspection bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InspectSymbolParams {
+    /// Stable project identifier whose symbol should be inspected.
+    pub project_id: String,
+    /// Snapshot-bound handle returned by symbol discovery.
+    pub symbol_handle: Option<SymbolHandle>,
+    /// Symbol name to resolve when no handle is supplied.
+    pub query: Option<String>,
+    /// Optional symbol-kind disambiguator.
+    pub kind: Option<String>,
+    /// Optional project-relative path disambiguator.
+    pub path: Option<String>,
+    /// Optional container-name disambiguator.
+    pub container: Option<String>,
+    /// Maximum candidates returned for ambiguous queries.
+    #[serde(default = "default_inspect_candidates")]
+    pub candidate_limit: u32,
+}
+
+const fn default_inspect_candidates() -> u32 {
+    10
+}
+
 const fn default_max_results() -> u32 {
     100
 }

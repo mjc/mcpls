@@ -9469,6 +9469,512 @@
     }
   },
   {
+    "name": "inspect_symbol",
+    "description": "Resolve a project symbol exactly and return a bounded source-bearing inspection bundle. Ambiguous names return candidates instead of choosing silently.",
+    "inputSchema": {
+      "$defs": {
+        "SymbolHandle": {
+          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "candidate_limit": {
+          "default": 10,
+          "description": "Maximum candidates returned for ambiguous queries.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "container": {
+          "description": "Optional container-name disambiguator.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Optional symbol-kind disambiguator.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Optional project-relative path disambiguator.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "description": "Stable project identifier whose symbol should be inspected.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Symbol name to resolve when no handle is supplied.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol_handle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SymbolHandle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Snapshot-bound handle returned by symbol discovery."
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "InspectSymbolResolution": {
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "selected",
+                  "type": "string"
+                },
+                "symbol": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/WorkspaceSymbol"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "symbol_handle": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/SymbolHandle"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "candidates": {
+                  "items": {
+                    "$ref": "#/$defs/WorkspaceSymbol"
+                  },
+                  "type": "array"
+                },
+                "status": {
+                  "const": "ambiguous",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "candidates"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "not_found",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "InspectSymbolSections": {
+          "properties": {
+            "declaration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "Location": {
+          "description": "Location in a document.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed targets.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range within the document."
+            },
+            "source": {
+              "$ref": "#/$defs/SourceContext",
+              "description": "Bounded source text for this location, or a stable reason it is unavailable."
+            },
+            "symbol_handle": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SymbolHandle"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+            },
+            "uri": {
+              "description": "URI of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range",
+            "source"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "SourceContext": {
+          "description": "Source context attached to a semantic result location.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceFrame",
+              "description": "The source was safely resolved.",
+              "properties": {
+                "status": {
+                  "const": "available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The source could not be safely resolved.",
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceUnavailableReason",
+                  "description": "Stable machine-readable reason."
+                },
+                "status": {
+                  "const": "unavailable",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceFrame": {
+          "description": "A bounded, line-numbered source excerpt.",
+          "properties": {
+            "content_hash": {
+              "description": "SHA-256 of the exact content used for this frame.",
+              "type": "string"
+            },
+            "document_version": {
+              "description": "Open-document version, when the frame came from actor-owned state.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "highlighted_range": {
+              "$ref": "#/$defs/Range",
+              "description": "Range highlighted by consumers; currently identical to `range`."
+            },
+            "language_id": {
+              "description": "Language identifier when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Canonical filesystem path.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Normalized 1-based result range."
+            },
+            "returned_bytes": {
+              "description": "Number of source bytes returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_lines": {
+              "description": "Number of source lines returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "text": {
+              "description": "Line-numbered source text.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Number of source bytes available in the selected line window.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_lines": {
+              "description": "Number of source lines in the resolved snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether a line or byte budget shortened the frame.",
+              "type": "boolean"
+            },
+            "uri": {
+              "description": "Canonical file URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "uri",
+            "range",
+            "highlighted_range",
+            "text",
+            "content_hash",
+            "returned_lines",
+            "total_lines",
+            "returned_bytes",
+            "total_bytes",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "SourceUnavailableReason": {
+          "description": "Stable reasons source text is unavailable.",
+          "oneOf": [
+            {
+              "const": "non_file_uri",
+              "description": "The LSP returned a URI other than `file:`.",
+              "type": "string"
+            },
+            {
+              "const": "outside_approved_roots",
+              "description": "The path is outside registered workspace and approved source roots.",
+              "type": "string"
+            },
+            {
+              "const": "not_found",
+              "description": "The tracked or on-disk source no longer exists.",
+              "type": "string"
+            },
+            {
+              "const": "unreadable",
+              "description": "The source could not be read as UTF-8 text.",
+              "type": "string"
+            },
+            {
+              "const": "response_budget_exhausted",
+              "description": "The response-wide source budget was exhausted.",
+              "type": "string"
+            }
+          ]
+        },
+        "SymbolHandle": {
+          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
+          "type": "string"
+        },
+        "WorkspaceSymbol": {
+          "description": "A workspace symbol.",
+          "properties": {
+            "container_name": {
+              "description": "Optional container name (parent scope).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Kind of symbol.",
+              "type": "string"
+            },
+            "location": {
+              "$ref": "#/$defs/Location",
+              "description": "Location of the symbol."
+            },
+            "match_class": {
+              "$ref": "#/$defs/WorkspaceSymbolMatch",
+              "description": "How the name matched the query."
+            },
+            "name": {
+              "description": "Name of the symbol.",
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/$defs/WorkspaceSymbolOrigin",
+              "description": "Whether the symbol belongs to the registered project or external source."
+            },
+            "project_relative_path": {
+              "description": "Path relative to the registered project root, when project-local.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "score": {
+              "description": "Stable score derived from `match_class`; larger is better.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "location",
+            "match_class",
+            "score",
+            "origin"
+          ],
+          "type": "object"
+        },
+        "WorkspaceSymbolMatch": {
+          "description": "How a workspace-symbol name matched the query.",
+          "oneOf": [
+            {
+              "const": "exact",
+              "description": "Exact case-sensitive name.",
+              "type": "string"
+            },
+            {
+              "const": "exact_case_insensitive",
+              "description": "Exact name ignoring case.",
+              "type": "string"
+            },
+            {
+              "const": "prefix",
+              "description": "Name starts with the query, ignoring case.",
+              "type": "string"
+            },
+            {
+              "const": "fuzzy",
+              "description": "Query characters occur in order in the name.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkspaceSymbolOrigin": {
+          "description": "Workspace-symbol ownership relative to the registered project.",
+          "oneOf": [
+            {
+              "const": "project_local",
+              "description": "Symbol source is under a registered project root.",
+              "type": "string"
+            },
+            {
+              "const": "external",
+              "description": "Symbol source is outside every registered project root.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "resolution": {
+          "$ref": "#/$defs/InspectSymbolResolution"
+        },
+        "sections": {
+          "$ref": "#/$defs/InspectSymbolSections"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "resolution",
+        "sections",
+        "truncated"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "name": "move_inline_module_preview",
     "description": "Preview moving a top-level inline Rust module to its own file using the project's current document state. Prefers rust-analyzer's native move_module_to_file edit and falls back to MCPLS's structural ast-grep refactor when unavailable; the response reports the selected producer. Supports raw and Unicode Rust identifiers. File-relative include/path constructs and ambiguous or nested modules fail closed. Apply the returned plan with workspace_edit_apply.",
     "inputSchema": {
