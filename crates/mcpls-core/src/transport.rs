@@ -169,15 +169,12 @@ pub struct HttpConfig {
     /// which this limit does not constrain). A value of `0` rejects every
     /// POST body.
     pub max_request_body_bytes: usize,
-    /// Maximum number of concurrent HTTP sessions.
+    /// Maximum number of concurrent HTTP requests and response streams.
     ///
-    /// This is a hard bound, enforced atomically at session creation via a
-    /// semaphore — never more than this many sessions can be active at once,
-    /// regardless of request concurrency.
-    /// Requests that would start a new session beyond this limit receive
-    /// `429 Too Many Requests`. Defaults to
-    /// [`HttpConfig::DEFAULT_MAX_CONCURRENT_SESSIONS`]. A value of `0`
-    /// rejects every session.
+    /// The field name is retained for compatibility with older configurations;
+    /// the bound now covers both legacy sessions and stateless 2026 requests.
+    /// Requests beyond this limit receive `429 Too Many Requests` with a
+    /// `Retry-After` header. A value of `0` rejects every request.
     pub max_concurrent_sessions: usize,
 }
 
@@ -188,7 +185,7 @@ impl HttpConfig {
     /// Default concurrent HTTP session cap.
     pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 100;
 
-    /// Create an [`HttpConfig`] with default body-size and session caps.
+    /// Create an [`HttpConfig`] with default body-size and request caps.
     ///
     /// # Examples
     ///
@@ -213,11 +210,17 @@ impl HttpConfig {
         self
     }
 
-    /// Override the maximum number of concurrent HTTP sessions.
+    /// Override the maximum number of concurrent HTTP requests and streams.
     #[must_use]
     pub const fn with_max_concurrent_sessions(mut self, max: usize) -> Self {
         self.max_concurrent_sessions = max;
         self
+    }
+
+    /// Override the maximum number of concurrent HTTP requests and streams.
+    #[must_use]
+    pub const fn with_max_concurrent_requests(self, max: usize) -> Self {
+        self.with_max_concurrent_sessions(max)
     }
 
     fn validate(&self) -> Result<(), crate::Error> {
@@ -435,18 +438,15 @@ pub(crate) async fn run_stdio(
 ///
 /// # Note
 ///
-/// Diagnostic push notifications (`resources/updated`) are not forwarded to
-/// HTTP sessions in this release — the single-peer pump architecture from
-/// stdio is kept as-is. Clients can still poll diagnostics via the existing
-/// MCP tools. A follow-up issue will add per-session broadcast.
-///
 /// # Resource limits
 ///
 /// POST bodies exceeding `cfg.max_request_body_bytes` are rejected with
-/// `413 Payload Too Large` (enforced by `rmcp`). Once `cfg.max_concurrent_sessions`
-/// sessions are active, a request that would start a new one is rejected with
-/// `429 Too Many Requests` — enforced as a hard bound at session creation by
-/// [`CappedSessionManager`] and surfaced over HTTP by [`enforce_session_cap`].
+/// `413 Payload Too Large` (enforced by `rmcp`). Once
+/// `cfg.max_concurrent_sessions` requests or response streams are active, a
+/// new request is rejected with `429 Too Many Requests` and `Retry-After: 1`.
+/// The permit is held until the response completes or disconnects.
+/// Preferred 2026 requests are stateless: they do not require
+/// `Mcp-Session-Id`, HTTP GET streams, `Last-Event-ID`, or SSE resumption.
 ///
 /// # Shutdown
 ///
@@ -480,6 +480,7 @@ pub(crate) async fn run_http(
     cfg.validate()?;
 
     let session_manager = Arc::new(CappedSessionManager::new(cfg.max_concurrent_sessions));
+    let request_limit = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_sessions));
     let cancel = CancellationToken::new();
 
     let mcp_for_factory = mcp_server;
@@ -498,6 +499,10 @@ pub(crate) async fn run_http(
     let app = axum::Router::new()
         .nest_service(&cfg.path, service.clone())
         .route_service("/", service)
+        .layer(axum::middleware::from_fn_with_state(
+            request_limit,
+            enforce_request_cap,
+        ))
         .layer(axum::middleware::from_fn(enforce_session_cap));
 
     let listener = tokio::net::TcpListener::bind(cfg.bind)
@@ -546,8 +551,50 @@ pub(crate) async fn run_http(
 #[cfg(feature = "transport-http")]
 const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Wraps [`LocalSessionManager`], bounding concurrent HTTP sessions to a
-/// fixed capacity.
+/// Keep one request permit alive until every response frame has been consumed.
+#[cfg(feature = "transport-http")]
+fn hold_request_permit(
+    body: axum::body::Body,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> axum::body::Body {
+    use futures::StreamExt as _;
+
+    let stream = body.into_data_stream();
+    let guarded = futures::stream::unfold((stream, permit), |(mut stream, permit)| async move {
+        stream.next().await.map(|item| (item, (stream, permit)))
+    });
+    axum::body::Body::from_stream(guarded)
+}
+
+/// Bound all HTTP requests, including stateless calls and long-lived streams.
+#[cfg(feature = "transport-http")]
+async fn enforce_request_cap(
+    axum::extract::State(semaphore): axum::extract::State<Arc<tokio::sync::Semaphore>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let Ok(permit) = semaphore.try_acquire_owned() else {
+        let mut response = (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "Too Many Requests: maximum concurrent HTTP requests reached",
+        )
+            .into_response();
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        return response;
+    };
+
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    axum::response::Response::from_parts(parts, hold_request_permit(body, permit))
+}
+
+/// Wraps [`LocalSessionManager`], retaining the legacy session bound for
+/// pre-2026 clients.
 ///
 /// A [`tokio::sync::Semaphore`] permit is acquired atomically inside
 /// [`create_session`](SessionManager::create_session) — before delegating to
@@ -869,6 +916,59 @@ mod tests {
             );
         }
 
+        #[test]
+        fn test_http_config_with_max_concurrent_requests_is_compatible_alias() {
+            let cfg = HttpConfig::new("127.0.0.1:3006".parse().unwrap(), "/mcp")
+                .with_max_concurrent_requests(7);
+            assert_eq!(cfg.max_concurrent_sessions, 7);
+        }
+
+        #[allow(clippy::significant_drop_tightening)]
+        #[tokio::test]
+        async fn request_permit_lives_until_response_body_is_drained() {
+            use futures::StreamExt as _;
+
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = semaphore.clone().try_acquire_owned().unwrap();
+            let body =
+                super::super::hold_request_permit(axum::body::Body::from("response"), permit);
+
+            assert!(semaphore.clone().try_acquire_owned().is_err());
+            let _frames = body.into_data_stream().collect::<Vec<_>>().await;
+            assert!(semaphore.try_acquire().is_ok());
+        }
+
+        #[tokio::test]
+        async fn request_cap_rejects_a_second_held_response_stream() {
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let app = axum::Router::new()
+                .route(
+                    "/",
+                    axum::routing::post(|| async {
+                        let stream =
+                            futures::stream::pending::<Result<&'static [u8], std::io::Error>>();
+                        axum::body::Body::from_stream(stream)
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    semaphore,
+                    super::super::enforce_request_cap,
+                ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let first = open_raw_http_post(addr, "/", "", b"{}").await;
+            let second = raw_http_post(addr, "/", "", b"{}").await;
+            assert!(second.starts_with("HTTP/1.1 429"), "{second}");
+            assert!(second.to_ascii_lowercase().contains("retry-after"));
+
+            drop(first);
+            server_task.abort();
+        }
+
         /// Verifies `run_http` binds successfully and accepts TCP connections.
         #[tokio::test]
         async fn test_run_http_binds() {
@@ -1029,6 +1129,38 @@ mod tests {
                 }
             }
             String::from_utf8_lossy(&response).into_owned()
+        }
+
+        async fn open_raw_http_post(
+            addr: SocketAddr,
+            path: &str,
+            extra_headers: &str,
+            body: &[u8],
+        ) -> tokio::net::TcpStream {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{extra_headers}Content-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+
+            let mut headers = Vec::new();
+            let mut byte = [0u8; 1];
+            while !headers.ends_with(b"\r\n\r\n") {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    stream.read_exact(&mut byte),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                headers.push(byte[0]);
+            }
+            assert!(headers.starts_with(b"HTTP/1.1 200"), "{headers:?}");
+            stream
         }
 
         #[tokio::test]
