@@ -1030,6 +1030,67 @@ mod tests {
             String::from_utf8_lossy(&response).into_owned()
         }
 
+        #[tokio::test]
+        async fn streamable_http_returns_structured_tool_content() {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            let server_task = tokio::spawn(super::super::run_http(
+                test_server(),
+                HttpConfig::new(addr, "/mcp"),
+                super::super::ShutdownSignal::new(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let headers =
+                "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
+            let initialize = raw_http_post(
+                addr,
+                "/mcp",
+                headers,
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+            )
+            .await;
+            let session = initialize
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("mcp-session-id: ")
+                        .or_else(|| line.strip_prefix("Mcp-Session-Id: "))
+                })
+                .map(str::trim)
+                .unwrap();
+            let session_headers = format!("{headers}Mcp-Session-Id: {session}\r\n");
+            let _ = raw_http_post(
+                addr,
+                "/mcp",
+                &session_headers,
+                br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            )
+            .await;
+            let listed = raw_http_post(
+                addr,
+                "/mcp",
+                &session_headers,
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            )
+            .await;
+            assert!(listed.contains("outputSchema"), "{listed}");
+            let response = raw_http_post(
+                addr,
+                "/mcp",
+                &session_headers,
+                br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"health","arguments":{}}}"#,
+            )
+            .await;
+
+            assert!(response.contains("structuredContent"), "{response}");
+            assert!(
+                response.contains("Structured result available"),
+                "{response}"
+            );
+            server_task.abort();
+        }
+
         /// A POST body exceeding `cfg.max_request_body_bytes` must be rejected
         /// with `413 Payload Too Large`, proving the config value reaches
         /// `StreamableHttpServerConfig::max_request_body_bytes`.

@@ -59,7 +59,7 @@ pub struct SupportedWorkspaceEdit {
     pub edit: Option<WorkspaceEdit>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 /// Semantic discovery operation requested from the active Rust analyzer.
 pub enum SemanticDiscoveryKind {
@@ -79,13 +79,13 @@ pub enum SemanticDiscoveryKind {
     RelatedTests,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MacroExpansion {
     pub name: String,
     pub expansion: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 /// Bounded result from one semantic discovery operation.
 pub struct SemanticDiscoveryResult {
     /// Whether the active server supports the operation.

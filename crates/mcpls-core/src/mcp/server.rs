@@ -60,6 +60,13 @@ use crate::project::{
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
+#[derive(Debug, schemars::JsonSchema)]
+#[allow(dead_code)] // Schema-only marker for dynamically assembled object responses.
+struct StructuredObject {
+    #[schemars(flatten)]
+    fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
 }
@@ -109,34 +116,63 @@ impl<T> Json<T> {
             marker: PhantomData,
         }
     }
+
+    fn into_result(self, legacy_text: bool) -> CallToolResult {
+        let text = if legacy_text {
+            self.legacy
+        } else {
+            "Structured result available in structuredContent.".to_owned()
+        };
+        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        result.structured_content = Some(self.value);
+        result
+    }
 }
 
 impl<T: schemars::JsonSchema + 'static> IntoCallToolResult for Json<T> {
     fn into_call_tool_result(self) -> Result<CallToolResponse, McpError> {
-        let text = std::env::var_os("MCPLS_LEGACY_TEXT_RESULTS").map_or_else(
-            || "Structured result available in structuredContent.".to_owned(),
-            |_| self.legacy,
-        );
-        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        result.structured_content = Some(self.value);
-        Ok(result.into())
+        Ok(self
+            .into_result(std::env::var_os("MCPLS_LEGACY_TEXT_RESULTS").is_some())
+            .into())
     }
 }
 
-fn encode_json<T: Serialize>(value: &T) -> Result<Json<serde_json::Value>, McpError> {
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ToolErrorData {
+    code: &'static str,
+    message: String,
+    action: &'static str,
+    retryable: bool,
+}
+
+fn operation_error(error: impl std::fmt::Display) -> McpError {
+    let error = ToolErrorData {
+        code: "operation_failed",
+        message: error.to_string(),
+        action: "Check project status and request parameters, then retry.",
+        retryable: true,
+    };
+    McpError::internal_error(error.message.clone(), serde_json::to_value(error).ok())
+}
+
+fn encode_json<T: Serialize>(value: &T) -> Result<Json<StructuredObject>, McpError> {
     let value = serde_json::to_value(value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
     Ok(Json::new(value.clone(), value.to_string()))
 }
 
-fn encode_tool_result<T, E>(result: Result<T, E>) -> Result<Json<serde_json::Value>, McpError>
+fn encode_tool_result<T, E>(result: Result<T, E>) -> Result<Json<T>, McpError>
 where
-    T: Serialize,
+    T: Serialize + schemars::JsonSchema,
     E: std::fmt::Display,
 {
     result.map_or_else(
-        |error| Err(McpError::internal_error(error.to_string(), None)),
-        |value| encode_json(&value),
+        |error| Err(operation_error(error)),
+        |value| {
+            let structured = serde_json::to_value(&value)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            Ok(Json::new(structured.clone(), structured.to_string()))
+        },
     )
 }
 
@@ -152,19 +188,19 @@ fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpErro
     })
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 struct ActorGroupState {
     group_id: usize,
     roots: Vec<PathBuf>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 struct ProjectLspCapabilitiesResponse {
     project_id: String,
     servers: Vec<ProjectServerCapability>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 struct DaemonPersistenceSnapshot {
     configured: bool,
     last_error: Option<String>,
@@ -296,7 +332,7 @@ const fn health_status(snapshot: &DaemonSnapshot) -> DaemonHealth {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 struct SubscriptionListResult {
     subscriptions: Vec<String>,
 }
@@ -578,7 +614,7 @@ impl McplsServer {
         project_id: &ProjectId,
         identity: &ProjectIdentity,
         state: &ProjectState,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let actor_group_roots = self
             .context
             .project_registry
@@ -669,7 +705,7 @@ impl McplsServer {
         id: &ProjectId,
         edit: lsp_types::WorkspaceEdit,
         encoding: PositionEncoding,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let artifact = self
             .context
             .project_registry
@@ -685,7 +721,7 @@ impl McplsServer {
         id: &ProjectId,
         result: SupportedWorkspaceEdit,
         encoding: PositionEncoding,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let Some(edit) = result.edit else {
             return encode_json(&serde_json::json!({
                 "project_id": id.as_str(),
@@ -710,7 +746,7 @@ impl McplsServer {
         &self,
         params: SemanticPositionParams,
         kind: SemanticDiscoveryKind,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(
                 Some(params.project_id),
@@ -724,14 +760,14 @@ impl McplsServer {
             .semantic_discovery(file_path, line, character, kind)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&result)
+        encode_tool_result::<_, std::convert::Infallible>(Ok(result))
     }
 
     async fn apply_project_plan(
         &self,
         id: &ProjectId,
         plan_id: PlanId,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         if !self.context.claim_plan(&plan_id).await {
             return Err(McpError::invalid_params(
                 "edit plan is not owned by this MCP session",
@@ -755,7 +791,7 @@ impl McplsServer {
     async fn apply_project_plan_params(
         &self,
         params: WorkspaceEditApplyParams,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(params.project_id)?;
         let plan_id = PlanId::parse(params.plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
@@ -830,7 +866,7 @@ impl McplsServer {
             root,
             config,
         }): Parameters<ProjectAddParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let config = config
             .map(serde_json::from_value::<crate::config::ProjectConfig>)
@@ -873,7 +909,7 @@ impl McplsServer {
     async fn project_activate(
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
             .context
@@ -895,7 +931,7 @@ impl McplsServer {
     async fn project_list(
         &self,
         Parameters(_params): Parameters<ProjectListParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let projects = self.context.project_registry.list().await;
         let result: Vec<_> = projects
             .iter()
@@ -916,9 +952,11 @@ impl McplsServer {
     async fn subscription_list(
         &self,
         Parameters(_params): Parameters<SubscriptionListParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<SubscriptionListResult>, McpError> {
         let subscriptions = self.context.subscriptions.sorted_snapshot().await;
-        encode_json(&SubscriptionListResult { subscriptions })
+        encode_tool_result::<_, std::convert::Infallible>(Ok(SubscriptionListResult {
+            subscriptions,
+        }))
     }
 
     /// Return a cheap process and project liveness snapshot.
@@ -926,7 +964,7 @@ impl McplsServer {
     async fn health(
         &self,
         Parameters(_params): Parameters<ProjectListParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
             "status": health_status(&snapshot).as_str(),
@@ -946,7 +984,7 @@ impl McplsServer {
     async fn server_status(
         &self,
         Parameters(_params): Parameters<ProjectListParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -967,7 +1005,7 @@ impl McplsServer {
     async fn project_status(
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
             .context
@@ -991,7 +1029,7 @@ impl McplsServer {
     async fn project_remove(
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         self.context
             .project_registry
@@ -1015,7 +1053,7 @@ impl McplsServer {
             workspace_edit,
             position_encoding,
         }): Parameters<WorkspaceEditPreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(workspace_edit)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
@@ -1037,7 +1075,7 @@ impl McplsServer {
             new_name,
             position_encoding,
         }): Parameters<RenamePreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let actor = self
@@ -1067,7 +1105,7 @@ impl McplsServer {
             insert_spaces,
             position_encoding,
         }): Parameters<FormatPreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let actor = self
@@ -1091,7 +1129,7 @@ impl McplsServer {
     async fn range_format_preview(
         &self,
         Parameters(params): Parameters<RangeFormatPreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(params.project_id)?;
         let encoding = parse_position_encoding(params.position_encoding.as_deref())?;
         let actor = self
@@ -1120,7 +1158,7 @@ impl McplsServer {
     async fn move_item_preview(
         &self,
         Parameters(params): Parameters<MoveItemPreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(params.project_id)?;
         let encoding = parse_position_encoding(params.position_encoding.as_deref())?;
         let actor = self
@@ -1155,7 +1193,7 @@ impl McplsServer {
             module_character,
             position_encoding,
         }): Parameters<MoveInlineModulePreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let module_position = match (module_line, module_character) {
@@ -1190,7 +1228,7 @@ impl McplsServer {
             new_path,
             position_encoding,
         }): Parameters<PathRenamePreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
         let result = self
@@ -1228,7 +1266,7 @@ impl McplsServer {
             parse_only,
             position_encoding,
         }): Parameters<StructuralReplacePreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let dialect = parse_structural_dialect(&dialect)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
@@ -1262,7 +1300,7 @@ impl McplsServer {
     async fn workspace_edit_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         self.apply_project_plan_params(params).await
     }
 
@@ -1273,7 +1311,7 @@ impl McplsServer {
     async fn rename_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         self.apply_project_plan_params(params).await
     }
 
@@ -1284,7 +1322,7 @@ impl McplsServer {
     async fn format_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         self.apply_project_plan_params(params).await
     }
 
@@ -1293,7 +1331,7 @@ impl McplsServer {
     async fn project_restart_lsp(
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
             .context
@@ -1315,7 +1353,7 @@ impl McplsServer {
     async fn project_refresh(
         &self,
         Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
             .context
@@ -1345,7 +1383,7 @@ impl McplsServer {
             project_id,
             symbol_handle,
         }): Parameters<HoverParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::HoverResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
@@ -1370,7 +1408,7 @@ impl McplsServer {
             project_id,
             symbol_handle,
         }): Parameters<DefinitionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::DefinitionResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
@@ -1389,7 +1427,7 @@ impl McplsServer {
     async fn get_declaration(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::Declaration)
             .await
     }
@@ -1401,7 +1439,7 @@ impl McplsServer {
     async fn get_parent_module(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::ParentModule)
             .await
     }
@@ -1413,7 +1451,7 @@ impl McplsServer {
     async fn get_child_modules(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::ChildModules)
             .await
     }
@@ -1425,7 +1463,7 @@ impl McplsServer {
     async fn expand_macro(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::MacroExpansion)
             .await
     }
@@ -1437,7 +1475,7 @@ impl McplsServer {
     async fn get_selection_ranges(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::SelectionRanges)
             .await
     }
@@ -1449,7 +1487,7 @@ impl McplsServer {
     async fn discover_runnables(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::Runnables)
             .await
     }
@@ -1461,7 +1499,7 @@ impl McplsServer {
     async fn discover_related_tests(
         &self,
         Parameters(params): Parameters<SemanticPositionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
         self.semantic_discovery(params, SemanticDiscoveryKind::RelatedTests)
             .await
     }
@@ -1481,7 +1519,7 @@ impl McplsServer {
             include_declaration,
             limits,
         }): Parameters<ReferencesParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::ReferencesResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
@@ -1500,7 +1538,7 @@ impl McplsServer {
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams { file_path, options }): Parameters<DiagnosticsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::DiagnosticsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1526,7 +1564,7 @@ impl McplsServer {
             character,
             new_name,
         }): Parameters<RenameParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::RenameResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1552,7 +1590,7 @@ impl McplsServer {
             character,
             trigger,
         }): Parameters<CompletionsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::CompletionsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1573,7 +1611,7 @@ impl McplsServer {
     async fn get_document_symbols(
         &self,
         Parameters(DocumentSymbolsParams { file_path, options }): Parameters<DocumentSymbolsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::DocumentSymbolsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1598,7 +1636,7 @@ impl McplsServer {
             tab_size,
             insert_spaces,
         }): Parameters<FormatDocumentParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::FormatDocumentResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1626,7 +1664,7 @@ impl McplsServer {
             scope,
             limit,
         }): Parameters<WorkspaceSymbolParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::WorkspaceSymbolResult>, McpError> {
         let id = parse_project_id(project_id)?;
         let actor = self
             .context
@@ -1656,7 +1694,7 @@ impl McplsServer {
             end_character,
             kind_filter,
         }): Parameters<CodeActionsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::CodeActionsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1690,7 +1728,7 @@ impl McplsServer {
             end_character,
             kind_filter,
         }): Parameters<CodeActionListParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::CodeActionsResult>, McpError> {
         let id = parse_project_id(project_id)?;
         let result = self
             .context
@@ -1719,7 +1757,7 @@ impl McplsServer {
             action_id,
             position_encoding,
         }): Parameters<CodeActionPreviewParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let action_id = PlanId::parse(action_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
@@ -1742,7 +1780,7 @@ impl McplsServer {
             project_id,
             plan_id,
         }): Parameters<CodeActionApplyParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let plan_id = PlanId::parse(plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
@@ -1762,7 +1800,7 @@ impl McplsServer {
             project_id,
             symbol_handle,
         }): Parameters<CallHierarchyPrepareParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::CallHierarchyPrepareResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
@@ -1781,7 +1819,7 @@ impl McplsServer {
     async fn get_incoming_calls(
         &self,
         Parameters(params): Parameters<CallHierarchyCallsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::IncomingCallsResult>, McpError> {
         let (actor, item, limits) = self.call_hierarchy_target(params).await?;
         let result = actor
             .incoming_calls(item, limits)
@@ -1798,7 +1836,7 @@ impl McplsServer {
     async fn get_outgoing_calls(
         &self,
         Parameters(params): Parameters<CallHierarchyCallsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::OutgoingCallsResult>, McpError> {
         let (actor, item, limits) = self.call_hierarchy_target(params).await?;
         let result = actor
             .outgoing_calls(item, limits)
@@ -1817,7 +1855,7 @@ impl McplsServer {
         Parameters(CachedDiagnosticsParams { file_path, options }): Parameters<
             CachedDiagnosticsParams,
         >,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::DiagnosticsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1842,7 +1880,7 @@ impl McplsServer {
             limit,
             min_level,
         }): Parameters<ServerLogsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::ServerLogsResult>, McpError> {
         let id = parse_project_id(project_id)?;
         encode_tool_result(
             self.context
@@ -1859,7 +1897,7 @@ impl McplsServer {
     async fn get_server_messages(
         &self,
         Parameters(ServerMessagesParams { project_id, limit }): Parameters<ServerMessagesParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::ServerMessagesResult>, McpError> {
         let id = parse_project_id(project_id)?;
         encode_tool_result(
             self.context
@@ -1879,7 +1917,7 @@ impl McplsServer {
             project_id,
             language_id,
         }): Parameters<ProjectLspCapabilitiesParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<ProjectLspCapabilitiesResponse>, McpError> {
         let id = parse_project_id(project_id)?;
         let servers = self
             .context
@@ -1887,10 +1925,10 @@ impl McplsServer {
             .server_capabilities(&id, language_id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        encode_json(&ProjectLspCapabilitiesResponse {
+        encode_tool_result::<_, std::convert::Infallible>(Ok(ProjectLspCapabilitiesResponse {
             project_id: id.as_str().to_string(),
             servers,
-        })
+        }))
     }
 
     /// Get signature help at a position.
@@ -1904,7 +1942,7 @@ impl McplsServer {
             line,
             character,
         }): Parameters<SignatureHelpParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::SignatureHelpResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -1931,7 +1969,7 @@ impl McplsServer {
             project_id,
             symbol_handle,
         }): Parameters<GoToImplementationParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::LocationsResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
@@ -1956,7 +1994,7 @@ impl McplsServer {
             project_id,
             symbol_handle,
         }): Parameters<GoToTypeDefinitionParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::LocationsResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
@@ -1981,7 +2019,7 @@ impl McplsServer {
             end_line,
             end_character,
         }): Parameters<InlayHintsParams>,
-    ) -> Result<Json<serde_json::Value>, McpError> {
+    ) -> Result<Json<crate::bridge::InlayHintsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -3023,16 +3061,52 @@ finally:
 
     #[test]
     fn json_tools_advertise_output_schemas() {
-        let missing: Vec<_> = McplsServer::tool_router()
-            .list_all()
-            .into_iter()
+        let tools = McplsServer::tool_router().list_all();
+        let missing: Vec<_> = tools
+            .iter()
             .filter(|tool| tool.output_schema.is_none())
-            .map(|tool| tool.name.into_owned())
+            .map(|tool| tool.name.clone().into_owned())
             .collect();
 
         assert!(
             missing.is_empty(),
             "tools without output schemas: {missing:?}"
+        );
+        let untyped: Vec<_> = tools
+            .iter()
+            .filter(|tool| {
+                tool.output_schema
+                    .as_ref()
+                    .is_some_and(|schema| schema.len() == 1)
+            })
+            .map(|tool| tool.name.clone().into_owned())
+            .collect();
+        assert!(
+            untyped.is_empty(),
+            "tools with empty output schemas: {untyped:?}"
+        );
+        let diagnostics = tools
+            .iter()
+            .find(|tool| tool.name == "get_diagnostics")
+            .unwrap();
+        assert!(
+            diagnostics.output_schema.as_ref().unwrap()["properties"]["diagnostics"].is_object()
+        );
+    }
+
+    #[test]
+    fn tool_surface_snapshot_is_current() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/tool_surface.json");
+        let rendered =
+            serde_json::to_string_pretty(&McplsServer::tool_router().list_all()).unwrap();
+        if std::env::var_os("UPDATE_TOOL_SURFACE").is_some() {
+            std::fs::write(path, format!("{rendered}\n")).unwrap();
+            return;
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{rendered}\n")
         );
     }
 
@@ -3041,18 +3115,22 @@ finally:
         let output = encode_json(&serde_json::json!({
             "line": 7,
             "available": true,
+            "optional": null,
+            "truncated": true,
+            "items": vec!["large-result-entry"; 1_000],
             "source": { "status": "available" },
         }))
         .unwrap();
-        let CallToolResponse::Complete(result) = output.into_call_tool_result().unwrap() else {
-            panic!("structured output unexpectedly created a task response");
-        };
+        let result = output.into_result(false);
 
         assert_eq!(
             result.structured_content,
             Some(serde_json::json!({
                 "line": 7,
                 "available": true,
+                "optional": null,
+                "truncated": true,
+                "items": vec!["large-result-entry"; 1_000],
                 "source": { "status": "available" },
             }))
         );
@@ -3060,6 +3138,28 @@ finally:
             result.content[0].as_text().unwrap().text,
             "Structured result available in structuredContent."
         );
+    }
+
+    #[test]
+    fn legacy_text_mode_keeps_the_previous_json_payload() {
+        let output = encode_json(&serde_json::json!({"line": 7, "available": true})).unwrap();
+        let result = output.into_result(true);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content[0].as_text().unwrap().text)
+                .unwrap(),
+            result.structured_content.unwrap()
+        );
+    }
+
+    #[test]
+    fn operation_errors_include_stable_actionable_data() {
+        let error =
+            encode_tool_result::<crate::bridge::DiagnosticsResult, _>(Err("offline")).unwrap_err();
+
+        assert_eq!(error.data.as_ref().unwrap()["code"], "operation_failed");
+        assert_eq!(error.data.as_ref().unwrap()["retryable"], true);
+        assert!(error.data.as_ref().unwrap()["action"].is_string());
     }
 
     #[tokio::test]

@@ -3,24 +3,29 @@
 
 use serde_json::Value;
 
-/// Extract the text content from an MCP tool call response.
+/// Extract JSON from native structured content, falling back to legacy text.
 ///
 /// MCP tool responses have the shape:
-/// `{"result": {"content": [{"type": "text", "text": "<json string>"}]}}`
+/// New servers populate `result.structuredContent`; compatibility servers put
+/// the same JSON in the first text block.
 ///
 /// Returns the inner text string or an empty string if absent.
 pub fn content_text(response: &Value) -> String {
-    response["result"]["content"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|item| item["text"].as_str())
-        .unwrap_or("")
-        .to_owned()
+    (!response["result"]["structuredContent"].is_null())
+        .then(|| response["result"]["structuredContent"].to_string())
+        .or_else(|| {
+            response["result"]["content"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|item| item["text"].as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 /// Assert that the MCP response is not an MCP-level error (isError = true).
 ///
-/// Returns the text content on success.
+/// Returns serialized structured content, or legacy text, on success.
 pub fn assert_tool_ok(response: &Value) -> String {
     let is_error = response["result"]["isError"].as_bool().unwrap_or(false);
     assert!(

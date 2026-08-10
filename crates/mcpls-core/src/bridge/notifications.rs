@@ -565,7 +565,7 @@ pub struct DiagnosticInfo {
 }
 
 /// A log entry from the LSP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LogEntry {
     /// Actor/LSP lifecycle generation that produced the entry.
     pub generation: u64,
@@ -578,7 +578,7 @@ pub struct LogEntry {
 }
 
 /// Log severity level.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     /// Error log level.
@@ -604,7 +604,7 @@ impl From<lsp_types::MessageType> for LogLevel {
 }
 
 /// A message from the LSP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerMessage {
     /// Actor/LSP lifecycle generation that produced the message.
     pub generation: u64,
@@ -617,7 +617,7 @@ pub struct ServerMessage {
 }
 
 /// Server message type.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageType {
     /// Error message.

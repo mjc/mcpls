@@ -99,6 +99,36 @@ fn test_e2e_list_tools() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_stdio_structured_tool_result_and_schema() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    let listed = client.list_tools()?;
+    let health = listed["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "health"));
+    let Some(health) = health else {
+        anyhow::bail!("tools/list omitted the health tool: {listed}");
+    };
+    assert!(health["outputSchema"].is_object());
+
+    let called = client.call_tool("health", &json!({}))?;
+    assert!(called["result"]["structuredContent"].is_object());
+    assert_eq!(
+        called["result"]["content"][0]["text"],
+        "Structured result available in structuredContent."
+    );
+    assert!(called["result"]["structuredContent"]["status"].is_string());
+    assert_eq!(
+        called["result"]["structuredContent"]["transport"]["mode"],
+        "stdio"
+    );
+
+    Ok(())
+}
+
 /// Test that all tools have valid JSON schemas.
 ///
 /// Validates that each tool has:

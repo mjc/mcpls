@@ -6348,7 +6348,7 @@ pub struct ProjectRegistryStatusSnapshot {
 }
 
 /// Negotiated capability data for one actor group in a logical project.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ProjectServerCapability {
     /// Actor-group ordinal within the logical project snapshot.
     pub group_id: usize,

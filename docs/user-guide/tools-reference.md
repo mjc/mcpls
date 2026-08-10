@@ -1,10 +1,18 @@
 # MCP Tools Reference
 
-Complete reference for all 20 MCP tools provided by mcpls.
+Complete reference for the MCP tools provided by mcpls.
 
 ## Overview
 
 mcpls exposes semantic code intelligence from Language Server Protocol (LSP) servers as MCP tools. Each tool corresponds to one or more LSP methods and provides rich code information to AI agents.
+
+## Structured result migration
+
+MCPLS tools return their machine-readable payload in MCP `structuredContent` and advertise an `outputSchema` from `tools/list`. Read `structuredContent` directly; numeric positions, booleans, nulls, and nested source frames no longer require parsing JSON from a text block. The accompanying text block is intentionally only a short human-readable summary. This contract is identical over stdio and Streamable HTTP.
+
+Legacy clients that only read text blocks can start MCPLS with `MCPLS_LEGACY_TEXT_RESULTS=1`. In that compatibility mode the text block contains the previous JSON serialization while `structuredContent` remains available. This switch is transitional; downstream clients should migrate to `structuredContent`.
+
+Tool failures retain MCP's standard JSON-RPC error code and message. Operational failures also include stable `data` fields: `code`, `message`, `action`, and `retryable`.
 
 ## Tool Index
 

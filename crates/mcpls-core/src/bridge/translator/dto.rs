@@ -29,7 +29,7 @@ impl std::fmt::Display for SymbolHandle {
 }
 
 /// Position in a document (1-based for MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Position2D {
     /// Line number (1-based).
     pub line: u32,
@@ -38,7 +38,7 @@ pub struct Position2D {
 }
 
 /// Range in a document (1-based for MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Range {
     /// Start position.
     pub start: Position2D,
@@ -47,7 +47,7 @@ pub struct Range {
 }
 
 /// Location in a document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Location {
     /// Human-readable filesystem path for file-backed targets.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,7 +64,7 @@ pub struct Location {
 }
 
 /// Source context attached to a semantic result location.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SourceContext {
     /// The source was safely resolved.
@@ -77,7 +77,7 @@ pub enum SourceContext {
 }
 
 /// A bounded, line-numbered source excerpt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SourceFrame {
     /// Canonical filesystem path.
     pub path: String,
@@ -110,7 +110,7 @@ pub struct SourceFrame {
 }
 
 /// Stable reasons source text is unavailable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceUnavailableReason {
     /// The LSP returned a URI other than `file:`.
@@ -126,7 +126,7 @@ pub enum SourceUnavailableReason {
 }
 
 /// Semantic relationship represented by a navigation result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NavigationKind {
     /// Hover data for the selected symbol.
@@ -148,7 +148,7 @@ pub enum NavigationKind {
 }
 
 /// Result of a hover request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HoverResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -168,7 +168,7 @@ pub struct HoverResult {
 }
 
 /// Result of a definition request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DefinitionResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -181,7 +181,7 @@ pub struct DefinitionResult {
 }
 
 /// Result of a references request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReferencesResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -207,7 +207,7 @@ pub struct ReferencesResult {
 }
 
 /// References returned from one source file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceGroup {
     /// Project-relative path, or the absolute path for external sources.
     pub project_relative_path: String,
@@ -219,7 +219,7 @@ pub struct ReferenceGroup {
 }
 
 /// One source use of the referenced symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceUse {
     /// Bounded location and highlighted source frame for the use.
     pub location: Location,
@@ -228,7 +228,7 @@ pub struct ReferenceUse {
 }
 
 /// Safely known role of a reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceRole {
     /// Definition or declaration, identified by a language-server definition result.
@@ -290,7 +290,7 @@ pub enum DiagnosticSeverity {
 }
 
 /// A single diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Diagnostic {
     /// Range where the diagnostic applies.
     pub range: Range,
@@ -306,7 +306,7 @@ pub struct Diagnostic {
 }
 
 /// Model-ready context attached to a diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiagnosticContext {
     /// Canonical filesystem path when the diagnostic is file-backed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -364,7 +364,7 @@ impl Default for DiagnosticContext {
 }
 
 /// A related diagnostic location and its bounded source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiagnosticRelatedInformation {
     /// Related source location.
     pub location: Location,
@@ -373,7 +373,7 @@ pub struct DiagnosticRelatedInformation {
 }
 
 /// Result of a diagnostics request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
@@ -467,7 +467,7 @@ impl DiagnosticsResult {
 }
 
 /// A text edit operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TextEdit {
     /// Range to replace.
     pub range: Range,
@@ -476,7 +476,7 @@ pub struct TextEdit {
 }
 
 /// Changes to a document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DocumentChanges {
     /// URI of the document.
     pub uri: String,
@@ -485,14 +485,14 @@ pub struct DocumentChanges {
 }
 
 /// Result of a rename request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RenameResult {
     /// Changes to apply across documents.
     pub changes: Vec<DocumentChanges>,
 }
 
 /// A completion item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Completion {
     /// Label of the completion.
     pub label: String,
@@ -505,14 +505,14 @@ pub struct Completion {
 }
 
 /// Result of a completions request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CompletionsResult {
     /// List of completion items.
     pub items: Vec<Completion>,
 }
 
 /// A document symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Symbol {
     /// Name of the symbol.
     pub name: String,
@@ -608,7 +608,7 @@ impl DocumentSymbolOptions {
 }
 
 /// Result of a document symbols request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DocumentSymbolsResult {
     /// List of symbols in the document.
     pub symbols: Vec<Symbol>,
@@ -625,14 +625,14 @@ pub struct DocumentSymbolsResult {
 }
 
 /// Result of a format document request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
 }
 
 /// A workspace symbol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceSymbol {
     /// Name of the symbol.
     pub name: String,
@@ -670,7 +670,9 @@ pub enum WorkspaceSymbolMatchMode {
 }
 
 /// How a workspace-symbol name matched the query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSymbolMatch {
     /// Exact case-sensitive name.
@@ -710,7 +712,7 @@ pub enum WorkspaceSymbolScope {
 }
 
 /// Workspace-symbol ownership relative to the registered project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSymbolOrigin {
     /// Symbol source is under a registered project root.
@@ -720,7 +722,7 @@ pub enum WorkspaceSymbolOrigin {
 }
 
 /// Result of workspace symbol search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceSymbolResult {
     /// List of symbols found.
     pub symbols: Vec<WorkspaceSymbol>,
@@ -733,7 +735,7 @@ pub struct WorkspaceSymbolResult {
 }
 
 /// A single code action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CodeAction {
     /// Opaque project-scoped reference for previewing this action.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,14 +769,14 @@ pub struct CodeAction {
 }
 
 /// Description of a workspace edit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceEditDescription {
     /// Changes to apply to documents.
     pub changes: Vec<DocumentChanges>,
 }
 
 /// Description of a command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CommandDescription {
     /// Title of the command.
     pub title: String,
@@ -786,14 +788,14 @@ pub struct CommandDescription {
 }
 
 /// Result of code actions request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CodeActionsResult {
     /// Available code actions.
     pub actions: Vec<CodeAction>,
 }
 
 /// A call hierarchy item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CallHierarchyItemResult {
     /// Name of the symbol.
     pub name: String,
@@ -829,7 +831,7 @@ pub struct CallHierarchyItemResult {
 }
 
 /// Result of call hierarchy prepare request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CallHierarchyPrepareResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -842,7 +844,7 @@ pub struct CallHierarchyPrepareResult {
 }
 
 /// An incoming call (caller of the current item).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IncomingCall {
     /// The item that calls the current item.
     pub from: CallHierarchyItemResult,
@@ -851,7 +853,7 @@ pub struct IncomingCall {
 }
 
 /// One bounded call site in a caller's source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CallSite {
     /// Highlighted call expression range.
     pub range: Range,
@@ -860,7 +862,7 @@ pub struct CallSite {
 }
 
 /// Result of incoming calls request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IncomingCallsResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -883,7 +885,7 @@ pub struct IncomingCallsResult {
 }
 
 /// An outgoing call (callee from the current item).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OutgoingCall {
     /// The item being called.
     pub to: CallHierarchyItemResult,
@@ -892,7 +894,7 @@ pub struct OutgoingCall {
 }
 
 /// Result of outgoing calls request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OutgoingCallsResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -915,21 +917,21 @@ pub struct OutgoingCallsResult {
 }
 
 /// Result of server logs request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerLogsResult {
     /// List of log entries.
     pub logs: Vec<crate::bridge::notifications::LogEntry>,
 }
 
 /// Result of server messages request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerMessagesResult {
     /// List of server messages.
     pub messages: Vec<crate::bridge::notifications::ServerMessage>,
 }
 
 /// A single parameter in a signature.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SignatureParameter {
     /// Label of the parameter.
     pub label: String,
@@ -939,7 +941,7 @@ pub struct SignatureParameter {
 }
 
 /// A single signature overload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SignatureInfo {
     /// Full label of the signature.
     pub label: String,
@@ -951,7 +953,7 @@ pub struct SignatureInfo {
 }
 
 /// Result of a signature help request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SignatureHelpResult {
     /// Available signatures.
     pub signatures: Vec<SignatureInfo>,
@@ -964,7 +966,7 @@ pub struct SignatureHelpResult {
 }
 
 /// Result of a go-to-implementation or go-to-type-definition request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LocationsResult {
     /// Stable protocol provider identity.
     pub provider: String,
@@ -977,7 +979,7 @@ pub struct LocationsResult {
 }
 
 /// A single inlay hint entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InlayHintEntry {
     /// Position of the hint (1-based MCP).
     pub position: Position2D,
@@ -998,7 +1000,7 @@ pub struct InlayHintEntry {
 }
 
 /// Result of an inlay hints request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
