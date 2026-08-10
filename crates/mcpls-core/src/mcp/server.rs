@@ -16,8 +16,10 @@ use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     ListResourcesResult, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, UnsubscribeRequestParams,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, SubscriptionFilter,
+    UnsubscribeRequestParams,
 };
+use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
 #[cfg(test)]
@@ -25,7 +27,7 @@ use tokio::sync::Mutex;
 
 use super::handlers::HandlerContext;
 use super::session::{
-    SessionResource, parse_session_resource_uri, project_events_resource_uri,
+    SessionResource, event_resource_uris, parse_session_resource_uri, project_events_resource_uri,
     project_status_resource_uri,
 };
 use super::tools::{
@@ -54,10 +56,11 @@ use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
 use crate::project::{
-    CanonicalRoot, GitRepositoryIdentity, PathRenamePreview, PathRenameRequest, ProjectEventRecord,
-    ProjectEventSnapshot, ProjectHandle, ProjectId, ProjectIdentity, ProjectQueuePressure,
-    ProjectRegistry, ProjectServerCapability, ProjectState, ProjectStatusCounts,
-    ProjectStatusSummary, StructuralDialect, StructuralPreview, StructuralReplaceRequest,
+    CanonicalRoot, GitRepositoryIdentity, PathRenamePreview, PathRenameRequest, ProjectEvent,
+    ProjectEventRecord, ProjectEventSnapshot, ProjectHandle, ProjectId, ProjectIdentity,
+    ProjectQueuePressure, ProjectRegistry, ProjectServerCapability, ProjectState,
+    ProjectStatusCounts, ProjectStatusSummary, StructuralDialect, StructuralPreview,
+    StructuralReplaceRequest,
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
@@ -487,6 +490,11 @@ pub struct McplsServer {
     context: Arc<HandlerContext>,
 }
 
+enum ListenEvent {
+    Event(ProjectId, ProjectEvent),
+    Lagged(ProjectId, u64),
+}
+
 fn supports_cache_hints(context: &rmcp::service::RequestContext<RoleServer>) -> bool {
     context
         .protocol_version()
@@ -502,6 +510,13 @@ fn private_resource_result(
         result.with_ttl_ms(0).with_cache_scope(CacheScope::Private)
     } else {
         result
+    }
+}
+
+async fn send_listen_update(context: &SubscriptionContext, uri: String) -> bool {
+    tokio::select! {
+        () = context.cancelled() => false,
+        result = context.sink().notify_resource_updated(uri) => result.is_ok(),
     }
 }
 
@@ -2112,6 +2127,81 @@ impl McplsServer {
     }
 }
 
+impl McplsServer {
+    async fn listen_project_ids(
+        &self,
+        accepted: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<ProjectId>, McpError> {
+        let mut project_ids = std::collections::HashSet::new();
+        for uri in accepted {
+            match parse_session_resource_uri(uri)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+            {
+                SessionResource::ProjectStatus(project_id)
+                | SessionResource::ProjectEvents { project_id, .. } => {
+                    project_ids.insert(project_id);
+                }
+                SessionResource::Diagnostics(path) => {
+                    let (project_id, _) = self
+                        .context
+                        .required_project_for_path(path)
+                        .await
+                        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                    project_ids.insert(project_id);
+                }
+            }
+        }
+        Ok(project_ids)
+    }
+
+    async fn spawn_listen_events(
+        &self,
+        project_ids: std::collections::HashSet<ProjectId>,
+        event_tx: &tokio::sync::mpsc::Sender<ListenEvent>,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>, McpError> {
+        let mut tasks = Vec::new();
+        for project_id in project_ids {
+            let actors = self
+                .context
+                .project_registry
+                .actors_for_project(&project_id)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            for actor in actors {
+                let mut events = actor.subscribe_events();
+                let event_tx = event_tx.clone();
+                let project_id = project_id.clone();
+                tasks.push(tokio::spawn(async move {
+                    loop {
+                        match events.recv().await {
+                            Ok(event) => {
+                                if event_tx
+                                    .send(ListenEvent::Event(project_id.clone(), event))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                if event_tx
+                                    .send(ListenEvent::Lagged(project_id.clone(), skipped))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }));
+            }
+        }
+        Ok(tasks)
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for McplsServer {
     async fn list_resources(
@@ -2225,6 +2315,75 @@ impl ServerHandler for McplsServer {
             supports_cache_hints,
         )
         .into())
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let resources = requested.resource_subscriptions.as_ref()?;
+        let accepted = resources
+            .iter()
+            .filter(|uri| parse_session_resource_uri(uri).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        (!accepted.is_empty()).then(|| {
+            SubscriptionFilter::builder()
+                .resource_subscriptions(accepted)
+                .build()
+        })
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
+        let accepted = context
+            .accepted()
+            .resource_subscriptions
+            .clone()
+            .unwrap_or_default();
+        let accepted = std::sync::Arc::new(
+            accepted
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+        );
+        let project_ids = self.listen_project_ids(&accepted).await?;
+
+        // The event source is live-only. Notify each accepted resource once so clients
+        // deterministically re-read the authoritative cached resource on subscription.
+        for uri in accepted.iter() {
+            if !send_listen_update(&context, uri.clone()).await {
+                return Ok(());
+            }
+        }
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let tasks = self.spawn_listen_events(project_ids, &event_tx).await?;
+
+        'listen: loop {
+            tokio::select! {
+                () = context.cancelled() => break,
+                queued = event_rx.recv() => {
+                    let Some(queued) = queued else { break };
+                    let uris = match queued {
+                        ListenEvent::Event(project_id, event) => {
+                            event_resource_uris(&project_id, &event)
+                        }
+                        ListenEvent::Lagged(project_id, skipped) => {
+                            tracing::warn!(%project_id, skipped, "subscriptions/listen event source lagged");
+                            vec![project_events_resource_uri(&project_id)]
+                        }
+                    };
+                    for uri in uris {
+                        if accepted.contains(&uri) && !send_listen_update(&context, uri).await {
+                            break 'listen;
+                        }
+                    }
+                }
+            }
+        }
+        for task in tasks {
+            task.abort();
+        }
+        Ok(())
     }
 
     async fn subscribe(
@@ -2361,6 +2520,26 @@ mod tests {
         let legacy = serde_json::to_value(private_resource_result(Vec::new(), false)).unwrap();
         assert!(legacy.get("ttlMs").is_none());
         assert!(legacy.get("cacheScope").is_none());
+    }
+
+    #[test]
+    fn listen_filter_accepts_only_session_resource_uris() {
+        let server = create_test_server();
+        let requested = SubscriptionFilter::builder()
+            .resource_subscriptions([
+                "lsp-diagnostics:///tmp/main.rs",
+                "mcpls-project-status:///project",
+                "https://outside.example/resource",
+            ])
+            .build();
+        let accepted = server.accepted_subscription_filter(&requested).unwrap();
+        assert_eq!(
+            accepted.resource_subscriptions,
+            Some(vec![
+                "lsp-diagnostics:///tmp/main.rs".to_owned(),
+                "mcpls-project-status:///project".to_owned(),
+            ])
+        );
     }
 
     #[test]

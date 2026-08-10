@@ -87,7 +87,7 @@ pub fn diagnostics_resource_uri(uri: &str) -> Option<String> {
     make_uri(&path).ok()
 }
 
-fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<String> {
+pub fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<String> {
     if !event.belongs_to(project_id) {
         return Vec::new();
     }

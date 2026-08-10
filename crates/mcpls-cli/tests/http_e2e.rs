@@ -166,6 +166,96 @@ struct HttpEventStream {
     stream: TcpStream,
 }
 
+struct HttpSubscriptionStream {
+    stream: TcpStream,
+    bytes: Vec<u8>,
+}
+
+impl HttpSubscriptionStream {
+    fn open(address: SocketAddr, uri: &str) -> Self {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": {
+                    "resourceSubscriptions": [uri]
+                }
+            }
+        }))
+        .unwrap();
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+
+        let mut headers = Vec::new();
+        let mut byte = [0; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let status = headers
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| line.split(|byte| *byte == b' ').nth(1))
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .and_then(|code| code.trim().parse::<u16>().ok())
+            .unwrap();
+        assert_eq!(
+            status,
+            200,
+            "subscriptions/listen failed: {}",
+            String::from_utf8_lossy(&headers)
+        );
+        Self {
+            stream,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let needle = needle.as_bytes();
+        while Instant::now() < deadline {
+            if self
+                .bytes
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                return true;
+            }
+            let mut chunk = [0; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(length) => self.bytes.extend_from_slice(&chunk[..length]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return false;
+                }
+                Err(error) => panic!("reading subscription stream failed: {error}"),
+            }
+        }
+        self.bytes
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+}
+
 impl HttpEventStream {
     fn open(address: SocketAddr, session_id: &str, last_event_id: Option<&str>) -> Self {
         let mut stream = TcpStream::connect(address).unwrap();
@@ -806,6 +896,31 @@ fn stateless_http_resource_cache_hints_are_private_and_stable() {
     assert_eq!(resource["_status"], 200, "{resource}");
     assert_eq!(resource["result"]["ttlMs"], 0);
     assert_eq!(resource["result"]["cacheScope"], "private");
+}
+
+#[test]
+fn stateless_http_modern_listen_acknowledges_and_replays_resource() {
+    let fixture = HttpFixture::new();
+    let root = fixture.project_root("listen-project");
+    let config = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        config.replace("/definitely/missing/mcpls-http-e2e", root.to_str().unwrap()),
+    )
+    .unwrap();
+    let daemon = HttpDaemon::spawn(&fixture.config);
+
+    let mut stream =
+        HttpSubscriptionStream::open(daemon.address, "mcpls-project-status:///default");
+    assert!(stream.wait_for(
+        "notifications/subscriptions/acknowledged",
+        Duration::from_secs(5)
+    ));
+    assert!(stream.wait_for("notifications/resources/updated", Duration::from_secs(5)));
+    assert!(stream.wait_for(
+        "io.modelcontextprotocol/subscriptionId",
+        Duration::from_secs(5)
+    ));
 }
 
 #[test]
