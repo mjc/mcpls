@@ -17,6 +17,8 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod no_reread;
+
 pub const RUST_ANALYZER_NAMES: [&str; 2] = ["rust-analyzer", "rust_analyzer"];
 
 #[derive(Debug, Clone, Deserialize)]
