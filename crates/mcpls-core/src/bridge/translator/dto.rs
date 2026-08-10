@@ -737,16 +737,24 @@ pub struct WorkspaceSymbolResult {
 /// Selectable sections of a high-level symbol inspection bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[allow(missing_docs)]
 pub enum InspectSymbolSectionKind {
+    /// Bounded declaration or body source.
     Declaration,
+    /// Signature, type, and documentation.
     Hover,
+    /// Definition targets.
     Definitions,
+    /// Trait, interface, or symbol implementations.
     Implementations,
+    /// Grouped references and call sites.
     References,
+    /// Incoming and outgoing call hierarchy samples.
     Calls,
+    /// Related tests, discovered but never executed.
     Tests,
+    /// Runnable metadata, discovered but never executed.
     Runnables,
+    /// Diagnostics intersecting the selected symbol.
     Diagnostics,
 }
 
@@ -803,25 +811,35 @@ const fn default_inspect_items() -> usize {
 /// Completeness of one requested inspection section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[allow(missing_docs)]
 pub enum InspectSectionCompleteness {
+    /// Provider returned every requested item within bounds.
     Complete,
+    /// Provider data is available but a response bound omitted content.
     Partial,
+    /// Provider does not advertise the requested capability.
     Unsupported,
+    /// Capability may exist but the provider request failed.
     Unavailable,
+    /// Caller did not select this section.
     NotRequested,
 }
 
 /// One typed inspection section with uniform provenance and bounds metadata.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-#[allow(missing_docs)]
 pub struct InspectSection<T> {
+    /// Stable provider identity, when a provider was selected.
     pub provider: Option<String>,
+    /// Machine-readable availability and completeness state.
     pub completeness: InspectSectionCompleteness,
+    /// Items available before bounds.
     pub total: usize,
+    /// Items represented in `data`.
     pub returned: usize,
+    /// Whether bounds omitted items or source.
     pub truncated: bool,
+    /// Actionable unsupported or unavailable reason.
     pub reason: Option<String>,
+    /// Typed section payload when available.
     pub data: Option<T>,
 }
 
@@ -901,50 +919,68 @@ impl<T> Default for InspectSection<T> {
 
 /// Incoming and outgoing call samples returned together.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-#[allow(missing_docs)]
 pub struct InspectCalls {
+    /// Bounded callers and call sites.
     pub incoming: IncomingCallsResult,
+    /// Bounded callees and call sites.
     pub outgoing: OutgoingCallsResult,
 }
 
 /// Exact resolution outcome for a symbol inspection request.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "status")]
-#[allow(missing_docs)]
 pub enum InspectSymbolResolution {
+    /// One exact symbol was selected safely.
     Selected {
+        /// Ranked source-bearing symbol metadata for query resolution.
         symbol: Option<Box<WorkspaceSymbol>>,
+        /// Snapshot-bound handle safe for semantic follow-ups.
         symbol_handle: Option<SymbolHandle>,
     },
+    /// Several exact candidates remain; clients must disambiguate.
     Ambiguous {
+        /// Ranked source-bearing candidates; never silently choose one.
         candidates: Vec<WorkspaceSymbol>,
     },
+    /// No exact candidate matched the supplied constraints.
     NotFound,
 }
 
 /// Typed semantic sections returned for one selected symbol.
 #[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
-#[allow(missing_docs)]
 pub struct InspectSymbolSections {
+    /// Bounded declaration or body source.
     pub declaration: InspectSection<SourceContext>,
+    /// Signature, type, and documentation at the symbol.
     pub hover: InspectSection<HoverResult>,
+    /// Definition targets with bounded source and handles.
     pub definitions: InspectSection<DefinitionResult>,
+    /// Implementation targets with bounded source and handles.
     pub implementations: InspectSection<LocationsResult>,
+    /// Grouped references with bounded call-site source.
     pub references: InspectSection<ReferencesResult>,
+    /// Incoming and outgoing call samples.
     pub calls: InspectSection<InspectCalls>,
+    /// Related tests discovered without executing them.
     pub tests: InspectSection<crate::bridge::SemanticDiscoveryResult>,
+    /// Runnable metadata discovered without executing commands.
     pub runnables: InspectSection<crate::bridge::SemanticDiscoveryResult>,
+    /// Diagnostics intersecting the selected symbol range.
     pub diagnostics: InspectSection<DiagnosticsResult>,
 }
 
 /// Bounded, snapshot-coherent answer about one project symbol.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-#[allow(missing_docs)]
 pub struct InspectSymbolResult {
+    /// Exact, ambiguous, or missing resolution outcome.
     pub resolution: InspectSymbolResolution,
+    /// Requested typed semantic sections and uniform metadata.
     pub sections: InspectSymbolSections,
+    /// Bounds applied to the response.
     pub budget: InspectSymbolBudget,
+    /// Serialized bytes in this bundle before the MCP envelope.
     pub returned_bytes: usize,
+    /// Whether the total budget removed lower-priority sections or candidates.
     pub truncated: bool,
 }
 

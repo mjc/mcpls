@@ -852,21 +852,35 @@ fn inspect_exact_symbol(
 
 /// High-level bundle: answer what `add` is and how it is used without reading the file.
 fn sc_inspect_symbol(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
+    let example_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/source-rich-workflow.json");
+    let example: Value = serde_json::from_slice(
+        &fs::read(&example_path)
+            .map_err(|error| format!("failed to read {}: {error}", example_path.display()))?,
+    )
+    .map_err(|error| format!("bad source-rich workflow example: {error}"))?;
+    let discovery_tool = example["discovery"]["tool"]
+        .as_str()
+        .ok_or_else(|| "workflow example has no discovery tool".to_owned())?;
+    let discovery = client
+        .call_tool(discovery_tool, &example["discovery"]["arguments"])
+        .map_err(|error| format!("inspect workflow discovery failed: {error}"))?;
+    let discovery: Value = serde_json::from_str(&assertions::assert_tool_ok(&discovery))
+        .map_err(|error| format!("bad inspect workflow discovery JSON: {error}"))?;
+    let handle = discovery["symbols"]
+        .as_array()
+        .and_then(|symbols| symbols.iter().find(|symbol| symbol["name"] == "add"))
+        .and_then(|symbol| symbol["location"]["symbol_handle"].as_str())
+        .ok_or_else(|| format!("inspect workflow discovery returned no add handle: {discovery}"))?;
+    let inspection_tool = example["inspection"]["tool"]
+        .as_str()
+        .ok_or_else(|| "workflow example has no inspection tool".to_owned())?;
+    let mut inspection_arguments = example["inspection"]["arguments"].clone();
+    inspection_arguments["symbol_handle"] = Value::String(handle.to_owned());
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let response = client
-            .call_tool(
-                "inspect_symbol",
-                &json!({
-                    "project_id": "default",
-                    "query": "add",
-                    "sections": [
-                        "declaration", "hover", "implementations", "references",
-                        "calls", "tests", "diagnostics"
-                    ],
-                    "budget": {"max_bytes": 65536, "max_items": 20}
-                }),
-            )
+            .call_tool(inspection_tool, &inspection_arguments)
             .map_err(|error| format!("inspect_symbol failed: {error}"))?;
         let result: Value = serde_json::from_str(&assertions::assert_tool_ok(&response))
             .map_err(|error| format!("bad inspect_symbol JSON: {error}"))?;

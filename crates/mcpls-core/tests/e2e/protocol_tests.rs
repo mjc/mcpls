@@ -43,6 +43,11 @@ fn test_e2e_initialize_handshake() -> Result<()> {
         result["serverInfo"]["name"], "mcpls",
         "Server name should be 'mcpls'"
     );
+    assert_eq!(
+        result["instructions"],
+        include_str!("../../src/mcp/server_instructions.txt").trim_end(),
+        "initialize guidance snapshot should match the checked-in workflow"
+    );
 
     Ok(())
 }

@@ -1373,7 +1373,7 @@ impl McplsServer {
 
     /// Get hover information at a position in a file.
     #[tool(
-        description = "Type, documentation, provider identity, snapshot-bound symbol handle, and bounded source frame at a position."
+        description = "Type, signature/documentation, provider identity, snapshot-bound symbol_handle, and bounded source frame. Pass project_id + symbol_handle from discovery instead of rereading or copying coordinates."
     )]
     async fn get_hover(
         &self,
@@ -1398,7 +1398,7 @@ impl McplsServer {
 
     /// Get the definition location of a symbol.
     #[tool(
-        description = "Bounded definition targets with provider identity, source frames, symbol handles, and explicit truncation state."
+        description = "Bounded definition targets with provider identity, source frames, reusable symbol_handle values, and explicit truncation. Returned source usually removes the need for a file read."
     )]
     async fn get_definition(
         &self,
@@ -1507,7 +1507,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = "References grouped by project-relative file and enclosing symbol, with one declaration, bounded source frames, counts, and truncation metadata."
+        description = "References grouped by project-relative file and enclosing symbol, with one declaration, bounded source frames, reusable handles, counts, and truncation metadata."
     )]
     async fn get_references(
         &self,
@@ -1653,7 +1653,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = "Search project symbols with exact-first ranking, bounded source frames, and reusable symbol handles. Match mode defaults to fuzzy; external/dependency symbols require scope=all."
+        description = "Preferred first call for an unknown symbol: exact-first ranked project matches with bounded source frames and reusable symbol_handle values. Disambiguate before follow-ups; external/dependency symbols require scope=all."
     )]
     async fn workspace_symbol_search(
         &self,
@@ -1683,7 +1683,7 @@ impl McplsServer {
 
     /// Resolve and inspect one symbol without requiring a file read between semantic calls.
     #[tool(
-        description = "Resolve a project symbol exactly and return a bounded source-bearing inspection bundle. Ambiguous names return candidates instead of choosing silently."
+        description = "Preferred no-reread workflow: resolve an exact query or prior symbol_handle into a byte/item-bounded source, docs/signature, definitions/implementations, uses/calls, tests, and diagnostics bundle. Ambiguous names return candidates; stale handles require fresh discovery."
     )]
     async fn inspect_symbol(
         &self,
@@ -2272,17 +2272,9 @@ impl ServerHandler for McplsServer {
         let mut server_info = ServerInfo::new(capabilities);
         server_info.server_info = implementation;
         server_info.instructions = Some(
-            concat!(
-                "Prefer MCPLS semantic results before shell file reads. Start unknown symbols ",
-                "with exact-first workspace_symbol_search; its source frames and symbol_handle ",
-                "are safe inputs to handle-aware follow-ups. Use inspect_symbol for a bounded ",
-                "definition, implementation, references/calls, tests, and diagnostics bundle. ",
-                "Set section and byte/item budget fields explicitly for tighter context. Never ",
-                "silently choose an ambiguous candidate. On stale_symbol_handle, rerun discovery ",
-                "and use the replacement handle. A direct file read is still appropriate for an ",
-                "intentionally uncapped full file or non-source/generated artifacts."
-            )
-            .to_string(),
+            include_str!("server_instructions.txt")
+                .trim_end()
+                .to_owned(),
         );
 
         server_info
@@ -3125,6 +3117,92 @@ finally:
                 instructions.contains(required),
                 "initialize instructions omit {required}: {instructions}"
             );
+        }
+    }
+
+    #[test]
+    fn initialize_instructions_snapshot_is_current() {
+        let snapshot = include_str!("server_instructions.txt").trim_end();
+        assert_eq!(
+            create_test_server().get_info().instructions.as_deref(),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn semantic_tool_descriptions_explain_source_and_handle_reuse() {
+        let tools = McplsServer::tool_router().list_all();
+        for name in [
+            "workspace_symbol_search",
+            "inspect_symbol",
+            "get_hover",
+            "get_definition",
+            "get_references",
+            "prepare_call_hierarchy",
+        ] {
+            let description = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.description.as_deref())
+                .unwrap_or_default();
+            assert!(description.contains("source"), "{name}: {description}");
+            assert!(
+                description.contains("handle") || name == "get_references",
+                "{name}: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_reread_guidance_cases_choose_semantic_tools_before_file_reads() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/no-reread-guidance.json");
+        let cases: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let cases = cases.as_array().unwrap();
+
+        for case in &cases[..4] {
+            let tools = case["expected_tools"].as_array().unwrap();
+            assert!(
+                matches!(
+                    tools[0].as_str(),
+                    Some("workspace_symbol_search" | "inspect_symbol")
+                ),
+                "source question starts with a read: {case}"
+            );
+            assert!(
+                case["forbidden_before_semantic_result"]
+                    .as_array()
+                    .is_some_and(|forbidden| forbidden.iter().any(|tool| tool == "read_file")),
+                "source case permits an early file read: {case}"
+            );
+        }
+        for case in &cases[4..] {
+            assert_eq!(case["expected_tools"][0], "read_file");
+        }
+    }
+
+    #[test]
+    fn bundled_skill_and_tool_reference_share_the_no_reread_workflow() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for path in [
+            root.join("skills/mcpls/SKILL.md"),
+            root.join("docs/user-guide/tools-reference.md"),
+        ] {
+            let guidance = std::fs::read_to_string(&path).unwrap();
+            for required in [
+                "workspace_symbol_search",
+                "inspect_symbol",
+                "symbol_handle",
+                "stale_symbol_handle",
+                "uncapped full file",
+            ] {
+                assert!(
+                    guidance.contains(required),
+                    "{} omits {required}",
+                    path.display()
+                );
+            }
         }
     }
 

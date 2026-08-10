@@ -23,13 +23,35 @@ metadata:
 mcpls is a single Rust binary that bridges the Model Context Protocol (MCP) to the
 Language Server Protocol (LSP). It spawns and speaks LSP to real language servers
 (rust-analyzer, pyright, gopls, clangd, …) and exposes their capabilities to an AI
-agent as 20 MCP tools — hover, go-to-definition, references, diagnostics, rename,
+agent as MCP tools — hover, go-to-definition, references, diagnostics, rename,
 completions, symbols, formatting, call hierarchy, and more.
 
-This skill covers operating the **binary**: installing it, choosing CLI flags and
-environment variables, registering it with an MCP client, and writing `mcpls.toml`.
-It does not enumerate the 20 MCP tools themselves or their parameters — for that, see
+This skill covers operating the **binary** and choosing its source-rich workflows:
+installing it, choosing CLI flags and environment variables, registering it with an
+MCP client, writing `mcpls.toml`, and avoiding redundant shell reads. For every tool,
+see
 [Tools Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/tools-reference.md).
+
+## Source-rich workflow
+
+Prefer MCPLS results before `rg`, `sed`, or a file-read tool:
+
+1. Call `workspace_symbol_search` with the registered `project_id` and an exact name. Its ranked candidates include bounded `source` frames and snapshot-bound `symbol_handle` values.
+2. If exactly one candidate matches, pass its `symbol_handle` with `project_id` to `inspect_symbol`, `get_hover`, `get_definition`, `get_references`, or call-hierarchy tools. Do not copy coordinates when a handle is available.
+3. For a broad question, call `inspect_symbol` once. Select only needed `sections` and set `budget.max_bytes` and `budget.max_items`; it returns declaration/body source, docs/signature, implementations, grouped uses/calls, tests/runnables, and relevant diagnostics.
+4. If discovery is ambiguous, present or narrow the ranked source-bearing candidates with `path`, `kind`, or `container`; never silently choose one.
+5. If a follow-up returns `stale_symbol_handle`, rerun discovery and use its replacement handle.
+
+Example with no intervening file read:
+
+```text
+workspace_symbol_search {project_id: "default", query: "charge", match_mode: "exact"}
+→ source frame + symbol_handle
+inspect_symbol {project_id: "default", symbol_handle: "…", sections: ["declaration", "implementations", "references", "calls", "tests", "diagnostics"], budget: {max_bytes: 32768, max_items: 20}}
+→ self-contained bounded answer
+```
+
+Read a file directly only when the task intentionally needs the uncapped full file, or when inspecting a non-source/generated artifact that semantic results cannot represent. An unavailable or truncated source frame is a reason to narrow/retry first, not automatically to reread the same file.
 
 ## Prerequisites
 

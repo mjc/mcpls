@@ -25,8 +25,9 @@ pub struct HoverParams {
     #[serde(default)]
     pub character: u32,
     /// Project owning `symbol_handle` when coordinates are omitted.
+    /// Reuse the handle from a source-bearing discovery result; refresh discovery on stale handles.
     pub project_id: Option<String>,
-    /// Snapshot-bound handle returned by a prior semantic result.
+    /// Snapshot-bound handle returned by a prior semantic result; safer than copying coordinates.
     pub symbol_handle: Option<SymbolHandle>,
 }
 
@@ -48,7 +49,7 @@ pub struct DefinitionParams {
     pub character: u32,
     /// Project owning `symbol_handle` when coordinates are omitted.
     pub project_id: Option<String>,
-    /// Snapshot-bound handle returned by a prior semantic result.
+    /// Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.
     pub symbol_handle: Option<SymbolHandle>,
 }
 
@@ -66,7 +67,7 @@ pub struct SemanticPositionParams {
     /// One-based character offset in the active server's negotiated encoding.
     #[serde(default)]
     pub character: u32,
-    /// Snapshot-bound handle returned by a prior semantic result.
+    /// Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.
     pub symbol_handle: Option<SymbolHandle>,
 }
 
@@ -88,7 +89,7 @@ pub struct ReferencesParams {
     pub character: u32,
     /// Project owning `symbol_handle` when coordinates are omitted.
     pub project_id: Option<String>,
-    /// Snapshot-bound handle returned by a prior semantic result.
+    /// Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.
     pub symbol_handle: Option<SymbolHandle>,
     /// Whether to include the declaration in the results.
     #[schemars(description = "Whether to include the declaration in the results.")]
@@ -363,23 +364,23 @@ pub struct WorkspaceSymbolParams {
 pub struct InspectSymbolParams {
     /// Stable project identifier whose symbol should be inspected.
     pub project_id: String,
-    /// Snapshot-bound handle returned by symbol discovery.
+    /// Snapshot-bound handle returned by symbol discovery; preferred over repeating coordinates.
     pub symbol_handle: Option<SymbolHandle>,
-    /// Symbol name to resolve when no handle is supplied.
+    /// Exact symbol name to resolve when no handle is supplied.
     pub query: Option<String>,
     /// Optional symbol-kind disambiguator.
     pub kind: Option<String>,
-    /// Optional project-relative path disambiguator.
+    /// Optional project-relative path disambiguator for duplicate names.
     pub path: Option<String>,
-    /// Optional container-name disambiguator.
+    /// Optional container-name disambiguator for duplicate names.
     pub container: Option<String>,
-    /// Maximum candidates returned for ambiguous queries.
+    /// Maximum ranked source-bearing candidates returned for ambiguous queries.
     #[serde(default = "default_inspect_candidates")]
     pub candidate_limit: u32,
-    /// Sections to include; empty uses the model-oriented defaults.
+    /// Sections to include; empty prioritizes declaration, implementations, uses, tests, and errors.
     #[serde(default)]
     pub sections: Vec<InspectSymbolSectionKind>,
-    /// Total response and per-provider item bounds.
+    /// Strict serialized-byte and per-provider item bounds for the complete bundle.
     #[serde(default)]
     pub budget: InspectSymbolBudget,
 }

@@ -719,7 +719,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -1128,7 +1128,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -1537,7 +1537,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -2732,7 +2732,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -3841,7 +3841,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -4208,7 +4208,7 @@
   },
   {
     "name": "get_definition",
-    "description": "Bounded definition targets with provider identity, source frames, symbol handles, and explicit truncation state.",
+    "description": "Bounded definition targets with provider identity, source frames, reusable symbol_handle values, and explicit truncation. Returned source usually removes the need for a file read.",
     "inputSchema": {
       "$defs": {
         "SymbolHandle": {
@@ -4253,7 +4253,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "type": "object"
@@ -5708,7 +5708,7 @@
   },
   {
     "name": "get_hover",
-    "description": "Type, documentation, provider identity, snapshot-bound symbol handle, and bounded source frame at a position.",
+    "description": "Type, signature/documentation, provider identity, snapshot-bound symbol_handle, and bounded source frame. Pass project_id + symbol_handle from discovery instead of rereading or copying coordinates.",
     "inputSchema": {
       "$defs": {
         "SymbolHandle": {
@@ -5738,7 +5738,7 @@
           "type": "integer"
         },
         "project_id": {
-          "description": "Project owning `symbol_handle` when coordinates are omitted.",
+          "description": "Project owning `symbol_handle` when coordinates are omitted.\nReuse the handle from a source-bearing discovery result; refresh discovery on stale handles.",
           "type": [
             "string",
             "null"
@@ -5753,7 +5753,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a prior semantic result; safer than copying coordinates."
         }
       },
       "type": "object"
@@ -7126,7 +7126,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -7493,7 +7493,7 @@
   },
   {
     "name": "get_references",
-    "description": "References grouped by project-relative file and enclosing symbol, with one declaration, bounded source frames, counts, and truncation metadata.",
+    "description": "References grouped by project-relative file and enclosing symbol, with one declaration, bounded source frames, reusable handles, counts, and truncation metadata.",
     "inputSchema": {
       "$defs": {
         "SemanticResultLimits": {
@@ -7579,7 +7579,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "type": "object"
@@ -8034,7 +8034,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
         }
       },
       "required": [
@@ -9470,7 +9470,7 @@
   },
   {
     "name": "inspect_symbol",
-    "description": "Resolve a project symbol exactly and return a bounded source-bearing inspection bundle. Ambiguous names return candidates instead of choosing silently.",
+    "description": "Preferred no-reread workflow: resolve an exact query or prior symbol_handle into a byte/item-bounded source, docs/signature, definitions/implementations, uses/calls, tests, and diagnostics bundle. Ambiguous names return candidates; stale handles require fresh discovery.",
     "inputSchema": {
       "$defs": {
         "InspectSymbolBudget": {
@@ -9495,18 +9495,53 @@
         },
         "InspectSymbolSectionKind": {
           "description": "Selectable sections of a high-level symbol inspection bundle.",
-          "enum": [
-            "declaration",
-            "hover",
-            "definitions",
-            "implementations",
-            "references",
-            "calls",
-            "tests",
-            "runnables",
-            "diagnostics"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "const": "declaration",
+              "description": "Bounded declaration or body source.",
+              "type": "string"
+            },
+            {
+              "const": "hover",
+              "description": "Signature, type, and documentation.",
+              "type": "string"
+            },
+            {
+              "const": "definitions",
+              "description": "Definition targets.",
+              "type": "string"
+            },
+            {
+              "const": "implementations",
+              "description": "Trait, interface, or symbol implementations.",
+              "type": "string"
+            },
+            {
+              "const": "references",
+              "description": "Grouped references and call sites.",
+              "type": "string"
+            },
+            {
+              "const": "calls",
+              "description": "Incoming and outgoing call hierarchy samples.",
+              "type": "string"
+            },
+            {
+              "const": "tests",
+              "description": "Related tests, discovered but never executed.",
+              "type": "string"
+            },
+            {
+              "const": "runnables",
+              "description": "Runnable metadata, discovered but never executed.",
+              "type": "string"
+            },
+            {
+              "const": "diagnostics",
+              "description": "Diagnostics intersecting the selected symbol.",
+              "type": "string"
+            }
+          ]
         },
         "SymbolHandle": {
           "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
@@ -9521,17 +9556,17 @@
             "max_bytes": 65536,
             "max_items": 20
           },
-          "description": "Total response and per-provider item bounds."
+          "description": "Strict serialized-byte and per-provider item bounds for the complete bundle."
         },
         "candidate_limit": {
           "default": 10,
-          "description": "Maximum candidates returned for ambiguous queries.",
+          "description": "Maximum ranked source-bearing candidates returned for ambiguous queries.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "container": {
-          "description": "Optional container-name disambiguator.",
+          "description": "Optional container-name disambiguator for duplicate names.",
           "type": [
             "string",
             "null"
@@ -9545,7 +9580,7 @@
           ]
         },
         "path": {
-          "description": "Optional project-relative path disambiguator.",
+          "description": "Optional project-relative path disambiguator for duplicate names.",
           "type": [
             "string",
             "null"
@@ -9556,7 +9591,7 @@
           "type": "string"
         },
         "query": {
-          "description": "Symbol name to resolve when no handle is supplied.",
+          "description": "Exact symbol name to resolve when no handle is supplied.",
           "type": [
             "string",
             "null"
@@ -9564,7 +9599,7 @@
         },
         "sections": {
           "default": [],
-          "description": "Sections to include; empty uses the model-oriented defaults.",
+          "description": "Sections to include; empty prioritizes declaration, implementations, uses, tests, and errors.",
           "items": {
             "$ref": "#/$defs/InspectSymbolSectionKind"
           },
@@ -9579,7 +9614,7 @@
               "type": "null"
             }
           ],
-          "description": "Snapshot-bound handle returned by symbol discovery."
+          "description": "Snapshot-bound handle returned by symbol discovery; preferred over repeating coordinates."
         }
       },
       "required": [
@@ -10099,10 +10134,12 @@
           "description": "Incoming and outgoing call samples returned together.",
           "properties": {
             "incoming": {
-              "$ref": "#/$defs/IncomingCallsResult"
+              "$ref": "#/$defs/IncomingCallsResult",
+              "description": "Bounded callers and call sites."
             },
             "outgoing": {
-              "$ref": "#/$defs/OutgoingCallsResult"
+              "$ref": "#/$defs/OutgoingCallsResult",
+              "description": "Bounded callees and call sites."
             }
           },
           "required": [
@@ -10115,7 +10152,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10125,31 +10163,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10165,7 +10209,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10175,31 +10220,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10215,7 +10266,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10225,31 +10277,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10265,7 +10323,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10275,31 +10334,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10315,7 +10380,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10325,31 +10391,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10365,7 +10437,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10375,31 +10448,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10415,7 +10494,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10425,31 +10505,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10465,7 +10551,8 @@
           "description": "One typed inspection section with uniform provenance and bounds metadata.",
           "properties": {
             "completeness": {
-              "$ref": "#/$defs/InspectSectionCompleteness"
+              "$ref": "#/$defs/InspectSectionCompleteness",
+              "description": "Machine-readable availability and completeness state."
             },
             "data": {
               "anyOf": [
@@ -10475,31 +10562,37 @@
                 {
                   "type": "null"
                 }
-              ]
+              ],
+              "description": "Typed section payload when available."
             },
             "provider": {
+              "description": "Stable provider identity, when a provider was selected.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "reason": {
+              "description": "Actionable unsupported or unavailable reason.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "returned": {
+              "description": "Items represented in `data`.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "total": {
+              "description": "Items available before bounds.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
             "truncated": {
+              "description": "Whether bounds omitted items or source.",
               "type": "boolean"
             }
           },
@@ -10513,14 +10606,33 @@
         },
         "InspectSectionCompleteness": {
           "description": "Completeness of one requested inspection section.",
-          "enum": [
-            "complete",
-            "partial",
-            "unsupported",
-            "unavailable",
-            "not_requested"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "const": "complete",
+              "description": "Provider returned every requested item within bounds.",
+              "type": "string"
+            },
+            {
+              "const": "partial",
+              "description": "Provider data is available but a response bound omitted content.",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "Provider does not advertise the requested capability.",
+              "type": "string"
+            },
+            {
+              "const": "unavailable",
+              "description": "Capability may exist but the provider request failed.",
+              "type": "string"
+            },
+            {
+              "const": "not_requested",
+              "description": "Caller did not select this section.",
+              "type": "string"
+            }
+          ]
         },
         "InspectSymbolBudget": {
           "description": "Cross-section bounds for a symbol inspection response.",
@@ -10546,6 +10658,7 @@
           "description": "Exact resolution outcome for a symbol inspection request.",
           "oneOf": [
             {
+              "description": "One exact symbol was selected safely.",
               "properties": {
                 "status": {
                   "const": "selected",
@@ -10559,7 +10672,8 @@
                     {
                       "type": "null"
                     }
-                  ]
+                  ],
+                  "description": "Ranked source-bearing symbol metadata for query resolution."
                 },
                 "symbol_handle": {
                   "anyOf": [
@@ -10569,7 +10683,8 @@
                     {
                       "type": "null"
                     }
-                  ]
+                  ],
+                  "description": "Snapshot-bound handle safe for semantic follow-ups."
                 }
               },
               "required": [
@@ -10578,8 +10693,10 @@
               "type": "object"
             },
             {
+              "description": "Several exact candidates remain; clients must disambiguate.",
               "properties": {
                 "candidates": {
+                  "description": "Ranked source-bearing candidates; never silently choose one.",
                   "items": {
                     "$ref": "#/$defs/WorkspaceSymbol"
                   },
@@ -10597,6 +10714,7 @@
               "type": "object"
             },
             {
+              "description": "No exact candidate matched the supplied constraints.",
               "properties": {
                 "status": {
                   "const": "not_found",
@@ -10614,31 +10732,40 @@
           "description": "Typed semantic sections returned for one selected symbol.",
           "properties": {
             "calls": {
-              "$ref": "#/$defs/InspectSection6"
+              "$ref": "#/$defs/InspectSection6",
+              "description": "Incoming and outgoing call samples."
             },
             "declaration": {
-              "$ref": "#/$defs/InspectSection"
+              "$ref": "#/$defs/InspectSection",
+              "description": "Bounded declaration or body source."
             },
             "definitions": {
-              "$ref": "#/$defs/InspectSection3"
+              "$ref": "#/$defs/InspectSection3",
+              "description": "Definition targets with bounded source and handles."
             },
             "diagnostics": {
-              "$ref": "#/$defs/InspectSection8"
+              "$ref": "#/$defs/InspectSection8",
+              "description": "Diagnostics intersecting the selected symbol range."
             },
             "hover": {
-              "$ref": "#/$defs/InspectSection2"
+              "$ref": "#/$defs/InspectSection2",
+              "description": "Signature, type, and documentation at the symbol."
             },
             "implementations": {
-              "$ref": "#/$defs/InspectSection4"
+              "$ref": "#/$defs/InspectSection4",
+              "description": "Implementation targets with bounded source and handles."
             },
             "references": {
-              "$ref": "#/$defs/InspectSection5"
+              "$ref": "#/$defs/InspectSection5",
+              "description": "Grouped references with bounded call-site source."
             },
             "runnables": {
-              "$ref": "#/$defs/InspectSection7"
+              "$ref": "#/$defs/InspectSection7",
+              "description": "Runnable metadata discovered without executing commands."
             },
             "tests": {
-              "$ref": "#/$defs/InspectSection7"
+              "$ref": "#/$defs/InspectSection7",
+              "description": "Related tests discovered without executing them."
             }
           },
           "required": [
@@ -11435,20 +11562,25 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "budget": {
-          "$ref": "#/$defs/InspectSymbolBudget"
+          "$ref": "#/$defs/InspectSymbolBudget",
+          "description": "Bounds applied to the response."
         },
         "resolution": {
-          "$ref": "#/$defs/InspectSymbolResolution"
+          "$ref": "#/$defs/InspectSymbolResolution",
+          "description": "Exact, ambiguous, or missing resolution outcome."
         },
         "returned_bytes": {
+          "description": "Serialized bytes in this bundle before the MCP envelope.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
         "sections": {
-          "$ref": "#/$defs/InspectSymbolSections"
+          "$ref": "#/$defs/InspectSymbolSections",
+          "description": "Requested typed semantic sections and uniform metadata."
         },
         "truncated": {
+          "description": "Whether the total budget removed lower-priority sections or candidates.",
           "type": "boolean"
         }
       },
@@ -12529,7 +12661,7 @@
   },
   {
     "name": "workspace_symbol_search",
-    "description": "Search project symbols with exact-first ranking, bounded source frames, and reusable symbol handles. Match mode defaults to fuzzy; external/dependency symbols require scope=all.",
+    "description": "Preferred first call for an unknown symbol: exact-first ranked project matches with bounded source frames and reusable symbol_handle values. Disambiguate before follow-ups; external/dependency symbols require scope=all.",
     "inputSchema": {
       "$defs": {
         "WorkspaceSymbolMatchMode": {

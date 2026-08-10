@@ -1,0 +1,31 @@
+{
+  "discovery": {
+    "tool": "workspace_symbol_search",
+    "arguments": {
+      "project_id": "default",
+      "query": "add",
+      "match_mode": "exact",
+      "scope": "project"
+    }
+  },
+  "inspection": {
+    "tool": "inspect_symbol",
+    "arguments": {
+      "project_id": "default",
+      "symbol_handle": "$discovery.symbol_handle",
+      "sections": [
+        "declaration",
+        "hover",
+        "implementations",
+        "references",
+        "calls",
+        "tests",
+        "diagnostics"
+      ],
+      "budget": {
+        "max_bytes": 65536,
+        "max_items": 20
+      }
+    }
+  }
+}

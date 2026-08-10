@@ -1,0 +1,38 @@
+[
+  {
+    "name": "unknown_exact_symbol",
+    "prompt": "Explain what charge does and show its callers.",
+    "expected_tools": ["workspace_symbol_search", "inspect_symbol"],
+    "forbidden_before_semantic_result": ["shell", "read_file"]
+  },
+  {
+    "name": "known_symbol_handle",
+    "prompt": "Given this symbol_handle, summarize the implementation and references.",
+    "expected_tools": ["inspect_symbol"],
+    "forbidden_before_semantic_result": ["shell", "read_file"]
+  },
+  {
+    "name": "ambiguous_symbol",
+    "prompt": "Find the right Config type when several exact matches exist.",
+    "expected_tools": ["workspace_symbol_search", "inspect_symbol"],
+    "forbidden_before_semantic_result": ["shell", "read_file"]
+  },
+  {
+    "name": "stale_handle_recovery",
+    "prompt": "Recover from stale_symbol_handle and continue the same semantic query.",
+    "expected_tools": ["workspace_symbol_search", "inspect_symbol"],
+    "forbidden_before_semantic_result": ["shell", "read_file"]
+  },
+  {
+    "name": "intentional_full_file",
+    "prompt": "Return the complete uncapped contents of this source file.",
+    "expected_tools": ["read_file"],
+    "forbidden_before_semantic_result": []
+  },
+  {
+    "name": "generated_binary_artifact",
+    "prompt": "Inspect this generated non-source binary artifact.",
+    "expected_tools": ["read_file"],
+    "forbidden_before_semantic_result": []
+  }
+]

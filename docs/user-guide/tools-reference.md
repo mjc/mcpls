@@ -188,8 +188,7 @@ Claude: [Uses get_definition] The function is defined in src/billing.rs at line 
 **Navigate to struct:**
 ```
 User: Show me the User struct definition
-Claude: [Uses get_definition] The User struct is defined in src/models/user.rs:
-        [shows code snippet]
+Claude: [Uses get_definition] The returned location.source frame shows the User struct in src/models/user.rs; no extra file read is needed.
 ```
 
 ### Notes
@@ -685,6 +684,27 @@ Claude: [Uses format_document] The file needs formatting changes:
 Resolve one project symbol by snapshot-bound `symbol_handle` or exact `query`. Optional `path`, `kind`, and `container` fields disambiguate duplicate names; unresolved ambiguity returns ranked source-bearing candidates without choosing one.
 
 `sections` selects any of `declaration`, `hover`, `definitions`, `implementations`, `references`, `calls`, `tests`, `runnables`, and `diagnostics`. An empty list requests the model-oriented defaults. `budget.max_bytes` bounds the complete serialized bundle and `budget.max_items` bounds collection-producing providers. Every section reports provider, completeness, total and returned counts, truncation, and an unavailable or unsupported reason. The operation is read-only and never executes runnables or fixes.
+
+### No-file-read workflow
+
+```text
+workspace_symbol_search {project_id: "default", query: "charge", match_mode: "exact"}
+→ ranked candidate with source.status="available" and symbol_handle="…"
+
+inspect_symbol {
+  project_id: "default",
+  symbol_handle: "…",
+  sections: ["declaration", "implementations", "references", "calls", "tests", "diagnostics"],
+  budget: {max_bytes: 32768, max_items: 20}
+}
+→ bounded source, docs/signature, implementations, grouped uses/calls, tests, and relevant diagnostics
+```
+
+The equivalent [machine-validated request example](../examples/source-rich-workflow.json) runs against real rust-analyzer in the MCPLS end-to-end suite.
+
+Pass returned handles directly to handle-aware tools instead of copying line/character coordinates. If the query is ambiguous, narrow with `path`, `kind`, or `container`; do not select a candidate silently. On `stale_symbol_handle`, rerun `workspace_symbol_search` or `get_document_symbols` and retry with the replacement.
+
+Use a direct file read only when intentionally requesting an uncapped full file or inspecting a non-source/generated artifact. For ordinary navigation, an available source frame is already the authoritative snapshot used by the semantic result; for truncation, first request a tighter section or larger explicit budget.
 
 ## workspace_symbol_search
 
