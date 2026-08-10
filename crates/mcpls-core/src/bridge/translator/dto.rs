@@ -47,7 +47,7 @@ pub struct Range {
 }
 
 /// Location in a document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     /// Human-readable filesystem path for file-backed targets.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,7 +64,7 @@ pub struct Location {
 }
 
 /// Source context attached to a semantic result location.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SourceContext {
     /// The source was safely resolved.
@@ -77,7 +77,7 @@ pub enum SourceContext {
 }
 
 /// A bounded, line-numbered source excerpt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFrame {
     /// Canonical filesystem path.
     pub path: String,
@@ -298,6 +298,72 @@ pub struct Diagnostic {
     pub message: String,
     /// Optional diagnostic code.
     pub code: Option<String>,
+    /// Source, grouping, and fix-preview metadata for this diagnostic.
+    #[serde(flatten)]
+    pub context: DiagnosticContext,
+}
+
+/// Model-ready context attached to a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticContext {
+    /// Canonical filesystem path when the diagnostic is file-backed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Path relative to the owning project root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_relative_path: Option<String>,
+    /// Canonical document URI.
+    pub uri: String,
+    /// Bounded source surrounding the highlighted range.
+    pub source_frame: SourceContext,
+    /// Language-server subsystem that produced the diagnostic.
+    #[serde(rename = "source", skip_serializing_if = "Option::is_none")]
+    pub diagnostic_source: Option<String>,
+    /// Documentation URI associated with the diagnostic code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_description: Option<String>,
+    /// Standard LSP diagnostic tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Related diagnostics with their own authorized source frames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_information: Vec<DiagnosticRelatedInformation>,
+    /// Language-server-specific payload after secret redaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Number of identical diagnostics represented by this group.
+    pub occurrence_count: usize,
+    /// Actor-owned code-action handles accepted by the preview flow.
+    pub fix_handles: Vec<String>,
+}
+
+impl Default for DiagnosticContext {
+    fn default() -> Self {
+        Self {
+            path: None,
+            project_relative_path: None,
+            uri: String::new(),
+            source_frame: SourceContext::Unavailable {
+                reason: SourceUnavailableReason::NotFound,
+            },
+            diagnostic_source: None,
+            code_description: None,
+            tags: Vec::new(),
+            related_information: Vec::new(),
+            data: None,
+            occurrence_count: 1,
+            fix_handles: Vec::new(),
+        }
+    }
+}
+
+/// A related diagnostic location and its bounded source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticRelatedInformation {
+    /// Related source location.
+    pub location: Location,
+    /// Relationship message supplied by the language server.
+    pub message: String,
 }
 
 /// Result of a diagnostics request.

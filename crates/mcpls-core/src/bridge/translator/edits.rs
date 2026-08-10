@@ -112,8 +112,13 @@ async fn convert_code_action(
     let diagnostics = match action.diagnostics {
         Some(diags) => {
             let mut result = Vec::with_capacity(diags.len());
+            let mut source_budget = super::source_context::SourceBudget::default();
+            let redaction_policy = crate::bridge::notifications::RedactionPolicy::default();
             for d in &diags {
-                result.push(diagnostic_to_mcp(d, ctx, uri).await);
+                result.push(
+                    diagnostic_to_mcp(d, ctx, uri, &[], &redaction_policy, &mut source_budget)
+                        .await,
+                );
             }
             result
         }

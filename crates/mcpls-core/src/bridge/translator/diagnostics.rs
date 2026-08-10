@@ -10,12 +10,14 @@ use tokio::sync::Mutex;
 
 use super::Translator;
 use super::dto::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, Position2D, Range, ServerLogsResult,
-    ServerMessagesResult,
+    Diagnostic, DiagnosticContext, DiagnosticRelatedInformation, DiagnosticSeverity,
+    DiagnosticsResult, Position2D, Range, ServerLogsResult, ServerMessagesResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
+use super::source_context::SourceBudget;
 use crate::bridge::encoding::PositionEncoding;
+use crate::bridge::notifications::RedactionPolicy;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, NotificationCache, path_to_uri};
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
@@ -54,9 +56,27 @@ pub(super) async fn diagnostic_to_mcp(
     diag: &lsp_types::Diagnostic,
     ctx: &EncodingCtx,
     uri: &lsp_types::Uri,
+    workspace_roots: &[PathBuf],
+    redaction_policy: &RedactionPolicy,
+    source_budget: &mut SourceBudget,
 ) -> Diagnostic {
+    let range = ctx.normalize_range(uri, diag.range).await;
+    let path = crate::bridge::uri_to_path(uri);
+    let mut data = diag.data.clone();
+    if let Some(data) = &mut data {
+        redaction_policy.redact_json(data);
+    }
+    let mut related_information = Vec::new();
+    for related in diag.related_information.iter().flatten() {
+        related_information.push(DiagnosticRelatedInformation {
+            location: ctx
+                .location(workspace_roots, related.location.clone(), source_budget)
+                .await,
+            message: related.message.clone(),
+        });
+    }
     Diagnostic {
-        range: ctx.normalize_range(uri, diag.range).await,
+        range: range.clone(),
         severity: match diag.severity {
             Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
             Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
@@ -69,6 +89,37 @@ pub(super) async fn diagnostic_to_mcp(
             lsp_types::NumberOrString::Number(n) => n.to_string(),
             lsp_types::NumberOrString::String(s) => s.clone(),
         }),
+        context: DiagnosticContext {
+            project_relative_path: path.as_ref().and_then(|path| {
+                workspace_roots.iter().find_map(|root| {
+                    path.strip_prefix(root)
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+            }),
+            path: path.map(|path| path.to_string_lossy().into_owned()),
+            uri: uri.to_string(),
+            source_frame: ctx
+                .source_context(workspace_roots, uri, range, source_budget)
+                .await,
+            diagnostic_source: diag.source.clone(),
+            code_description: diag
+                .code_description
+                .as_ref()
+                .map(|description| description.href.to_string()),
+            tags: diag.tags.as_ref().map_or_else(Vec::new, |tags| {
+                tags.iter()
+                    .filter_map(|tag| match *tag {
+                        lsp_types::DiagnosticTag::UNNECESSARY => Some("unnecessary".to_owned()),
+                        lsp_types::DiagnosticTag::DEPRECATED => Some("deprecated".to_owned()),
+                        _ => None,
+                    })
+                    .collect()
+            }),
+            related_information,
+            data,
+            ..DiagnosticContext::default()
+        },
     }
 }
 
@@ -153,8 +204,19 @@ impl Translator {
                     lsp_types::DocumentDiagnosticReportResult::Partial(_) => vec![],
                 };
                 let mut diagnostics = Vec::with_capacity(items.len());
+                let mut source_budget = SourceBudget::default();
                 for d in &items {
-                    diagnostics.push(diagnostic_to_mcp(d, &ctx, &uri).await);
+                    diagnostics.push(
+                        diagnostic_to_mcp(
+                            d,
+                            &ctx,
+                            &uri,
+                            &self.workspace_roots,
+                            &self.redaction_policy,
+                            &mut source_budget,
+                        )
+                        .await,
+                    );
                 }
                 let pull = DiagnosticsResult { diagnostics };
                 Ok(Self::merge_diagnostics(
@@ -204,8 +266,20 @@ impl Translator {
                     tracker: tracker.clone(),
                 };
                 let mut result = Vec::with_capacity(diag_info.diagnostics.len());
+                let mut source_budget = SourceBudget::default();
+                let redaction_policy = RedactionPolicy::default();
                 for d in &diag_info.diagnostics {
-                    result.push(diagnostic_to_mcp(d, &ctx, &diag_info.uri).await);
+                    result.push(
+                        diagnostic_to_mcp(
+                            d,
+                            &ctx,
+                            &diag_info.uri,
+                            &[],
+                            &redaction_policy,
+                            &mut source_budget,
+                        )
+                        .await,
+                    );
                 }
                 result
             }
@@ -386,6 +460,108 @@ mod tests {
         assert_eq!(value["textDocument"]["uri"], "file:///test.ts");
         assert!(value.get("identifier").is_none());
         assert!(value.get("previousResultId").is_none());
+    }
+
+    #[test]
+    fn diagnostics_serialize_model_ready_metadata() {
+        let diagnostic = Diagnostic {
+            range: Range {
+                start: Position2D {
+                    line: 2,
+                    character: 3,
+                },
+                end: Position2D {
+                    line: 2,
+                    character: 8,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "mismatched types".to_owned(),
+            code: Some("E0308".to_owned()),
+            context: DiagnosticContext {
+                path: Some("/workspace/src/lib.rs".to_owned()),
+                project_relative_path: Some("src/lib.rs".to_owned()),
+                uri: "file:///workspace/src/lib.rs".to_owned(),
+                source_frame: super::super::dto::SourceContext::Unavailable {
+                    reason: super::super::dto::SourceUnavailableReason::NotFound,
+                },
+                occurrence_count: 1,
+                fix_handles: Vec::new(),
+                ..DiagnosticContext::default()
+            },
+        };
+
+        let value = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(value["project_relative_path"], "src/lib.rs");
+        assert_eq!(value["source_frame"]["status"], "unavailable");
+        assert_eq!(value["occurrence_count"], 1);
+        assert_eq!(value["fix_handles"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_conversion_preserves_metadata_and_source_safely() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lib.rs");
+        fs::write(&path, "fn main() { missing(); }\n").unwrap();
+        let uri: lsp_types::Uri = Url::from_file_path(&path)
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap();
+        let location = lsp_types::Location {
+            uri: uri.clone(),
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 12),
+                lsp_types::Position::new(0, 19),
+            ),
+        };
+        let diagnostic = lsp_types::Diagnostic {
+            range: location.range,
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: Some(lsp_types::NumberOrString::String("E0425".to_owned())),
+            code_description: Some(lsp_types::CodeDescription {
+                href: "https://doc.rust-lang.org/error_codes/E0425.html"
+                    .parse()
+                    .unwrap(),
+            }),
+            source: Some("rustc".to_owned()),
+            message: "cannot find function".to_owned(),
+            related_information: Some(vec![lsp_types::DiagnosticRelatedInformation {
+                location,
+                message: "called here".to_owned(),
+            }]),
+            tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+            data: Some(serde_json::json!({"password": "secret", "kind": "quickfix"})),
+        };
+        let ctx = EncodingCtx {
+            encoding: PositionEncoding::Utf16,
+            tracker: test_tracker(),
+        };
+        let mut budget = SourceBudget::default();
+        let converted = diagnostic_to_mcp(
+            &diagnostic,
+            &ctx,
+            &uri,
+            &[dir.path().to_path_buf()],
+            &RedactionPolicy::default(),
+            &mut budget,
+        )
+        .await;
+
+        assert!(matches!(
+            converted.context.source_frame,
+            super::super::dto::SourceContext::Available(_)
+        ));
+        assert!(matches!(
+            converted.context.related_information[0].location.source,
+            super::super::dto::SourceContext::Available(_)
+        ));
+        assert_eq!(
+            converted.context.diagnostic_source.as_deref(),
+            Some("rustc")
+        );
+        assert_eq!(converted.context.tags, ["unnecessary"]);
+        assert_eq!(converted.context.data.unwrap()["password"], "[REDACTED]");
     }
 
     #[tokio::test]
@@ -760,6 +936,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "mismatched types".to_string(),
             code: Some("E0308".to_string()),
+            context: DiagnosticContext::default(),
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
@@ -800,6 +977,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "syntax error".to_string(),
             code: None,
+            context: DiagnosticContext::default(),
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
@@ -873,6 +1051,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "mismatched types".to_string(),
             code: None,
+            context: DiagnosticContext::default(),
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag],
@@ -921,6 +1100,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "not all trait items implemented, missing: `fn hello`".to_string(),
             code: Some("E0046".to_string()),
+            context: DiagnosticContext::default(),
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],
@@ -979,6 +1159,7 @@ mod tests {
             severity: DiagnosticSeverity::Error,
             message: "mismatched types: expected `i32`, found `&str`".to_string(),
             code: Some("E0308".to_string()),
+            context: DiagnosticContext::default(),
         };
         let pull = DiagnosticsResult {
             diagnostics: vec![pull_diag.clone()],

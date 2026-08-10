@@ -619,6 +619,12 @@ impl Translator {
                             lsp_types::NumberOrString::Number(value) => value.to_string(),
                             lsp_types::NumberOrString::String(value) => value.clone(),
                         }),
+                        context: super::DiagnosticContext {
+                            path: crate::bridge::uri_to_path(&entry.uri)
+                                .map(|path| path.to_string_lossy().into_owned()),
+                            uri: entry.uri.to_string(),
+                            ..super::DiagnosticContext::default()
+                        },
                     })
                     .collect()
             });

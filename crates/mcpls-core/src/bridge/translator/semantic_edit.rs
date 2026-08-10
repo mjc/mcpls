@@ -1293,6 +1293,7 @@ fn convert_diagnostic(diagnostic: lsp_types::Diagnostic) -> Diagnostic {
             lsp_types::NumberOrString::Number(value) => value.to_string(),
             lsp_types::NumberOrString::String(value) => value,
         }),
+        context: super::dto::DiagnosticContext::default(),
     }
 }
 
