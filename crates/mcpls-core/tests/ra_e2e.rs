@@ -477,24 +477,31 @@ fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     let text = assertions::assert_tool_ok(&resp);
     let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
 
-    let locs = inner["locations"]
+    let groups = inner["groups"]
         .as_array()
-        .ok_or_else(|| format!("expected locations array, got {inner}"))?;
-    if locs.len() < 2 {
+        .ok_or_else(|| format!("expected grouped references, got {inner}"))?;
+    if inner["returned_references"]
+        .as_u64()
+        .is_none_or(|count| count < 2)
+    {
         return Err(format!(
             "expected ≥2 references (decl + call site), got {}",
-            locs.len()
+            inner["returned_references"]
         ));
     }
-
-    // All reference URIs should point to lib.rs.
-    for loc in locs {
-        let uri = loc["uri"].as_str().unwrap_or("");
-        if !uri.ends_with("/src/lib.rs") {
-            return Err(format!(
-                "reference URI does not end with '/src/lib.rs': {uri}"
-            ));
-        }
+    if inner["declaration"]["location"]["source"]["status"] != "available"
+        || groups.iter().any(|group| {
+            group["project_relative_path"] != "src/lib.rs"
+                || group["references"].as_array().is_none_or(|references| {
+                    references
+                        .iter()
+                        .any(|reference| reference["location"]["source"]["status"] != "available")
+                })
+        })
+    {
+        return Err(format!(
+            "references omitted coherent source frames: {inner}"
+        ));
     }
     Ok(())
 }
@@ -507,7 +514,11 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
     let resp = client
         .call_tool(
             "get_diagnostics",
-            &json!({ "file_path": broken.to_string_lossy() }),
+            &json!({
+                "file_path": broken.to_string_lossy(),
+                "item_limit": 20,
+                "byte_limit": 32768
+            }),
         )
         .map_err(|e| format!("call failed: {e}"))?;
 
@@ -530,7 +541,11 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
             let j2: Value = client
                 .call_tool(
                     "get_diagnostics",
-                    &json!({ "file_path": broken.to_string_lossy() }),
+                    &json!({
+                        "file_path": broken.to_string_lossy(),
+                        "item_limit": 20,
+                        "byte_limit": 32768
+                    }),
                 )
                 .ok()
                 .map_or(Value::Null, |r| {
@@ -572,6 +587,20 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
     if !has_error {
         return Err(format!(
             "no Error-severity diagnostic in broken.rs: {final_diags:?}"
+        ));
+    }
+    if final_diags.iter().any(|diagnostic| {
+        diagnostic["source_frame"]["status"] != "available"
+            || diagnostic["source_frame"]["path"]
+                .as_str()
+                .is_none_or(|path| !path.ends_with("/src/broken.rs"))
+            || diagnostic["source_frame"]["highlighted_range"] != diagnostic["range"]
+            || diagnostic["source_frame"]["text"]
+                .as_str()
+                .is_none_or(str::is_empty)
+    }) {
+        return Err(format!(
+            "diagnostics omitted coherent highlighted source: {final_diags:?}"
         ));
     }
     Ok(())
@@ -795,11 +824,18 @@ fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Resu
                 && symbol["origin"] == "project_local"
                 && symbol["project_relative_path"] == "src/lib.rs"
                 && symbol["location"]["source"]["status"] == "available"
+                && symbol["location"]["source"]["text"]
+                    .as_str()
+                    .is_some_and(|source| source.contains("pub fn add"))
+                && symbol["location"]["source"]["highlighted_range"] == symbol["location"]["range"]
                 && symbol["location"]["symbol_handle"].is_string()
                 && inner["total"].as_u64().is_some()
                 && inner["returned"].as_u64().is_some()
                 && inner["truncated"].is_boolean();
-            if contract_is_complete && syms.iter().all(|symbol| symbol["name"] == "add") {
+            if contract_is_complete
+                && syms.first().is_some_and(|symbol| symbol["name"] == "add")
+                && syms.iter().all(|symbol| symbol["name"] == "add")
+            {
                 return Ok(());
             }
             return Err(format!(
@@ -940,6 +976,83 @@ fn sc_inspect_symbol(client: &mut McpClient, _workspace: &Path) -> Result<(), St
     Ok(())
 }
 
+fn sc_no_reread_corpus(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let corpus_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/no-reread-corpus.json");
+    let corpus: Value = serde_json::from_slice(
+        &fs::read(&corpus_path)
+            .map_err(|error| format!("failed to read {}: {error}", corpus_path.display()))?,
+    )
+    .map_err(|error| format!("bad no-reread corpus: {error}"))?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| "no-reread corpus cases are not an array".to_owned())?;
+    for case in cases {
+        match case["scenario"].as_str().unwrap_or_default() {
+            "workspace_symbol_search" => sc_workspace_symbol_search(client, workspace)?,
+            "large_document_outline" => {
+                let path = workspace.join("src/large_outline.rs");
+                let started = Instant::now();
+                let response = client
+                    .call_tool(
+                        "get_document_symbols",
+                        &json!({"file_path": path, "limit": 12, "include_bodies": true}),
+                    )
+                    .map_err(|error| format!("large outline call failed: {error}"))?;
+                let structured = &response["result"]["structuredContent"];
+                let symbols = structured["symbols"]
+                    .as_array()
+                    .ok_or_else(|| format!("large outline has no symbols: {structured}"))?;
+                let first = symbols
+                    .first()
+                    .ok_or_else(|| "large outline returned no symbols".to_owned())?;
+                if structured["total"].as_u64().is_none_or(|total| total < 32)
+                    || structured["returned"] != 12
+                    || structured["truncated"] != true
+                    || first["name"] != "fixture_item_00"
+                    || first["source"]["status"] != "available"
+                    || first["source"]["text"]
+                        .as_str()
+                        .is_none_or(|text| !text.contains("pub fn fixture_item_00()"))
+                    || first["range"]["start"]["line"].as_u64().is_none()
+                    || response.to_string().len() > 65_536
+                    || started.elapsed() > Duration::from_secs(15)
+                {
+                    return Err(format!(
+                        "large outline quality contract failed: {structured}"
+                    ));
+                }
+            }
+            "symbol_handle_follow_ups" => sc_symbol_handle_follow_ups(client, workspace)?,
+            "definition_hover" => {
+                sc_get_definition(client, workspace)?;
+                sc_get_hover(client, workspace)?;
+            }
+            "references_calls" => {
+                sc_get_references(client, workspace)?;
+                sc_prepare_call_hierarchy(client, workspace)?;
+                sc_get_incoming_calls(client, workspace)?;
+            }
+            "diagnostics" => sc_get_diagnostics(client, workspace)?,
+            "structured_content" => {
+                let response = client
+                    .call_tool(
+                        "workspace_symbol_search",
+                        &json!({"project_id":"default","query":"add","match_mode":"exact"}),
+                    )
+                    .map_err(|error| format!("structured result call failed: {error}"))?;
+                if !response["result"]["structuredContent"].is_object() {
+                    return Err(format!("tool returned no structuredContent: {response}"));
+                }
+            }
+            "inspect_symbol" => sc_inspect_symbol(client, workspace)?,
+            "instrumented_agent_trace" => {}
+            scenario => return Err(format!("unknown no-reread corpus scenario: {scenario}")),
+        }
+    }
+    Ok(())
+}
+
 fn sc_symbol_handle_follow_ups(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let search = client
         .call_tool(
@@ -983,7 +1096,19 @@ fn sc_symbol_handle_follow_ups(client: &mut McpClient, workspace: &Path) -> Resu
             .map_err(|error| format!("handle references failed: {error}"))?;
         let references: Value = serde_json::from_str(&assertions::assert_tool_ok(&references))
             .map_err(|error| format!("bad references JSON: {error}"))?;
-        if references["locations"].as_array().map_or(0, Vec::len) >= 2 {
+        if references["returned_references"]
+            .as_u64()
+            .is_some_and(|count| count >= 2)
+            && references["groups"].as_array().is_some_and(|groups| {
+                groups.iter().all(|group| {
+                    group["references"].as_array().is_some_and(|references| {
+                        references.iter().all(|reference| {
+                            reference["location"]["source"]["status"] == "available"
+                        })
+                    })
+                })
+            })
+        {
             break;
         }
         if Instant::now() >= deadline {
@@ -2557,6 +2682,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_format_document),
         sub_case!(sc_workspace_symbol_search),
         sub_case!(sc_inspect_symbol),
+        sub_case!(sc_no_reread_corpus),
         sub_case!(sc_symbol_handle_follow_ups),
         sub_case!(sc_get_code_actions),
         sub_case!(sc_prepare_call_hierarchy),

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "provenance": "privacy_preserving_chat_history_aggregate",
+  "contains_raw_prompts_or_paths": false,
+  "historical_observations": {
+    "workspace_symbol_search": {"post_source_read": 70, "semantic_calls": 96},
+    "get_document_symbols": {"post_source_read": 234, "same_basename_read": 182, "semantic_calls": 280},
+    "get_definition": {"post_source_read": 7, "semantic_calls": 7},
+    "get_hover": {"post_source_read": 8, "semantic_calls": 11},
+    "get_references": {"post_source_read": 56, "semantic_calls": 64}
+  },
+  "ticket_baselines": {
+    "MCPLS-54": {"kind":"observed","metric":"post_semantic_source_read_rate","value":{"numerator":70,"denominator":96}},
+    "MCPLS-55": {"kind":"observed","metric":"post_semantic_same_file_read_rate","value":{"numerator":182,"denominator":280}},
+    "MCPLS-56": {"kind":"pre_feature_contract","metric":"coordinate_free_followup_coverage","value":{"numerator":0,"denominator":1}},
+    "MCPLS-57": {"kind":"observed","metric":"post_semantic_source_read_rate","value":{"numerator":15,"denominator":18}},
+    "MCPLS-58": {"kind":"pre_feature_contract","metric":"source_context_coverage","value":{"numerator":0,"denominator":1}},
+    "MCPLS-59": {"kind":"observed","metric":"post_semantic_source_read_rate","value":{"numerator":56,"denominator":64}},
+    "MCPLS-60": {"kind":"pre_feature_contract","metric":"diagnostic_source_coverage","value":{"numerator":0,"denominator":1}},
+    "MCPLS-61": {"kind":"pre_feature_contract","metric":"structured_content_coverage","value":{"numerator":0,"denominator":1}},
+    "MCPLS-62": {"kind":"pre_feature_contract","metric":"inspect_symbol_coverage","value":{"numerator":0,"denominator":1}},
+    "MCPLS-64": {"kind":"observed","metric":"post_semantic_source_read_rate","value":{"numerator":375,"denominator":458}}
+  },
+  "targets": {
+    "MCPLS-54": {"metric":"post_semantic_same_file_read_rate","maximum":{"numerator":1,"denominator":10}},
+    "MCPLS-55": {"metric":"post_semantic_same_file_read_rate","maximum":{"numerator":1,"denominator":10}},
+    "MCPLS-56": {"metric":"coordinate_free_followup_coverage","minimum":{"numerator":1,"denominator":1}},
+    "MCPLS-57": {"metric":"post_semantic_same_file_read_rate","maximum":{"numerator":1,"denominator":10}},
+    "MCPLS-58": {"metric":"source_context_coverage","minimum":{"numerator":19,"denominator":20}},
+    "MCPLS-59": {"metric":"post_semantic_same_file_read_rate","maximum":{"numerator":1,"denominator":10}},
+    "MCPLS-60": {"metric":"diagnostic_source_coverage","minimum":{"numerator":19,"denominator":20}},
+    "MCPLS-61": {"metric":"structured_content_coverage","minimum":{"numerator":1,"denominator":1}},
+    "MCPLS-62": {"metric":"inspect_symbol_coverage","minimum":{"numerator":1,"denominator":1}},
+    "MCPLS-64": {"metric":"post_semantic_same_file_read_rate","maximum":{"numerator":1,"denominator":10}}
+  }
+}

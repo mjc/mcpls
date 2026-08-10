@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "fixture_repositories": ["crates/mcpls-core/tests/fixtures/rust_workspace"],
+  "cases": [
+    {"id":"workspace_lookup","ticket":"MCPLS-54","query_shape":"exact_workspace_symbol","scenario":"workspace_symbol_search","required_quality":["intended_symbol_first","declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"large_document_outline","ticket":"MCPLS-55","query_shape":"bounded_large_outline","scenario":"large_document_outline","required_quality":["intended_symbol_first","declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"handle_followup","ticket":"MCPLS-56","query_shape":"coordinate_free_handle_followup","scenario":"symbol_handle_follow_ups","required_quality":["declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"definition_hover","ticket":"MCPLS-57","query_shape":"definition_and_hover","scenario":"definition_hover","required_quality":["declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"source_context","ticket":"MCPLS-58","query_shape":"shared_source_envelope","scenario":"workspace_symbol_search","required_quality":["declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"references_calls","ticket":"MCPLS-59","query_shape":"grouped_references_call_hierarchy","scenario":"references_calls","required_quality":["declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"diagnostics","ticket":"MCPLS-60","query_shape":"source_framed_diagnostics","scenario":"diagnostics","required_quality":["declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"structured_content","ticket":"MCPLS-61","query_shape":"native_structured_result","scenario":"structured_content","required_quality":["bounded_bytes_items"]},
+    {"id":"symbol_inspection","ticket":"MCPLS-62","query_shape":"bounded_symbol_bundle","scenario":"inspect_symbol","required_quality":["intended_symbol_first","declaration_source","coherent_path_range","bounded_bytes_items","highlight_complete"]},
+    {"id":"client_guidance","ticket":"MCPLS-64","query_shape":"semantic_before_source_read","scenario":"instrumented_agent_trace","required_quality":["semantic_call_first","no_same_file_reread"]}
+  ]
+}

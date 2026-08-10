@@ -8,6 +8,7 @@
 
 pub mod types;
 pub mod functions;
+pub mod large_outline;
 
 pub use functions::create_repo as reexported_create_repo;
 

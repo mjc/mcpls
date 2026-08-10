@@ -18,6 +18,10 @@ path = "src/bin/mcpls-residency.rs"
 name = "rust-analyzer-memory"
 path = "src/bin/rust-analyzer-memory.rs"
 
+[[bin]]
+name = "no-reread-eval"
+path = "src/bin/no-reread-eval.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }

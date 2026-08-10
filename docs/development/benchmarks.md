@@ -4,6 +4,55 @@ MCPLS keeps deterministic in-process benchmarks separate from language-server
 system measurements. This prevents an improvement in one layer from hiding a
 regression in another.
 
+## No-reread evaluation
+
+`benchmarks/no-reread-corpus.json` contains scrubbed query shapes for workspace
+lookup, a large bounded outline, definition/hover, handle follow-ups,
+references/call hierarchy, diagnostics, structured results, and
+`inspect_symbol`. It contains fixture-relative identifiers and assertion names,
+not user prompts, chat prose, home paths, or proprietary source. The ordinary
+`mcpls-bench` tests validate that privacy and coverage contract:
+
+```sh
+cargo nextest run -p mcpls-bench no_reread
+```
+
+The ignored real-server lane executes the same corpus against the checked-in
+Rust fixture and verifies exact-first ranking, declaration source, coherent
+paths/ranges, byte/item limits, and complete highlighted code:
+
+```sh
+cargo build -p mcpls
+MCPLS_RA_FILTER=sc_no_reread_corpus \
+  cargo nextest run -p mcpls-core --test ra_e2e --run-ignored all \
+  -E 'test(/ra_e2e_suite/)'
+```
+
+For a repeatable agent/task evaluation, aggregate local Codex histories without
+copying or exporting them:
+
+```sh
+cargo run -p mcpls-bench --bin no-reread-eval -- \
+  --history ~/.codex/sessions \
+  --output target/benchmarks/no-reread-history.json
+```
+
+The evaluator reads histories locally and emits only counts grouped by MCPLS
+tool. It ignores messages and prompts, reduces paths to a `src/...` suffix or
+basename, and never emits commands, result bodies, or source. Its adjacency
+classifier reports post-semantic same-file reads and pre-coordinate source
+reads as exact numerator/denominator rates, plus total result bytes and latency,
+and truncation, unsupported, and error rates. These are workflow heuristics,
+not a model-quality score; model selection remains outside required CI.
+
+To evaluate another instrumented runner, serialize its scrubbed events as a JSON
+array of `semantic` and `source_read` records and replace `--history` with
+`--trace`. `benchmarks/no-reread-baseline.json` preserves the original
+privacy-safe history counts and a target for every result-enrichment ticket.
+Compare like-for-like agent, model, repository fixture, and task corpus runs;
+tool-only fixture success is necessary quality evidence but is not evidence that
+an agent stopped rereading files.
+
 ## Gungraun hot paths
 
 Enter the repository's pinned development shell and run:
