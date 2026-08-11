@@ -1046,6 +1046,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
     fallback_profile("linker-script", &["**/*.ld", "**/*.lds"]),
     fallback_profile("nu", &["**/*.nu"]),
     fallback_profile("lisp", &["**/*.lisp", "**/*.lsp", "**/*.cl"]),
+    fallback_profile("lispbm", &["**/*.lispbm"]),
     fallback_profile("expect", &["**/*.exp"]),
 ];
 
@@ -1712,6 +1713,7 @@ mod tests {
             "lean",
             "linker-script",
             "lisp",
+            "lispbm",
             "luau",
             "matlab",
             "msl",
