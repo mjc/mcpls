@@ -428,7 +428,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         ],
         &["**/*.py"],
         &[
-            candidate("ty", &["server"], BuiltinProfileStability::Experimental),
+            candidate("ty", &["server"], BuiltinProfileStability::Stable),
             candidate(
                 "pyright-langserver",
                 &["--stdio"],
@@ -443,7 +443,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &["package.json", "tsconfig.json", "jsconfig.json"],
         &["**/*.ts", "**/*.tsx"],
         &[
-            candidate("vtsls", &["--stdio"], BuiltinProfileStability::Experimental),
+            candidate("vtsls", &["--stdio"], BuiltinProfileStability::Stable),
             candidate(
                 "typescript-language-server",
                 &["--stdio"],
@@ -566,7 +566,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &["rebar.config", "erlang.mk", "mix.exs"],
         &["**/*.erl", "**/*.hrl", "**/*.yrl"],
         &[
-            candidate("elp", &["lsp"], BuiltinProfileStability::Experimental),
+            candidate("elp", &["server"], BuiltinProfileStability::Stable),
             candidate("erlang_ls", &[], BuiltinProfileStability::Stable),
         ],
         &[],
@@ -782,11 +782,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &["**/*.xml", "**/*.plist"],
         &["pom.xml", "Info.plist", "project.pbxproj"],
         &[],
-        &[candidate(
-            "lemminx-linux-x86_64",
-            &[],
-            BuiltinProfileStability::Experimental,
-        )],
+        &[candidate("lemminx", &[], BuiltinProfileStability::Stable)],
         &[],
     ),
     profile(
@@ -829,7 +825,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &[candidate(
             "neocmakelsp",
             &["stdio"],
-            BuiltinProfileStability::Experimental,
+            BuiltinProfileStability::Stable,
         )],
         &[],
     ),
@@ -909,7 +905,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &[candidate(
             "autotools-language-server",
             &[],
-            BuiltinProfileStability::Experimental,
+            BuiltinProfileStability::Stable,
         )],
         &[],
     ),
@@ -1052,11 +1048,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &["**/*.dts", "**/*.dtsi", "**/*.dtso", "**/*.overlay"],
         &["Kconfig", "Makefile", "meson.build"],
         &["**/*.dts", "**/*.dtsi", "**/*.dtso", "**/*.overlay"],
-        &[candidate(
-            "dts-lsp",
-            &[],
-            BuiltinProfileStability::Experimental,
-        )],
+        &[candidate("dts-lsp", &[], BuiltinProfileStability::Stable)],
         &[],
     ),
     profile(
@@ -1076,11 +1068,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &["**/*.f", "**/*.f90", "**/*.f95", "**/*.f03"],
         &["fpm.toml", "CMakeLists.txt"],
         &["**/*.f", "**/*.f90", "**/*.f95", "**/*.f03"],
-        &[candidate(
-            "fortls",
-            &[],
-            BuiltinProfileStability::Experimental,
-        )],
+        &[candidate("fortls", &[], BuiltinProfileStability::Stable)],
         &[],
     ),
     profile(
@@ -1407,12 +1395,55 @@ impl LspServerConfig {
         config
     }
 
+    /// Create the preferred default configuration for ty.
+    #[must_use]
+    pub fn ty() -> Self {
+        let mut config = Self::builtin(
+            "python",
+            "ty",
+            &["server"],
+            &["**/*.py"],
+            [
+                "pyproject.toml",
+                "setup.py",
+                "requirements.txt",
+                "pyrightconfig.json",
+            ],
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns.push("**/*.py".to_string());
+        }
+        config
+    }
+
     /// Create a default configuration for TypeScript language server.
     #[must_use]
     pub fn typescript() -> Self {
         let mut config = Self::builtin(
             "typescript",
             "typescript-language-server",
+            &["--stdio"],
+            &["**/*.ts", "**/*.tsx"],
+            ["package.json", "tsconfig.json", "jsconfig.json"],
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns = vec!["**/*.ts".to_string(), "**/*.tsx".to_string()];
+            heuristics.excluded_directories = vec![
+                "node_modules".to_string(),
+                "dist".to_string(),
+                "build".to_string(),
+            ];
+            heuristics.content_exclusions = vec![SourceContentExclusion::QtTranslationXml];
+        }
+        config
+    }
+
+    /// Create the preferred default configuration for vtsls.
+    #[must_use]
+    pub fn vtsls() -> Self {
+        let mut config = Self::builtin(
+            "typescript",
+            "vtsls",
             &["--stdio"],
             &["**/*.ts", "**/*.tsx"],
             ["package.json", "tsconfig.json", "jsconfig.json"],
@@ -1539,8 +1570,8 @@ impl LspServerConfig {
 pub fn builtin_server_configs() -> Vec<LspServerConfig> {
     let mut configs = vec![
         LspServerConfig::rust_analyzer(),
-        LspServerConfig::pyright(),
-        LspServerConfig::typescript(),
+        LspServerConfig::ty(),
+        LspServerConfig::vtsls(),
         LspServerConfig::gopls(),
         LspServerConfig::clangd(),
         LspServerConfig::zls(),
@@ -2038,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    fn test_experimental_profile_commands_use_lsp_stdio_modes() {
+    fn test_builtin_profile_commands_use_lsp_stdio_modes_and_smoked_erlang_default() {
         let fortls = builtin_language_profiles()
             .iter()
             .find(|profile| profile.language_id == "fortran")
@@ -2057,6 +2088,76 @@ mod tests {
         assert!(neocmakelsp.candidates.iter().any(|candidate| {
             candidate.command == "neocmakelsp" && candidate.args == ["stdio"]
         }));
+
+        let erlang = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "erlang")
+            .unwrap();
+        assert_eq!(
+            erlang.candidates[0].stability,
+            BuiltinProfileStability::Stable
+        );
+        assert!(
+            erlang
+                .candidates
+                .iter()
+                .any(|candidate| candidate.command == "elp" && candidate.args == ["server"])
+        );
+        let default = builtin_server_configs()
+            .into_iter()
+            .find(|config| config.language_id == "erlang")
+            .unwrap();
+        assert_eq!(default.command, "elp");
+        assert_eq!(default.args, vec!["server"]);
+
+        let python = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "python")
+            .unwrap();
+        assert_eq!(
+            python.candidates[0].stability,
+            BuiltinProfileStability::Stable
+        );
+        let default = builtin_server_configs()
+            .into_iter()
+            .find(|config| config.language_id == "python")
+            .unwrap();
+        assert_eq!(default.command, "ty");
+        assert_eq!(default.args, vec!["server"]);
+
+        let typescript = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "typescript")
+            .unwrap();
+        assert_eq!(
+            typescript.candidates[0].stability,
+            BuiltinProfileStability::Stable
+        );
+        let default = builtin_server_configs()
+            .into_iter()
+            .find(|config| config.language_id == "typescript")
+            .unwrap();
+        assert_eq!(default.command, "vtsls");
+        assert_eq!(default.args, vec!["--stdio"]);
+
+        for language_id in ["fortran", "cmake", "device-tree", "autotools"] {
+            let profile = builtin_language_profiles()
+                .iter()
+                .find(|profile| profile.language_id == language_id)
+                .unwrap();
+            assert_eq!(
+                profile.candidates[0].stability,
+                BuiltinProfileStability::Stable,
+                "{language_id} was not promoted after capability smoke"
+            );
+        }
+
+        let xml = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "xml")
+            .unwrap();
+        assert_eq!(xml.candidates[0].command, "lemminx");
+        assert_eq!(xml.candidates[0].stability, BuiltinProfileStability::Stable);
     }
 
     #[test]

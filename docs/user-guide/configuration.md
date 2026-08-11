@@ -345,11 +345,13 @@ excluded_directories = ["fixtures", "generated"]
 content_exclusions = ["qt_translation_xml"]
 ```
 
-Candidate definitions are ordered in the built-in profile. Selecting a
-different candidate is an intentional `command`/`args` override (for example,
-`ty` with `args = ["server"]` instead of Pyright); mcpls does not silently
-promote experimental candidates. A supported profile also does not imply that
-mcpls installs or bundles the executable.
+Candidate definitions are ordered in the built-in profile. The shipped stable
+defaults include the capability-smoked `ty`, `vtsls`, ELP, LemMinX, fortls,
+neocmakelsp, and dts-lsp candidates; Pyright and
+`typescript-language-server` remain explicit fallbacks. Selecting another
+candidate is still an intentional `command`/`args` override, and mcpls does
+not silently promote candidates that remain experimental. A supported profile
+also does not imply that mcpls installs or bundles the executable.
 
 Specialist profiles (such as Vue, Angular, QML, and Ansible) carry explicit
 precedence metadata so they can supersede generic TypeScript, HTML, or YAML
