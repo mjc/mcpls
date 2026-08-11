@@ -41,7 +41,7 @@ pub enum Transport {
     /// by MCP clients that launch mcpls as a child process.
     Stdio,
 
-    /// Streamable HTTP transport (MCP spec 2025-11-25).
+    /// Streamable HTTP transport (MCP spec 2026-07-28; 2025-11-25 remains supported).
     ///
     /// Binds a TCP listener and serves the MCP protocol over HTTP, enabling
     /// network-accessible deployments and clients that speak HTTP rather than
@@ -426,7 +426,7 @@ pub(crate) async fn run_stdio(
     }
 }
 
-/// Run the MCP server over Streamable HTTP (MCP spec 2025-11-25).
+/// Run the MCP server over Streamable HTTP (MCP spec 2026-07-28; 2025-11-25 remains supported).
 ///
 /// Binds `cfg.bind`, mounts the MCP service at `cfg.path` (and `/`), and
 /// serves until `Ctrl-C` or `SIGTERM` is received.

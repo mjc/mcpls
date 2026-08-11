@@ -74,6 +74,31 @@ cargo install --path crates/mcpls-cli
 
 </details>
 
+## MCP protocol and transports
+
+MCPLS prefers the MCP `2026-07-28` stateless lifecycle. Clients should use
+`server/discover`, then self-describing requests carrying required request
+metadata and HTTP routing headers:
+
+```bash
+curl -sS http://127.0.0.1:3000/mcp \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/list' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+Use `Mcp-Name` for tool names and resource URIs. `ttlMs`/`cacheScope` cache
+hints are dynamic; diagnostic resources are private, so recover with
+`resources/read` after reconnect. Long-lived updates use
+`subscriptions/listen`; cancellation closes the stream and clients can poll
+authoritative state. `2025-11-25` and the legacy `initialize` /
+`resources/subscribe` flow remain supported for compatibility, but new clients
+should target `2026-07-28`. HTTP is loopback-only; use an authenticated reverse
+proxy for network access. Stateless request and concurrent-session limits are
+configurable through `HttpConfig`.
+
 <details>
 <summary><strong>Prerequisites (language servers)</strong></summary>
 

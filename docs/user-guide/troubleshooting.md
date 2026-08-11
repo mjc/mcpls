@@ -136,11 +136,21 @@ which mcpls
 
 **Test manually**:
 ```bash
-# Test mcpls stdio communication
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' | mcpls
+# Test preferred 2026-07-28 stateless stdio communication
+echo '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | mcpls
 ```
 
-Expected output should include:
+Expected output should include a self-describing discovery result. The older
+`initialize` handshake is an MCP compatibility path; occurrences of
+`initialize` elsewhere in this guide refer to the separate downstream LSP
+startup handshake.
+
+For HTTP requests, send `MCP-Protocol-Version`, `Mcp-Method`, and (for tools or
+resources) `Mcp-Name`, plus matching request `_meta` fields. Missing or
+mismatched metadata is rejected with HTTP 400. Keep MCPLS on loopback and put
+an authenticated reverse proxy in front of it for network access.
+
+Legacy example:
 ```json
 {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",...}}
 ```
@@ -744,8 +754,8 @@ rust-analyzer
 
 Test mcpls MCP implementation:
 ```bash
-# Send MCP initialize
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' | mcpls
+# Send preferred stateless discovery
+echo '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | mcpls
 
 # List tools
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | mcpls
@@ -774,8 +784,11 @@ tcpdump -i lo0 -A port 3000
 
 # Test MCP over HTTP with curl
 curl -X POST http://127.0.0.1:3000/mcp \
+  -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}'
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
 ---

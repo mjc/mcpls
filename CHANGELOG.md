@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **MCP 2026-07-28 migration guidance and conformance coverage** — document
+  stateless discovery, required request metadata, Streamable HTTP routing,
+  cache hints, subscriptions/listen recovery, legacy compatibility, and the
+  loopback reverse-proxy boundary. The HTTP matrix uses MCPLS-owned raw JSON-RPC
+  assertions; the chunked decoder now recognizes standard transfer-encoding
+  headers. SDK-provided lifecycle behavior remains unchanged.
 - **Built-in Nix and Linux/macOS Swift language-server profiles** — add marker-gated `nixd` and `sourcekit-lsp` defaults on platforms supported by the Swift toolchain; add Nix to the default extension map so ast-grep fallback recognizes `.nix` files.
 
 ## [0.3.9] - 2026-08-05

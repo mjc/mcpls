@@ -452,11 +452,13 @@ mcpls --version
 # Check help
 mcpls --help
 
-# Test with initialize request (manual test)
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | mcpls
+# Preferred 2026-07-28 stateless discovery over stdio
+echo '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | mcpls
 ```
 
-Expected output should be a JSON response with `"method":"initialize"` result.
+Expected output is a self-describing discovery result. The older `initialize`
+handshake remains supported for clients using the `2025-11-25` compatibility
+flow.
 
 ## Troubleshooting
 
