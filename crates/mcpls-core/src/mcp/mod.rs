@@ -4,10 +4,12 @@
 //! to AI agents.
 
 mod handlers;
+mod instrumentation;
 mod server;
 mod session;
 mod tools;
 
+pub(crate) use instrumentation::InstrumentedServer;
 pub use server::McplsServer;
 pub use tools::{
     CallHierarchyCallsParams, CallHierarchyPrepareParams, CodeActionApplyParams,

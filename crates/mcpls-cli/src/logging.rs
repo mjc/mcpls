@@ -1,8 +1,13 @@
 //! Logging initialization and configuration.
 
 use anyhow::{Context, Result};
+use opentelemetry::global;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
+
+static OTEL_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
 
 /// Initialize the logging subsystem.
 ///
@@ -20,38 +25,88 @@ pub fn init(level: &str, log_json: bool) -> Result<()> {
         .or_else(|_| EnvFilter::try_new("info"))
         .context("failed to parse log level")?;
 
-    // Use stderr for logs so stdout remains clean for MCP protocol
-    let registry = tracing_subscriber::registry().with(filter);
+    let tracer = build_otel_tracer()?;
 
+    // Use stderr for logs so stdout remains clean for MCP protocol
     if log_json {
-        registry
-            .with(
-                fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_target(true)
-                    .with_thread_ids(false)
-                    .with_file(false)
-                    .with_line_number(false)
-                    .json(),
-            )
-            .try_init()
-            .ok(); // Ignore if already initialized
+        let layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_line_number(false)
+            .json();
+        if let Some(tracer) = tracer {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .try_init()
+                .ok();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .try_init()
+                .ok();
+        }
     } else {
-        registry
-            .with(
-                fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_target(true)
-                    .with_thread_ids(false)
-                    .with_file(false)
-                    .with_line_number(false)
-                    .compact(),
-            )
-            .try_init()
-            .ok(); // Ignore if already initialized
+        let layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_line_number(false)
+            .compact();
+        if let Some(tracer) = tracer {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .try_init()
+                .ok();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .try_init()
+                .ok();
+        }
     }
 
     Ok(())
+}
+
+fn build_otel_tracer() -> Result<Option<opentelemetry_sdk::trace::Tracer>> {
+    let enabled = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some();
+    if !enabled {
+        return Ok(None);
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Ok(None);
+    }
+    if let Some(provider) = OTEL_PROVIDER.get() {
+        return Ok(Some(provider.tracer("mcpls")));
+    }
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .context("failed to configure OTLP trace exporter")?;
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .build();
+    let tracer = provider.tracer("mcpls");
+    global::set_tracer_provider(provider.clone());
+    let _ = OTEL_PROVIDER.set(provider);
+    Ok(Some(tracer))
+}
+
+pub fn shutdown() {
+    if let Some(provider) = OTEL_PROVIDER.get() {
+        let _ = provider.shutdown();
+    }
 }
 
 #[cfg(test)]

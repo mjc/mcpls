@@ -43,6 +43,7 @@ async fn main() {
     // finished. `process::exit` terminates immediately, bypassing that wait
     // -- safe here because everything that matters has already completed
     // above. See #308.
+    logging::shutdown();
     std::process::exit(exit_code);
 }
 

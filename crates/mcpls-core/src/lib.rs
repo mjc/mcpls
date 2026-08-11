@@ -270,7 +270,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let result = match transport {
         Transport::Stdio => {
             info!("Listening for MCP requests on stdio...");
-            run_stdio(mcp_server, &peer_cell, transport::ShutdownSignal::new()).await
+            run_stdio(
+                mcp::InstrumentedServer::new(mcp_server, "stdio"),
+                &peer_cell,
+                transport::ShutdownSignal::new(),
+            )
+            .await
         }
         #[cfg(feature = "transport-http")]
         Transport::Http(cfg) => run_http(mcp_server, cfg, transport::ShutdownSignal::new()).await,

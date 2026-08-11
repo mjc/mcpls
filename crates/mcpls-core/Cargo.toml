@@ -22,9 +22,11 @@ globset = { workspace = true }
 ignore = { workspace = true }
 lsp-types = { workspace = true }
 notify = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
 axum = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true, features = ["rt"] }
+tokio-util = { workspace = true, features = ["rt"] }
 schemars = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -34,6 +36,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
@@ -59,7 +62,6 @@ bench = []
 transport-http = [
     "rmcp/transport-streamable-http-server",
     "dep:axum",
-    "dep:tokio-util",
 ]
 
 [lints]

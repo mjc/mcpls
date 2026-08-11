@@ -234,7 +234,6 @@ impl HttpConfig {
     }
 }
 
-use rmcp::ServiceExt as _;
 #[cfg(feature = "transport-http")]
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 #[cfg(feature = "transport-http")]
@@ -398,12 +397,12 @@ impl ShutdownSignal {
 /// or an uncancellable `tokio::io::stdin()` blocking thread can stall
 /// runtime shutdown indefinitely (see `mcpls-cli`'s `main.rs` and #308).
 pub(crate) async fn run_stdio(
-    mcp_server: crate::mcp::McplsServer,
+    mcp_server: crate::mcp::InstrumentedServer<crate::mcp::McplsServer>,
     peer_cell: &tokio::sync::OnceCell<rmcp::Peer<rmcp::RoleServer>>,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
     let service = tokio::select! {
-        result = mcp_server.serve(rmcp::transport::stdio()) => {
+        result = rmcp::ServiceExt::serve(mcp_server, rmcp::transport::stdio()) => {
             result.map_err(|e| crate::Error::McpServer(format!("Failed to start MCP server: {e}")))?
         }
         () = shutdown_signal.recv() => {
@@ -483,7 +482,7 @@ pub(crate) async fn run_http(
     let request_limit = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_sessions));
     let cancel = CancellationToken::new();
 
-    let mcp_for_factory = mcp_server;
+    let mcp_for_factory = crate::mcp::InstrumentedServer::new(mcp_server, "http");
     // StreamableHttpServerConfig is #[non_exhaustive]; construct via Default then mutate.
     let mut http_cfg = StreamableHttpServerConfig::default();
     http_cfg.cancellation_token = cancel.clone();
@@ -837,7 +836,11 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::run_stdio(server, &peer_cell, super::ShutdownSignal::new()),
+            super::run_stdio(
+                crate::mcp::InstrumentedServer::new(server, "stdio"),
+                &peer_cell,
+                super::ShutdownSignal::new(),
+            ),
         )
         .await;
 
