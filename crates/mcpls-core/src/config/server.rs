@@ -2006,6 +2006,38 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_profiles_have_complete_typed_metadata() {
+        for profile in builtin_language_profiles() {
+            assert!(!profile.language_id.is_empty());
+            assert!(
+                !profile.file_patterns.is_empty(),
+                "{} has no file patterns",
+                profile.language_id
+            );
+            assert!(
+                !profile.platforms.is_empty(),
+                "{} has no platform gate",
+                profile.language_id
+            );
+            for candidate in profile.candidates {
+                assert!(
+                    !candidate.command.is_empty(),
+                    "{} has an empty candidate",
+                    profile.language_id
+                );
+            }
+            assert!(
+                profile
+                    .supersedes
+                    .iter()
+                    .all(|language| !language.eq_ignore_ascii_case(profile.language_id)),
+                "{} supersedes itself",
+                profile.language_id
+            );
+        }
+    }
+
+    #[test]
     fn test_markerless_openscad_profile_is_source_gated() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("model.scad"), "cube(1);\n").unwrap();
