@@ -16,9 +16,9 @@ pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
-    BuiltinLanguageProfile, BuiltinProfileStability, BuiltinServerCandidate,
+    BuiltinLanguageProfile, BuiltinPlatform, BuiltinProfileStability, BuiltinServerCandidate,
     DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
-    builtin_language_profiles, builtin_server_configs,
+    SourceContentExclusion, builtin_language_profiles, builtin_server_configs,
 };
 
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
@@ -624,6 +624,17 @@ impl ServerConfig {
         for server in &self.lsp_servers {
             for pattern in &server.file_patterns {
                 if let Some(ext) = extract_extension_from_pattern(pattern) {
+                    if server
+                        .builtin_profile()
+                        .is_some_and(|profile| !profile.supersedes.is_empty())
+                        && map.contains_key(&ext)
+                    {
+                        // Specialist profiles are activated by project
+                        // markers, not by globally reclassifying every file
+                        // with an ambiguous extension (for example, all
+                        // YAML as Ansible or all TypeScript as Angular).
+                        continue;
+                    }
                     let language_id = language_id_for_pattern_extension(&server.language_id, &ext);
                     map.insert(ext, language_id);
                 }
@@ -1851,6 +1862,18 @@ mod tests {
             workspace.get_language_for_extension("cpp"),
             Some("cpp".to_string())
         );
+    }
+
+    #[test]
+    fn test_specialist_profiles_do_not_globally_reclassify_ambiguous_extensions() {
+        let config = ServerConfig::default();
+        let map = config.build_effective_extension_map();
+
+        assert_eq!(map.get("ts"), Some(&"typescript".to_string()));
+        assert_eq!(map.get("yaml"), Some(&"yaml".to_string()));
+        assert_eq!(map.get("yml"), Some(&"yaml".to_string()));
+        assert_eq!(map.get("qml"), Some(&"qml".to_string()));
+        assert_eq!(map.get("vue"), Some(&"vue".to_string()));
     }
 
     #[test]

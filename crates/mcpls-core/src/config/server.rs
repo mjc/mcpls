@@ -1,6 +1,7 @@
 //! LSP server configuration types.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -64,6 +65,10 @@ pub struct ServerHeuristics {
     /// Additional directory names excluded from recursive source detection.
     #[serde(default)]
     pub excluded_directories: Vec<String>,
+
+    /// Content-level exclusions for ambiguous source extensions.
+    #[serde(default)]
+    pub content_exclusions: Vec<SourceContentExclusion>,
 }
 
 impl ServerHeuristics {
@@ -78,6 +83,7 @@ impl ServerHeuristics {
             project_markers: markers.into_iter().map(Into::into).collect(),
             source_patterns: Vec::new(),
             excluded_directories: Vec::new(),
+            content_exclusions: Vec::new(),
         }
     }
 
@@ -103,11 +109,22 @@ impl ServerHeuristics {
         self
     }
 
-    /// Check if any marker exists at the given workspace root.
+    /// Add content predicates that exclude ambiguous source files.
+    #[must_use]
+    pub fn with_content_exclusions(
+        mut self,
+        exclusions: impl IntoIterator<Item = SourceContentExclusion>,
+    ) -> Self {
+        self.content_exclusions = exclusions.into_iter().collect();
+        self
+    }
+
+    /// Check if any configured marker or source predicate matches the workspace.
     ///
     /// Returns `true` if:
-    /// - No markers are defined (empty = always applicable)
-    /// - At least one marker file/directory exists
+    /// - No markers or source patterns are defined (empty = always applicable)
+    /// - At least one marker exists, or a source file matches the configured
+    ///   predicates
     #[must_use]
     pub fn is_applicable(&self, workspace_root: &Path) -> bool {
         if self.project_markers.is_empty() && self.source_patterns.is_empty() {
@@ -116,7 +133,7 @@ impl ServerHeuristics {
         !self.matching_roots(workspace_root, None).is_empty()
     }
 
-    /// Check if any marker exists anywhere in the workspace tree.
+    /// Check if any marker or source predicate matches anywhere in the workspace tree.
     ///
     /// Recursively searches the workspace for project markers, excluding
     /// well-known directories like `node_modules`, `target`, `.git`, etc.
@@ -149,7 +166,10 @@ impl ServerHeuristics {
             .project_markers
             .iter()
             .any(|marker| workspace_root.join(marker).exists());
-        if (self.project_markers.is_empty() && self.source_patterns.is_empty()) || marker_at_root {
+        if self.project_markers.is_empty() && self.source_patterns.is_empty() {
+            return vec![workspace_root.to_path_buf()];
+        }
+        if self.source_patterns.is_empty() && marker_at_root {
             return vec![workspace_root.to_path_buf()];
         }
 
@@ -182,14 +202,18 @@ impl ServerHeuristics {
             .filter_map(|entry| {
                 let path = entry.path();
                 let file_name = path.file_name()?.to_str()?;
-                let marker_match = self
-                    .project_markers
-                    .iter()
-                    .any(|marker| marker == file_name);
+                let marker_match = self.content_exclusions.is_empty()
+                    && self
+                        .project_markers
+                        .iter()
+                        .any(|marker| marker == file_name);
                 let source_match = source_patterns.as_ref().is_some_and(|patterns| {
                     path.strip_prefix(workspace_root)
                         .ok()
-                        .is_some_and(|relative| patterns.is_match(relative))
+                        .is_some_and(|relative| {
+                            patterns.is_match(relative)
+                                && !content_excluded(path, &self.content_exclusions)
+                        })
                 });
                 (marker_match || source_match)
                     .then_some(path)
@@ -201,6 +225,34 @@ impl ServerHeuristics {
         roots.dedup();
         roots
     }
+}
+
+/// Content-level guards used by profiles with ambiguous file extensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceContentExclusion {
+    /// Qt Linguist translation XML stored in a `.ts` file.
+    QtTranslationXml,
+}
+
+fn content_excluded(path: &Path, exclusions: &[SourceContentExclusion]) -> bool {
+    exclusions.iter().any(|exclusion| match exclusion {
+        SourceContentExclusion::QtTranslationXml => {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"))
+                && is_qt_translation_xml(path)
+        }
+    })
+}
+
+fn is_qt_translation_xml(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut sample = String::new();
+    file.take(8 * 1024).read_to_string(&mut sample).is_ok()
+        && sample.trim_start().starts_with("<?xml")
+        && sample.contains("<TS")
 }
 
 fn source_glob_set(patterns: &[String]) -> Option<GlobSet> {
@@ -229,6 +281,30 @@ pub enum BuiltinProfileStability {
     FallbackOnly,
 }
 
+/// Host platforms on which a built-in profile may be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinPlatform {
+    /// Any supported host platform.
+    Any,
+    /// Linux hosts.
+    Linux,
+    /// macOS hosts.
+    Macos,
+    /// Windows hosts.
+    Windows,
+}
+
+impl BuiltinPlatform {
+    const fn is_supported(self) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Linux => cfg!(target_os = "linux"),
+            Self::Macos => cfg!(target_os = "macos"),
+            Self::Windows => cfg!(target_os = "windows"),
+        }
+    }
+}
+
 /// One ordered command candidate for a built-in profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinServerCandidate {
@@ -253,6 +329,12 @@ pub struct BuiltinLanguageProfile {
     pub source_patterns: &'static [&'static str],
     /// Ordered executable candidates.
     pub candidates: &'static [BuiltinServerCandidate],
+    /// Host platform gates for this profile.
+    pub platforms: &'static [BuiltinPlatform],
+    /// Profile-specific directory exclusions.
+    pub excluded_directories: &'static [&'static str],
+    /// Content predicates used to disambiguate source files.
+    pub content_exclusions: &'static [SourceContentExclusion],
     /// Profile language IDs superseded when this profile applies.
     pub supersedes: &'static [&'static str],
 }
@@ -277,12 +359,40 @@ const fn profile(
     candidates: &'static [BuiltinServerCandidate],
     supersedes: &'static [&'static str],
 ) -> BuiltinLanguageProfile {
+    profile_with_options(
+        language_id,
+        file_patterns,
+        project_markers,
+        source_patterns,
+        candidates,
+        &[BuiltinPlatform::Any],
+        &[],
+        &[],
+        supersedes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn profile_with_options(
+    language_id: &'static str,
+    file_patterns: &'static [&'static str],
+    project_markers: &'static [&'static str],
+    source_patterns: &'static [&'static str],
+    candidates: &'static [BuiltinServerCandidate],
+    platforms: &'static [BuiltinPlatform],
+    excluded_directories: &'static [&'static str],
+    content_exclusions: &'static [SourceContentExclusion],
+    supersedes: &'static [&'static str],
+) -> BuiltinLanguageProfile {
     BuiltinLanguageProfile {
         language_id,
         file_patterns,
         project_markers,
         source_patterns,
         candidates,
+        platforms,
+        excluded_directories,
+        content_exclusions,
         supersedes,
     }
 }
@@ -327,11 +437,11 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         ],
         &[],
     ),
-    profile(
+    profile_with_options(
         "typescript",
         &["**/*.ts", "**/*.tsx"],
         &["package.json", "tsconfig.json", "jsconfig.json"],
-        &[],
+        &["**/*.ts", "**/*.tsx"],
         &[
             candidate("vtsls", &["--stdio"], BuiltinProfileStability::Experimental),
             candidate(
@@ -340,6 +450,9 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
                 BuiltinProfileStability::Stable,
             ),
         ],
+        &[BuiltinPlatform::Any],
+        &["node_modules", "dist", "build"],
+        &[SourceContentExclusion::QtTranslationXml],
         &[],
     ),
     profile(
@@ -483,7 +596,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &[candidate("clangd", &[], BuiltinProfileStability::Stable)],
         &[],
     ),
-    profile(
+    profile_with_options(
         "swift",
         &["**/*.swift"],
         &[
@@ -497,6 +610,9 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
             &[],
             BuiltinProfileStability::Stable,
         )],
+        &[BuiltinPlatform::Linux, BuiltinPlatform::Macos],
+        &["DerivedData", "build"],
+        &[],
         &[],
     ),
     profile(
@@ -1228,7 +1344,9 @@ impl LspServerConfig {
             request_timeout_seconds: default_request_timeout(),
             heuristics: Some(
                 ServerHeuristics::with_markers(profile.project_markers.iter().copied())
-                    .with_source_patterns(profile.source_patterns.iter().copied()),
+                    .with_source_patterns(profile.source_patterns.iter().copied())
+                    .with_excluded_directories(profile.excluded_directories.iter().copied())
+                    .with_content_exclusions(profile.content_exclusions.iter().copied()),
             ),
             name: None,
             handles: None,
@@ -1240,16 +1358,11 @@ impl LspServerConfig {
     pub fn builtin_profile(&self) -> Option<&'static BuiltinLanguageProfile> {
         builtin_language_profiles().iter().find(|profile| {
             profile.language_id == self.language_id
-                && profile
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.command == self.command)
-                && self.heuristics.as_ref().is_some_and(|heuristics| {
-                    heuristics
-                        .source_patterns
-                        .iter()
-                        .map(String::as_str)
-                        .eq(profile.source_patterns.iter().copied())
+                && profile.candidates.iter().any(|candidate| {
+                    candidate.command == self.command
+                        || Path::new(&self.command)
+                            .file_name()
+                            .is_some_and(|name| name == candidate.command)
                 })
         })
     }
@@ -1297,13 +1410,23 @@ impl LspServerConfig {
     /// Create a default configuration for TypeScript language server.
     #[must_use]
     pub fn typescript() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "typescript",
             "typescript-language-server",
             &["--stdio"],
             &["**/*.ts", "**/*.tsx"],
             ["package.json", "tsconfig.json", "jsconfig.json"],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns = vec!["**/*.ts".to_string(), "**/*.tsx".to_string()];
+            heuristics.excluded_directories = vec![
+                "node_modules".to_string(),
+                "dist".to_string(),
+                "build".to_string(),
+            ];
+            heuristics.content_exclusions = vec![SourceContentExclusion::QtTranslationXml];
+        }
+        config
     }
 
     /// Create a default configuration for gopls.
@@ -1427,6 +1550,14 @@ pub fn builtin_server_configs() -> Vec<LspServerConfig> {
     configs.push(LspServerConfig::sourcekit_lsp());
 
     for profile in builtin_language_profiles() {
+        if !profile
+            .platforms
+            .iter()
+            .copied()
+            .any(BuiltinPlatform::is_supported)
+        {
+            continue;
+        }
         if configs
             .iter()
             .any(|config| config.language_id == profile.language_id)
@@ -1646,6 +1777,90 @@ mod tests {
     }
 
     #[test]
+    fn test_typescript_content_guard_distinguishes_qt_translation_xml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("translations.ts"),
+            "<?xml version=\"1.0\"?><TS version=\"2.1\"></TS>\n",
+        )
+        .unwrap();
+
+        assert!(!LspServerConfig::typescript().should_spawn(tmp.path(), None));
+
+        std::fs::write(tmp.path().join("app.ts"), "export const answer = 42;\n").unwrap();
+        assert!(LspServerConfig::typescript().should_spawn(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_qml_source_is_not_claimed_by_typescript() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("main.qml"), "import QtQuick\nItem {}\n").unwrap();
+
+        let qml = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "qml")
+            .unwrap();
+        let qml_heuristics = ServerHeuristics::with_markers(qml.project_markers.iter().copied())
+            .with_source_patterns(qml.source_patterns.iter().copied());
+        assert!(qml_heuristics.is_applicable_recursive(tmp.path(), None));
+        assert!(!LspServerConfig::typescript().should_spawn(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_markerless_swift_and_openscad_source_detection() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("main.swift"), "print(\"hello\")\n").unwrap();
+        std::fs::write(tmp.path().join("part.scad"), "cube(1);\n").unwrap();
+
+        for language_id in ["swift", "openscad"] {
+            let profile = builtin_language_profiles()
+                .iter()
+                .find(|profile| profile.language_id == language_id)
+                .unwrap();
+            let heuristics =
+                ServerHeuristics::with_markers(profile.project_markers.iter().copied())
+                    .with_source_patterns(profile.source_patterns.iter().copied())
+                    .with_excluded_directories(profile.excluded_directories.iter().copied());
+            assert!(
+                heuristics.is_applicable_recursive(tmp.path(), None),
+                "{language_id} source presence should activate markerless project"
+            );
+        }
+    }
+
+    #[test]
+    fn test_monorepo_detection_returns_effective_language_roots() {
+        let tmp = TempDir::new().unwrap();
+        let frontend = tmp.path().join("frontend");
+        let backend = tmp.path().join("backend");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::create_dir_all(backend.join("src")).unwrap();
+        std::fs::write(frontend.join("package.json"), "{}\n").unwrap();
+        std::fs::write(frontend.join("app.ts"), "export const app = true;\n").unwrap();
+        std::fs::write(backend.join("Cargo.toml"), "[package]\nname=\"backend\"\n").unwrap();
+        std::fs::write(backend.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let typescript = LspServerConfig::typescript();
+        let rust = LspServerConfig::rust_analyzer();
+        assert_eq!(
+            typescript
+                .heuristics
+                .as_ref()
+                .unwrap()
+                .matching_roots(tmp.path(), None),
+            vec![frontend]
+        );
+        assert_eq!(
+            rust.heuristics
+                .as_ref()
+                .unwrap()
+                .matching_roots(tmp.path(), None),
+            vec![backend]
+        );
+    }
+
+    #[test]
     fn test_source_pattern_excludes_generated_tree() {
         let tmp = TempDir::new().unwrap();
         let generated = tmp.path().join("generated");
@@ -1671,6 +1886,33 @@ mod tests {
             .find(|profile| profile.language_id == "kconfig")
             .unwrap();
         assert!(fallback_only.candidates.is_empty());
+
+        let swift = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "swift")
+            .unwrap();
+        assert!(swift.platforms.contains(&BuiltinPlatform::Linux));
+        assert!(swift.platforms.contains(&BuiltinPlatform::Macos));
+        assert!(swift.excluded_directories.contains(&"DerivedData"));
+
+        let typescript = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "typescript")
+            .unwrap();
+        assert!(
+            typescript
+                .content_exclusions
+                .contains(&SourceContentExclusion::QtTranslationXml)
+        );
+    }
+
+    #[test]
+    fn test_builtin_override_without_heuristics_keeps_optional_fallback() {
+        let mut config = LspServerConfig::pyright();
+        config.heuristics = None;
+        config.command = "/definitely-missing/pyright-langserver".to_string();
+
+        assert!(config.is_optional_builtin_profile());
     }
 
     #[test]

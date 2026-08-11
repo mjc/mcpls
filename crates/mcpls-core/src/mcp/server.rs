@@ -5384,7 +5384,7 @@ while True:
         .unwrap();
         let mut translator = Translator::new();
         let mut config = crate::config::LspServerConfig::rust_analyzer();
-        config.command = "/definitely/missing/rust-analyzer".to_string();
+        config.command = "/definitely/missing/custom-rust-lsp".to_string();
         translator.set_lsp_configs(vec![config], Some(1));
         let template = translator.configuration_template();
         let subscriptions = Arc::new(ResourceSubscriptions::new());

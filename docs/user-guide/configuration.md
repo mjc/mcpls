@@ -317,13 +317,17 @@ excluded from source detection by default.
 The catalog is metadata, not a bundle: mcpls resolves each selected `command`
 from the project/dev-shell environment and skips an unavailable optional server
 without making the project unavailable. Ast-grep and text tools remain usable
-when no profile applies or no executable is installed.
+when no profile applies or no executable is installed. Platform-gated profiles
+(for example SourceKit-LSP) are only considered on supported hosts.
 
-Override one profile field by declaring a project or user `[[lsp_servers]]`
-entry with the same language and the desired command, arguments, markers, source
-patterns, initialization options, or exclusions. This replaces the matching
-server entry for that configuration; it does not require copying the rest of
-the built-in catalog. For example:
+For a project registration, override one profile by declaring an
+`[[lsp_servers]]` entry with the same language and the desired command,
+arguments, markers, source patterns, initialization options, or exclusions.
+The project override replaces only the matching built-in server and retains
+the rest of the catalog; an otherwise custom language is appended. In a
+standalone user config file, `[[lsp_servers]]` remains an explicit complete
+server list, so edit the generated default file if you want to keep every
+profile there. For example:
 
 ```toml
 [[lsp_servers]]
@@ -336,7 +340,16 @@ file_patterns = ["**/*.py"]
 project_markers = ["pyproject.toml", "ty.toml"]
 source_patterns = ["**/*.py"]
 excluded_directories = ["fixtures", "generated"]
+# Content guards are named values; for example, `qt_translation_xml` keeps
+# Qt Linguist `.ts` files out of the TypeScript profile.
+content_exclusions = ["qt_translation_xml"]
 ```
+
+Candidate definitions are ordered in the built-in profile. Selecting a
+different candidate is an intentional `command`/`args` override (for example,
+`ty` with `args = ["server"]` instead of Pyright); mcpls does not silently
+promote experimental candidates. A supported profile also does not imply that
+mcpls installs or bundles the executable.
 
 Specialist profiles (such as Vue, Angular, QML, and Ansible) carry explicit
 precedence metadata so they can supersede generic TypeScript, HTML, or YAML

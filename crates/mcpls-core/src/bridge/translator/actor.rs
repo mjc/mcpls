@@ -151,7 +151,16 @@ impl TranslatorTemplate {
     #[must_use]
     pub fn with_project_config(mut self, config: &ProjectConfig) -> Self {
         if let Some(lsp_servers) = &config.lsp_servers {
-            self.lsp_configs.clone_from(lsp_servers);
+            for override_config in lsp_servers {
+                if let Some(existing) = self.lsp_configs.iter_mut().find(|existing| {
+                    existing.id() == override_config.id()
+                        || existing.language_id == override_config.language_id
+                }) {
+                    existing.clone_from(override_config);
+                } else {
+                    self.lsp_configs.push(override_config.clone());
+                }
+            }
         }
         if let Some(max_depth) = config.heuristics_max_depth {
             self.heuristics_max_depth = Some(max_depth);
@@ -1025,6 +1034,51 @@ mod tests {
         let filtered = apply_builtin_precedence(&[typescript, angular]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].language_id, "angular");
+
+        let yaml = defaults
+            .iter()
+            .find(|config| config.language_id == "yaml")
+            .cloned()
+            .unwrap();
+        let ansible = defaults
+            .iter()
+            .find(|config| config.language_id == "ansible")
+            .cloned()
+            .unwrap();
+        let filtered = apply_builtin_precedence(&[yaml, ansible]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].language_id, "ansible");
+    }
+
+    #[test]
+    fn project_lsp_override_replaces_one_builtin_and_keeps_the_catalog() {
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(crate::config::builtin_server_configs(), Some(10));
+        let mut rust = LspServerConfig::rust_analyzer();
+        rust.args.push("--log-file=mcpls-test.log".to_string());
+
+        let merged = translator
+            .configuration_template()
+            .with_project_config(&ProjectConfig {
+                lsp_servers: Some(vec![rust]),
+                ..ProjectConfig::default()
+            });
+
+        assert!(
+            merged
+                .lsp_configs
+                .iter()
+                .any(|config| config.language_id == "python")
+        );
+        assert_eq!(
+            merged
+                .lsp_configs
+                .iter()
+                .find(|config| config.language_id == "rust")
+                .unwrap()
+                .args,
+            vec!["--log-file=mcpls-test.log"]
+        );
     }
 
     #[test]
@@ -1046,5 +1100,28 @@ mod tests {
                 .language_applies_to_root("rust", outer.path())
         );
         assert_eq!(effective, vec![nested]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_optional_builtin_keeps_project_structural_only() {
+        let root = TempDir::new().expect("temporary project");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname=\"fixture\"\n",
+        )
+        .expect("python marker");
+        std::fs::write(root.path().join("main.py"), "print('fallback')\n").expect("python source");
+
+        let mut config = LspServerConfig::pyright();
+        config.command = "/definitely-missing/pyright-langserver".to_string();
+        assert!(config.is_optional_builtin_profile());
+
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![config], Some(10));
+        let activation = translator
+            .activate_project(root.path().to_path_buf())
+            .await
+            .expect("missing optional server must not fail activation");
+        assert_eq!(activation.health(), ActivationHealth::StructuralOnly);
     }
 }
