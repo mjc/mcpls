@@ -1839,6 +1839,25 @@ mod tests {
     }
 
     #[test]
+    fn test_objective_c_m_files_require_project_context() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("script.m"),
+            "function y = f(x)\n y = x;\nend\n",
+        )
+        .unwrap();
+
+        let objective_c = builtin_server_configs()
+            .into_iter()
+            .find(|config| config.language_id == "objective-c")
+            .unwrap();
+        assert!(!objective_c.should_spawn(tmp.path(), None));
+
+        std::fs::write(tmp.path().join("compile_commands.json"), "[]\n").unwrap();
+        assert!(objective_c.should_spawn(tmp.path(), None));
+    }
+
+    #[test]
     fn test_markerless_swift_and_openscad_source_detection() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("main.swift"), "print(\"hello\")\n").unwrap();
