@@ -9,7 +9,7 @@ use lsp_types::{
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use super::Translator;
+use super::{ActiveLanguageAlias, Translator};
 use crate::bridge::notifications::RedactionPolicy;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std, uri_to_path};
 use crate::config::{
@@ -224,8 +224,9 @@ fn apply_builtin_precedence(configs: &[LspServerConfig]) -> Vec<LspServerConfig>
 fn active_builtin_aliases(
     configs: &[LspServerConfig],
     successful: &HashSet<ServerId>,
-) -> HashMap<String, String> {
-    let mut aliases = HashMap::new();
+    roots_by_id: &HashMap<ServerId, Vec<PathBuf>>,
+) -> Vec<ActiveLanguageAlias> {
+    let mut aliases = Vec::new();
     for specialist in configs {
         if !successful.contains(&specialist.id()) {
             continue;
@@ -245,7 +246,13 @@ fn active_builtin_aliases(
                         .any(|configured| configured == pattern)
                 })
         }) {
-            aliases.insert(generic.language_id.clone(), specialist.language_id.clone());
+            for root in roots_by_id.get(&specialist.id()).into_iter().flatten() {
+                aliases.push(ActiveLanguageAlias {
+                    root: root.clone(),
+                    language: generic.language_id.clone(),
+                    specialist: specialist.language_id.clone(),
+                });
+            }
         }
     }
     aliases
@@ -484,8 +491,12 @@ impl Translator {
             .collect::<Vec<_>>();
         if pending.is_empty() {
             let active_ids = lock_std(&self.lsp_servers).keys().cloned().collect();
-            lock_std(&self.active_language_aliases)
-                .clone_from(&active_builtin_aliases(&configs, &active_ids));
+            let active_roots = lock_std(&self.project_lsp_roots).clone();
+            lock_std(&self.active_language_aliases).clone_from(&active_builtin_aliases(
+                &configs,
+                &active_ids,
+                &active_roots,
+            ));
             self.set_workspace_roots(roots);
             return Ok(ProjectActivation::ready());
         }
@@ -612,8 +623,12 @@ impl Translator {
                 }
             }
         }
-        lock_std(&self.active_language_aliases)
-            .clone_from(&active_builtin_aliases(&configs, &successful));
+        let active_roots = lock_std(&self.project_lsp_roots).clone();
+        lock_std(&self.active_language_aliases).clone_from(&active_builtin_aliases(
+            &configs,
+            &successful,
+            &active_roots,
+        ));
         let diagnostics_routes = init_by_id
             .iter()
             .filter(|(id, config)| {
@@ -1114,11 +1129,22 @@ mod tests {
             ansible.clone(),
         ];
         let successful = HashSet::from([angular.id(), ansible.id()]);
+        let root = PathBuf::from("/workspace/frontend");
+        let roots = HashMap::from([
+            (angular.id(), vec![root.clone()]),
+            (ansible.id(), vec![PathBuf::from("/workspace/automation")]),
+        ]);
 
-        let aliases = active_builtin_aliases(&configs, &successful);
+        let aliases = active_builtin_aliases(&configs, &successful, &roots);
 
-        assert_eq!(aliases.get("typescript"), Some(&"angular".to_string()));
-        assert_eq!(aliases.get("yaml"), Some(&"ansible".to_string()));
+        assert!(aliases.iter().any(|alias| {
+            alias.root == root && alias.language == "typescript" && alias.specialist == "angular"
+        }));
+        assert!(
+            aliases
+                .iter()
+                .any(|alias| { alias.language == "yaml" && alias.specialist == "ansible" })
+        );
     }
 
     #[test]

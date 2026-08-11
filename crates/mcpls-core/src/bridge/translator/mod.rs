@@ -44,6 +44,13 @@ pub use actor::*;
 pub use dto::*;
 pub use semantic_edit::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ActiveLanguageAlias {
+    pub(super) root: PathBuf,
+    pub(super) language: String,
+    pub(super) specialist: String,
+}
+
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
 /// All fields use interior mutability so `Translator` can be shared via a
@@ -91,7 +98,7 @@ pub struct Translator {
     router: Arc<StdMutex<ToolRouter>>,
     /// Project-scoped aliases from generic language IDs to live specialist
     /// profiles (for example, TypeScript files routed through Angular).
-    active_language_aliases: Arc<StdMutex<HashMap<String, String>>>,
+    active_language_aliases: Arc<StdMutex<Vec<ActiveLanguageAlias>>>,
     /// Configs needed to respawn a server if its process dies later, keyed
     /// by routing identity. Populated once per server right after a
     /// successful spawn (see [`Self::register_server_config`]); the respawn
@@ -159,7 +166,7 @@ impl Translator {
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
-            active_language_aliases: Arc::new(StdMutex::new(HashMap::new())),
+            active_language_aliases: Arc::new(StdMutex::new(Vec::new())),
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),

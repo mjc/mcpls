@@ -101,9 +101,10 @@ impl Translator {
     ) -> Result<(ServerId, LspClient)> {
         let language = detect_language(path, &self.extension_map);
         let alias = lock_std(&self.active_language_aliases)
-            .get(&language)
-            .filter(|alias| alias.as_str() != language.as_str())
-            .cloned();
+            .iter()
+            .filter(|alias| alias.language == language && path.starts_with(&alias.root))
+            .max_by_key(|alias| alias.root.components().count())
+            .map(|alias| alias.specialist.clone());
         let mut candidates: Vec<&str> = alias.as_deref().into_iter().collect();
         candidates.push(language.as_str());
         if let Some(base) = base_language_id(&language) {
@@ -536,8 +537,11 @@ mod tests {
                     .unwrap(),
             ),
         );
-        lock_std(&translator.active_language_aliases)
-            .insert("typescript".to_string(), "angular".to_string());
+        lock_std(&translator.active_language_aliases).push(super::super::ActiveLanguageAlias {
+            root: temp_dir.path().to_path_buf(),
+            language: "typescript".to_string(),
+            specialist: "angular".to_string(),
+        });
 
         let (id, client) = translator
             .get_client_for_file(&test_file, ToolKind::Hover)
