@@ -296,6 +296,21 @@ pub struct EditPlan {
     estimated_bytes: usize,
 }
 
+/// Bounded metadata used to ask for approval without exposing plan contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditPlanApprovalSummary {
+    pub(crate) plan_id: PlanId,
+    pub(crate) project_id: String,
+    pub(crate) affected_files: Vec<PathBuf>,
+    pub(crate) operations: Vec<String>,
+    pub(crate) file_operations: Vec<FileOperation>,
+    pub(crate) diff_files: Vec<FileDiffSummary>,
+    pub(crate) diff_truncated: bool,
+    pub(crate) safe_to_apply: bool,
+    pub(crate) snapshot_hashes: Vec<String>,
+    pub(crate) versions: Vec<Option<i32>>,
+}
+
 impl EditPlan {
     /// Build a plan from exact snapshots and preview metadata.
     #[must_use]
@@ -432,6 +447,27 @@ impl EditPlan {
     #[must_use]
     pub const fn estimated_bytes(&self) -> usize {
         self.estimated_bytes
+    }
+
+    /// Return approval metadata without copying original or planned source.
+    #[must_use]
+    pub(crate) fn approval_summary(&self) -> EditPlanApprovalSummary {
+        EditPlanApprovalSummary {
+            plan_id: self.id.clone(),
+            project_id: self.project_id.clone(),
+            affected_files: self.files.iter().map(|file| file.path.clone()).collect(),
+            operations: self.operations.clone(),
+            file_operations: self.file_operations.clone(),
+            diff_files: self.diff_files.clone(),
+            diff_truncated: self.diff_truncated,
+            safe_to_apply: self.safe_to_apply,
+            snapshot_hashes: self
+                .files
+                .iter()
+                .map(|file| file.content_hash.clone())
+                .collect(),
+            versions: self.files.iter().map(|file| file.version).collect(),
+        }
     }
 }
 

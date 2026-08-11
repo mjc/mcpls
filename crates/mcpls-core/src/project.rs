@@ -1599,6 +1599,11 @@ enum ProjectRequest {
         project_id: String,
         reply: oneshot::Sender<Result<EditPlan, String>>,
     },
+    InspectEditPlan {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<crate::edit_plan::EditPlanApprovalSummary, String>>,
+    },
     ApplyEditPlan {
         plan_id: PlanId,
         project_id: String,
@@ -1844,6 +1849,7 @@ impl ProjectRequest {
             }
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
+            Self::InspectEditPlan { reply, .. } => reply.is_closed(),
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
@@ -3002,6 +3008,27 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Inspect one project-owned edit plan without consuming it.
+    pub(crate) async fn inspect_edit_plan(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<crate::edit_plan::EditPlanApprovalSummary, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::InspectEditPlan {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Consume and apply one project-owned workspace edit preview.
     ///
     /// # Errors
@@ -3994,6 +4021,17 @@ impl ProjectRuntime {
     fn take_edit_plan(&mut self, plan_id: &PlanId, project_id: &str) -> Result<EditPlan, String> {
         self.edit_plans
             .take_for_project(plan_id, project_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn inspect_edit_plan(
+        &self,
+        plan_id: &PlanId,
+        project_id: &str,
+    ) -> Result<crate::edit_plan::EditPlanApprovalSummary, String> {
+        self.edit_plans
+            .get_for_project(plan_id, project_id)
+            .map(EditPlan::approval_summary)
             .map_err(|error| error.to_string())
     }
 
@@ -6230,6 +6268,13 @@ async fn handle_project_request(
         } => {
             let _ = reply.send(runtime.take_edit_plan(&plan_id, &project_id));
         }
+        ProjectRequest::InspectEditPlan {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.inspect_edit_plan(&plan_id, &project_id));
+        }
         ProjectRequest::ApplyEditPlan {
             plan_id,
             project_id,
@@ -7884,6 +7929,19 @@ impl ProjectRegistry {
     ) -> Result<AppliedEditPlan, ProjectRegistryError> {
         self.apply_edit_plan_with_context(id, plan_id, None, None)
             .await
+    }
+
+    /// Inspect a project-owned edit plan without consuming it.
+    pub(crate) async fn inspect_edit_plan(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<crate::edit_plan::EditPlanApprovalSummary, ProjectRegistryError> {
+        self.actor(id)
+            .await?
+            .inspect_edit_plan(plan_id, id.as_str().to_string())
+            .await
+            .map_err(ProjectRegistryError::from)
     }
 
     /// Consume and apply a project-owned edit plan while recording audit context.

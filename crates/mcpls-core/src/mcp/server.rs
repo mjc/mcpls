@@ -10,22 +10,27 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::bridge::DocumentSymbolOptions;
-use rmcp::handler::server::tool::IntoCallToolResult;
+use rmcp::handler::server::tool::{
+    InputResponses as ToolInputResponses, IntoCallToolResult, RequestState, ToolCallContext,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CacheScope, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListResourcesResult, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, SubscriptionFilter,
-    UnsubscribeRequestParams,
+    CacheScope, CallToolResponse, CallToolResult, ContentBlock, ElicitRequest, ElicitRequestParams,
+    ElicitationSchema, Implementation, InputRequest, InputRequests, InputRequiredResult,
+    InputResponses, ListResourcesResult, MetaObject, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    SubscriptionFilter, UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use super::handlers::HandlerContext;
+use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
     SessionResource, event_resource_uris, parse_session_resource_uri, project_events_resource_uri,
     project_status_resource_uri,
@@ -52,6 +57,8 @@ use crate::bridge::{
     PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SupportedWorkspaceEdit,
     SymbolHandle,
 };
+use crate::edit_paths::FileOperation;
+use crate::edit_plan::EditPlanApprovalSummary;
 use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
 use crate::project::AppliedEditPlan;
@@ -381,6 +388,209 @@ fn applied_edit_plan_json(result: &AppliedEditPlan, project_id: &str) -> serde_j
         };
     }
     value
+}
+
+const MAX_APPROVAL_ITEMS: usize = 64;
+const MAX_APPROVAL_TEXT_BYTES: usize = 256;
+const APPROVAL_METHOD: &str = "tools/call";
+
+fn approval_arguments_digest(project_id: &str, plan_id: &PlanId) -> String {
+    let input = format!("{project_id}\0{}", plan_id.as_str());
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+fn approval_binding(
+    session_id: &str,
+    principal: Option<&str>,
+    tool_name: &str,
+    arguments_digest: &str,
+) -> Vec<u8> {
+    format!(
+        "mcpls-mrtr-v1\0{APPROVAL_METHOD}\0{tool_name}\0{session_id}\0{}\0{arguments_digest}",
+        principal.unwrap_or_default()
+    )
+    .into_bytes()
+}
+
+fn bounded_approval_text(value: &str) -> String {
+    crate::util::truncate_str(value, MAX_APPROVAL_TEXT_BYTES)
+}
+
+fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value {
+    let mut created_files = Vec::new();
+    let mut renamed_files = Vec::new();
+    let mut deleted_files = Vec::new();
+    let mut risk_flags = Vec::new();
+    for operation in summary.file_operations.iter().take(MAX_APPROVAL_ITEMS) {
+        match operation {
+            FileOperation::Create { path, .. } => {
+                created_files.push(bounded_approval_text(&path.display().to_string()));
+            }
+            FileOperation::Rename { from, to, .. } => {
+                renamed_files.push(serde_json::json!({
+                    "from": bounded_approval_text(&from.display().to_string()),
+                    "to": bounded_approval_text(&to.display().to_string()),
+                }));
+            }
+            FileOperation::Delete { path, .. } => {
+                deleted_files.push(bounded_approval_text(&path.display().to_string()));
+            }
+        }
+    }
+    if !created_files.is_empty() {
+        risk_flags.push("creates_files");
+    }
+    if !renamed_files.is_empty() {
+        risk_flags.push("renames_files");
+    }
+    if !deleted_files.is_empty() {
+        risk_flags.push("deletes_files");
+    }
+    if summary.diff_truncated {
+        risk_flags.push("diff_truncated");
+    }
+    if !summary.safe_to_apply {
+        risk_flags.push("plan_not_safe_to_apply");
+    }
+    let diff_files = summary
+        .diff_files
+        .iter()
+        .take(MAX_APPROVAL_ITEMS)
+        .map(|file| {
+            serde_json::json!({
+                "path": bounded_approval_text(&file.path().display().to_string()),
+                "additions": file.additions(),
+                "deletions": file.deletions(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let operation_kind = if !deleted_files.is_empty() {
+        "delete"
+    } else if !renamed_files.is_empty() {
+        "rename"
+    } else if !created_files.is_empty() {
+        "create"
+    } else {
+        "text_edit"
+    };
+    serde_json::json!({
+        "operation_kind": operation_kind,
+        "affected_file_count": summary.affected_files.len(),
+        "affected_files": summary
+            .affected_files
+            .iter()
+            .take(MAX_APPROVAL_ITEMS)
+            .map(|path| bounded_approval_text(&path.display().to_string()))
+            .collect::<Vec<_>>(),
+        "created_files": created_files,
+        "renamed_files": renamed_files,
+        "deleted_files": deleted_files,
+        "operations": summary
+            .operations
+            .iter()
+            .take(MAX_APPROVAL_ITEMS)
+            .map(|operation| bounded_approval_text(operation))
+            .collect::<Vec<_>>(),
+        "diff_files": diff_files,
+        "diff_truncated": summary.diff_truncated,
+        "safe_to_apply": summary.safe_to_apply,
+        "risk_flags": risk_flags,
+    })
+}
+
+fn approval_input_required(
+    sealed_state: String,
+    summary: &EditPlanApprovalSummary,
+) -> Result<CallToolResponse, McpError> {
+    let summary_json = approval_summary_json(summary);
+    let schema = serde_json::from_value::<ElicitationSchema>(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "approved": {
+                "type": "boolean",
+                "description": "Apply this exact previewed edit plan"
+            }
+        },
+        "required": ["approved"],
+        "additionalProperties": false
+    }))
+    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let operation_kind = summary_json["operation_kind"].as_str().unwrap_or("edit");
+    let affected_file_count = summary_json["affected_file_count"]
+        .as_u64()
+        .unwrap_or_default();
+    let mut input_requests = InputRequests::new();
+    input_requests.insert(
+        APPROVAL_INPUT_ID.to_owned(),
+        InputRequest::Elicitation(ElicitRequest::new(
+            ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message: format!(
+                    "Approve {operation_kind} affecting {affected_file_count} workspace file(s)?"
+                ),
+                requested_schema: schema,
+            },
+        )),
+    );
+    let mut meta = MetaObject::new();
+    meta.0.insert("approvalSummary".to_owned(), summary_json);
+    Ok(
+        InputRequiredResult::new(Some(input_requests), Some(sealed_state))
+            .with_meta(meta)
+            .into(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    Accept,
+    Decline,
+}
+
+struct ApprovalRequest<'a> {
+    id: &'a ProjectId,
+    plan_id: &'a PlanId,
+    tool_name: &'a str,
+    binding: &'a [u8],
+    arguments_digest: String,
+}
+
+fn parse_approval_response(
+    input_responses: Option<InputResponses>,
+) -> Result<ApprovalDecision, McpError> {
+    let Some(input_responses) = input_responses else {
+        return Err(McpError::invalid_params(
+            "approval response is required with requestState",
+            None,
+        ));
+    };
+    if input_responses.len() != 1 || !input_responses.contains_key(APPROVAL_INPUT_ID) {
+        return Err(McpError::invalid_params(
+            "approval response must contain exactly one approval entry",
+            None,
+        ));
+    }
+    let response = &input_responses[APPROVAL_INPUT_ID];
+    match response.get("action").and_then(serde_json::Value::as_str) {
+        Some("accept") => {
+            if response
+                .get("content")
+                .and_then(|content| content.get("approved"))
+                != Some(&serde_json::Value::Bool(true))
+            {
+                return Err(McpError::invalid_params(
+                    "approval response must explicitly set approved=true",
+                    None,
+                ));
+            }
+            Ok(ApprovalDecision::Accept)
+        }
+        Some("decline" | "cancel") => Ok(ApprovalDecision::Decline),
+        _ => Err(McpError::invalid_params(
+            "approval response action must be accept, decline, or cancel",
+            None,
+        )),
+    }
 }
 
 fn preview_artifact_json(result: &PreviewArtifact, project_id: &str) -> serde_json::Value {
@@ -807,6 +1017,7 @@ impl McplsServer {
         encode_tool_result::<_, std::convert::Infallible>(Ok(result))
     }
 
+    #[cfg(test)]
     async fn apply_project_plan(
         &self,
         id: &ProjectId,
@@ -818,6 +1029,14 @@ impl McplsServer {
                 None,
             ));
         }
+        self.apply_project_plan_claimed(id, plan_id).await
+    }
+
+    async fn apply_project_plan_claimed(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<Json<StructuredObject>, McpError> {
         let result = self
             .context
             .project_registry
@@ -832,6 +1051,188 @@ impl McplsServer {
         encode_json(&applied_edit_plan_json(&result, id.as_str()))
     }
 
+    async fn apply_project_plan_with_approval(
+        &self,
+        tool_name: &str,
+        params: WorkspaceEditApplyParams,
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        if !self.context.supports_mutation_approval() {
+            return Err(McpError::invalid_params(
+                "mutating apply requires MCP 2026-07-28 form elicitation support; use the preview tool without applying",
+                None,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(McpError::invalid_params(
+                "mutating apply was cancelled before approval",
+                None,
+            ));
+        }
+        let id = parse_project_id(params.project_id.clone())?;
+        let plan_id = PlanId::parse(params.plan_id.clone())
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let arguments_digest = approval_arguments_digest(id.as_str(), &plan_id);
+        let principal = None;
+        let binding = approval_binding(
+            self.context.session_id(),
+            principal,
+            tool_name,
+            &arguments_digest,
+        );
+        match (request_state, input_responses) {
+            (None, None) => {
+                self.prepare_mutation_approval(&id, &plan_id, tool_name, &binding, arguments_digest)
+                    .await
+            }
+            (Some(sealed), Some(input_responses)) => {
+                self.retry_mutation_approval(
+                    ApprovalRequest {
+                        id: &id,
+                        plan_id: &plan_id,
+                        tool_name,
+                        binding: &binding,
+                        arguments_digest,
+                    },
+                    sealed,
+                    input_responses,
+                    cancellation,
+                )
+                .await
+            }
+            (None, Some(_)) => Err(McpError::invalid_params(
+                "inputResponses requires the matching requestState",
+                None,
+            )),
+            (Some(_), None) => Err(McpError::invalid_params(
+                "requestState requires inputResponses",
+                None,
+            )),
+        }
+    }
+
+    async fn prepare_mutation_approval(
+        &self,
+        id: &ProjectId,
+        plan_id: &PlanId,
+        tool_name: &str,
+        binding: &[u8],
+        arguments_digest: String,
+    ) -> Result<CallToolResponse, McpError> {
+        if !self.context.owns_plan(plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit plan is not owned by this MCP session",
+                None,
+            ));
+        }
+        let summary = self
+            .context
+            .project_registry
+            .inspect_edit_plan(id, plan_id.clone())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        if !summary.safe_to_apply {
+            return Err(McpError::invalid_params(
+                "edit plan is not safe to apply",
+                None,
+            ));
+        }
+        let state = MutationApprovalState {
+            session_id: self.context.session_id().to_owned(),
+            principal: None,
+            method: APPROVAL_METHOD.to_owned(),
+            tool_name: tool_name.to_owned(),
+            project_id: id.as_str().to_owned(),
+            plan_id: plan_id.as_str().to_owned(),
+            arguments_digest,
+            snapshot_hashes: summary.snapshot_hashes.clone(),
+            versions: summary.versions.clone(),
+            nonce: PlanId::new().as_str().to_owned(),
+        };
+        let nonce = state.nonce.clone();
+        let sealed = self
+            .context
+            .seal_approval_state(&state, binding)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        self.context.remember_approval(nonce).await;
+        approval_input_required(sealed, &summary)
+    }
+
+    async fn retry_mutation_approval(
+        &self,
+        request: ApprovalRequest<'_>,
+        sealed: String,
+        input_responses: InputResponses,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        let state = self
+            .context
+            .open_approval_state(&sealed, request.binding)
+            .map_err(|error| {
+                McpError::invalid_params(
+                    format!("invalid or expired approval request state: {error}"),
+                    None,
+                )
+            })?;
+        if state.session_id != self.context.session_id()
+            || state.principal.is_some()
+            || state.method != APPROVAL_METHOD
+            || state.tool_name != request.tool_name
+            || state.project_id != request.id.as_str()
+            || state.plan_id != request.plan_id.as_str()
+            || state.arguments_digest != request.arguments_digest
+        {
+            return Err(McpError::invalid_params(
+                "approval request state does not match this apply request",
+                None,
+            ));
+        }
+        if parse_approval_response(Some(input_responses))? == ApprovalDecision::Decline {
+            let _ = self.context.consume_approval(&state.nonce).await;
+            return Err(McpError::invalid_params(
+                "approval declined or cancelled; no files were changed",
+                None,
+            ));
+        }
+        let summary = self
+            .context
+            .project_registry
+            .inspect_edit_plan(request.id, request.plan_id.clone())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        if summary.snapshot_hashes != state.snapshot_hashes || summary.versions != state.versions {
+            return Err(McpError::invalid_params(
+                "edit plan is stale; preview the change again",
+                None,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(McpError::invalid_params(
+                "mutating apply was cancelled before filesystem changes",
+                None,
+            ));
+        }
+        if !self.context.consume_approval(&state.nonce).await {
+            return Err(McpError::invalid_params(
+                "approval request has already been consumed",
+                None,
+            ));
+        }
+        if !self.context.claim_plan(request.plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit plan is not owned by this MCP session",
+                None,
+            ));
+        }
+        let result = self
+            .apply_project_plan_claimed(request.id, request.plan_id.clone())
+            .await?;
+        result.into_call_tool_result()
+    }
+
+    #[cfg(test)]
     async fn apply_project_plan_params(
         &self,
         params: WorkspaceEditApplyParams,
@@ -1339,6 +1740,8 @@ impl McplsServer {
 
     /// Apply a previously previewed, session-owned workspace edit plan.
     #[tool(
+        name = "workspace_edit_apply",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
         description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced.",
         annotations(
             title = "Apply workspace edit",
@@ -1347,6 +1750,24 @@ impl McplsServer {
             idempotent_hint = false
         )
     )]
+    async fn workspace_edit_apply_tool(
+        &self,
+        Parameters(params): Parameters<WorkspaceEditApplyParams>,
+        RequestState(request_state): RequestState,
+        ToolInputResponses(input_responses): ToolInputResponses,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        self.apply_project_plan_with_approval(
+            "workspace_edit_apply",
+            params,
+            request_state,
+            input_responses,
+            cancellation,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn workspace_edit_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
@@ -1356,6 +1777,8 @@ impl McplsServer {
 
     /// Apply a rename preview through the generic workspace-edit transaction.
     #[tool(
+        name = "rename_apply",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
         description = "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced.",
         annotations(
             title = "Apply rename",
@@ -1364,6 +1787,24 @@ impl McplsServer {
             idempotent_hint = false
         )
     )]
+    async fn rename_apply_tool(
+        &self,
+        Parameters(params): Parameters<WorkspaceEditApplyParams>,
+        RequestState(request_state): RequestState,
+        ToolInputResponses(input_responses): ToolInputResponses,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        self.apply_project_plan_with_approval(
+            "rename_apply",
+            params,
+            request_state,
+            input_responses,
+            cancellation,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn rename_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
@@ -1373,6 +1814,8 @@ impl McplsServer {
 
     /// Apply a formatting preview through the generic workspace-edit transaction.
     #[tool(
+        name = "format_apply",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
         description = "Apply a formatting plan returned by format_preview. Plans are single-use and revalidated before any file is replaced.",
         annotations(
             title = "Apply formatting",
@@ -1381,6 +1824,24 @@ impl McplsServer {
             idempotent_hint = false
         )
     )]
+    async fn format_apply_tool(
+        &self,
+        Parameters(params): Parameters<WorkspaceEditApplyParams>,
+        RequestState(request_state): RequestState,
+        ToolInputResponses(input_responses): ToolInputResponses,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        self.apply_project_plan_with_approval(
+            "format_apply",
+            params,
+            request_state,
+            input_responses,
+            cancellation,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn format_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
@@ -1879,6 +2340,8 @@ impl McplsServer {
 
     /// Apply a code action plan previewed by this MCP session.
     #[tool(
+        name = "code_action_apply",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
         description = "Apply a code action preview plan owned by this MCP session.",
         annotations(
             title = "Apply code action",
@@ -1887,17 +2350,27 @@ impl McplsServer {
             idempotent_hint = false
         )
     )]
-    async fn code_action_apply(
+    async fn code_action_apply_tool(
         &self,
         Parameters(CodeActionApplyParams {
             project_id,
             plan_id,
         }): Parameters<CodeActionApplyParams>,
-    ) -> Result<Json<StructuredObject>, McpError> {
-        let id = parse_project_id(project_id)?;
-        let plan_id = PlanId::parse(plan_id)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        self.apply_project_plan(&id, plan_id).await
+        RequestState(request_state): RequestState,
+        ToolInputResponses(input_responses): ToolInputResponses,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        self.apply_project_plan_with_approval(
+            "code_action_apply",
+            WorkspaceEditApplyParams {
+                project_id,
+                plan_id,
+            },
+            request_state,
+            input_responses,
+            cancellation,
+        )
+        .await
     }
 
     /// Prepare call hierarchy at a position.
@@ -2230,6 +2703,21 @@ impl McplsServer {
 
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.context.set_client_capabilities(
+            context.client_capabilities(),
+            context
+                .protocol_version()
+                .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28),
+        );
+        let tool_context = ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tool_context).await
+    }
+
     async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -4820,13 +5308,13 @@ while True:
             1
         );
         fs::write(&renamed, "occupied\n").unwrap();
-        let stale = server
+        let stale_result = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: stale_preview["plan_id"].as_str().unwrap().to_string(),
             }))
             .await;
-        assert!(stale.is_err());
+        assert!(stale_result.is_err());
         assert_eq!(fs::read_to_string(&source).unwrap(), "structural\n");
         assert_eq!(fs::read_to_string(&sibling).unwrap(), "new_name();\n");
         fs::remove_file(&renamed).unwrap();
@@ -5111,13 +5599,13 @@ while True:
             .unwrap();
         assert_eq!(fs::read_to_string(&renamed).unwrap(), "moved\n");
 
-        let stale = server
+        let stale_result = server
             .format_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: format["plan_id"].as_str().unwrap().to_string(),
             }))
             .await;
-        assert!(stale.is_err());
+        assert!(stale_result.is_err());
     }
 
     #[cfg(unix)]
@@ -6709,10 +7197,10 @@ while True:
     #[test]
     fn mutating_apply_tools_advertise_destructive_annotations() {
         for tool in [
-            McplsServer::workspace_edit_apply_tool_attr(),
-            McplsServer::rename_apply_tool_attr(),
-            McplsServer::format_apply_tool_attr(),
-            McplsServer::code_action_apply_tool_attr(),
+            McplsServer::workspace_edit_apply_tool_tool_attr(),
+            McplsServer::rename_apply_tool_tool_attr(),
+            McplsServer::format_apply_tool_tool_attr(),
+            McplsServer::code_action_apply_tool_tool_attr(),
         ] {
             let Some(annotations) = tool.annotations else {
                 panic!("mutating tool annotations");
@@ -6721,5 +7209,347 @@ while True:
             assert_eq!(annotations.destructive_hint, Some(true));
             assert_eq!(annotations.idempotent_hint, Some(false));
         }
+    }
+
+    async fn approval_fixture() -> (TempDir, McplsServer, String) {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        std::fs::write(&file, "before\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let actor = registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = EditPlan::new(
+            "project".to_owned(),
+            vec![FileSnapshot::from_contents(
+                file,
+                SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace src.rs".to_owned()],
+            true,
+            std::time::Duration::from_secs(60),
+        );
+        let plan_id = plan.id().as_str().to_owned();
+        let plan_handle = PlanId::parse(plan_id.clone()).unwrap();
+        actor.store_edit_plan(plan).await.unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        server.context.remember_plan(plan_handle).await;
+        (root, server, plan_id)
+    }
+
+    #[tokio::test]
+    async fn mutating_apply_first_round_requests_approval_without_writing() {
+        let (root, server, plan_id) = approval_fixture().await;
+        let response = server
+            .workspace_edit_apply_tool(
+                Parameters(WorkspaceEditApplyParams {
+                    project_id: "project".to_owned(),
+                    plan_id,
+                }),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::InputRequired(result) = response else {
+            panic!("first apply round must request input");
+        };
+        assert!(result.request_state.is_some());
+        assert!(
+            result
+                .input_requests
+                .as_ref()
+                .unwrap()
+                .contains_key(APPROVAL_INPUT_ID)
+        );
+        let summary = result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get("approvalSummary"))
+            .unwrap();
+        assert_eq!(summary["affected_file_count"], 1);
+        assert_eq!(summary["operations"][0], "replace src.rs");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "before\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_apply_acceptance_applies_once_and_replay_is_rejected() {
+        let (root, server, plan_id) = approval_fixture().await;
+        let params = || {
+            Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_owned(),
+                plan_id: plan_id.clone(),
+            })
+        };
+        let first = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::InputRequired(first) = first else {
+            panic!("first apply round must request input");
+        };
+        let state = first.request_state.unwrap();
+        let mut responses = InputResponses::new();
+        responses.insert(
+            APPROVAL_INPUT_ID.to_owned(),
+            serde_json::json!({
+                "action": "accept",
+                "content": {"approved": true}
+            }),
+        );
+        let applied = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(Some(state.clone())),
+                ToolInputResponses(Some(responses.clone())),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(applied, CallToolResponse::Complete(_)));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "after\n"
+        );
+
+        let replay = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(Some(state)),
+                ToolInputResponses(Some(responses)),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(replay.is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "after\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_apply_decline_and_tamper_leave_files_unchanged() {
+        let (root, server, plan_id) = approval_fixture().await;
+        let params = || {
+            Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_owned(),
+                plan_id: plan_id.clone(),
+            })
+        };
+        let first = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::InputRequired(first) = first else {
+            panic!("first apply round must request input");
+        };
+        let state = first.request_state.unwrap();
+        let mut decline = InputResponses::new();
+        decline.insert(
+            APPROVAL_INPUT_ID.to_owned(),
+            serde_json::json!({"action": "decline"}),
+        );
+        assert!(
+            server
+                .workspace_edit_apply_tool(
+                    params(),
+                    RequestState(Some(state.clone())),
+                    ToolInputResponses(Some(decline)),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "before\n"
+        );
+
+        let tampered = format!("{}x", &state[..state.len() - 1]);
+        let mut accept = InputResponses::new();
+        accept.insert(
+            APPROVAL_INPUT_ID.to_owned(),
+            serde_json::json!({
+                "action": "accept",
+                "content": {"approved": true}
+            }),
+        );
+        assert!(
+            server
+                .workspace_edit_apply_tool(
+                    params(),
+                    RequestState(Some(tampered)),
+                    ToolInputResponses(Some(accept)),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "before\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_apply_requires_declared_elicitation_capability() {
+        let (root, server, plan_id) = approval_fixture().await;
+        server.context.set_client_capabilities(None, true);
+        let result = server
+            .workspace_edit_apply_tool(
+                Parameters(WorkspaceEditApplyParams {
+                    project_id: "project".to_owned(),
+                    plan_id,
+                }),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(result.message.contains("form elicitation"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "before\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_apply_rejects_malformed_response_and_stale_snapshot() {
+        let (root, server, plan_id) = approval_fixture().await;
+        let params = || {
+            Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_owned(),
+                plan_id: plan_id.clone(),
+            })
+        };
+        let first = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::InputRequired(first) = first else {
+            panic!("first apply round must request input");
+        };
+        let state = first.request_state.unwrap();
+        let mut malformed = InputResponses::new();
+        malformed.insert(
+            APPROVAL_INPUT_ID.to_owned(),
+            serde_json::json!({"action": "accept", "content": {}}),
+        );
+        assert!(
+            server
+                .workspace_edit_apply_tool(
+                    params(),
+                    RequestState(Some(state.clone())),
+                    ToolInputResponses(Some(malformed)),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        std::fs::write(root.path().join("src.rs"), "changed\n").unwrap();
+        let mut accepted = InputResponses::new();
+        accepted.insert(
+            APPROVAL_INPUT_ID.to_owned(),
+            serde_json::json!({
+                "action": "accept",
+                "content": {"approved": true}
+            }),
+        );
+        let stale_retry = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(Some(state)),
+                ToolInputResponses(Some(accepted)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(stale_retry.message.contains("stale"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "changed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_apply_concurrent_retries_commit_at_most_once() {
+        let (root, server, plan_id) = approval_fixture().await;
+        let first = server
+            .workspace_edit_apply_tool(
+                Parameters(WorkspaceEditApplyParams {
+                    project_id: "project".to_owned(),
+                    plan_id: plan_id.clone(),
+                }),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::InputRequired(first) = first else {
+            panic!("first apply round must request input");
+        };
+        let state = first.request_state.unwrap();
+        let mut accepted = InputResponses::new();
+        accepted.insert(
+            APPROVAL_INPUT_ID.to_owned(),
+            serde_json::json!({
+                "action": "accept",
+                "content": {"approved": true}
+            }),
+        );
+        let params = || {
+            Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_owned(),
+                plan_id: plan_id.clone(),
+            })
+        };
+        let (left, right) = tokio::join!(
+            server.workspace_edit_apply_tool(
+                params(),
+                RequestState(Some(state.clone())),
+                ToolInputResponses(Some(accepted.clone())),
+                CancellationToken::new(),
+            ),
+            server.workspace_edit_apply_tool(
+                params(),
+                RequestState(Some(state)),
+                ToolInputResponses(Some(accepted)),
+                CancellationToken::new(),
+            )
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "after\n"
+        );
     }
 }
