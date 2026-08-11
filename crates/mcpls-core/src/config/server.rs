@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,11 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[
     "coverage",
     ".next",
     ".nuxt",
+    "_build",
+    "deps",
+    "third_party",
+    "generated",
+    "fixtures",
 ];
 
 /// Heuristics for determining if an LSP server should be spawned.
@@ -49,6 +55,15 @@ pub struct ServerHeuristics {
     /// If empty, the server will always attempt to spawn.
     #[serde(default)]
     pub project_markers: Vec<String>,
+
+    /// Source globs that make a profile applicable when no project marker is
+    /// present. Patterns are relative to the workspace root.
+    #[serde(default)]
+    pub source_patterns: Vec<String>,
+
+    /// Additional directory names excluded from recursive source detection.
+    #[serde(default)]
+    pub excluded_directories: Vec<String>,
 }
 
 impl ServerHeuristics {
@@ -61,7 +76,31 @@ impl ServerHeuristics {
     {
         Self {
             project_markers: markers.into_iter().map(Into::into).collect(),
+            source_patterns: Vec::new(),
+            excluded_directories: Vec::new(),
         }
+    }
+
+    /// Add source globs to this heuristic set.
+    #[must_use]
+    pub fn with_source_patterns<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.source_patterns = patterns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Add profile-specific directory exclusions.
+    #[must_use]
+    pub fn with_excluded_directories<I, S>(mut self, directories: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.excluded_directories = directories.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Check if any marker exists at the given workspace root.
@@ -71,12 +110,10 @@ impl ServerHeuristics {
     /// - At least one marker file/directory exists
     #[must_use]
     pub fn is_applicable(&self, workspace_root: &Path) -> bool {
-        if self.project_markers.is_empty() {
+        if self.project_markers.is_empty() && self.source_patterns.is_empty() {
             return true;
         }
-        self.project_markers
-            .iter()
-            .any(|marker| workspace_root.join(marker).exists())
+        !self.matching_roots(workspace_root, None).is_empty()
     }
 
     /// Check if any marker exists anywhere in the workspace tree.
@@ -108,10 +145,15 @@ impl ServerHeuristics {
         workspace_root: &Path,
         max_depth: Option<usize>,
     ) -> Vec<PathBuf> {
-        if self.project_markers.is_empty() || self.is_applicable(workspace_root) {
+        let marker_at_root = self
+            .project_markers
+            .iter()
+            .any(|marker| workspace_root.join(marker).exists());
+        if (self.project_markers.is_empty() && self.source_patterns.is_empty()) || marker_at_root {
             return vec![workspace_root.to_path_buf()];
         }
 
+        let excluded_directories = self.excluded_directories.clone();
         let mut builder = WalkBuilder::new(workspace_root);
         builder
             .max_depth(max_depth.or(Some(DEFAULT_HEURISTICS_MAX_DEPTH)))
@@ -121,15 +163,18 @@ impl ServerHeuristics {
             .git_exclude(false)
             .follow_links(false)
             .standard_filters(false)
-            .filter_entry(|entry| {
+            .filter_entry(move |entry| {
                 if entry.file_type().is_some_and(|ft| ft.is_dir())
                     && let Some(name) = entry.file_name().to_str()
-                    && EXCLUDED_DIRECTORIES.contains(&name)
+                    && (EXCLUDED_DIRECTORIES.contains(&name)
+                        || excluded_directories.iter().any(|dir| dir == name))
                 {
                     return false;
                 }
                 true
             });
+
+        let source_patterns = source_glob_set(&self.source_patterns);
 
         let mut roots = builder
             .build()
@@ -137,9 +182,16 @@ impl ServerHeuristics {
             .filter_map(|entry| {
                 let path = entry.path();
                 let file_name = path.file_name()?.to_str()?;
-                self.project_markers
+                let marker_match = self
+                    .project_markers
                     .iter()
-                    .any(|marker| marker == file_name)
+                    .any(|marker| marker == file_name);
+                let source_match = source_patterns.as_ref().is_some_and(|patterns| {
+                    path.strip_prefix(workspace_root)
+                        .ok()
+                        .is_some_and(|relative| patterns.is_match(relative))
+                });
+                (marker_match || source_match)
                     .then_some(path)
                     .and_then(Path::parent)
                     .map(Path::to_path_buf)
@@ -149,6 +201,858 @@ impl ServerHeuristics {
         roots.dedup();
         roots
     }
+}
+
+fn source_glob_set(patterns: &[String]) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .ok()?;
+        builder.add(glob);
+    }
+    builder.build().ok()
+}
+
+/// Stability of a built-in language-server candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinProfileStability {
+    /// Candidate is suitable for the automatic default catalog.
+    Stable,
+    /// Candidate is recorded for explicit opt-in or future promotion.
+    Experimental,
+    /// No compatible semantic server is currently promoted for this profile.
+    FallbackOnly,
+}
+
+/// One ordered command candidate for a built-in profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinServerCandidate {
+    /// Executable name or path.
+    pub command: &'static str,
+    /// Arguments passed before LSP stdio traffic begins.
+    pub args: &'static [&'static str],
+    /// Promotion status of this candidate.
+    pub stability: BuiltinProfileStability,
+}
+
+/// Declarative metadata for one built-in language profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinLanguageProfile {
+    /// LSP language identifier.
+    pub language_id: &'static str,
+    /// File patterns routed to this profile.
+    pub file_patterns: &'static [&'static str],
+    /// Project markers that take precedence over source-only detection.
+    pub project_markers: &'static [&'static str],
+    /// Source patterns used for markerless projects.
+    pub source_patterns: &'static [&'static str],
+    /// Ordered executable candidates.
+    pub candidates: &'static [BuiltinServerCandidate],
+    /// Profile language IDs superseded when this profile applies.
+    pub supersedes: &'static [&'static str],
+}
+
+const fn candidate(
+    command: &'static str,
+    args: &'static [&'static str],
+    stability: BuiltinProfileStability,
+) -> BuiltinServerCandidate {
+    BuiltinServerCandidate {
+        command,
+        args,
+        stability,
+    }
+}
+
+const fn profile(
+    language_id: &'static str,
+    file_patterns: &'static [&'static str],
+    project_markers: &'static [&'static str],
+    source_patterns: &'static [&'static str],
+    candidates: &'static [BuiltinServerCandidate],
+    supersedes: &'static [&'static str],
+) -> BuiltinLanguageProfile {
+    BuiltinLanguageProfile {
+        language_id,
+        file_patterns,
+        project_markers,
+        source_patterns,
+        candidates,
+        supersedes,
+    }
+}
+
+const fn fallback_profile(
+    language_id: &'static str,
+    file_patterns: &'static [&'static str],
+) -> BuiltinLanguageProfile {
+    profile(language_id, file_patterns, &[], file_patterns, &[], &[])
+}
+
+static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
+    profile(
+        "rust",
+        &["**/*.rs"],
+        &["Cargo.toml", "rust-toolchain.toml"],
+        &[],
+        &[candidate(
+            "rust-analyzer",
+            &[],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "python",
+        &["**/*.py"],
+        &[
+            "pyproject.toml",
+            "setup.py",
+            "requirements.txt",
+            "pyrightconfig.json",
+        ],
+        &["**/*.py"],
+        &[
+            candidate("ty", &["server"], BuiltinProfileStability::Experimental),
+            candidate(
+                "pyright-langserver",
+                &["--stdio"],
+                BuiltinProfileStability::Stable,
+            ),
+        ],
+        &[],
+    ),
+    profile(
+        "typescript",
+        &["**/*.ts", "**/*.tsx"],
+        &["package.json", "tsconfig.json", "jsconfig.json"],
+        &[],
+        &[
+            candidate("vtsls", &["--stdio"], BuiltinProfileStability::Experimental),
+            candidate(
+                "typescript-language-server",
+                &["--stdio"],
+                BuiltinProfileStability::Stable,
+            ),
+        ],
+        &[],
+    ),
+    profile(
+        "javascript",
+        &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        &["package.json", "jsconfig.json"],
+        &[],
+        &[candidate(
+            "typescript-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "vue",
+        &["**/*.vue"],
+        &[
+            "package.json",
+            "vite.config.js",
+            "vite.config.ts",
+            "vue.config.js",
+        ],
+        &["**/*.vue"],
+        &[candidate(
+            "vue-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &["typescript", "javascript", "html"],
+    ),
+    profile(
+        "angular",
+        &["**/*.ts", "**/*.html"],
+        &["angular.json"],
+        &["**/*.component.ts", "**/*.component.html"],
+        &[candidate(
+            "ngserver",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &["typescript", "javascript", "html"],
+    ),
+    profile(
+        "java",
+        &["**/*.java"],
+        &["pom.xml", "build.gradle", "build.gradle.kts", ".project"],
+        &["**/*.java"],
+        &[candidate("jdtls", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "kotlin",
+        &["**/*.kt", "**/*.kts"],
+        &["build.gradle.kts", "settings.gradle.kts", "pom.xml"],
+        &["**/*.kt", "**/*.kts"],
+        &[candidate(
+            "kotlin-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "groovy",
+        &["**/*.groovy", "**/*.gradle"],
+        &["build.gradle", "settings.gradle"],
+        &["**/*.groovy", "**/*.gradle"],
+        &[candidate(
+            "groovy-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "gradle",
+        &["**/*.gradle", "**/*.gradle.kts"],
+        &[
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ],
+        &["**/*.gradle", "**/*.gradle.kts"],
+        &[candidate(
+            "gradle-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "elixir",
+        &["**/*.ex", "**/*.exs"],
+        &["mix.exs"],
+        &["**/*.ex", "**/*.exs"],
+        &[
+            candidate(
+                "expert",
+                &["language-server"],
+                BuiltinProfileStability::Experimental,
+            ),
+            candidate("elixir-ls", &[], BuiltinProfileStability::Stable),
+        ],
+        &[],
+    ),
+    profile(
+        "erlang",
+        &["**/*.erl", "**/*.hrl", "**/*.yrl"],
+        &["rebar.config", "erlang.mk", "mix.exs"],
+        &["**/*.erl", "**/*.hrl", "**/*.yrl"],
+        &[
+            candidate("elp", &["lsp"], BuiltinProfileStability::Experimental),
+            candidate("erlang_ls", &[], BuiltinProfileStability::Stable),
+        ],
+        &[],
+    ),
+    profile(
+        "cpp",
+        &[
+            "**/*.c", "**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.h", "**/*.hpp", "**/*.hh",
+        ],
+        &[
+            "CMakeLists.txt",
+            "compile_commands.json",
+            "Makefile",
+            ".clangd",
+        ],
+        &[
+            "**/*.c", "**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.h", "**/*.hpp", "**/*.hh",
+        ],
+        &[candidate("clangd", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "objective-c",
+        &["**/*.m", "**/*.mm"],
+        &["compile_commands.json", "CMakeLists.txt", "project.pbxproj"],
+        &[],
+        &[candidate("clangd", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "swift",
+        &["**/*.swift"],
+        &[
+            "Package.swift",
+            "project.pbxproj",
+            "contents.xcworkspacedata",
+        ],
+        &["**/*.swift"],
+        &[candidate(
+            "sourcekit-lsp",
+            &[],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "go",
+        &["**/*.go"],
+        &["go.mod", "go.sum"],
+        &["**/*.go"],
+        &[candidate(
+            "gopls",
+            &["serve"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "zig",
+        &["**/*.zig"],
+        &["build.zig", "build.zig.zon"],
+        &["**/*.zig"],
+        &[candidate("zls", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "ruby",
+        &["**/*.rb", "**/*.rake"],
+        &["Gemfile", ".ruby-version", "Rakefile"],
+        &["**/*.rb", "**/*.rake"],
+        &[candidate("ruby-lsp", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "haskell",
+        &["**/*.hs", "**/*.lhs"],
+        &["*.cabal", "stack.yaml", "package.yaml", "cabal.project"],
+        &["**/*.hs", "**/*.lhs"],
+        &[candidate(
+            "haskell-language-server-wrapper",
+            &["--lsp"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "perl",
+        &["**/*.pl", "**/*.pm", "**/*.t"],
+        &["Makefile.PL", "Build.PL", "cpanfile"],
+        &["**/*.pl", "**/*.pm"],
+        &[candidate(
+            "perl-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "powershell",
+        &["**/*.ps1", "**/*.psm1", "**/*.psd1"],
+        &["*.psd1", "*.psm1"],
+        &["**/*.ps1", "**/*.psm1", "**/*.psd1"],
+        &[candidate(
+            "PowerShellEditorServices",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "nix",
+        &["**/*.nix"],
+        &[
+            "flake.nix",
+            "shell.nix",
+            "default.nix",
+            "configuration.nix",
+            "home.nix",
+        ],
+        &["**/*.nix"],
+        &[candidate("nixd", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "shellscript",
+        &["**/*.sh", "**/*.bash", "**/*.zsh"],
+        &[".bashrc", ".zshrc", "Makefile", "flake.nix"],
+        &["**/*.sh", "**/*.bash", "**/*.zsh"],
+        &[candidate(
+            "bash-language-server",
+            &["start"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "sql",
+        &["**/*.sql"],
+        &[".sqls.yml", "dbt_project.yml"],
+        &["**/*.sql"],
+        &[candidate(
+            "sqls",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "html",
+        &["**/*.html", "**/*.htm"],
+        &["package.json", "vite.config.js", "index.html"],
+        &[],
+        &[candidate(
+            "vscode-html-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "css",
+        &["**/*.css"],
+        &["package.json"],
+        &["**/*.css"],
+        &[candidate(
+            "vscode-css-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "scss",
+        &["**/*.scss", "**/*.sass"],
+        &["package.json"],
+        &["**/*.scss", "**/*.sass"],
+        &[candidate(
+            "some-sass-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "json",
+        &["**/*.json", "**/*.jsonc"],
+        &["package.json", "tsconfig.json", "flake.lock"],
+        &[],
+        &[candidate(
+            "vscode-json-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "yaml",
+        &["**/*.yaml", "**/*.yml"],
+        &[".yamllint", ".github", "docker-compose.yml"],
+        &[],
+        &[candidate(
+            "yaml-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "xml",
+        &["**/*.xml", "**/*.plist"],
+        &["pom.xml", "Info.plist", "project.pbxproj"],
+        &[],
+        &[candidate(
+            "lemminx-linux-x86_64",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "toml",
+        &["**/*.toml"],
+        &["Cargo.toml", "pyproject.toml", "package.json"],
+        &[],
+        &[candidate(
+            "taplo",
+            &["lsp", "stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "markdown",
+        &["**/*.md", "**/*.markdown"],
+        &["README.md", "mkdocs.yml", "book.toml"],
+        &[],
+        &[candidate("marksman", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "dockerfile",
+        &["**/Dockerfile", "**/*.dockerfile"],
+        &["Dockerfile", "docker-compose.yml", "docker-compose.yaml"],
+        &[],
+        &[candidate(
+            "docker-langserver",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "cmake",
+        &["**/CMakeLists.txt", "**/*.cmake"],
+        &["CMakeLists.txt", "CMakePresets.json"],
+        &[],
+        &[candidate(
+            "neocmakelsp",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "gherkin",
+        &["**/*.feature"],
+        &["cucumber.yml"],
+        &["**/*.feature"],
+        &[candidate(
+            "cucumber-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "openscad",
+        &["**/*.scad"],
+        &[],
+        &["**/*.scad"],
+        &[candidate(
+            "openscad-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "qml",
+        &["**/*.qml", "**/*.qmltypes"],
+        &["*.qmlproject", "CMakeLists.txt"],
+        &["**/*.qml", "**/*.qmltypes"],
+        &[candidate("qmlls", &[], BuiltinProfileStability::Stable)],
+        &["typescript", "javascript"],
+    ),
+    profile(
+        "ansible",
+        &["**/*.yaml", "**/*.yml"],
+        &["ansible.cfg", "galaxy.yml", "roles"],
+        &[],
+        &[candidate(
+            "ansible-language-server",
+            &["--stdio"],
+            BuiltinProfileStability::Stable,
+        )],
+        &["yaml"],
+    ),
+    profile(
+        "protobuf",
+        &["**/*.proto"],
+        &["buf.yaml", "buf.work"],
+        &["**/*.proto"],
+        &[candidate(
+            "buf",
+            &["lsp", "serve"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "asn1",
+        &["**/*.asn1", "**/*.asn"],
+        &["rebar.config", "asn1.config", "Makefile"],
+        &["**/*.asn1", "**/*.asn"],
+        &[candidate(
+            "asn1-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "autotools",
+        &["**/configure.ac", "**/configure.in", "**/*.m4"],
+        &["configure.ac", "configure.in", "aclocal.m4"],
+        &[],
+        &[candidate(
+            "autotools-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "make",
+        &["**/Makefile", "**/*.mk"],
+        &["Makefile", "GNUmakefile", "makefile"],
+        &[],
+        &[candidate(
+            "make-language-server",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "clojure",
+        &["**/*.clj", "**/*.cljs", "**/*.cljc"],
+        &["deps.edn", "project.clj", "shadow-cljs.edn"],
+        &["**/*.clj", "**/*.cljs", "**/*.cljc"],
+        &[candidate(
+            "clojure-lsp",
+            &[],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "dart",
+        &["**/*.dart"],
+        &["pubspec.yaml", "analysis_options.yaml"],
+        &["**/*.dart"],
+        &[candidate(
+            "dart",
+            &["language-server"],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "latex",
+        &["**/*.tex", "**/*.bib"],
+        &[".latexmkrc", "texmf.cnf"],
+        &["**/*.tex", "**/*.bib"],
+        &[candidate("texlab", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "ocaml",
+        &["**/*.ml", "**/*.mli"],
+        &["dune-project", "dune-workspace", "*.opam"],
+        &["**/*.ml", "**/*.mli"],
+        &[candidate("ocamllsp", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "php",
+        &["**/*.php"],
+        &["composer.json", "phpunit.xml", "artisan"],
+        &["**/*.php"],
+        &[
+            candidate("intelephense", &[], BuiltinProfileStability::Experimental),
+            candidate(
+                "phpactor",
+                &["language-server"],
+                BuiltinProfileStability::Experimental,
+            ),
+        ],
+        &[],
+    ),
+    profile(
+        "scala",
+        &["**/*.scala", "**/*.sc"],
+        &["build.sbt", "project/build.properties"],
+        &["**/*.scala", "**/*.sc"],
+        &[candidate(
+            "metals",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "terraform",
+        &["**/*.tf", "**/*.tfvars"],
+        &["*.tf", ".terraform.lock.hcl"],
+        &["**/*.tf", "**/*.tfvars"],
+        &[candidate(
+            "terraform-ls",
+            &[],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "vhdl",
+        &["**/*.vhd", "**/*.vhdl"],
+        &["*.vhd", "*.vhdl"],
+        &["**/*.vhd", "**/*.vhdl"],
+        &[candidate("vhdl_ls", &[], BuiltinProfileStability::Stable)],
+        &[],
+    ),
+    profile(
+        "csharp",
+        &["**/*.cs"],
+        &["*.sln", "*.csproj", "global.json"],
+        &["**/*.cs"],
+        &[
+            candidate("csharp-ls", &[], BuiltinProfileStability::Experimental),
+            candidate(
+                "roslyn-language-server",
+                &[],
+                BuiltinProfileStability::Experimental,
+            ),
+        ],
+        &[],
+    ),
+    profile(
+        "d",
+        &["**/*.d", "**/*.di"],
+        &["dub.json", "dub.sdl"],
+        &[],
+        &[candidate(
+            "serve-d",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "dtrace",
+        &["**/*.d"],
+        &["DTrace", "dtrace.conf"],
+        &[],
+        &[candidate("dls", &[], BuiltinProfileStability::Experimental)],
+        &[],
+    ),
+    profile(
+        "device-tree",
+        &["**/*.dts", "**/*.dtsi", "**/*.dtso", "**/*.overlay"],
+        &["Kconfig", "Makefile", "meson.build"],
+        &["**/*.dts", "**/*.dtsi", "**/*.dtso", "**/*.overlay"],
+        &[candidate(
+            "dts-lsp",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "ada",
+        &["**/*.adb", "**/*.ads"],
+        &["*.gpr", "alire.toml"],
+        &["**/*.adb", "**/*.ads"],
+        &[candidate(
+            "ada-language-server",
+            &[],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "fortran",
+        &["**/*.f", "**/*.f90", "**/*.f95", "**/*.f03"],
+        &["fpm.toml", "CMakeLists.txt"],
+        &["**/*.f", "**/*.f90", "**/*.f95", "**/*.f03"],
+        &[candidate(
+            "fortls",
+            &["--debug_ls"],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "lua",
+        &["**/*.lua"],
+        &[".luacheckrc", ".luarc.json", "stylua.toml"],
+        &["**/*.lua"],
+        &[candidate(
+            "lua-language-server",
+            &[],
+            BuiltinProfileStability::Stable,
+        )],
+        &[],
+    ),
+    profile(
+        "assembly",
+        &["**/*.s", "**/*.S", "**/*.asm"],
+        &["CMakeLists.txt", "Makefile"],
+        &["**/*.s", "**/*.S", "**/*.asm"],
+        &[candidate(
+            "asm-lsp",
+            &[],
+            BuiltinProfileStability::Experimental,
+        )],
+        &[],
+    ),
+    profile(
+        "kconfig",
+        &["**/Kconfig", "**/Kconfig.*"],
+        &["Kconfig", "Config.in", "Makefile"],
+        &["**/Kconfig", "**/Kconfig.*"],
+        &[],
+        &[],
+    ),
+    profile(
+        "smpl",
+        &["**/*.cocci"],
+        &[".cocciconfig"],
+        &["**/*.cocci"],
+        &[],
+        &[],
+    ),
+    profile(
+        "plantuml",
+        &["**/*.puml", "**/*.plantuml"],
+        &["plantuml.cfg"],
+        &["**/*.puml", "**/*.plantuml"],
+        &[],
+        &[],
+    ),
+    // These profiles deliberately remain fallback-only until a candidate
+    // passes the initialize/shutdown capability smoke test. Keeping their
+    // source predicates in the registry makes classification explicit without
+    // claiming semantic support or starting an incompatible server.
+    fallback_profile("al", &["**/*.al"]),
+    fallback_profile("apex", &["**/*.cls", "**/*.trigger"]),
+    fallback_profile("bsl", &["**/*.bsl"]),
+    fallback_profile("crystal", &["**/*.cr"]),
+    fallback_profile("cue", &["**/*.cue"]),
+    fallback_profile("elm", &["**/*.elm"]),
+    fallback_profile("fsharp", &["**/*.fs", "**/*.fsi", "**/*.fsx"]),
+    fallback_profile("gdscript", &["**/*.gd"]),
+    fallback_profile("gleam", &["**/*.gleam"]),
+    fallback_profile("graphql", &["**/*.graphql", "**/*.gql"]),
+    fallback_profile("haxe", &["**/*.hx"]),
+    fallback_profile("hlsl", &["**/*.hlsl", "**/*.shader"]),
+    fallback_profile("julia", &["**/*.jl"]),
+    fallback_profile("ksh", &["**/*.ksh"]),
+    fallback_profile("lean", &["**/*.lean"]),
+    fallback_profile("luau", &["**/*.luau"]),
+    fallback_profile("matlab", &["**/*.m"]),
+    fallback_profile("msl", &["**/*.metal"]),
+    fallback_profile("pascal", &["**/*.pas", "**/*.pp"]),
+    fallback_profile("r", &["**/*.r", "**/*.R"]),
+    fallback_profile("rego", &["**/*.rego"]),
+    fallback_profile("solidity", &["**/*.sol"]),
+    fallback_profile("systemverilog", &["**/*.sv", "**/*.svh"]),
+    fallback_profile("verilog", &["**/*.v", "**/*.vh"]),
+    fallback_profile("linker-script", &["**/*.ld", "**/*.lds"]),
+    fallback_profile("nu", &["**/*.nu"]),
+    fallback_profile("lisp", &["**/*.lisp", "**/*.lsp", "**/*.cl"]),
+    fallback_profile("expect", &["**/*.exp"]),
+];
+
+/// Return the immutable built-in profile catalog.
+#[must_use]
+pub fn builtin_language_profiles() -> &'static [BuiltinLanguageProfile] {
+    BUILTIN_LANGUAGE_PROFILES
 }
 
 /// Configuration for a single LSP server.
@@ -303,6 +1207,59 @@ impl LspServerConfig {
         }
     }
 
+    fn from_profile(profile: &BuiltinLanguageProfile) -> Option<Self> {
+        let candidate = profile
+            .candidates
+            .iter()
+            .find(|candidate| candidate.stability == BuiltinProfileStability::Stable)?;
+        Some(Self {
+            language_id: profile.language_id.to_string(),
+            command: candidate.command.to_string(),
+            args: candidate.args.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            file_patterns: profile
+                .file_patterns
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            initialization_options: None,
+            timeout_seconds: default_timeout(),
+            request_timeout_seconds: default_request_timeout(),
+            heuristics: Some(
+                ServerHeuristics::with_markers(profile.project_markers.iter().copied())
+                    .with_source_patterns(profile.source_patterns.iter().copied()),
+            ),
+            name: None,
+            handles: None,
+        })
+    }
+
+    /// Return the built-in profile that produced this configuration, if any.
+    #[must_use]
+    pub fn builtin_profile(&self) -> Option<&'static BuiltinLanguageProfile> {
+        builtin_language_profiles().iter().find(|profile| {
+            profile.language_id == self.language_id
+                && profile
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.command == self.command)
+                && self.heuristics.as_ref().is_some_and(|heuristics| {
+                    heuristics
+                        .source_patterns
+                        .iter()
+                        .map(String::as_str)
+                        .eq(profile.source_patterns.iter().copied())
+                })
+        })
+    }
+
+    /// Whether this configuration is an optional built-in profile.
+    #[must_use]
+    pub fn is_optional_builtin_profile(&self) -> bool {
+        self.builtin_profile()
+            .is_some_and(|profile| !profile.candidates.is_empty())
+    }
+
     /// Create a default configuration for rust-analyzer.
     #[must_use]
     pub fn rust_analyzer() -> Self {
@@ -318,7 +1275,7 @@ impl LspServerConfig {
     /// Create a default configuration for pyright.
     #[must_use]
     pub fn pyright() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "python",
             "pyright-langserver",
             &["--stdio"],
@@ -329,7 +1286,11 @@ impl LspServerConfig {
                 "requirements.txt",
                 "pyrightconfig.json",
             ],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns.push("**/*.py".to_string());
+        }
+        config
     }
 
     /// Create a default configuration for TypeScript language server.
@@ -347,19 +1308,23 @@ impl LspServerConfig {
     /// Create a default configuration for gopls.
     #[must_use]
     pub fn gopls() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "go",
             "gopls",
             &["serve"],
             &["**/*.go"],
             ["go.mod", "go.sum"],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns.push("**/*.go".to_string());
+        }
+        config
     }
 
     /// Create a default configuration for clangd.
     #[must_use]
     pub fn clangd() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "cpp",
             "clangd",
             &[],
@@ -370,25 +1335,41 @@ impl LspServerConfig {
                 "Makefile",
                 ".clangd",
             ],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns = vec![
+                "**/*.c".to_string(),
+                "**/*.cc".to_string(),
+                "**/*.cpp".to_string(),
+                "**/*.cxx".to_string(),
+                "**/*.h".to_string(),
+                "**/*.hpp".to_string(),
+                "**/*.hh".to_string(),
+            ];
+        }
+        config
     }
 
     /// Create a default configuration for zls.
     #[must_use]
     pub fn zls() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "zig",
             "zls",
             &[],
             &["**/*.zig"],
             ["build.zig", "build.zig.zon"],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns.push("**/*.zig".to_string());
+        }
+        config
     }
 
     /// Create a default configuration for nixd.
     #[must_use]
     pub fn nixd() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "nix",
             "nixd",
             &[],
@@ -400,14 +1381,18 @@ impl LspServerConfig {
                 "configuration.nix",
                 "home.nix",
             ],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns.push("**/*.nix".to_string());
+        }
+        config
     }
 
     /// Create a default configuration for sourcekit-lsp on Linux and macOS.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[must_use]
     pub fn sourcekit_lsp() -> Self {
-        Self::builtin(
+        let mut config = Self::builtin(
             "swift",
             "sourcekit-lsp",
             &[],
@@ -417,8 +1402,41 @@ impl LspServerConfig {
                 "project.pbxproj",
                 "contents.xcworkspacedata",
             ],
-        )
+        );
+        if let Some(heuristics) = &mut config.heuristics {
+            heuristics.source_patterns.push("**/*.swift".to_string());
+        }
+        config
     }
+}
+
+/// Build the automatic default server list from the built-in catalog.
+#[must_use]
+pub fn builtin_server_configs() -> Vec<LspServerConfig> {
+    let mut configs = vec![
+        LspServerConfig::rust_analyzer(),
+        LspServerConfig::pyright(),
+        LspServerConfig::typescript(),
+        LspServerConfig::gopls(),
+        LspServerConfig::clangd(),
+        LspServerConfig::zls(),
+        LspServerConfig::nixd(),
+    ];
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    configs.push(LspServerConfig::sourcekit_lsp());
+
+    for profile in builtin_language_profiles() {
+        if configs
+            .iter()
+            .any(|config| config.language_id == profile.language_id)
+        {
+            continue;
+        }
+        if let Some(config) = LspServerConfig::from_profile(profile) {
+            configs.push(config);
+        }
+    }
+    configs
 }
 
 #[cfg(test)]
@@ -610,6 +1628,148 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let heuristics = ServerHeuristics::with_markers(["Cargo.toml"]);
         assert!(!heuristics.is_applicable(tmp.path()));
+    }
+
+    #[test]
+    fn test_source_pattern_matches_markerless_project() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("main.swift"), "import Foundation\n").unwrap();
+
+        let heuristics = ServerHeuristics::default().with_source_patterns(["**/*.swift"]);
+
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+        assert_eq!(
+            heuristics.matching_roots(tmp.path(), None),
+            vec![tmp.path()]
+        );
+    }
+
+    #[test]
+    fn test_source_pattern_excludes_generated_tree() {
+        let tmp = TempDir::new().unwrap();
+        let generated = tmp.path().join("generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("main.swift"), "generated").unwrap();
+
+        let heuristics = ServerHeuristics::default().with_source_patterns(["**/*.swift"]);
+
+        assert!(!heuristics.is_applicable_recursive(tmp.path(), None));
+    }
+
+    #[test]
+    fn test_builtin_catalog_keeps_specialist_precedence_typed() {
+        let vue = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "vue")
+            .unwrap();
+        assert!(vue.supersedes.contains(&"typescript"));
+        assert!(vue.source_patterns.contains(&"**/*.vue"));
+
+        let fallback_only = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "kconfig")
+            .unwrap();
+        assert!(fallback_only.candidates.is_empty());
+    }
+
+    #[test]
+    fn test_builtin_catalog_covers_optional_language_surface() {
+        let profiles = builtin_language_profiles();
+        let mut language_ids = profiles
+            .iter()
+            .map(|profile| profile.language_id)
+            .collect::<Vec<_>>();
+        language_ids.sort_unstable();
+        language_ids.dedup();
+        assert_eq!(
+            language_ids.len(),
+            profiles.len(),
+            "duplicate profile language ID"
+        );
+
+        for language in [
+            "al",
+            "apex",
+            "asn1",
+            "autotools",
+            "bsl",
+            "clojure",
+            "crystal",
+            "cue",
+            "dart",
+            "dtrace",
+            "elm",
+            "expect",
+            "fsharp",
+            "gdscript",
+            "gleam",
+            "graphql",
+            "haxe",
+            "hlsl",
+            "julia",
+            "ksh",
+            "latex",
+            "lean",
+            "linker-script",
+            "lisp",
+            "luau",
+            "matlab",
+            "msl",
+            "nu",
+            "pascal",
+            "php",
+            "r",
+            "rego",
+            "scala",
+            "solidity",
+            "systemverilog",
+            "terraform",
+            "verilog",
+            "vhdl",
+        ] {
+            assert!(
+                profiles
+                    .iter()
+                    .any(|profile| profile.language_id == language),
+                "missing built-in profile: {language}"
+            );
+        }
+
+        let php = profiles
+            .iter()
+            .find(|profile| profile.language_id == "php")
+            .unwrap();
+        assert_eq!(php.candidates.len(), 2);
+        assert!(
+            php.candidates
+                .iter()
+                .all(|candidate| candidate.stability == BuiltinProfileStability::Experimental)
+        );
+
+        let terraform = profiles
+            .iter()
+            .find(|profile| profile.language_id == "terraform")
+            .unwrap();
+        assert_eq!(terraform.candidates[0].command, "terraform-ls");
+    }
+
+    #[test]
+    fn test_markerless_openscad_profile_is_source_gated() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("model.scad"), "cube(1);\n").unwrap();
+        let profile = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "openscad")
+            .unwrap();
+        let heuristics = ServerHeuristics::default()
+            .with_source_patterns(profile.source_patterns.iter().copied());
+        assert!(heuristics.is_applicable_recursive(tmp.path(), None));
+        assert!(
+            profile
+                .candidates
+                .iter()
+                .all(|candidate| { candidate.stability != BuiltinProfileStability::Stable })
+        );
     }
 
     #[test]

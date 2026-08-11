@@ -16,7 +16,9 @@ pub use language::{base_language_id, react_variant_language_id};
 pub use routing::{NoServerReason, ServerId, ToolKind, ToolRouter};
 use serde::{Deserialize, Serialize};
 pub use server::{
+    BuiltinLanguageProfile, BuiltinProfileStability, BuiltinServerCandidate,
     DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_TIMEOUT_SECONDS, ServerHeuristics,
+    builtin_language_profiles, builtin_server_configs,
 };
 
 use crate::bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits};
@@ -937,17 +939,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             workspace: WorkspaceConfig::default(),
-            lsp_servers: vec![
-                LspServerConfig::rust_analyzer(),
-                LspServerConfig::pyright(),
-                LspServerConfig::typescript(),
-                LspServerConfig::gopls(),
-                LspServerConfig::clangd(),
-                LspServerConfig::zls(),
-                LspServerConfig::nixd(),
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                LspServerConfig::sourcekit_lsp(),
-            ],
+            lsp_servers: builtin_server_configs(),
             daemon: DaemonConfig::default(),
             project_config_ignored: false,
         }
@@ -966,14 +958,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
-        assert_eq!(
-            config.lsp_servers.len(),
-            if cfg!(any(target_os = "linux", target_os = "macos")) {
-                8
-            } else {
-                7
-            }
-        );
+        assert!(config.lsp_servers.len() >= 8);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
         assert_eq!(config.lsp_servers[1].language_id, "python");
         assert_eq!(config.lsp_servers[2].language_id, "typescript");
@@ -1879,14 +1864,7 @@ mod tests {
 
         let loaded_config = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(loaded_config.workspace.language_extensions.len(), 31);
-        assert_eq!(
-            loaded_config.lsp_servers.len(),
-            if cfg!(any(target_os = "linux", target_os = "macos")) {
-                8
-            } else {
-                7
-            }
-        );
+        assert!(loaded_config.lsp_servers.len() >= 8);
         assert_eq!(loaded_config.lsp_servers[0].language_id, "rust");
     }
 
@@ -1895,14 +1873,7 @@ mod tests {
         // When called directly, default() should return config with all language extensions
         let config = ServerConfig::default();
         assert_eq!(config.workspace.language_extensions.len(), 31);
-        assert_eq!(
-            config.lsp_servers.len(),
-            if cfg!(any(target_os = "linux", target_os = "macos")) {
-                8
-            } else {
-                7
-            }
-        );
+        assert!(config.lsp_servers.len() >= 8);
         assert_eq!(config.lsp_servers[0].language_id, "rust");
     }
 

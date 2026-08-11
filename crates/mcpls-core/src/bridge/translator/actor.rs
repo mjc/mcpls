@@ -18,7 +18,7 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lsp::{
     LspNotification, LspServer, ServerInitConfig, apply_project_environment,
-    load_project_environment,
+    load_project_environment, resolve_command,
 };
 
 /// Health of a project activation across its configured language servers.
@@ -185,6 +185,38 @@ impl TranslatorTemplate {
             .clone_from(&self.position_encodings);
         translator
     }
+}
+
+fn apply_builtin_precedence(configs: &[LspServerConfig]) -> Vec<LspServerConfig> {
+    configs
+        .iter()
+        .filter(|config| {
+            !configs.iter().any(|candidate| {
+                candidate.language_id != config.language_id
+                    && candidate.builtin_profile().is_some_and(|profile| {
+                        profile
+                            .supersedes
+                            .iter()
+                            .any(|language| language.eq_ignore_ascii_case(&config.language_id))
+                            && profile.file_patterns.iter().any(|pattern| {
+                                config
+                                    .file_patterns
+                                    .iter()
+                                    .any(|configured| configured == pattern)
+                            })
+                    })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn builtin_command_available(
+    config: &LspServerConfig,
+    project_environment: Option<&HashMap<String, Option<String>>>,
+) -> bool {
+    !config.is_optional_builtin_profile()
+        || resolve_command(&config.command, project_environment).is_file()
 }
 
 impl Translator {
@@ -375,6 +407,7 @@ impl Translator {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let configs = apply_builtin_precedence(&configs);
         let router = ToolRouter::from_configs(configs.iter())?;
         *lock_std(&self.router) = router;
 
@@ -447,6 +480,19 @@ impl Translator {
                     apply_project_environment(&mut server_config, project_environment);
                 }
             }
+            let project_environment = server_roots
+                .first()
+                .and_then(|root| project_environments.get(root))
+                .and_then(Option::as_ref);
+            if !builtin_command_available(&server_config, project_environment) {
+                tracing::debug!(
+                    language = %server_config.language_id,
+                    command = %server_config.command,
+                    "skipping unavailable optional built-in language server"
+                );
+                self.clear_expected_server(&server_config.id());
+                continue;
+            }
             init_configs.push(ServerInitConfig {
                 initialization_options: rust_analyzer_initialization_options(
                     &server_config,
@@ -459,6 +505,14 @@ impl Translator {
             });
         }
         self.set_workspace_roots(roots);
+        if init_configs.is_empty() {
+            self.clear_expected_servers();
+            return Ok(if lock_std(&self.lsp_servers).is_empty() {
+                ProjectActivation::structural_only()
+            } else {
+                ProjectActivation::ready()
+            });
+        }
         let result = LspServer::spawn_batch(&init_configs).await;
         if result.all_failed() {
             self.clear_expected_servers();
@@ -944,6 +998,34 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn builtin_specialist_profiles_supersede_generic_profiles() {
+        let defaults = crate::config::ServerConfig::default().lsp_servers;
+        let typescript = defaults
+            .iter()
+            .find(|config| config.language_id == "typescript")
+            .cloned()
+            .unwrap();
+        let vue = defaults
+            .iter()
+            .find(|config| config.language_id == "vue")
+            .cloned()
+            .unwrap();
+
+        let filtered = apply_builtin_precedence(&[typescript.clone(), vue]);
+
+        assert_eq!(filtered.len(), 2);
+
+        let angular = defaults
+            .iter()
+            .find(|config| config.language_id == "angular")
+            .cloned()
+            .unwrap();
+        let filtered = apply_builtin_precedence(&[typescript, angular]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].language_id, "angular");
+    }
 
     #[test]
     fn nested_marker_uses_effective_project_root_for_rust_analyzer() {

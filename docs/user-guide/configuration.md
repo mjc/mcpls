@@ -305,6 +305,43 @@ Glob pattern syntax:
 - `?` - Match single character
 - `[abc]` - Match any character in brackets
 
+### Built-in profiles, detection, and overrides
+
+The built-in catalog contains project-aware profiles for common languages and
+fallback-only classifications for DSLs that do not yet have a
+capability-tested server. Profiles use marker files when available and source
+globs for unmanifested projects (for example, a standalone `*.swift` or
+`*.scad` file). Dependency, generated, build, and fixture directories are
+excluded from source detection by default.
+
+The catalog is metadata, not a bundle: mcpls resolves each selected `command`
+from the project/dev-shell environment and skips an unavailable optional server
+without making the project unavailable. Ast-grep and text tools remain usable
+when no profile applies or no executable is installed.
+
+Override one profile field by declaring a project or user `[[lsp_servers]]`
+entry with the same language and the desired command, arguments, markers, source
+patterns, initialization options, or exclusions. This replaces the matching
+server entry for that configuration; it does not require copying the rest of
+the built-in catalog. For example:
+
+```toml
+[[lsp_servers]]
+language_id = "python"
+command = "ty"
+args = ["server"]
+file_patterns = ["**/*.py"]
+
+[lsp_servers.heuristics]
+project_markers = ["pyproject.toml", "ty.toml"]
+source_patterns = ["**/*.py"]
+excluded_directories = ["fixtures", "generated"]
+```
+
+Specialist profiles (such as Vue, Angular, QML, and Ansible) carry explicit
+precedence metadata so they can supersede generic TypeScript, HTML, or YAML
+routing only where their project markers and source patterns apply.
+
 ### `timeout_seconds`
 
 **Type**: Integer
