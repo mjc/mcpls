@@ -828,7 +828,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &[],
         &[candidate(
             "neocmakelsp",
-            &[],
+            &["stdio"],
             BuiltinProfileStability::Experimental,
         )],
         &[],
@@ -1078,7 +1078,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &["**/*.f", "**/*.f90", "**/*.f95", "**/*.f03"],
         &[candidate(
             "fortls",
-            &["--debug_ls"],
+            &[],
             BuiltinProfileStability::Experimental,
         )],
         &[],
@@ -2035,6 +2035,28 @@ mod tests {
                 profile.language_id
             );
         }
+    }
+
+    #[test]
+    fn test_experimental_profile_commands_use_lsp_stdio_modes() {
+        let fortls = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "fortran")
+            .unwrap();
+        assert!(
+            fortls
+                .candidates
+                .iter()
+                .any(|candidate| candidate.command == "fortls" && candidate.args.is_empty())
+        );
+
+        let neocmakelsp = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "cmake")
+            .unwrap();
+        assert!(neocmakelsp.candidates.iter().any(|candidate| {
+            candidate.command == "neocmakelsp" && candidate.args == ["stdio"]
+        }));
     }
 
     #[test]
