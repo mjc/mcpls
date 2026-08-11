@@ -410,7 +410,7 @@ fn parse_response(bytes: &[u8]) -> Value {
     });
     let decoded = if header_text
         .lines()
-        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked\r"))
+        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
     {
         decode_chunked(body)
     } else {
