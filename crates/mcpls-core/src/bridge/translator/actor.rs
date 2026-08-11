@@ -196,6 +196,7 @@ impl TranslatorTemplate {
     }
 }
 
+#[cfg(test)]
 fn apply_builtin_precedence(configs: &[LspServerConfig]) -> Vec<LspServerConfig> {
     configs
         .iter()
@@ -218,6 +219,36 @@ fn apply_builtin_precedence(configs: &[LspServerConfig]) -> Vec<LspServerConfig>
         })
         .cloned()
         .collect()
+}
+
+fn active_builtin_aliases(
+    configs: &[LspServerConfig],
+    successful: &HashSet<ServerId>,
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for specialist in configs {
+        if !successful.contains(&specialist.id()) {
+            continue;
+        }
+        let Some(profile) = specialist.builtin_profile() else {
+            continue;
+        };
+        for generic in configs.iter().filter(|generic| {
+            profile
+                .supersedes
+                .iter()
+                .any(|language| language.eq_ignore_ascii_case(&generic.language_id))
+                && profile.file_patterns.iter().any(|pattern| {
+                    generic
+                        .file_patterns
+                        .iter()
+                        .any(|configured| configured == pattern)
+                })
+        }) {
+            aliases.insert(generic.language_id.clone(), specialist.language_id.clone());
+        }
+    }
+    aliases
 }
 
 fn builtin_command_available(
@@ -407,6 +438,7 @@ impl Translator {
         if roots.is_empty() {
             return Err(Error::NoServerConfigured);
         }
+        lock_std(&self.active_language_aliases).clear();
         let configs = lock_std(&self.project_lsp_configs)
             .iter()
             .filter(|config| {
@@ -416,7 +448,6 @@ impl Translator {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let configs = apply_builtin_precedence(&configs);
         let router = ToolRouter::from_configs(configs.iter())?;
         *lock_std(&self.router) = router;
 
@@ -452,6 +483,9 @@ impl Translator {
             .cloned()
             .collect::<Vec<_>>();
         if pending.is_empty() {
+            let active_ids = lock_std(&self.lsp_servers).keys().cloned().collect();
+            lock_std(&self.active_language_aliases)
+                .clone_from(&active_builtin_aliases(&configs, &active_ids));
             self.set_workspace_roots(roots);
             return Ok(ProjectActivation::ready());
         }
@@ -525,6 +559,7 @@ impl Translator {
         let result = LspServer::spawn_batch(&init_configs).await;
         if result.all_failed() {
             self.clear_expected_servers();
+            lock_std(&self.active_language_aliases).clear();
             return Err(Error::LspInitFailed {
                 message: result
                     .failures
@@ -577,6 +612,8 @@ impl Translator {
                 }
             }
         }
+        lock_std(&self.active_language_aliases)
+            .clone_from(&active_builtin_aliases(&configs, &successful));
         let diagnostics_routes = init_by_id
             .iter()
             .filter(|(id, config)| {
@@ -598,6 +635,7 @@ impl Translator {
         self.shutdown_servers().await;
         lock_std(&self.lsp_clients).clear();
         lock_std(&self.project_lsp_roots).clear();
+        lock_std(&self.active_language_aliases).clear();
         self.clear_expected_servers();
         Ok(())
     }
@@ -1048,6 +1086,39 @@ mod tests {
         let filtered = apply_builtin_precedence(&[yaml, ansible]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].language_id, "ansible");
+    }
+
+    #[test]
+    fn live_specialist_aliases_preserve_generic_fallbacks() {
+        let defaults = crate::config::ServerConfig::default().lsp_servers;
+        let angular = defaults
+            .iter()
+            .find(|config| config.language_id == "angular")
+            .unwrap();
+        let typescript = defaults
+            .iter()
+            .find(|config| config.language_id == "typescript")
+            .unwrap();
+        let ansible = defaults
+            .iter()
+            .find(|config| config.language_id == "ansible")
+            .unwrap();
+        let yaml = defaults
+            .iter()
+            .find(|config| config.language_id == "yaml")
+            .unwrap();
+        let configs = vec![
+            typescript.clone(),
+            angular.clone(),
+            yaml.clone(),
+            ansible.clone(),
+        ];
+        let successful = HashSet::from([angular.id(), ansible.id()]);
+
+        let aliases = active_builtin_aliases(&configs, &successful);
+
+        assert_eq!(aliases.get("typescript"), Some(&"angular".to_string()));
+        assert_eq!(aliases.get("yaml"), Some(&"ansible".to_string()));
     }
 
     #[test]

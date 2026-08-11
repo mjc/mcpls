@@ -89,6 +89,9 @@ pub struct Translator {
     /// task once registration completes) never contends with an in-flight
     /// LSP round trip.
     router: Arc<StdMutex<ToolRouter>>,
+    /// Project-scoped aliases from generic language IDs to live specialist
+    /// profiles (for example, TypeScript files routed through Angular).
+    active_language_aliases: Arc<StdMutex<HashMap<String, String>>>,
     /// Configs needed to respawn a server if its process dies later, keyed
     /// by routing identity. Populated once per server right after a
     /// successful spawn (see [`Self::register_server_config`]); the respawn
@@ -156,6 +159,7 @@ impl Translator {
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
+            active_language_aliases: Arc::new(StdMutex::new(HashMap::new())),
             server_configs: Arc::new(StdMutex::new(HashMap::new())),
             respawn_locks: Arc::new(StdMutex::new(HashMap::new())),
             respawn_backoffs: Arc::new(StdMutex::new(HashMap::new())),

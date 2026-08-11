@@ -85,11 +85,11 @@ impl Translator {
     /// Resolve the server that should handle `tool` for the file at `path`,
     /// returning both its routing identity and a cloned client.
     ///
-    /// Tries the file's detected language first, then (if that has no route)
-    /// its React base language (`.tsx` falling back from `typescriptreact` to
-    /// `typescript`, and similarly for `.jsx`) -- in that order, so an
-    /// explicit `typescriptreact` server still wins over the `typescript`
-    /// fallback when both are configured.
+    /// Tries a live project specialist alias first, then the file's detected
+    /// language, then (if that has no route) its React base language (`.tsx`
+    /// falling back from `typescriptreact` to `typescript`, and similarly for
+    /// `.jsx`) -- in that order, so an explicit `typescriptreact` server still
+    /// wins over the `typescript` fallback when both are configured.
     ///
     /// Locks `router`, `lsp_clients`, and (on the not-yet-registered path)
     /// `expected_servers` only for their respective lookups — every guard is
@@ -100,7 +100,12 @@ impl Translator {
         tool: ToolKind,
     ) -> Result<(ServerId, LspClient)> {
         let language = detect_language(path, &self.extension_map);
-        let mut candidates: Vec<&str> = vec![language.as_str()];
+        let alias = lock_std(&self.active_language_aliases)
+            .get(&language)
+            .filter(|alias| alias.as_str() != language.as_str())
+            .cloned();
+        let mut candidates: Vec<&str> = alias.as_deref().into_iter().collect();
+        candidates.push(language.as_str());
         if let Some(base) = base_language_id(&language) {
             candidates.push(base);
         }
@@ -501,6 +506,44 @@ mod tests {
             .get_client_for_file(&test_file, ToolKind::Hover)
             .unwrap();
         assert_eq!(client.language_id(), "typescript");
+    }
+
+    #[test]
+    fn test_get_client_for_file_prefers_live_specialist_alias() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_file = temp_dir.path().join("app.component.ts");
+        fs::write(&test_file, "export class AppComponent {}").unwrap();
+
+        let mut extension_map = HashMap::new();
+        extension_map.insert("ts".to_string(), "typescript".to_string());
+        let translator = Translator::new()
+            .with_extensions(extension_map)
+            .with_router(ToolRouter::catch_all([
+                (ServerId::from("typescript"), "typescript".to_string()),
+                (ServerId::from("angular"), "angular".to_string()),
+            ]));
+        translator.register_client(
+            "typescript".to_string(),
+            LspClient::new(crate::config::LspServerConfig::typescript()),
+        );
+        translator.register_client(
+            "angular".to_string(),
+            LspClient::new(
+                crate::config::ServerConfig::default()
+                    .lsp_servers
+                    .into_iter()
+                    .find(|config| config.language_id == "angular")
+                    .unwrap(),
+            ),
+        );
+        lock_std(&translator.active_language_aliases)
+            .insert("typescript".to_string(), "angular".to_string());
+
+        let (id, client) = translator
+            .get_client_for_file(&test_file, ToolKind::Hover)
+            .unwrap();
+        assert_eq!(id, ServerId::from("angular"));
+        assert_eq!(client.language_id(), "angular");
     }
 
     #[test]

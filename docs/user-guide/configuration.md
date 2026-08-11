@@ -353,7 +353,9 @@ mcpls installs or bundles the executable.
 
 Specialist profiles (such as Vue, Angular, QML, and Ansible) carry explicit
 precedence metadata so they can supersede generic TypeScript, HTML, or YAML
-routing only where their project markers and source patterns apply.
+routing only where their project markers and source patterns apply. The alias is
+installed only after the specialist initializes; if it is unavailable or fails,
+the generic server remains the route.
 
 ### `timeout_seconds`
 

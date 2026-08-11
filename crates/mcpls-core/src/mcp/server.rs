@@ -5510,6 +5510,62 @@ while True:
     }
 
     #[tokio::test]
+    async fn project_activate_without_optional_executable_keeps_ast_fallback() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname=\"fixture\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("main.py"),
+            "def missing_server_fallback():\n    return 42\n",
+        )
+        .unwrap();
+
+        let mut config = crate::config::LspServerConfig::pyright();
+        config.command = "/definitely-missing/pyright-langserver".to_string();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![config], Some(2));
+        let registry =
+            ProjectRegistry::with_translator_template(2, translator.configuration_template());
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        server
+            .project_add(Parameters(ProjectAddParams {
+                project_id: "missing-optional".to_string(),
+                root: root.path().display().to_string(),
+                config: None,
+            }))
+            .await
+            .unwrap();
+        let activated = server
+            .project_activate(Parameters(ProjectIdParams {
+                project_id: "missing-optional".to_string(),
+            }))
+            .await
+            .unwrap();
+        let activated: serde_json::Value = serde_json::from_str(&activated).unwrap();
+        assert_eq!(activated["status"], "Degraded");
+        assert_eq!(activated["active_language_servers"], serde_json::json!([]));
+
+        let symbols = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: "missing-optional".to_string(),
+                query: "missing_server_fallback".to_string(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
+                limit: 20,
+            }))
+            .await
+            .unwrap();
+        let symbols: serde_json::Value = serde_json::from_str(&symbols).unwrap();
+        assert_eq!(symbols["symbols"][0]["name"], "missing_server_fallback");
+    }
+
+    #[tokio::test]
     async fn test_server_can_share_an_injected_registry() {
         let subscriptions = Arc::new(ResourceSubscriptions::new());
         let registry = crate::project::ProjectRegistry::new(2);

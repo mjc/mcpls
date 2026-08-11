@@ -1873,6 +1873,14 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_with_no_matching_language_stays_inactive() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        assert!(!LspServerConfig::typescript().should_spawn(tmp.path(), None));
+    }
+
+    #[test]
     fn test_builtin_catalog_keeps_specialist_precedence_typed() {
         let vue = builtin_language_profiles()
             .iter()
