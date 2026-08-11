@@ -937,3 +937,32 @@ fn rust_analyzer_excluded_paths(roots: &[PathBuf]) -> Vec<String> {
     excluded.sort();
     excluded
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn nested_marker_uses_effective_project_root_for_rust_analyzer() {
+        let outer = TempDir::new().expect("temporary workspace");
+        let nested = outer.path().join("pkgs/ai-integrations");
+        std::fs::create_dir_all(&nested).expect("nested project directory");
+        std::fs::write(nested.join("Cargo.toml"), "[workspace]\n").expect("nested Cargo manifest");
+
+        let config = LspServerConfig::rust_analyzer();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![config.clone()], Some(10));
+        let requested = vec![outer.path().to_path_buf()];
+        let effective = translator.server_workspace_roots(&config, &requested);
+
+        assert!(
+            translator
+                .configuration_template()
+                .language_applies_to_root("rust", outer.path())
+        );
+        assert_eq!(effective, vec![nested]);
+    }
+}
