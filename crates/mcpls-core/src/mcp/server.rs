@@ -1339,7 +1339,13 @@ impl McplsServer {
 
     /// Apply a previously previewed, session-owned workspace edit plan.
     #[tool(
-        description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced."
+        description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced.",
+        annotations(
+            title = "Apply workspace edit",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn workspace_edit_apply(
         &self,
@@ -1350,7 +1356,13 @@ impl McplsServer {
 
     /// Apply a rename preview through the generic workspace-edit transaction.
     #[tool(
-        description = "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced."
+        description = "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced.",
+        annotations(
+            title = "Apply rename",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn rename_apply(
         &self,
@@ -1361,7 +1373,13 @@ impl McplsServer {
 
     /// Apply a formatting preview through the generic workspace-edit transaction.
     #[tool(
-        description = "Apply a formatting plan returned by format_preview. Plans are single-use and revalidated before any file is replaced."
+        description = "Apply a formatting plan returned by format_preview. Plans are single-use and revalidated before any file is replaced.",
+        annotations(
+            title = "Apply formatting",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
     )]
     async fn format_apply(
         &self,
@@ -1860,7 +1878,15 @@ impl McplsServer {
     }
 
     /// Apply a code action plan previewed by this MCP session.
-    #[tool(description = "Apply a code action preview plan owned by this MCP session.")]
+    #[tool(
+        description = "Apply a code action preview plan owned by this MCP session.",
+        annotations(
+            title = "Apply code action",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
     async fn code_action_apply(
         &self,
         Parameters(CodeActionApplyParams {
@@ -6678,5 +6704,22 @@ while True:
         let server = create_test_server();
         let info = server.get_info();
         assert!(info.capabilities.resources.is_some());
+    }
+
+    #[test]
+    fn mutating_apply_tools_advertise_destructive_annotations() {
+        for tool in [
+            McplsServer::workspace_edit_apply_tool_attr(),
+            McplsServer::rename_apply_tool_attr(),
+            McplsServer::format_apply_tool_attr(),
+            McplsServer::code_action_apply_tool_attr(),
+        ] {
+            let Some(annotations) = tool.annotations else {
+                panic!("mutating tool annotations");
+            };
+            assert_eq!(annotations.read_only_hint, Some(false));
+            assert_eq!(annotations.destructive_hint, Some(true));
+            assert_eq!(annotations.idempotent_hint, Some(false));
+        }
     }
 }

@@ -24,6 +24,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Apply code action",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
     }
   },
   {
@@ -1927,6 +1933,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Apply formatting",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
     }
   },
   {
@@ -12307,6 +12319,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Apply rename",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
     }
   },
   {
@@ -12623,6 +12641,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Apply workspace edit",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false
     }
   },
   {
