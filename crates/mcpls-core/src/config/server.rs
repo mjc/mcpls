@@ -1059,7 +1059,7 @@ static BUILTIN_LANGUAGE_PROFILES: &[BuiltinLanguageProfile] = &[
         &[candidate(
             "ada-language-server",
             &[],
-            BuiltinProfileStability::Stable,
+            BuiltinProfileStability::Experimental,
         )],
         &[],
     ),
@@ -2158,6 +2158,15 @@ mod tests {
             .unwrap();
         assert_eq!(xml.candidates[0].command, "lemminx");
         assert_eq!(xml.candidates[0].stability, BuiltinProfileStability::Stable);
+
+        let ada = builtin_language_profiles()
+            .iter()
+            .find(|profile| profile.language_id == "ada")
+            .unwrap();
+        assert_eq!(
+            ada.candidates[0].stability,
+            BuiltinProfileStability::Experimental
+        );
     }
 
     #[test]
