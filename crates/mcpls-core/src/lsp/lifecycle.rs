@@ -52,6 +52,10 @@ const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEM
 /// forced process-tree termination.
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 
+/// Bound project-environment discovery so a stuck `.envrc` cannot hold an
+/// activation mailbox indefinitely.
+const PROJECT_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 struct ProcessGroup(Pid);
@@ -1009,12 +1013,33 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = Command::new(command)
-        .args(args)
-        .current_dir(root)
-        .output()
-        .await
-        .ok()?;
+    command_environment_with_timeout(command, args, root, PROJECT_ENVIRONMENT_TIMEOUT).await
+}
+
+async fn command_environment_with_timeout<I, S>(
+    command: &str,
+    args: I,
+    root: &Path,
+    timeout: Duration,
+) -> Option<HashMap<String, Option<String>>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let output = tokio::time::timeout(
+        timeout,
+        Command::new(command)
+            .args(args)
+            .current_dir(root)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        warn!(command, ?timeout, root = %root.display(), "project environment command timed out");
+    })
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2554,6 +2579,24 @@ fn main() {
 
         assert_eq!(envs.get("PATH"), Some(&"/project/bin".to_string()));
         assert!(!envs.contains_key("MCPLS_TEST_LEAK_CANARY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_environment_command_times_out_without_waiting_for_child() {
+        let root = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+
+        let environment = command_environment_with_timeout(
+            "sh",
+            ["-c", "sleep 1"],
+            root.path(),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(environment.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     /// Regression test for #247: `LspServerConfig::env` entries must reach
