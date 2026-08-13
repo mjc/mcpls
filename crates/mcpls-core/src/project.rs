@@ -1720,6 +1720,7 @@ impl ProjectRequest {
                 | Self::SemanticDiscovery { .. }
                 | Self::WorkspaceSymbol { .. }
                 | Self::InspectSymbol { .. }
+                | Self::ReadDeferredResource { .. }
                 | Self::CodeActions { .. }
                 | Self::CodeActionList { .. }
                 | Self::PrepareCallHierarchy { .. }
