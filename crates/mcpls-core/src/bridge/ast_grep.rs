@@ -265,6 +265,14 @@ fn structural_search_sync(
                 .map_err(|_| "ast-grep replacement is not valid UTF-8".to_string())?;
             planned.replace_range(edit.position..end, &inserted);
         }
+        let planned_tree = language.ast_grep(&planned);
+        if planned_tree
+            .root()
+            .dfs()
+            .any(|node| node.is_error() || node.is_missing())
+        {
+            return Err("ast-grep replacement produced invalid syntax".to_string());
+        }
         if planned.len() > MAX_PLANNED_FILE_BYTES {
             return Err("ast-grep replacement exceeded per-file byte limit".to_string());
         }
@@ -864,6 +872,31 @@ mod tests {
         assert_eq!(
             changes[&path_to_uri(&path).expect("temporary path must convert to URI")][0].new_text,
             "fn main() { bar(2); }\n"
+        );
+    }
+
+    #[test]
+    fn structural_replacement_rejects_invalid_planned_source() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let path = temp.path().join("source.rs");
+        fs::write(&path, "fn target() { let value = 1; }\n")
+            .expect("fixture source should be written");
+
+        let result = structural_search_sync(
+            temp.path(),
+            "rust",
+            "fn target() { $$$BODY }",
+            Some("fn target() { $$$ }"),
+            PositionEncoding::Utf8,
+            &HashMap::new(),
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            result
+                .expect_err("invalid replacement output must fail closed")
+                .contains("invalid syntax")
         );
     }
 
