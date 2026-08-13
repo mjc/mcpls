@@ -41,6 +41,7 @@ impl RustResidencyBudget {
         }
     }
 
+    #[cfg(test)]
     fn pin(&mut self, group: RustGroupId, excluded: &HashSet<RustGroupId>) -> ResidencyDecision {
         self.pin_with_minimum_idle(group, excluded, self.idle_timeout)
     }
@@ -183,26 +184,10 @@ impl RustResidencyController {
     }
 
     pub(super) async fn acquire(&self, group: RustGroupId) -> RustResidencyGuard {
-        self.acquire_with_policy(group, false).await
-    }
-
-    pub(super) async fn acquire_for_request(&self, group: RustGroupId) -> RustResidencyGuard {
-        self.acquire_with_policy(group, true).await
-    }
-
-    async fn acquire_with_policy(
-        &self,
-        group: RustGroupId,
-        evict_recent: bool,
-    ) -> RustResidencyGuard {
         let mut excluded = HashSet::new();
         loop {
             let transition = self.inner.transition.lock().await;
-            let decision = if evict_recent {
-                self.state().budget.pin_for_activation(group, &excluded)
-            } else {
-                self.state().budget.pin(group, &excluded)
-            };
+            let decision = self.state().budget.pin_for_activation(group, &excluded);
             match decision {
                 ResidencyDecision::Admit | ResidencyDecision::Reuse => {
                     return self.guard(group);
@@ -407,12 +392,10 @@ mod tests {
             };
             reply.send(Ok(())).unwrap();
         });
-        let guard = tokio::time::timeout(
-            Duration::from_secs(1),
-            controller.acquire_for_request(RustGroupId(2)),
-        )
-        .await
-        .expect("a cold request should not wait for the idle timeout");
+        let guard =
+            tokio::time::timeout(Duration::from_secs(1), controller.acquire(RustGroupId(2)))
+                .await
+                .expect("a cold request should not wait for the idle timeout");
 
         suspension.await.unwrap();
         drop(guard);

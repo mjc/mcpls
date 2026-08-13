@@ -5675,7 +5675,7 @@ impl ProjectResidency {
 
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
         assert!(request.uses_rust_residency());
-        let guard = self.controller.acquire_for_request(self.group).await;
+        let guard = self.acquire().await;
         ProjectRequest::Resident {
             request: Box::new(request),
             guard,
