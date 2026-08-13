@@ -5674,15 +5674,8 @@ impl ProjectResidency {
     }
 
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
-        let guard = match request.rust_residency_requirement() {
-            RustResidencyRequirement::Activate => {
-                self.controller.acquire_for_activation(self.group).await
-            }
-            RustResidencyRequirement::Resume => self.acquire().await,
-            RustResidencyRequirement::None => {
-                unreachable!("non-resident request reached residency admission")
-            }
-        };
+        assert!(request.uses_rust_residency());
+        let guard = self.controller.acquire_for_request(self.group).await;
         ProjectRequest::Resident {
             request: Box::new(request),
             guard,

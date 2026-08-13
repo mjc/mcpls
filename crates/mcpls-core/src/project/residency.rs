@@ -186,7 +186,7 @@ impl RustResidencyController {
         self.acquire_with_policy(group, false).await
     }
 
-    pub(super) async fn acquire_for_activation(&self, group: RustGroupId) -> RustResidencyGuard {
+    pub(super) async fn acquire_for_request(&self, group: RustGroupId) -> RustResidencyGuard {
         self.acquire_with_policy(group, true).await
     }
 
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_activation_evicts_a_recent_unpinned_group() {
+    async fn cold_request_evicts_a_recent_unpinned_group() {
         let controller =
             RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
         let (first_sender, mut first_receiver) = mpsc::channel(1);
@@ -409,10 +409,10 @@ mod tests {
         });
         let guard = tokio::time::timeout(
             Duration::from_secs(1),
-            controller.acquire_for_activation(RustGroupId(2)),
+            controller.acquire_for_request(RustGroupId(2)),
         )
         .await
-        .expect("explicit activation should not wait for the idle timeout");
+        .expect("a cold request should not wait for the idle timeout");
 
         suspension.await.unwrap();
         drop(guard);
