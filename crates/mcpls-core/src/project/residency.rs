@@ -186,10 +186,7 @@ impl RustResidencyController {
         self.acquire_with_policy(group, false).await
     }
 
-    pub(super) async fn acquire_for_activation(
-        &self,
-        group: RustGroupId,
-    ) -> RustResidencyGuard {
+    pub(super) async fn acquire_for_activation(&self, group: RustGroupId) -> RustResidencyGuard {
         self.acquire_with_policy(group, true).await
     }
 

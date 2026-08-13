@@ -1691,6 +1691,13 @@ enum ProjectRequest {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustResidencyRequirement {
+    None,
+    Resume,
+    Activate,
+}
+
 impl ProjectRequest {
     fn into_resident(self) -> (Self, Option<residency::RustResidencyGuard>) {
         match self {
@@ -1699,12 +1706,19 @@ impl ProjectRequest {
         }
     }
 
-    const fn uses_rust_residency(&self) -> bool {
-        matches!(
+    const fn rust_residency_requirement(&self) -> RustResidencyRequirement {
+        if matches!(
             self,
             Self::Activate { .. }
                 | Self::ActivateWorkspaceRoots { .. }
-                | Self::Hover { .. }
+                | Self::AddWorkspaceRoot { .. }
+                | Self::Restart { .. }
+        ) {
+            return RustResidencyRequirement::Activate;
+        }
+        if matches!(
+            self,
+            Self::Hover { .. }
                 | Self::Definition { .. }
                 | Self::References { .. }
                 | Self::ResolveSymbolHandle { .. }
@@ -1730,11 +1744,9 @@ impl ProjectRequest {
                 | Self::InlayHints { .. }
                 | Self::GoToImplementation { .. }
                 | Self::GoToTypeDefinition { .. }
-                | Self::AddWorkspaceRoot { .. }
                 | Self::ApplyEditPlan { .. }
                 | Self::MoveInlineModulePreview { .. }
                 | Self::PathRenamePreview { .. }
-                | Self::Restart { .. }
         ) || matches!(
             self,
             Self::StructuralReplacePreview {
@@ -1744,28 +1756,25 @@ impl ProjectRequest {
                 },
                 ..
             }
-        )
+        ) {
+            RustResidencyRequirement::Resume
+        } else {
+            RustResidencyRequirement::None
+        }
     }
 
-    const fn explicitly_activates_rust_runtime(&self) -> bool {
-        matches!(
-            self,
-            Self::Activate { .. }
-                | Self::ActivateWorkspaceRoots { .. }
-                | Self::AddWorkspaceRoot { .. }
-                | Self::Restart { .. }
+    const fn uses_rust_residency(&self) -> bool {
+        !matches!(
+            self.rust_residency_requirement(),
+            RustResidencyRequirement::None
         )
     }
 
     const fn resumes_rust_runtime(&self) -> bool {
-        self.uses_rust_residency()
-            && !matches!(
-                self,
-                Self::Activate { .. }
-                    | Self::ActivateWorkspaceRoots { .. }
-                    | Self::AddWorkspaceRoot { .. }
-                    | Self::Restart { .. }
-            )
+        matches!(
+            self.rust_residency_requirement(),
+            RustResidencyRequirement::Resume
+        )
     }
 
     /// Fail LSP work that was queued while this actor exhausted recovery.
@@ -5665,10 +5674,14 @@ impl ProjectResidency {
     }
 
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
-        let guard = if request.explicitly_activates_rust_runtime() {
-            self.controller.acquire_for_activation(self.group).await
-        } else {
-            self.acquire().await
+        let guard = match request.rust_residency_requirement() {
+            RustResidencyRequirement::Activate => {
+                self.controller.acquire_for_activation(self.group).await
+            }
+            RustResidencyRequirement::Resume => self.acquire().await,
+            RustResidencyRequirement::None => {
+                unreachable!("non-resident request reached residency admission")
+            }
         };
         ProjectRequest::Resident {
             request: Box::new(request),
