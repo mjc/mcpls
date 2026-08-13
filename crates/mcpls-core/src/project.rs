@@ -2093,6 +2093,11 @@ impl ProjectHandle {
     }
 
     /// Route one deterministic reference page through this project's actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
     pub async fn references_with_cursor(
         &self,
         file_path: String,
@@ -4447,8 +4452,8 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn read_deferred_resource(&mut self, token: String) -> Result<serde_json::Value, String> {
-        self.deferred_results.read(&token)
+    fn read_deferred_resource(&mut self, token: &str) -> Result<serde_json::Value, String> {
+        self.deferred_results.read(token)
     }
 
     fn defer_inspect_section<T: Serialize>(
@@ -5035,8 +5040,10 @@ impl ProjectRuntime {
             .translator
             .source_snapshot(Path::new(&file_path))
             .await
-            .map(|(_, _, hash, _)| hash)
-            .unwrap_or_else(|_| format!("generation:{}", self.generation));
+            .map_or_else(
+                |_| format!("generation:{}", self.generation),
+                |(_, _, hash, _)| hash,
+            );
         macro_rules! drop_section_if_over_budget {
             ($field:ident) => {
                 if serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len())
@@ -5757,6 +5764,7 @@ impl ProjectActorChannels {
     }
 }
 
+#[allow(clippy::large_futures)]
 async fn run_project_actor(
     mut receiver: mpsc::Receiver<ProjectRequest>,
     actor_sender: mpsc::WeakSender<ProjectRequest>,
@@ -6083,7 +6091,7 @@ async fn handle_project_request(
             let _ = reply.send(runtime.read_source_resource(resource).await);
         }
         ProjectRequest::ReadDeferredResource { token, reply } => {
-            let _ = reply.send(runtime.read_deferred_resource(token));
+            let _ = reply.send(runtime.read_deferred_resource(&token));
         }
         ProjectRequest::ResolveSymbolHandle {
             symbol_handle,
@@ -8394,7 +8402,7 @@ impl ProjectRegistry {
         for actor in actors {
             match actor.read_deferred_resource(token.clone()).await {
                 Ok(value) => return Ok(value),
-                Err(error) if error.to_string().starts_with("stale_resource") => continue,
+                Err(error) if error.to_string().starts_with("stale_resource") => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
@@ -9461,6 +9469,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::large_futures)]
     async fn project_actor_delivers_active_mutation_after_response_cancellation() {
         let (status_tx, _) = watch::channel(ProjectStatus::Starting);
         let (event_tx, _) = broadcast::channel(1);

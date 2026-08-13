@@ -3116,8 +3116,8 @@ impl ServerHandler for McplsServer {
             }
             SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
-            | SessionResource::Source(_) => request.uri,
-            SessionResource::Deferred(_) => request.uri,
+            | SessionResource::Source(_)
+            | SessionResource::Deferred(_) => request.uri,
         };
         self.context.subscriptions.unsubscribe(&uri).await;
         self.context.event_sink.untrack_subscription(&uri);

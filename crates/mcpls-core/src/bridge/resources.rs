@@ -66,6 +66,10 @@ pub struct SourceResource {
 }
 
 /// Encode a source context resource without exposing mutable actor state.
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be encoded as a resource URI.
 pub fn make_source_uri(
     path: &Path,
     start_line: u32,
@@ -96,20 +100,22 @@ pub fn make_source_uri(
 }
 
 /// Decode a snapshot-bound source context resource URI.
+///
+/// # Errors
+///
+/// Returns an error when the URI scheme, path, or required snapshot/range
+/// fields are malformed.
 pub fn parse_source_uri(uri: &str) -> Result<SourceResource, ResourceUriError> {
     if !uri.starts_with(SOURCE_PREFIX) {
         return Err(ResourceUriError::InvalidScheme(uri.to_owned()));
     }
     let parsed =
         Url::parse(uri).map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
-    let mut file_uri = parsed.clone();
-    file_uri
-        .set_scheme("file")
-        .map_err(|()| ResourceUriError::DecodeFailed(uri.to_owned()))?;
-    file_uri.set_query(None);
-    let path = file_uri
-        .to_file_path()
-        .map_err(|()| ResourceUriError::DecodeFailed(uri.to_owned()))?;
+    let path_uri =
+        uri.split_once('?')
+            .map_or(uri, |(path, _)| path)
+            .replacen(SOURCE_PREFIX, PREFIX, 1);
+    let path = parse_uri(&path_uri)?;
     let value = |name: &str| {
         parsed
             .query_pairs()

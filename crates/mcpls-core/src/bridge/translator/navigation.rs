@@ -243,6 +243,12 @@ impl Translator {
     }
 
     /// Handle one deterministic page of references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LSP request fails, the file cannot be opened,
+    /// or the routed server does not advertise `referencesProvider` support.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_references_page(
         &self,
         file_path: String,
@@ -614,6 +620,7 @@ fn collect_reference_groups(
     groups
 }
 
+#[allow(clippy::too_many_arguments)]
 fn group_references_page(
     locations: Vec<Location>,
     declaration: Option<ReferenceUse>,
@@ -626,13 +633,9 @@ fn group_references_page(
 ) -> ReferencesResult {
     let all_groups = collect_reference_groups(locations, workspace_roots, enclosing_symbols);
     let total_groups = all_groups.len();
-    let page_size = limits.total;
+    let page_size = limits.total.max(1);
     let start = page_offset.min(total_references);
-    let end = if page_size == 0 {
-        start
-    } else {
-        start.saturating_add(page_size).min(total_references)
-    };
+    let end = start.saturating_add(page_size).min(total_references);
     let mut index = 0usize;
     let declaration = declaration.filter(|_| {
         let included = (start..end).contains(&index);
@@ -1022,7 +1025,7 @@ mod tests {
             .declaration
             .into_iter()
             .chain(first.groups.into_iter().flat_map(|group| group.references))
-            .chain(second.declaration.into_iter())
+            .chain(second.declaration)
             .chain(second.groups.into_iter().flat_map(|group| group.references))
             .map(|reference| reference.location.range.start.line)
             .collect::<Vec<_>>();

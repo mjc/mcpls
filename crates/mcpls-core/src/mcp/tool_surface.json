@@ -187,6 +187,46 @@
           ],
           "type": "object"
         },
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Diagnostic": {
           "description": "A single diagnostic.",
           "properties": {
@@ -457,6 +497,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -509,6 +567,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -735,6 +804,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -889,6 +998,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -941,6 +1068,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -1144,6 +1282,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -1298,6 +1476,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -1350,6 +1546,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -1553,6 +1760,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -1707,6 +1954,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -1759,6 +2024,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -2191,6 +2467,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Diagnostic": {
           "description": "A single diagnostic.",
           "properties": {
@@ -2499,6 +2815,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -2551,6 +2885,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -2754,6 +3099,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -2908,6 +3293,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -2960,6 +3363,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -3259,6 +3673,46 @@
           ],
           "type": "object"
         },
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Diagnostic": {
           "description": "A single diagnostic.",
           "properties": {
@@ -3529,6 +3983,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -3581,6 +4053,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -3863,6 +4346,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -4017,6 +4540,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -4069,6 +4610,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -4272,6 +4824,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -4416,6 +5008,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -4468,6 +5078,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -4685,6 +5306,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Diagnostic": {
           "description": "A single diagnostic.",
           "properties": {
@@ -4993,6 +5654,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -5045,6 +5724,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -5284,6 +5974,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "DocumentSymbolOptions": {
           "description": "Query and output bounds for a document semantic outline.",
           "properties": {
@@ -5398,6 +6128,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -5450,6 +6198,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -5772,6 +6531,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "NavigationKind": {
           "description": "Semantic relationship represented by a navigation result.",
           "oneOf": [
@@ -5875,6 +6674,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -5927,6 +6744,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -6207,6 +7035,46 @@
           ],
           "type": "object"
         },
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "IncomingCall": {
           "description": "An incoming call (caller of the current item).",
           "properties": {
@@ -6313,6 +7181,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -6365,6 +7251,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -6786,6 +7683,46 @@
           ],
           "type": "object"
         },
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "OutgoingCall": {
           "description": "An outgoing call (callee from the current item).",
           "properties": {
@@ -6892,6 +7829,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -6944,6 +7899,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -7148,6 +8114,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -7302,6 +8308,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -7354,6 +8378,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -7575,6 +8610,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Decimal offset returned by a prior response's `next_cursor`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Project owning `symbol_handle` when coordinates are omitted.",
           "type": [
@@ -7598,6 +8641,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -7785,6 +8868,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -7837,6 +8938,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -7949,6 +9061,13 @@
           "$ref": "#/$defs/SemanticResultLimits",
           "description": "Limits applied to this result."
         },
+        "next_cursor": {
+          "description": "Cursor for the next deterministic page of compact references.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "omitted_groups": {
           "description": "Number of complete groups omitted by limits.",
           "format": "uint",
@@ -8056,6 +9175,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -8210,6 +9369,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -8262,6 +9439,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -8783,6 +9971,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -8927,6 +10155,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -8979,6 +10225,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -9152,6 +10409,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -9296,6 +10593,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -9348,6 +10663,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -9696,6 +11022,46 @@
           "required": [
             "range",
             "source"
+          ],
+          "type": "object"
+        },
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
           ],
           "type": "object"
         },
@@ -10192,6 +11558,17 @@
                 "null"
               ]
             },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
+            },
             "returned": {
               "description": "Items represented in `data`.",
               "format": "uint",
@@ -10248,6 +11625,17 @@
                 "string",
                 "null"
               ]
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
             },
             "returned": {
               "description": "Items represented in `data`.",
@@ -10306,6 +11694,17 @@
                 "null"
               ]
             },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
+            },
             "returned": {
               "description": "Items represented in `data`.",
               "format": "uint",
@@ -10362,6 +11761,17 @@
                 "string",
                 "null"
               ]
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
             },
             "returned": {
               "description": "Items represented in `data`.",
@@ -10420,6 +11830,17 @@
                 "null"
               ]
             },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
+            },
             "returned": {
               "description": "Items represented in `data`.",
               "format": "uint",
@@ -10476,6 +11897,17 @@
                 "string",
                 "null"
               ]
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
             },
             "returned": {
               "description": "Items represented in `data`.",
@@ -10534,6 +11966,17 @@
                 "null"
               ]
             },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
+            },
             "returned": {
               "description": "Items represented in `data`.",
               "format": "uint",
@@ -10591,6 +12034,17 @@
                 "null"
               ]
             },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for data omitted from the inline bundle."
+            },
             "returned": {
               "description": "Items represented in `data`.",
               "format": "uint",
@@ -10627,6 +12081,11 @@
             {
               "const": "partial",
               "description": "Provider data is available but a response bound omitted content.",
+              "type": "string"
+            },
+            {
+              "const": "deferred",
+              "description": "Provider data was retained behind a direct resource because the bundle budget was full.",
               "type": "string"
             },
             {
@@ -11138,6 +12597,13 @@
               "$ref": "#/$defs/SemanticResultLimits",
               "description": "Limits applied to this result."
             },
+            "next_cursor": {
+              "description": "Cursor for the next deterministic page of compact references.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Number of complete groups omitted by limits.",
               "format": "uint",
@@ -11336,6 +12802,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -11388,6 +12872,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -12767,6 +14262,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI to pass to `resources/read`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -12866,6 +14401,24 @@
               "type": "object"
             },
             {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The source could not be safely resolved.",
               "properties": {
                 "reason": {
@@ -12918,6 +14471,17 @@
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Normalized 1-based result range."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",

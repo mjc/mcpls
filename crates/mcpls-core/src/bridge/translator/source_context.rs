@@ -63,6 +63,7 @@ pub(super) async fn resolve_source_context(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn resolve_source_context_with_max_lines(
     tracker: &DocumentTracker,
     workspace_roots: &[PathBuf],
