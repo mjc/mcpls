@@ -417,15 +417,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -660,10 +656,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         },
         "TextEdit": {
           "description": "A text edit operation.",
@@ -754,12 +746,6 @@
     "name": "discover_related_tests",
     "description": "Project-scoped rust-analyzer related-test discovery as bounded runnable data. MCPLS never executes returned commands.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -786,15 +772,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -863,15 +845,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -1161,10 +1139,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1232,12 +1206,6 @@
     "name": "discover_runnables",
     "description": "Project-scoped rust-analyzer runnable discovery. Returns bounded serialized command, args, environment, cwd, and location data; MCPLS never executes it.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -1264,15 +1232,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1341,15 +1305,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -1639,10 +1599,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1710,12 +1666,6 @@
     "name": "expand_macro",
     "description": "Project-scoped rust-analyzer macro expansion, bounded to 1 MiB. Returns expansion source as data and never executes anything.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -1742,15 +1692,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1819,15 +1765,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -2117,10 +2059,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2735,15 +2673,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -2978,10 +2912,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3049,12 +2979,6 @@
     "name": "get_child_modules",
     "description": "Project-scoped rust-analyzer child-module targets with bounded source frames and symbol handles. Returns supported=false when unavailable.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -3081,15 +3005,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -3158,15 +3078,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -3456,10 +3372,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3903,15 +3815,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -4147,10 +4055,6 @@
             }
           ]
         },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        },
         "TextEdit": {
           "description": "A text edit operation.",
           "properties": {
@@ -4296,12 +4200,6 @@
     "name": "get_declaration",
     "description": "Project-scoped declaration targets with bounded source frames and symbol handles. Returns supported=false when unavailable.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -4328,15 +4226,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -4405,15 +4299,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -4703,10 +4593,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4774,12 +4660,6 @@
     "name": "get_definition",
     "description": "Bounded definition targets with provider identity, source frames, reusable symbol_handle values, and explicit truncation. Returned source usually removes the need for a file read.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -4809,15 +4689,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -4883,15 +4759,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -5171,10 +5043,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5574,15 +5442,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -5817,10 +5681,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5888,28 +5748,6 @@
     "name": "get_document_symbols",
     "description": "Bounded semantic outline for one file. Supports name/kind queries, hierarchy depth, private/test controls, declaration frames, optional bodies, and reusable symbol handles.",
     "inputSchema": {
-      "$defs": {
-        "WorkspaceSymbolMatchMode": {
-          "description": "Requested workspace-symbol name matching behavior.",
-          "oneOf": [
-            {
-              "const": "exact",
-              "description": "Return only exact case-sensitive or case-insensitive names.",
-              "type": "string"
-            },
-            {
-              "const": "prefix",
-              "description": "Return exact and prefix matches.",
-              "type": "string"
-            },
-            {
-              "const": "fuzzy",
-              "description": "Return exact, prefix, and fuzzy matches, ranked in that order.",
-              "type": "string"
-            }
-          ]
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "file_path": {
@@ -5946,9 +5784,25 @@
           "type": "integer"
         },
         "match_mode": {
-          "$ref": "#/$defs/WorkspaceSymbolMatchMode",
           "default": "fuzzy",
-          "description": "Exact, prefix, or exact-first fuzzy matching."
+          "description": "Exact, prefix, or exact-first fuzzy matching.",
+          "oneOf": [
+            {
+              "const": "exact",
+              "description": "Return only exact case-sensitive or case-insensitive names.",
+              "type": "string"
+            },
+            {
+              "const": "prefix",
+              "description": "Return exact and prefix matches.",
+              "type": "string"
+            },
+            {
+              "const": "fuzzy",
+              "description": "Return exact, prefix, and fuzzy matches, ranked in that order.",
+              "type": "string"
+            }
+          ]
         },
         "max_depth": {
           "description": "Maximum hierarchy depth; defaults to one for compact no-query outlines.",
@@ -6047,9 +5901,25 @@
               "type": "integer"
             },
             "match_mode": {
-              "$ref": "#/$defs/WorkspaceSymbolMatchMode",
               "default": "fuzzy",
-              "description": "Exact, prefix, or exact-first fuzzy matching."
+              "description": "Exact, prefix, or exact-first fuzzy matching.",
+              "oneOf": [
+                {
+                  "const": "exact",
+                  "description": "Return only exact case-sensitive or case-insensitive names.",
+                  "type": "string"
+                },
+                {
+                  "const": "prefix",
+                  "description": "Return exact and prefix matches.",
+                  "type": "string"
+                },
+                {
+                  "const": "fuzzy",
+                  "description": "Return exact, prefix, and fuzzy matches, ranked in that order.",
+                  "type": "string"
+                }
+              ]
             },
             "max_depth": {
               "description": "Maximum hierarchy depth; defaults to one for compact no-query outlines.",
@@ -6361,15 +6231,11 @@
               "description": "Bounded declaration source attached after filtering."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -6379,10 +6245,6 @@
             "selection_range"
           ],
           "type": "object"
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         },
         "WorkspaceSymbolMatch": {
           "description": "How a workspace-symbol name matched the query.",
@@ -6405,26 +6267,6 @@
             {
               "const": "fuzzy",
               "description": "Query characters occur in order in the name.",
-              "type": "string"
-            }
-          ]
-        },
-        "WorkspaceSymbolMatchMode": {
-          "description": "Requested workspace-symbol name matching behavior.",
-          "oneOf": [
-            {
-              "const": "exact",
-              "description": "Return only exact case-sensitive or case-insensitive names.",
-              "type": "string"
-            },
-            {
-              "const": "prefix",
-              "description": "Return exact and prefix matches.",
-              "type": "string"
-            },
-            {
-              "const": "fuzzy",
-              "description": "Return exact, prefix, and fuzzy matches, ranked in that order.",
               "type": "string"
             }
           ]
@@ -6481,12 +6323,6 @@
     "name": "get_hover",
     "description": "Type, signature/documentation, provider identity, snapshot-bound symbol_handle, and bounded source frame. Pass project_id + symbol_handle from discovery instead of rereading or copying coordinates.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -6516,15 +6352,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a prior semantic result; safer than copying coordinates."
+          "description": "Snapshot-bound handle returned by a prior semantic result; safer than copying coordinates.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -6837,10 +6669,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6873,15 +6701,11 @@
           "description": "Bounded source surrounding the hovered target."
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+          "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "truncated": {
           "description": "Whether the source preview was shortened by a response budget.",
@@ -6929,10 +6753,6 @@
             }
           },
           "type": "object"
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6957,15 +6777,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a prior semantic result.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -7577,10 +7393,6 @@
             }
           },
           "type": "object"
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7605,15 +7417,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a prior semantic result.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -8064,12 +7872,6 @@
     "name": "get_parent_module",
     "description": "Project-scoped rust-analyzer parent-module target with a bounded source frame and symbol handle. Returns supported=false when unavailable.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -8096,15 +7898,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -8173,15 +7971,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -8471,10 +8265,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -8569,10 +8359,6 @@
             }
           },
           "type": "object"
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -8626,15 +8412,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -8700,15 +8482,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -9031,10 +8809,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -9125,12 +8899,6 @@
     "name": "get_selection_ranges",
     "description": "Project-scoped standard LSP selection-range expansion, ordered from innermost to outermost and bounded to 100 ranges.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -9157,15 +8925,11 @@
           "type": "string"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale."
+          "description": "Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -9234,15 +8998,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -9532,10 +9292,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -9921,12 +9677,6 @@
     "name": "go_to_implementation",
     "description": "Bounded implementation targets with provider identity, source frames, symbol handles, and explicit truncation state.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -9956,15 +9706,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a prior semantic result.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -10030,15 +9776,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -10318,10 +10060,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10359,12 +10097,6 @@
     "name": "go_to_type_definition",
     "description": "Bounded type-definition targets with provider identity, source frames, symbol handles, and explicit truncation state.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -10394,15 +10126,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a prior semantic result.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -10468,15 +10196,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -10756,10 +10480,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10810,9 +10530,14 @@
     "name": "inspect_symbol",
     "description": "Preferred no-reread workflow: resolve an exact query or prior symbol_handle into a byte/item-bounded source, docs/signature, definitions/implementations, uses/calls, tests, and diagnostics bundle. Ambiguous names return candidates; stale handles require fresh discovery.",
     "inputSchema": {
-      "$defs": {
-        "InspectSymbolBudget": {
-          "description": "Cross-section bounds for a symbol inspection response.",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "budget": {
+          "default": {
+            "max_bytes": 65536,
+            "max_items": 20
+          },
+          "description": "Strict serialized-byte and per-provider item bounds for the complete bundle.",
           "properties": {
             "max_bytes": {
               "default": 65536,
@@ -10830,71 +10555,6 @@
             }
           },
           "type": "object"
-        },
-        "InspectSymbolSectionKind": {
-          "description": "Selectable sections of a high-level symbol inspection bundle.",
-          "oneOf": [
-            {
-              "const": "declaration",
-              "description": "Bounded declaration or body source.",
-              "type": "string"
-            },
-            {
-              "const": "hover",
-              "description": "Signature, type, and documentation.",
-              "type": "string"
-            },
-            {
-              "const": "definitions",
-              "description": "Definition targets.",
-              "type": "string"
-            },
-            {
-              "const": "implementations",
-              "description": "Trait, interface, or symbol implementations.",
-              "type": "string"
-            },
-            {
-              "const": "references",
-              "description": "Grouped references and call sites.",
-              "type": "string"
-            },
-            {
-              "const": "calls",
-              "description": "Incoming and outgoing call hierarchy samples.",
-              "type": "string"
-            },
-            {
-              "const": "tests",
-              "description": "Related tests, discovered but never executed.",
-              "type": "string"
-            },
-            {
-              "const": "runnables",
-              "description": "Runnable metadata, discovered but never executed.",
-              "type": "string"
-            },
-            {
-              "const": "diagnostics",
-              "description": "Diagnostics intersecting the selected symbol.",
-              "type": "string"
-            }
-          ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "budget": {
-          "$ref": "#/$defs/InspectSymbolBudget",
-          "default": {
-            "max_bytes": 65536,
-            "max_items": 20
-          },
-          "description": "Strict serialized-byte and per-provider item bounds for the complete bundle."
         },
         "candidate_limit": {
           "default": 10,
@@ -10937,22 +10597,65 @@
         },
         "sections": {
           "default": [],
-          "description": "Sections to include; empty prioritizes declaration, implementations, uses, tests, and errors.",
+          "description": "Sections to include; empty prioritizes declaration, implementations, references, tests, and diagnostics.",
           "items": {
-            "$ref": "#/$defs/InspectSymbolSectionKind"
+            "description": "Selectable sections of a high-level symbol inspection bundle.",
+            "oneOf": [
+              {
+                "const": "declaration",
+                "description": "Bounded declaration or body source.",
+                "type": "string"
+              },
+              {
+                "const": "hover",
+                "description": "Signature, type, and documentation.",
+                "type": "string"
+              },
+              {
+                "const": "definitions",
+                "description": "Definition targets.",
+                "type": "string"
+              },
+              {
+                "const": "implementations",
+                "description": "Trait, interface, or symbol implementations.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "Grouped references and call sites.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "Incoming and outgoing call hierarchy samples.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "Related tests, discovered but never executed.",
+                "type": "string"
+              },
+              {
+                "const": "runnables",
+                "description": "Runnable metadata, discovered but never executed.",
+                "type": "string"
+              },
+              {
+                "const": "diagnostics",
+                "description": "Diagnostics intersecting the selected symbol.",
+                "type": "string"
+              }
+            ]
           },
           "type": "array"
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by symbol discovery; preferred over repeating coordinates."
+          "description": "Snapshot-bound handle returned by symbol discovery; preferred over repeating coordinates.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -11397,15 +11100,11 @@
               "description": "Bounded source surrounding the hovered target."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "truncated": {
               "description": "Whether the source preview was shortened by a response budget.",
@@ -12105,26 +11804,6 @@
             }
           ]
         },
-        "InspectSymbolBudget": {
-          "description": "Cross-section bounds for a symbol inspection response.",
-          "properties": {
-            "max_bytes": {
-              "default": 65536,
-              "description": "Maximum serialized response bytes.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "max_items": {
-              "default": 20,
-              "description": "Maximum items requested from each collection-producing provider.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
         "InspectSymbolResolution": {
           "description": "Exact resolution outcome for a symbol inspection request.",
           "oneOf": [
@@ -12147,15 +11826,11 @@
                   "description": "Ranked source-bearing symbol metadata for query resolution."
                 },
                 "symbol_handle": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/SymbolHandle"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Snapshot-bound handle safe for semantic follow-ups."
+                  "description": "Snapshot-bound handle safe for semantic follow-ups.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -12271,15 +11946,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -12966,10 +12637,6 @@
             }
           ]
         },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        },
         "WorkspaceSymbol": {
           "description": "A workspace symbol.",
           "properties": {
@@ -13069,8 +12736,24 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "budget": {
-          "$ref": "#/$defs/InspectSymbolBudget",
-          "description": "Bounds applied to the response."
+          "description": "Bounds applied to the response.",
+          "properties": {
+            "max_bytes": {
+              "default": 65536,
+              "description": "Maximum serialized response bytes.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_items": {
+              "default": 20,
+              "description": "Maximum items requested from each collection-producing provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
         },
         "resolution": {
           "$ref": "#/$defs/InspectSymbolResolution",
@@ -13273,12 +12956,6 @@
     "name": "prepare_call_hierarchy",
     "description": "Prepare bounded call-hierarchy targets with provider identity, source frames, and symbol handles for follow-up analysis.",
     "inputSchema": {
-      "$defs": {
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "character": {
@@ -13308,15 +12985,11 @@
           ]
         },
         "symbol_handle": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolHandle"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Snapshot-bound handle returned by a prior semantic result."
+          "description": "Snapshot-bound handle returned by a prior semantic result.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -14182,9 +13855,25 @@
     "name": "workspace_symbol_search",
     "description": "Preferred first call for an unknown symbol: exact-first ranked project matches with bounded source frames and reusable symbol_handle values. Disambiguate before follow-ups; external/dependency symbols require scope=all.",
     "inputSchema": {
-      "$defs": {
-        "WorkspaceSymbolMatchMode": {
-          "description": "Requested workspace-symbol name matching behavior.",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "kind_filter": {
+          "description": "Optional filter by symbol kind (function, class, variable, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum results to return (default: 100).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "match_mode": {
+          "default": "fuzzy",
+          "description": "Name matching behavior; defaults to exact-first fuzzy search.",
           "oneOf": [
             {
               "const": "exact",
@@ -14203,8 +13892,17 @@
             }
           ]
         },
-        "WorkspaceSymbolScope": {
-          "description": "Requested workspace-symbol source scope.",
+        "project_id": {
+          "description": "Registered project identifier whose workspace should be searched.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Search query for symbol names (supports partial matching).",
+          "type": "string"
+        },
+        "scope": {
+          "default": "project",
+          "description": "Source scope; dependencies and external symbols require explicit `all`.",
           "oneOf": [
             {
               "const": "project",
@@ -14217,41 +13915,6 @@
               "type": "string"
             }
           ]
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "kind_filter": {
-          "description": "Optional filter by symbol kind (function, class, variable, etc.).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "limit": {
-          "default": 100,
-          "description": "Maximum results to return (default: 100).",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "match_mode": {
-          "$ref": "#/$defs/WorkspaceSymbolMatchMode",
-          "default": "fuzzy",
-          "description": "Name matching behavior; defaults to exact-first fuzzy search."
-        },
-        "project_id": {
-          "description": "Registered project identifier whose workspace should be searched.",
-          "type": "string"
-        },
-        "query": {
-          "description": "Search query for symbol names (supports partial matching).",
-          "type": "string"
-        },
-        "scope": {
-          "$ref": "#/$defs/WorkspaceSymbolScope",
-          "default": "project",
-          "description": "Source scope; dependencies and external symbols require explicit `all`."
         }
       },
       "required": [
@@ -14321,15 +13984,11 @@
               "description": "Bounded source text for this location, or a stable reason it is unavailable."
             },
             "symbol_handle": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/SymbolHandle"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Snapshot-bound target for coordinate-free semantic follow-ups."
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "uri": {
               "description": "URI of the document.",
@@ -14564,10 +14223,6 @@
               "type": "string"
             }
           ]
-        },
-        "SymbolHandle": {
-          "description": "Opaque project-actor-owned reference to a symbol at one source snapshot.",
-          "type": "string"
         },
         "WorkspaceSymbol": {
           "description": "A workspace symbol.",

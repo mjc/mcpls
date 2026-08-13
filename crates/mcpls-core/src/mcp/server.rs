@@ -4090,6 +4090,10 @@ finally:
     #[test]
     fn inspect_symbol_is_advertised_with_typed_contract() {
         let tools = McplsServer::tool_router().list_all();
+        let workspace = tools
+            .iter()
+            .find(|tool| tool.name == "workspace_symbol_search")
+            .unwrap();
         let inspect = tools.iter().find(|tool| tool.name == "inspect_symbol");
 
         assert!(
@@ -4098,6 +4102,15 @@ finally:
         );
         let inspect = inspect.unwrap();
         assert!(inspect.input_schema["properties"]["project_id"].is_object());
+        assert_eq!(
+            workspace.input_schema["properties"]["scope"]["oneOf"][0]["const"],
+            "project"
+        );
+        assert_eq!(
+            inspect.input_schema["properties"]["sections"]["items"]["oneOf"][4]["const"],
+            "references"
+        );
+        assert!(inspect.input_schema["properties"]["budget"]["properties"].is_object());
         assert!(inspect.output_schema.as_ref().is_some_and(|schema| {
             schema["properties"]["resolution"].is_object()
                 && schema["properties"]["sections"].is_object()

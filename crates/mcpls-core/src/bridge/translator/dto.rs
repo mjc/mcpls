@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque project-actor-owned reference to a symbol at one source snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
 #[serde(transparent)]
 pub struct SymbolHandle(String);
 
@@ -686,6 +687,7 @@ pub struct WorkspaceSymbol {
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
+#[schemars(inline)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSymbolMatchMode {
     /// Return only exact case-sensitive or case-insensitive names.
@@ -730,6 +732,7 @@ impl WorkspaceSymbolMatch {
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
+#[schemars(inline)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSymbolScope {
     /// Only symbols under a registered project root.
@@ -764,6 +767,7 @@ pub struct WorkspaceSymbolResult {
 
 /// Selectable sections of a high-level symbol inspection bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
 #[serde(rename_all = "snake_case")]
 pub enum InspectSymbolSectionKind {
     /// Bounded declaration or body source.
@@ -810,6 +814,7 @@ impl InspectSymbolRequest {
 
 /// Cross-section bounds for a symbol inspection response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
 pub struct InspectSymbolBudget {
     /// Maximum serialized response bytes.
     #[serde(default = "default_inspect_bytes")]
