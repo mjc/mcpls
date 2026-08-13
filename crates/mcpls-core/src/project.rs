@@ -3642,6 +3642,42 @@ fn attach_document_symbol_handles(
     }
 }
 
+fn document_symbol_as_workspace_symbol(
+    symbol: crate::bridge::Symbol,
+    path: &Path,
+    uri: &str,
+    project_relative_path: Option<String>,
+) -> crate::bridge::translator::WorkspaceSymbol {
+    crate::bridge::translator::WorkspaceSymbol {
+        name: symbol.name,
+        kind: symbol.kind,
+        location: crate::bridge::Location {
+            path: Some(path.display().to_string()),
+            uri: uri.to_owned(),
+            range: symbol.selection_range,
+            source: symbol
+                .source
+                .unwrap_or(crate::bridge::SourceContext::Unavailable {
+                    reason: crate::bridge::translator::SourceUnavailableReason::NotFound,
+                }),
+            symbol_handle: symbol.symbol_handle,
+        },
+        container_name: symbol.container_name,
+        match_class: symbol
+            .match_class
+            .unwrap_or(crate::bridge::translator::WorkspaceSymbolMatch::Exact),
+        score: symbol.score.unwrap_or(100),
+        project_relative_path,
+        origin: crate::bridge::translator::WorkspaceSymbolOrigin::ProjectLocal,
+    }
+}
+
+fn missing_call_hierarchy_item() -> crate::bridge::InspectSection<crate::bridge::InspectCalls> {
+    crate::bridge::InspectSection::unavailable(
+        "call hierarchy provider returned no item at the symbol selection",
+    )
+}
+
 impl SymbolHandleStore {
     fn new() -> Self {
         Self {
@@ -4763,25 +4799,13 @@ impl ProjectRuntime {
                 let symbols = outline
                     .symbols
                     .into_iter()
-                    .map(|symbol| crate::bridge::translator::WorkspaceSymbol {
-                        name: symbol.name,
-                        kind: symbol.kind,
-                        location: crate::bridge::Location {
-                            path: Some(path.display().to_string()),
-                            uri: uri.clone(),
-                            range: symbol.range,
-                            source: symbol.source.unwrap_or(crate::bridge::SourceContext::Unavailable {
-                                reason: crate::bridge::translator::SourceUnavailableReason::NotFound,
-                            }),
-                            symbol_handle: symbol.symbol_handle,
-                        },
-                        container_name: symbol.container_name,
-                        match_class: symbol.match_class.unwrap_or(
-                            crate::bridge::translator::WorkspaceSymbolMatch::Exact,
-                        ),
-                        score: symbol.score.unwrap_or(100),
-                        project_relative_path: outline.project_relative_path.clone(),
-                        origin: crate::bridge::translator::WorkspaceSymbolOrigin::ProjectLocal,
+                    .map(|symbol| {
+                        document_symbol_as_workspace_symbol(
+                            symbol,
+                            &path,
+                            &uri,
+                            outline.project_relative_path.clone(),
+                        )
                     })
                     .collect::<Vec<_>>();
                 WorkspaceSymbolResult {
@@ -4956,9 +4980,7 @@ impl ProjectRuntime {
                 .prepare_call_hierarchy(file_path.clone(), line, character)
                 .await
             {
-                Ok(prepared) if prepared.items.is_empty() => {
-                    InspectSection::unsupported(prepared.provider, "symbol is not callable")
-                }
+                Ok(prepared) if prepared.items.is_empty() => missing_call_hierarchy_item(),
                 Ok(prepared) => {
                     let provider = prepared.provider.clone();
                     let item = serde_json::to_value(&prepared.items[0])
@@ -8967,6 +8989,67 @@ mod tests {
         );
         assert_eq!(result.sections.references.returned, 0);
         assert!(result.returned_bytes <= result.budget.max_bytes);
+    }
+
+    #[test]
+    fn inspect_symbol_path_targets_the_identifier_selection() {
+        let whole = crate::bridge::Range {
+            start: crate::bridge::Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: crate::bridge::Position2D {
+                line: 3,
+                character: 2,
+            },
+        };
+        let selection = crate::bridge::Range {
+            start: crate::bridge::Position2D {
+                line: 2,
+                character: 4,
+            },
+            end: crate::bridge::Position2D {
+                line: 2,
+                character: 13,
+            },
+        };
+        let symbol = crate::bridge::Symbol {
+            name: "inspected".to_owned(),
+            kind: "Function".to_owned(),
+            range: whole,
+            selection_range: selection.clone(),
+            symbol_handle: None,
+            container_name: None,
+            match_class: None,
+            score: None,
+            source: None,
+            is_private: true,
+            is_test: true,
+            children: None,
+        };
+
+        let selected = document_symbol_as_workspace_symbol(
+            symbol,
+            Path::new("/workspace/lib.rs"),
+            "file:///workspace/lib.rs",
+            Some("lib.rs".to_owned()),
+        );
+
+        assert_eq!(selected.location.range, selection);
+    }
+
+    #[test]
+    fn empty_call_hierarchy_is_not_misclassified_as_non_callable() {
+        let section = missing_call_hierarchy_item();
+
+        assert_eq!(
+            section.completeness,
+            crate::bridge::InspectSectionCompleteness::Unavailable
+        );
+        assert_eq!(
+            section.reason.as_deref(),
+            Some("call hierarchy provider returned no item at the symbol selection")
+        );
     }
 
     #[tokio::test]

@@ -43,10 +43,10 @@ use super::tools::{
     HoverParams, InlayHintsParams, InspectSymbolParams, MoveInlineModulePreviewParams,
     MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectIdParams,
     ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
-    RenameParams, RenamePreviewParams, SemanticPositionParams, ServerLogsParams,
-    SemanticResourceReadParams, SemanticResourceReadResult, ServerMessagesParams,
-    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
-    WorkspaceEditApplyParams, WorkspaceEditPreviewParams, WorkspaceSymbolParams,
+    RenameParams, RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
+    SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
+    StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
+    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
