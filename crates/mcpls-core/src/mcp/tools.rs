@@ -715,6 +715,24 @@ pub struct ProjectListParams {}
 #[schemars(description = "List resource subscriptions owned by this MCP session.")]
 pub struct SubscriptionListParams {}
 
+/// Parameters for reading source or deferred semantic context through a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticResourceReadParams {
+    /// `mcpls-source://` or `mcpls-deferred://` URI returned by another MCPLS tool.
+    pub uri: String,
+}
+
+/// Tool-call representation of one deferred semantic resource.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticResourceReadResult {
+    /// Resource URI that was read.
+    pub uri: String,
+    /// MIME type of `text`.
+    pub mime_type: String,
+    /// Complete JSON resource payload.
+    pub text: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

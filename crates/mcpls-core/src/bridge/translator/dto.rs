@@ -121,7 +121,7 @@ pub struct SourceFrame {
 /// Snapshot-bound MCP resource for context omitted from an inline result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DeferredResourceReference {
-    /// Resource URI to pass to `resources/read`.
+    /// Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.
     pub uri: String,
     /// Stable kind of deferred payload.
     pub kind: String,

@@ -44,9 +44,9 @@ use super::tools::{
     MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectIdParams,
     ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
     RenameParams, RenamePreviewParams, SemanticPositionParams, ServerLogsParams,
-    ServerMessagesParams, SignatureHelpParams, StructuralReplacePreviewParams,
-    SubscriptionListParams, WorkspaceEditApplyParams, WorkspaceEditPreviewParams,
-    WorkspaceSymbolParams,
+    SemanticResourceReadParams, SemanticResourceReadResult, ServerMessagesParams,
+    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
+    WorkspaceEditApplyParams, WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -2644,6 +2644,56 @@ impl McplsServer {
 
         encode_tool_result(result)
     }
+
+    /// Read source context omitted from a bounded result when the client does not expose MCP resources.
+    #[tool(
+        description = "Read a complete snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. This is the callable fallback for clients that do not expose resources/read."
+    )]
+    async fn read_semantic_resource(
+        &self,
+        Parameters(SemanticResourceReadParams { uri }): Parameters<SemanticResourceReadParams>,
+    ) -> Result<Json<SemanticResourceReadResult>, McpError> {
+        let resource = parse_session_resource_uri(&uri)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let text = match resource {
+            SessionResource::Source(source) => {
+                let actor = self
+                    .context
+                    .required_actor_for_path(&source.path)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let frame = actor
+                    .read_source_resource(source)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                serde_json::to_string(&frame)
+            }
+            SessionResource::Deferred(token) => {
+                let value = self
+                    .context
+                    .project_registry
+                    .read_deferred_resource(token)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error, None))?;
+                serde_json::to_string(&value)
+            }
+            SessionResource::Diagnostics(_)
+            | SessionResource::ProjectStatus(_)
+            | SessionResource::ProjectEvents { .. } => {
+                return Err(McpError::invalid_params(
+                    "read_semantic_resource accepts only mcpls-source:// or mcpls-deferred:// references",
+                    None,
+                ));
+            }
+        }
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        encode_tool_result(Ok::<_, String>(SemanticResourceReadResult {
+            uri,
+            mime_type: "application/json".to_owned(),
+            text,
+        }))
+    }
 }
 
 impl McplsServer {
@@ -3957,6 +4007,8 @@ finally:
             "budget",
             "ambiguous",
             "stale_symbol_handle",
+            "read_semantic_resource",
+            "resources/read",
             "file read",
         ] {
             assert!(
@@ -4115,6 +4167,18 @@ finally:
             schema["properties"]["resolution"].is_object()
                 && schema["properties"]["sections"].is_object()
         }));
+    }
+
+    #[test]
+    fn deferred_semantic_resources_are_readable_as_a_tool() {
+        let tools = McplsServer::tool_router().list_all();
+        let read = tools
+            .iter()
+            .find(|tool| tool.name == "read_semantic_resource")
+            .expect("deferred references need a callable tool fallback");
+
+        assert!(read.input_schema["properties"]["uri"].is_object());
+        assert!(read.output_schema.as_ref().is_some());
     }
 
     #[test]

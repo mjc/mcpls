@@ -216,7 +216,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -815,7 +815,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -1275,7 +1275,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -1735,7 +1735,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -2434,7 +2434,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -3048,7 +3048,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -3614,7 +3614,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -4269,7 +4269,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -4729,7 +4729,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -5203,7 +5203,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -5857,7 +5857,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -6392,7 +6392,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -6880,7 +6880,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -7520,7 +7520,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -7941,7 +7941,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -8452,7 +8452,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -8968,7 +8968,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -9746,7 +9746,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -10166,7 +10166,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -10757,7 +10757,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
@@ -13463,6 +13463,46 @@
     }
   },
   {
+    "name": "read_semantic_resource",
+    "description": "Read a complete snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. This is the callable fallback for clients that do not expose resources/read.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "uri": {
+          "description": "`mcpls-source://` or `mcpls-deferred://` URI returned by another MCPLS tool.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "mime_type": {
+          "description": "MIME type of `text`.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Complete JSON resource payload.",
+          "type": "string"
+        },
+        "uri": {
+          "description": "Resource URI that was read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "mime_type",
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "name": "rename_apply",
     "description": "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced.",
     "inputSchema": {
@@ -13954,7 +13994,7 @@
               ]
             },
             "uri": {
-              "description": "Resource URI to pass to `resources/read`.",
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
               "type": "string"
             }
           },
