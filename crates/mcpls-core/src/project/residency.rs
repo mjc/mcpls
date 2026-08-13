@@ -42,6 +42,23 @@ impl RustResidencyBudget {
     }
 
     fn pin(&mut self, group: RustGroupId, excluded: &HashSet<RustGroupId>) -> ResidencyDecision {
+        self.pin_with_minimum_idle(group, excluded, self.idle_timeout)
+    }
+
+    fn pin_for_activation(
+        &mut self,
+        group: RustGroupId,
+        excluded: &HashSet<RustGroupId>,
+    ) -> ResidencyDecision {
+        self.pin_with_minimum_idle(group, excluded, Duration::ZERO)
+    }
+
+    fn pin_with_minimum_idle(
+        &mut self,
+        group: RustGroupId,
+        excluded: &HashSet<RustGroupId>,
+        minimum_idle: Duration,
+    ) -> ResidencyDecision {
         let now = Instant::now();
         if let Some(resident) = self.residents.get_mut(&group) {
             resident.pins = resident.pins.saturating_add(1);
@@ -63,7 +80,7 @@ impl RustResidencyBudget {
             .filter(|(candidate, resident)| {
                 resident.pins == 0
                     && !excluded.contains(candidate)
-                    && resident.last_used.elapsed() >= self.idle_timeout
+                    && resident.last_used.elapsed() >= minimum_idle
             })
             .min_by_key(|(_, resident)| resident.last_used)
             .map_or(ResidencyDecision::Wait, |(candidate, _)| {
@@ -166,10 +183,29 @@ impl RustResidencyController {
     }
 
     pub(super) async fn acquire(&self, group: RustGroupId) -> RustResidencyGuard {
+        self.acquire_with_policy(group, false).await
+    }
+
+    pub(super) async fn acquire_for_activation(
+        &self,
+        group: RustGroupId,
+    ) -> RustResidencyGuard {
+        self.acquire_with_policy(group, true).await
+    }
+
+    async fn acquire_with_policy(
+        &self,
+        group: RustGroupId,
+        evict_recent: bool,
+    ) -> RustResidencyGuard {
         let mut excluded = HashSet::new();
         loop {
             let transition = self.inner.transition.lock().await;
-            let decision = self.state().budget.pin(group, &excluded);
+            let decision = if evict_recent {
+                self.state().budget.pin_for_activation(group, &excluded)
+            } else {
+                self.state().budget.pin(group, &excluded)
+            };
             match decision {
                 ResidencyDecision::Admit | ResidencyDecision::Reuse => {
                     return self.guard(group);

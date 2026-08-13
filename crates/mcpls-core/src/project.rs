@@ -1747,6 +1747,16 @@ impl ProjectRequest {
         )
     }
 
+    const fn explicitly_activates_rust_runtime(&self) -> bool {
+        matches!(
+            self,
+            Self::Activate { .. }
+                | Self::ActivateWorkspaceRoots { .. }
+                | Self::AddWorkspaceRoot { .. }
+                | Self::Restart { .. }
+        )
+    }
+
     const fn resumes_rust_runtime(&self) -> bool {
         self.uses_rust_residency()
             && !matches!(
@@ -5655,7 +5665,11 @@ impl ProjectResidency {
     }
 
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
-        let guard = self.acquire().await;
+        let guard = if request.explicitly_activates_rust_runtime() {
+            self.controller.acquire_for_activation(self.group).await
+        } else {
+            self.acquire().await
+        };
         ProjectRequest::Resident {
             request: Box::new(request),
             guard,
