@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
@@ -19,30 +20,32 @@ enum ResidencyDecision {
 #[derive(Debug, Clone, Copy)]
 struct ResidentGroup {
     pins: usize,
-    last_used: u64,
+    last_used: Instant,
 }
 
 #[derive(Debug)]
 struct RustResidencyBudget {
     limit: usize,
-    clock: u64,
+    idle_timeout: Duration,
     residents: HashMap<RustGroupId, ResidentGroup>,
 }
 
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 impl RustResidencyBudget {
-    fn new(limit: usize) -> Self {
+    fn with_idle_timeout(limit: usize, idle_timeout: Duration) -> Self {
         Self {
             limit: limit.max(1),
-            clock: 0,
+            idle_timeout,
             residents: HashMap::new(),
         }
     }
 
     fn pin(&mut self, group: RustGroupId, excluded: &HashSet<RustGroupId>) -> ResidencyDecision {
-        self.clock = self.clock.wrapping_add(1);
+        let now = Instant::now();
         if let Some(resident) = self.residents.get_mut(&group) {
             resident.pins = resident.pins.saturating_add(1);
-            resident.last_used = self.clock;
+            resident.last_used = now;
             return ResidencyDecision::Reuse;
         }
         if self.residents.len() < self.limit {
@@ -50,14 +53,18 @@ impl RustResidencyBudget {
                 group,
                 ResidentGroup {
                     pins: 1,
-                    last_used: self.clock,
+                    last_used: now,
                 },
             );
             return ResidencyDecision::Admit;
         }
         self.residents
             .iter()
-            .filter(|(candidate, resident)| resident.pins == 0 && !excluded.contains(candidate))
+            .filter(|(candidate, resident)| {
+                resident.pins == 0
+                    && !excluded.contains(candidate)
+                    && resident.last_used.elapsed() >= self.idle_timeout
+            })
             .min_by_key(|(_, resident)| resident.last_used)
             .map_or(ResidencyDecision::Wait, |(candidate, _)| {
                 ResidencyDecision::Evict(*candidate)
@@ -65,32 +72,31 @@ impl RustResidencyBudget {
     }
 
     fn pin_existing(&mut self, group: RustGroupId) -> bool {
-        self.clock = self.clock.wrapping_add(1);
+        let now = Instant::now();
         let Some(resident) = self.residents.get_mut(&group) else {
             return false;
         };
         resident.pins = resident.pins.saturating_add(1);
-        resident.last_used = self.clock;
+        resident.last_used = now;
         true
     }
 
     fn replace(&mut self, victim: RustGroupId, group: RustGroupId) {
-        self.clock = self.clock.wrapping_add(1);
+        let now = Instant::now();
         self.residents.remove(&victim);
         self.residents.insert(
             group,
             ResidentGroup {
                 pins: 1,
-                last_used: self.clock,
+                last_used: now,
             },
         );
     }
 
     fn unpin(&mut self, group: RustGroupId) {
-        self.clock = self.clock.wrapping_add(1);
         if let Some(resident) = self.residents.get_mut(&group) {
             resident.pins = resident.pins.saturating_sub(1);
-            resident.last_used = self.clock;
+            resident.last_used = Instant::now();
         }
     }
 
@@ -101,6 +107,18 @@ impl RustResidencyBudget {
     #[cfg(test)]
     fn resident_count(&self) -> usize {
         self.residents.len()
+    }
+
+    fn next_idle_delay(&self, excluded: &HashSet<RustGroupId>) -> Option<Duration> {
+        self.residents
+            .iter()
+            .filter(|(candidate, resident)| resident.pins == 0 && !excluded.contains(candidate))
+            .map(|(_, resident)| {
+                self.idle_timeout
+                    .checked_sub(resident.last_used.elapsed())
+                    .unwrap_or_default()
+            })
+            .min()
     }
 }
 
@@ -122,10 +140,14 @@ struct RustResidencyState {
 
 impl RustResidencyController {
     pub(super) fn new(limit: usize) -> Self {
+        Self::with_idle_timeout(limit, DEFAULT_IDLE_TIMEOUT)
+    }
+
+    fn with_idle_timeout(limit: usize, idle_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(RustResidencyInner {
                 state: StdMutex::new(RustResidencyState {
-                    budget: RustResidencyBudget::new(limit),
+                    budget: RustResidencyBudget::with_idle_timeout(limit, idle_timeout),
                     actors: HashMap::new(),
                 }),
                 transition: Mutex::new(()),
@@ -186,8 +208,16 @@ impl RustResidencyController {
                     let changed = self.inner.changed.notified();
                     tokio::pin!(changed);
                     changed.as_mut().enable();
+                    let delay = self
+                        .state()
+                        .budget
+                        .next_idle_delay(&excluded)
+                        .unwrap_or(Duration::from_secs(1));
                     drop(transition);
-                    changed.await;
+                    tokio::select! {
+                        () = changed => {}
+                        () = tokio::time::sleep(delay) => {}
+                    }
                     excluded.clear();
                     continue;
                 }
@@ -247,11 +277,9 @@ impl Drop for RustResidencyGuard {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
     #[test]
     fn pinned_group_forces_second_cold_group_to_wait() {
-        let mut budget = RustResidencyBudget::new(1);
+        let mut budget = RustResidencyBudget::with_idle_timeout(1, Duration::ZERO);
 
         assert_eq!(
             budget.pin(RustGroupId(1), &HashSet::new()),
@@ -266,7 +294,7 @@ mod tests {
 
     #[test]
     fn least_recently_used_unpinned_group_is_evicted() {
-        let mut budget = RustResidencyBudget::new(2);
+        let mut budget = RustResidencyBudget::with_idle_timeout(2, Duration::ZERO);
         let excluded = HashSet::new();
 
         assert_eq!(
@@ -287,8 +315,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpinned_group_waits_for_idle_timeout_before_eviction() {
+        let mut budget = RustResidencyBudget::with_idle_timeout(1, Duration::from_millis(20));
+        let excluded = HashSet::new();
+        assert_eq!(
+            budget.pin(RustGroupId(1), &excluded),
+            ResidencyDecision::Admit
+        );
+        budget.unpin(RustGroupId(1));
+        assert_eq!(
+            budget.pin(RustGroupId(2), &excluded),
+            ResidencyDecision::Wait
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            budget.pin(RustGroupId(2), &excluded),
+            ResidencyDecision::Evict(RustGroupId(1))
+        );
+    }
+
+    #[tokio::test]
     async fn controller_suspends_unpinned_victim_before_admission() {
-        let controller = RustResidencyController::new(1);
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::ZERO);
         let (first_sender, mut first_receiver) = mpsc::channel(1);
         let (second_sender, _second_receiver) = mpsc::channel(1);
         controller.register(RustGroupId(1), first_sender.downgrade());
@@ -312,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_queues_while_every_resident_group_is_pinned() {
-        let controller = RustResidencyController::new(1);
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::ZERO);
         let (first_sender, mut first_receiver) = mpsc::channel(1);
         let (second_sender, _second_receiver) = mpsc::channel(1);
         controller.register(RustGroupId(1), first_sender.downgrade());
@@ -340,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_keeps_waiting_when_victim_refuses_suspension() {
-        let controller = RustResidencyController::new(1);
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::ZERO);
         let (first_sender, mut first_receiver) = mpsc::channel(1);
         let (second_sender, _second_receiver) = mpsc::channel(1);
         controller.register(RustGroupId(1), first_sender.downgrade());
