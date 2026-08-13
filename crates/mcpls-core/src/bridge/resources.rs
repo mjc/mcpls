@@ -22,6 +22,8 @@ const SCHEME: &str = "lsp-diagnostics";
 /// Three-slash form (`lsp-diagnostics:///`) is produced by appending an empty
 /// authority and the absolute path: `{PREFIX}{path}`.
 const PREFIX: &str = "lsp-diagnostics://";
+const SOURCE_SCHEME: &str = "mcpls-source";
+const SOURCE_PREFIX: &str = "mcpls-source://";
 
 /// Maximum number of resource URIs a single client session may subscribe to.
 ///
@@ -42,6 +44,97 @@ pub enum ResourceUriError {
     /// The URI path could not be decoded to a filesystem path.
     #[error("failed to decode URI to filesystem path: {0}")]
     DecodeFailed(String),
+}
+
+/// Snapshot-bound source context resource encoded in an MCP resource URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceResource {
+    /// Authorized absolute source path.
+    pub path: PathBuf,
+    /// One-based selected range.
+    pub start_line: u32,
+    /// One-based selected range start character.
+    pub start_character: u32,
+    /// One-based selected range end line.
+    pub end_line: u32,
+    /// One-based selected range end character.
+    pub end_character: u32,
+    /// Content hash captured when the resource was created.
+    pub snapshot_hash: String,
+    /// Open-document version captured when the resource was created.
+    pub document_version: Option<i32>,
+}
+
+/// Encode a source context resource without exposing mutable actor state.
+pub fn make_source_uri(
+    path: &Path,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    snapshot_hash: &str,
+    document_version: Option<i32>,
+) -> Result<String, ResourceUriError> {
+    let diagnostics_uri = make_uri(path)?;
+    let mut uri = Url::parse(&diagnostics_uri)
+        .map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
+    uri.set_scheme(SOURCE_SCHEME)
+        .map_err(|()| ResourceUriError::DecodeFailed(diagnostics_uri.clone()))?;
+    {
+        let mut query = uri.query_pairs_mut();
+        query
+            .append_pair("start_line", &start_line.to_string())
+            .append_pair("start_character", &start_character.to_string())
+            .append_pair("end_line", &end_line.to_string())
+            .append_pair("end_character", &end_character.to_string())
+            .append_pair("snapshot", snapshot_hash);
+        if let Some(version) = document_version {
+            query.append_pair("version", &version.to_string());
+        }
+    }
+    Ok(uri.to_string())
+}
+
+/// Decode a snapshot-bound source context resource URI.
+pub fn parse_source_uri(uri: &str) -> Result<SourceResource, ResourceUriError> {
+    if !uri.starts_with(SOURCE_PREFIX) {
+        return Err(ResourceUriError::InvalidScheme(uri.to_owned()));
+    }
+    let parsed = Url::parse(uri).map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
+    let mut file_uri = parsed.clone();
+    file_uri
+        .set_scheme("file")
+        .map_err(|()| ResourceUriError::DecodeFailed(uri.to_owned()))?;
+    file_uri.set_query(None);
+    let path = file_uri
+        .to_file_path()
+        .map_err(|()| ResourceUriError::DecodeFailed(uri.to_owned()))?;
+    let value = |name: &str| {
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+    };
+    let parse_u32 = |name: &str| {
+        value(name)
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| ResourceUriError::DecodeFailed(format!("missing or invalid {name}")))
+    };
+    let snapshot_hash = value("snapshot")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ResourceUriError::DecodeFailed("missing snapshot".to_owned()))?;
+    let document_version = value("version")
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| ResourceUriError::DecodeFailed("invalid version".to_owned()))?;
+    Ok(SourceResource {
+        path,
+        start_line: parse_u32("start_line")?,
+        start_character: parse_u32("start_character")?,
+        end_line: parse_u32("end_line")?,
+        end_character: parse_u32("end_character")?,
+        snapshot_hash,
+        document_version,
+    })
 }
 
 /// Encode an absolute filesystem path into a `lsp-diagnostics:///…` resource URI.

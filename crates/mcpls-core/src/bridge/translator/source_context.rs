@@ -2,9 +2,12 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::dto::{Location, Range, SourceContext, SourceFrame, SourceUnavailableReason};
+use super::dto::{
+    DeferredResourceReference, Location, Range, SourceContext, SourceFrame, SourceUnavailableReason,
+};
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::DocumentTracker;
+use crate::bridge::resources::make_source_uri;
 use crate::bridge::state::{path_to_uri, uri_to_path};
 
 const MAX_FRAME_LINES: usize = 12;
@@ -84,11 +87,6 @@ pub(super) async fn resolve_source_context_with_max_lines(
             SourceUnavailableReason::NotFound
         });
     };
-    if budget.remaining_bytes == 0 {
-        budget.truncated = true;
-        return unavailable(SourceUnavailableReason::ResponseBudgetExhausted);
-    }
-
     let (content, language_id, document_version) = if let Some(document) = document {
         (
             document.content().to_owned(),
@@ -105,6 +103,34 @@ pub(super) async fn resolve_source_context_with_max_lines(
         };
         (content, language_id(&canonical_path), None)
     };
+
+    let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let deferred = || {
+        make_source_uri(
+            &canonical_path,
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+            &content_hash,
+            document_version,
+        )
+        .ok()
+        .map(|uri| DeferredResourceReference {
+            uri,
+            kind: "source_context".to_owned(),
+            snapshot_hash: content_hash.clone(),
+            document_version,
+            total_bytes: Some(content.len()),
+        })
+    };
+    if budget.remaining_bytes == 0 {
+        budget.truncated = true;
+        return deferred().map_or_else(
+            || unavailable(SourceUnavailableReason::ResponseBudgetExhausted),
+            |resource| SourceContext::Deferred { resource },
+        );
+    }
 
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -134,12 +160,12 @@ pub(super) async fn resolve_source_context_with_max_lines(
         budget.remaining_bytes.saturating_sub(text.len())
     };
     let returned_bytes = text.len();
-    let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
     let canonical_uri =
         path_to_uri(&canonical_path).map_or_else(|_| uri.to_string(), |uri| uri.to_string());
 
     let truncated = start > 0 || returned_lines < selected.len() || end < total_lines;
     budget.truncated |= truncated;
+    let resource = truncated.then(deferred).flatten();
     SourceContext::Available(SourceFrame {
         path: canonical_path.to_string_lossy().into_owned(),
         uri: canonical_uri,
@@ -154,6 +180,7 @@ pub(super) async fn resolve_source_context_with_max_lines(
         returned_bytes,
         total_bytes,
         truncated,
+        resource,
     })
 }
 
@@ -447,9 +474,7 @@ mod tests {
         .await;
         assert!(matches!(
             source,
-            SourceContext::Unavailable {
-                reason: SourceUnavailableReason::ResponseBudgetExhausted
-            }
+            SourceContext::Deferred { .. }
         ));
     }
 

@@ -69,6 +69,11 @@ pub struct Location {
 pub enum SourceContext {
     /// The source was safely resolved.
     Available(SourceFrame),
+    /// The source exists but was omitted from the bounded response.
+    Deferred {
+        /// Direct snapshot-bound resource for the omitted source.
+        resource: DeferredResourceReference,
+    },
     /// The source could not be safely resolved.
     Unavailable {
         /// Stable machine-readable reason.
@@ -107,6 +112,26 @@ pub struct SourceFrame {
     pub total_bytes: usize,
     /// Whether a line or byte budget shortened the frame.
     pub truncated: bool,
+    /// Direct resource for the complete selected context when this frame is bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<DeferredResourceReference>,
+}
+
+/// Snapshot-bound MCP resource for context omitted from an inline result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DeferredResourceReference {
+    /// Resource URI to pass to `resources/read`.
+    pub uri: String,
+    /// Stable kind of deferred payload.
+    pub kind: String,
+    /// Snapshot content hash used to reject stale reads.
+    pub snapshot_hash: String,
+    /// Open-document version when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
+    /// Known byte size of the deferred payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<usize>,
 }
 
 /// Stable reasons source text is unavailable.
@@ -204,6 +229,9 @@ pub struct ReferencesResult {
     pub limits: SemanticResultLimits,
     /// Whether response budgets omitted source or references.
     pub truncated: bool,
+    /// Cursor for the next deterministic page of compact references.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// References returned from one source file.

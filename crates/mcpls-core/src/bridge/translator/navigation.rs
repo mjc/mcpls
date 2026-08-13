@@ -567,6 +567,7 @@ fn group_references(
         omitted_groups,
         limits,
         truncated: source_truncated || returned_references < total_references,
+        next_cursor: None,
     }
 }
 
