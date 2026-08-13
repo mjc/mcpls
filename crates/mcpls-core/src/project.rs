@@ -13,7 +13,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 
+use crate::bridge::DeferredResourceReference;
 use crate::bridge::convert_code_action_or_command;
+use crate::bridge::resources::SourceResource;
 use crate::bridge::translator::DiagnosticOptions;
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
@@ -29,8 +31,6 @@ use crate::bridge::{
     uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
-use crate::bridge::resources::SourceResource;
-use crate::bridge::DeferredResourceReference;
 use crate::edit_apply::{
     ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
 };
@@ -4440,10 +4440,7 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    async fn read_source_resource(
-        &self,
-        resource: SourceResource,
-    ) -> Result<SourceFrame, String> {
+    async fn read_source_resource(&self, resource: SourceResource) -> Result<SourceFrame, String> {
         self.translator
             .read_source_resource(&resource)
             .await
@@ -6079,7 +6076,7 @@ async fn handle_project_request(
                         limits,
                         page_offset,
                     )
-                .await,
+                    .await,
             );
         }
         ProjectRequest::ReadSourceResource { resource, reply } => {

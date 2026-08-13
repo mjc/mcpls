@@ -25,18 +25,16 @@ pub use state::{
 };
 pub use translator::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
-    DefinitionResult, DeferredResourceReference, Diagnostic, DiagnosticSeverity, DiagnosticsResult,
-    DocumentChanges,
-    DocumentSymbolOptions, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
-    IncomingCallsResult, InlayHintsResult, InspectCalls, InspectSection,
+    DeferredResourceReference, DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult,
+    DocumentChanges, DocumentSymbolOptions, DocumentSymbolsResult, FormatDocumentResult,
+    HoverResult, IncomingCallsResult, InlayHintsResult, InspectCalls, InspectSection,
     InspectSectionCompleteness, InspectSymbolBudget, InspectSymbolRequest, InspectSymbolResolution,
     InspectSymbolResult, InspectSymbolSectionKind, InspectSymbolSections, Location,
     LocationsResult, OutgoingCallsResult, Position2D, ProjectActivation, ProviderSynchronization,
     Range, ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessagesResult,
     SignatureHelpResult, SourceContext, SourceFrame, SupportedWorkspaceEdit, Symbol, SymbolHandle,
-    TextEdit,
-    Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
+    TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
     WorkspaceSymbolResult, WorkspaceSymbolScope, convert_code_action_or_command,
 };
 

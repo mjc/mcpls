@@ -8,8 +8,8 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::DocumentTracker;
 use crate::bridge::resources::{SourceResource, make_source_uri};
-use crate::error::{Error, Result};
 use crate::bridge::state::{path_to_uri, uri_to_path};
+use crate::error::{Error, Result};
 
 const MAX_FRAME_LINES: usize = 12;
 const MAX_FRAME_BYTES: usize = 4 * 1024;
@@ -515,10 +515,7 @@ mod tests {
             &mut budget,
         )
         .await;
-        assert!(matches!(
-            source,
-            SourceContext::Deferred { .. }
-        ));
+        assert!(matches!(source, SourceContext::Deferred { .. }));
     }
 
     #[tokio::test]

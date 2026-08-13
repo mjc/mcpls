@@ -100,7 +100,8 @@ pub fn parse_source_uri(uri: &str) -> Result<SourceResource, ResourceUriError> {
     if !uri.starts_with(SOURCE_PREFIX) {
         return Err(ResourceUriError::InvalidScheme(uri.to_owned()));
     }
-    let parsed = Url::parse(uri).map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
+    let parsed =
+        Url::parse(uri).map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
     let mut file_uri = parsed.clone();
     file_uri
         .set_scheme("file")

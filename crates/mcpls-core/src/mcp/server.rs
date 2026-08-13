@@ -2109,6 +2109,7 @@ impl McplsServer {
                 })
             })
             .transpose()?;
+        let page_offset = page_offset.or(Some(0));
         let result = actor
             .references_with_cursor(
                 file_path,
@@ -2933,10 +2934,14 @@ impl ServerHandler for McplsServer {
             }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => {
-                return self.read_source_resource(source, request.uri, supports_cache_hints).await;
+                return self
+                    .read_source_resource(source, request.uri, supports_cache_hints)
+                    .await;
             }
             SessionResource::Deferred(token) => {
-                return self.read_deferred_resource(token, request.uri, supports_cache_hints).await;
+                return self
+                    .read_deferred_resource(token, request.uri, supports_cache_hints)
+                    .await;
             }
         };
 

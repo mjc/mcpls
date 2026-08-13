@@ -520,7 +520,7 @@ impl Translator {
 }
 
 fn group_references(
-    mut locations: Vec<Location>,
+    locations: Vec<Location>,
     declaration: Option<ReferenceUse>,
     total_references: usize,
     workspace_roots: &[std::path::PathBuf],
@@ -528,6 +528,50 @@ fn group_references(
     limits: SemanticResultLimits,
     source_truncated: bool,
 ) -> ReferencesResult {
+    let mut groups = collect_reference_groups(locations, workspace_roots, enclosing_symbols);
+    let total_groups = groups.len();
+    let declaration = declaration.filter(|_| limits.total > 0);
+    let mut returned_references = usize::from(declaration.is_some());
+    let mut per_file = std::collections::HashMap::<String, usize>::new();
+    groups.retain_mut(|group| {
+        let file_count = per_file
+            .entry(group.project_relative_path.clone())
+            .or_default();
+        if *file_count >= limits.per_file || returned_references >= limits.total {
+            return false;
+        }
+        let available = limits
+            .total
+            .saturating_sub(returned_references)
+            .min(limits.per_file.saturating_sub(*file_count))
+            .min(limits.per_symbol);
+        group.references.truncate(available);
+        *file_count += group.references.len();
+        returned_references += group.references.len();
+        !group.references.is_empty()
+    });
+    let returned_groups = groups.len();
+    let omitted_groups = total_groups.saturating_sub(returned_groups);
+    ReferencesResult {
+        provider: "standard_lsp".to_owned(),
+        groups,
+        declaration,
+        total_references,
+        returned_references,
+        total_groups,
+        returned_groups,
+        omitted_groups,
+        limits,
+        truncated: source_truncated || returned_references < total_references,
+        next_cursor: None,
+    }
+}
+
+fn collect_reference_groups(
+    mut locations: Vec<Location>,
+    workspace_roots: &[std::path::PathBuf],
+    enclosing_symbols: &std::collections::HashMap<String, Vec<Symbol>>,
+) -> Vec<ReferenceGroup> {
     locations.sort_by(|left, right| {
         reference_source_order(left, workspace_roots)
             .cmp(&reference_source_order(right, workspace_roots))
@@ -567,42 +611,7 @@ fn group_references(
             });
         }
     }
-    let total_groups = groups.len();
-    let declaration = declaration.filter(|_| limits.total > 0);
-    let mut returned_references = usize::from(declaration.is_some());
-    let mut per_file = std::collections::HashMap::<String, usize>::new();
-    groups.retain_mut(|group| {
-        let file_count = per_file
-            .entry(group.project_relative_path.clone())
-            .or_default();
-        if *file_count >= limits.per_file || returned_references >= limits.total {
-            return false;
-        }
-        let available = limits
-            .total
-            .saturating_sub(returned_references)
-            .min(limits.per_file.saturating_sub(*file_count))
-            .min(limits.per_symbol);
-        group.references.truncate(available);
-        *file_count += group.references.len();
-        returned_references += group.references.len();
-        !group.references.is_empty()
-    });
-    let returned_groups = groups.len();
-    let omitted_groups = total_groups.saturating_sub(returned_groups);
-    ReferencesResult {
-        provider: "standard_lsp".to_owned(),
-        groups,
-        declaration,
-        total_references,
-        returned_references,
-        total_groups,
-        returned_groups,
-        omitted_groups,
-        limits,
-        truncated: source_truncated || returned_references < total_references,
-        next_cursor: None,
-    }
+    groups
 }
 
 fn group_references_page(
@@ -615,19 +624,8 @@ fn group_references_page(
     page_offset: usize,
     source_truncated: bool,
 ) -> ReferencesResult {
-    let full = group_references(
-        locations,
-        declaration,
-        total_references,
-        workspace_roots,
-        enclosing_symbols,
-        SemanticResultLimits {
-            total: usize::MAX,
-            per_file: usize::MAX,
-            per_symbol: usize::MAX,
-        },
-        source_truncated,
-    );
+    let all_groups = collect_reference_groups(locations, workspace_roots, enclosing_symbols);
+    let total_groups = all_groups.len();
     let page_size = limits.total;
     let start = page_offset.min(total_references);
     let end = if page_size == 0 {
@@ -636,13 +634,13 @@ fn group_references_page(
         start.saturating_add(page_size).min(total_references)
     };
     let mut index = 0usize;
-    let declaration = full.declaration.filter(|_| {
+    let declaration = declaration.filter(|_| {
         let included = (start..end).contains(&index);
         index = index.saturating_add(1);
         included
     });
-    let mut groups = Vec::new();
-    for group in full.groups {
+    let mut page_groups: Vec<ReferenceGroup> = Vec::new();
+    for group in all_groups {
         let mut references = Vec::new();
         for reference in group.references {
             if (start..end).contains(&index) {
@@ -651,23 +649,23 @@ fn group_references_page(
             index = index.saturating_add(1);
         }
         if !references.is_empty() {
-            groups.push(ReferenceGroup {
+            page_groups.push(ReferenceGroup {
                 project_relative_path: group.project_relative_path,
                 enclosing_symbol: group.enclosing_symbol,
                 references,
             });
         }
     }
-    let returned_groups = groups.len();
+    let returned_groups = page_groups.len();
     ReferencesResult {
-        provider: full.provider,
-        groups,
+        provider: "standard_lsp".to_owned(),
+        groups: page_groups,
         declaration,
         total_references,
         returned_references: end.saturating_sub(start),
-        total_groups: full.total_groups,
+        total_groups,
         returned_groups,
-        omitted_groups: full.total_groups.saturating_sub(returned_groups),
+        omitted_groups: total_groups.saturating_sub(returned_groups),
         limits,
         truncated: source_truncated || end < total_references,
         next_cursor: (end < total_references).then(|| end.to_string()),
