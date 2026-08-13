@@ -359,6 +359,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_activation_evicts_a_recent_unpinned_group() {
+        let controller =
+            RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let suspension = tokio::spawn(async move {
+            let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+                panic!("expected suspension request");
+            };
+            reply.send(Ok(())).unwrap();
+        });
+        let guard = tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.acquire_for_activation(RustGroupId(2)),
+        )
+        .await
+        .expect("explicit activation should not wait for the idle timeout");
+
+        suspension.await.unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test]
     async fn controller_queues_while_every_resident_group_is_pinned() {
         let controller = RustResidencyController::with_idle_timeout(1, Duration::ZERO);
         let (first_sender, mut first_receiver) = mpsc::channel(1);
