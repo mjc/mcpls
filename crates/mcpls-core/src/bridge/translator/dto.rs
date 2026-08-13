@@ -844,6 +844,8 @@ pub enum InspectSectionCompleteness {
     Complete,
     /// Provider data is available but a response bound omitted content.
     Partial,
+    /// Provider data was retained behind a direct resource because the bundle budget was full.
+    Deferred,
     /// Provider does not advertise the requested capability.
     Unsupported,
     /// Capability may exist but the provider request failed.
@@ -867,6 +869,9 @@ pub struct InspectSection<T> {
     pub truncated: bool,
     /// Actionable unsupported or unavailable reason.
     pub reason: Option<String>,
+    /// Direct resource for data omitted from the inline bundle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<DeferredResourceReference>,
     /// Typed section payload when available.
     pub data: Option<T>,
 }
@@ -882,6 +887,7 @@ impl<T> InspectSection<T> {
             returned: 0,
             truncated: false,
             reason: None,
+            resource: None,
             data: None,
         }
     }
@@ -896,6 +902,7 @@ impl<T> InspectSection<T> {
             returned: 0,
             truncated: false,
             reason: Some(reason.into()),
+            resource: None,
             data: None,
         }
     }
@@ -910,6 +917,7 @@ impl<T> InspectSection<T> {
             returned: 0,
             truncated: false,
             reason: Some(reason.into()),
+            resource: None,
             data: None,
         }
     }
@@ -934,7 +942,29 @@ impl<T> InspectSection<T> {
             returned,
             truncated,
             reason: None,
+            resource: None,
             data: Some(data),
+        }
+    }
+
+    /// Build section metadata for data retained behind a deferred resource.
+    #[must_use]
+    pub fn deferred(
+        provider: impl Into<String>,
+        total: usize,
+        returned: usize,
+        reason: impl Into<String>,
+        resource: DeferredResourceReference,
+    ) -> Self {
+        Self {
+            provider: Some(provider.into()),
+            completeness: InspectSectionCompleteness::Deferred,
+            total,
+            returned,
+            truncated: true,
+            reason: Some(reason.into()),
+            resource: Some(resource),
+            data: None,
         }
     }
 }

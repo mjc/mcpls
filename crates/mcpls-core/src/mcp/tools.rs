@@ -98,6 +98,9 @@ pub struct ReferencesParams {
     /// Bounds applied to references and groups.
     #[serde(default)]
     pub limits: SemanticResultLimits,
+    /// Decimal offset returned by a prior response's `next_cursor`.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `get_diagnostics` tool.

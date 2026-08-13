@@ -2092,13 +2092,32 @@ impl McplsServer {
             symbol_handle,
             include_declaration,
             limits,
+            page_token,
         }): Parameters<ReferencesParams>,
     ) -> Result<Json<crate::bridge::ReferencesResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
+        let page_offset = page_token
+            .as_deref()
+            .map(|token| {
+                token.parse::<usize>().map_err(|_| {
+                    McpError::invalid_params(
+                        "page_token must be the decimal next_cursor returned by get_references",
+                        None,
+                    )
+                })
+            })
+            .transpose()?;
         let result = actor
-            .references(file_path, line, character, include_declaration, limits)
+            .references_with_cursor(
+                file_path,
+                line,
+                character,
+                include_declaration,
+                limits,
+                page_offset,
+            )
             .await
             .map_err(|error| error.to_string());
 
@@ -2678,6 +2697,51 @@ impl McplsServer {
 }
 
 impl McplsServer {
+    async fn read_source_resource(
+        &self,
+        resource: crate::bridge::resources::SourceResource,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let actor = self
+            .context
+            .required_actor_for_path(&resource.path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let frame = actor
+            .read_source_resource(resource)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let json = serde_json::to_string(&frame)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_deferred_resource(
+        &self,
+        token: String,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let value = self
+            .context
+            .project_registry
+            .read_deferred_resource(token)
+            .await
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let json = serde_json::to_string(&value)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
     async fn listen_project_ids(
         &self,
         accepted: &std::collections::HashSet<String>,
@@ -2698,6 +2762,20 @@ impl McplsServer {
                         .await
                         .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
                     project_ids.insert(project_id);
+                }
+                SessionResource::Source(source) => {
+                    let (project_id, _) = self
+                        .context
+                        .required_project_for_path(source.path)
+                        .await
+                        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                    project_ids.insert(project_id);
+                }
+                SessionResource::Deferred(_) => {
+                    return Err(McpError::invalid_params(
+                        "deferred semantic resources are readable but not subscribable",
+                        None,
+                    ));
                 }
             }
         }
@@ -2854,6 +2932,12 @@ impl ServerHandler for McplsServer {
                     .await;
             }
             SessionResource::Diagnostics(path) => path,
+            SessionResource::Source(source) => {
+                return self.read_source_resource(source, request.uri, supports_cache_hints).await;
+            }
+            SessionResource::Deferred(token) => {
+                return self.read_deferred_resource(token, request.uri, supports_cache_hints).await;
+            }
         };
 
         // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
@@ -2974,6 +3058,13 @@ impl ServerHandler for McplsServer {
                 return Ok(());
             }
             SessionResource::Diagnostics(path) => path,
+            SessionResource::Source(source) => source.path,
+            SessionResource::Deferred(_) => {
+                return Err(McpError::invalid_params(
+                    "deferred semantic resources are readable but not subscribable",
+                    None,
+                ));
+            }
         };
 
         let (project_id, actor) = self
@@ -3018,7 +3109,10 @@ impl ServerHandler for McplsServer {
             SessionResource::ProjectEvents { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
-            SessionResource::ProjectStatus(_) | SessionResource::Diagnostics(_) => request.uri,
+            SessionResource::ProjectStatus(_)
+            | SessionResource::Diagnostics(_)
+            | SessionResource::Source(_) => request.uri,
+            SessionResource::Deferred(_) => request.uri,
         };
         self.context.subscriptions.unsubscribe(&uri).await;
         self.context.event_sink.untrack_subscription(&uri);
@@ -6275,6 +6369,7 @@ while True:
                 symbol_handle: None,
                 include_declaration: false,
                 limits: crate::bridge::SemanticResultLimits::default(),
+                page_token: None,
             }))
             .await;
 
@@ -6665,6 +6760,7 @@ while True:
             symbol_handle: None,
             include_declaration: false,
             limits: crate::bridge::SemanticResultLimits::default(),
+            page_token: None,
         });
 
         let result = server.get_references(params).await;

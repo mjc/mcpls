@@ -23,12 +23,14 @@ use crate::bridge::{
     LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
-    SignatureHelpResult, SourceContext, StructuralMatch, StructuralSearchResult,
+    SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
     SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult,
     WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri,
     uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
+use crate::bridge::resources::SourceResource;
+use crate::bridge::DeferredResourceReference;
 use crate::edit_apply::{
     ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
 };
@@ -1420,7 +1422,16 @@ enum ProjectRequest {
         character: u32,
         include_declaration: bool,
         limits: SemanticResultLimits,
+        page_offset: Option<usize>,
         reply: oneshot::Sender<Result<ReferencesResult, String>>,
+    },
+    ReadSourceResource {
+        resource: SourceResource,
+        reply: oneshot::Sender<Result<SourceFrame, String>>,
+    },
+    ReadDeferredResource {
+        token: String,
+        reply: oneshot::Sender<Result<serde_json::Value, String>>,
     },
     ResolveSymbolHandle {
         symbol_handle: SymbolHandle,
@@ -1810,6 +1821,8 @@ impl ProjectRequest {
             Self::Hover { reply, .. } => reply.is_closed(),
             Self::Definition { reply, .. } => reply.is_closed(),
             Self::References { reply, .. } => reply.is_closed(),
+            Self::ReadSourceResource { reply, .. } => reply.is_closed(),
+            Self::ReadDeferredResource { reply, .. } => reply.is_closed(),
             Self::ResolveSymbolHandle { reply, .. } => reply.is_closed(),
             Self::Diagnostics { reply, .. } | Self::CachedDiagnostics { reply, .. } => {
                 reply.is_closed()
@@ -2068,6 +2081,27 @@ impl ProjectHandle {
         include_declaration: bool,
         limits: SemanticResultLimits,
     ) -> Result<ReferencesResult, ProjectActorError> {
+        self.references_with_cursor(
+            file_path,
+            line,
+            character,
+            include_declaration,
+            limits,
+            None,
+        )
+        .await
+    }
+
+    /// Route one deterministic reference page through this project's actor.
+    pub async fn references_with_cursor(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+        limits: SemanticResultLimits,
+        page_offset: Option<usize>,
+    ) -> Result<ReferencesResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::References {
@@ -2076,8 +2110,40 @@ impl ProjectHandle {
                 character,
                 include_declaration,
                 limits,
+                page_offset,
                 reply,
             })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Read a snapshot-bound source context resource.
+    pub(crate) async fn read_source_resource(
+        &self,
+        resource: SourceResource,
+    ) -> Result<SourceFrame, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReadSourceResource { resource, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    pub(crate) async fn read_deferred_resource(
+        &self,
+        token: String,
+    ) -> Result<serde_json::Value, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReadDeferredResource { token, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3246,6 +3312,7 @@ struct ProjectRuntime {
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
     symbol_handles: SymbolHandleStore,
+    deferred_results: DeferredResultStore,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -3457,6 +3524,76 @@ struct SymbolHandleStore {
     max_entries: usize,
 }
 
+struct StoredDeferredResult {
+    value: serde_json::Value,
+    created_at: Instant,
+}
+
+struct DeferredResultStore {
+    entries: HashMap<String, StoredDeferredResult>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl DeferredResultStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(15 * 60),
+            max_entries: 128,
+        }
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, result| now.duration_since(result.created_at) < self.ttl);
+    }
+
+    fn insert(
+        &mut self,
+        value: serde_json::Value,
+        snapshot_hash: String,
+    ) -> DeferredResourceReference {
+        self.prune();
+        while self.entries.len() >= self.max_entries {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, result)| result.created_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        let total_bytes = serde_json::to_vec(&value).ok().map(|json| json.len());
+        self.entries.insert(
+            token.clone(),
+            StoredDeferredResult {
+                value,
+                created_at: Instant::now(),
+            },
+        );
+        DeferredResourceReference {
+            uri: format!("mcpls-deferred:///{token}"),
+            kind: "inspect_symbol_section".to_owned(),
+            snapshot_hash,
+            document_version: None,
+            total_bytes,
+        }
+    }
+
+    fn read(&mut self, token: &str) -> Result<serde_json::Value, String> {
+        self.prune();
+        self.entries
+            .get(token)
+            .map(|result| result.value.clone())
+            .ok_or_else(|| "stale_resource: deferred result is missing or expired".to_owned())
+    }
+}
+
 fn attach_document_symbol_handles(
     store: &mut SymbolHandleStore,
     symbols: &mut [crate::bridge::Symbol],
@@ -3579,6 +3716,7 @@ impl ProjectRuntime {
             edit_safety,
             code_actions: CodeActionStore::new(),
             symbol_handles: SymbolHandleStore::new(),
+            deferred_results: DeferredResultStore::new(),
             inline_module_checks: HashMap::new(),
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -4280,10 +4418,18 @@ impl ProjectRuntime {
         character: u32,
         include_declaration: bool,
         limits: SemanticResultLimits,
+        page_offset: Option<usize>,
     ) -> Result<ReferencesResult, String> {
         let mut result = self
             .translator
-            .handle_references(file_path, line, character, include_declaration, limits)
+            .handle_references_page(
+                file_path,
+                line,
+                character,
+                include_declaration,
+                limits,
+                page_offset,
+            )
             .await
             .map_err(|error| error.to_string())?;
         for group in &mut result.groups {
@@ -4292,6 +4438,47 @@ impl ProjectRuntime {
             }
         }
         Ok(result)
+    }
+
+    async fn read_source_resource(
+        &self,
+        resource: SourceResource,
+    ) -> Result<SourceFrame, String> {
+        self.translator
+            .read_source_resource(&resource)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_deferred_resource(&mut self, token: String) -> Result<serde_json::Value, String> {
+        self.deferred_results.read(&token)
+    }
+
+    fn defer_inspect_section<T: Serialize>(
+        &mut self,
+        section: &mut crate::bridge::InspectSection<T>,
+        snapshot_hash: &str,
+    ) {
+        let Some(data) = section.data.take() else {
+            return;
+        };
+        let Ok(value) = serde_json::to_value(data) else {
+            return;
+        };
+        let provider = section
+            .provider
+            .clone()
+            .unwrap_or_else(|| "mcpls".to_owned());
+        let reference = self
+            .deferred_results
+            .insert(value, snapshot_hash.to_owned());
+        *section = crate::bridge::InspectSection::deferred(
+            provider,
+            section.total,
+            section.returned,
+            "response_budget_exhausted",
+            reference,
+        );
     }
 
     async fn resolve_symbol_handle(
@@ -4729,7 +4916,7 @@ impl ProjectRuntime {
         }
         if request.wants(InspectSymbolSectionKind::References) {
             sections.references = match self
-                .references(file_path.clone(), line, character, true, limits)
+                .references(file_path.clone(), line, character, true, limits, Some(0))
                 .await
             {
                 Ok(result) => InspectSection::available(
@@ -4847,15 +5034,22 @@ impl ProjectRuntime {
             returned_bytes: 0,
             truncated: false,
         };
+        let snapshot_hash = self
+            .translator
+            .source_snapshot(Path::new(&file_path))
+            .await
+            .map(|(_, _, hash, _)| hash)
+            .unwrap_or_else(|_| format!("generation:{}", self.generation));
         macro_rules! drop_section_if_over_budget {
             ($field:ident) => {
                 if serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len())
                     > result.budget.max_bytes
                     && result.sections.$field.completeness
                         != crate::bridge::InspectSectionCompleteness::NotRequested
+                    && result.sections.$field.completeness
+                        != crate::bridge::InspectSectionCompleteness::Deferred
                 {
-                    result.sections.$field =
-                        InspectSection::unavailable("total_response_budget_exhausted");
+                    self.defer_inspect_section(&mut result.sections.$field, &snapshot_hash);
                     result.truncated = true;
                 }
             };
@@ -5872,13 +6066,27 @@ async fn handle_project_request(
             character,
             include_declaration,
             limits,
+            page_offset,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .references(file_path, line, character, include_declaration, limits)
-                    .await,
+                    .references(
+                        file_path,
+                        line,
+                        character,
+                        include_declaration,
+                        limits,
+                        page_offset,
+                    )
+                .await,
             );
+        }
+        ProjectRequest::ReadSourceResource { resource, reply } => {
+            let _ = reply.send(runtime.read_source_resource(resource).await);
+        }
+        ProjectRequest::ReadDeferredResource { token, reply } => {
+            let _ = reply.send(runtime.read_deferred_resource(token));
         }
         ProjectRequest::ResolveSymbolHandle {
             symbol_handle,
@@ -8173,6 +8381,27 @@ impl ProjectRegistry {
             }
         }
         Err("invalid_symbol_handle: unknown or forged handle; rerun symbol discovery".to_owned())
+    }
+
+    pub(crate) async fn read_deferred_resource(
+        &self,
+        token: String,
+    ) -> Result<serde_json::Value, String> {
+        let actors = self
+            .projects
+            .read()
+            .await
+            .values()
+            .flat_map(|project| project.actors.iter().map(|entry| entry.actor.clone()))
+            .collect::<Vec<_>>();
+        for actor in actors {
+            match actor.read_deferred_resource(token.clone()).await {
+                Ok(value) => return Ok(value),
+                Err(error) if error.to_string().starts_with("stale_resource") => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("stale_resource: deferred result is missing or expired".to_owned())
     }
 
     /// Return the number of actor groups backing one logical project.

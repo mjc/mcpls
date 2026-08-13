@@ -10,7 +10,9 @@ use rmcp::{Peer, RoleServer};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::bridge::resources::{ResourceUriError, make_uri, parse_uri};
+use crate::bridge::resources::{
+    ResourceUriError, SourceResource, make_uri, parse_source_uri, parse_uri,
+};
 use crate::bridge::{ResourceSubscriptions, uri_to_path};
 use crate::project::{ProjectEvent, ProjectHandle, ProjectId};
 
@@ -66,6 +68,10 @@ pub enum SessionResource {
         /// Return only events newer than this cursor.
         cursor: Option<u64>,
     },
+    /// Snapshot-bound source context omitted from a bounded semantic result.
+    Source(SourceResource),
+    /// Actor-owned deferred semantic section identified by an opaque token.
+    Deferred(String),
 }
 
 /// Parse either a diagnostics or project-status resource URI.
@@ -75,6 +81,15 @@ pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, Resource
     }
     if let Some((project_id, cursor)) = parse_project_events_resource_uri(uri) {
         return Ok(SessionResource::ProjectEvents { project_id, cursor });
+    }
+    if uri.starts_with("mcpls-source://") {
+        return parse_source_uri(uri).map(SessionResource::Source);
+    }
+    if let Some(token) = uri.strip_prefix("mcpls-deferred:///")
+        && !token.is_empty()
+        && !token.contains('/')
+    {
+        return Ok(SessionResource::Deferred(token.to_owned()));
     }
     parse_uri(uri).map(SessionResource::Diagnostics)
 }

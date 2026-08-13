@@ -231,6 +231,27 @@ impl Translator {
         include_declaration: bool,
         limits: SemanticResultLimits,
     ) -> Result<ReferencesResult> {
+        self.handle_references_page(
+            file_path,
+            line,
+            character,
+            include_declaration,
+            limits,
+            None,
+        )
+        .await
+    }
+
+    /// Handle one deterministic page of references.
+    pub async fn handle_references_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+        limits: SemanticResultLimits,
+        page_offset: Option<usize>,
+    ) -> Result<ReferencesResult> {
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -311,15 +332,28 @@ impl Translator {
             result_locations.push(ctx.location(&self.workspace_roots, loc, &mut budget).await);
         }
         let enclosing_symbols = self.reference_symbols(&result_locations).await;
-        let result = group_references(
-            result_locations,
-            declaration,
-            total_references,
-            &self.workspace_roots,
-            &enclosing_symbols,
-            limits,
-            budget.truncated(),
-        );
+        let result = if let Some(offset) = page_offset {
+            group_references_page(
+                result_locations,
+                declaration,
+                total_references,
+                &self.workspace_roots,
+                &enclosing_symbols,
+                limits,
+                offset,
+                budget.truncated(),
+            )
+        } else {
+            group_references(
+                result_locations,
+                declaration,
+                total_references,
+                &self.workspace_roots,
+                &enclosing_symbols,
+                limits,
+                budget.truncated(),
+            )
+        };
 
         Ok(result)
     }
@@ -568,6 +602,75 @@ fn group_references(
         limits,
         truncated: source_truncated || returned_references < total_references,
         next_cursor: None,
+    }
+}
+
+fn group_references_page(
+    locations: Vec<Location>,
+    declaration: Option<ReferenceUse>,
+    total_references: usize,
+    workspace_roots: &[std::path::PathBuf],
+    enclosing_symbols: &std::collections::HashMap<String, Vec<Symbol>>,
+    limits: SemanticResultLimits,
+    page_offset: usize,
+    source_truncated: bool,
+) -> ReferencesResult {
+    let full = group_references(
+        locations,
+        declaration,
+        total_references,
+        workspace_roots,
+        enclosing_symbols,
+        SemanticResultLimits {
+            total: usize::MAX,
+            per_file: usize::MAX,
+            per_symbol: usize::MAX,
+        },
+        source_truncated,
+    );
+    let page_size = limits.total;
+    let start = page_offset.min(total_references);
+    let end = if page_size == 0 {
+        start
+    } else {
+        start.saturating_add(page_size).min(total_references)
+    };
+    let mut index = 0usize;
+    let declaration = full.declaration.filter(|_| {
+        let included = (start..end).contains(&index);
+        index = index.saturating_add(1);
+        included
+    });
+    let mut groups = Vec::new();
+    for group in full.groups {
+        let mut references = Vec::new();
+        for reference in group.references {
+            if (start..end).contains(&index) {
+                references.push(reference);
+            }
+            index = index.saturating_add(1);
+        }
+        if !references.is_empty() {
+            groups.push(ReferenceGroup {
+                project_relative_path: group.project_relative_path,
+                enclosing_symbol: group.enclosing_symbol,
+                references,
+            });
+        }
+    }
+    let returned_groups = groups.len();
+    ReferencesResult {
+        provider: full.provider,
+        groups,
+        declaration,
+        total_references,
+        returned_references: end.saturating_sub(start),
+        total_groups: full.total_groups,
+        returned_groups,
+        omitted_groups: full.total_groups.saturating_sub(returned_groups),
+        limits,
+        truncated: source_truncated || end < total_references,
+        next_cursor: (end < total_references).then(|| end.to_string()),
     }
 }
 
@@ -872,5 +975,60 @@ mod tests {
                 "target/generated.rs"
             ]
         );
+    }
+
+    #[test]
+    fn references_page_exhaustion_returns_every_compact_location_once() {
+        let roots = [std::path::PathBuf::from("/workspace")];
+        let locations = vec![
+            unavailable_location("/workspace/src/a.rs", 2),
+            unavailable_location("/workspace/src/a.rs", 4),
+            unavailable_location("/workspace/src/b.rs", 2),
+        ];
+        let limits = SemanticResultLimits {
+            total: 2,
+            per_file: 1,
+            per_symbol: 1,
+        };
+        let first = group_references_page(
+            locations.clone(),
+            Some(ReferenceUse {
+                location: unavailable_location("/workspace/src/lib.rs", 1),
+                role: ReferenceRole::Declaration,
+            }),
+            4,
+            &roots,
+            &std::collections::HashMap::new(),
+            limits,
+            0,
+            false,
+        );
+        let second = group_references_page(
+            locations,
+            Some(ReferenceUse {
+                location: unavailable_location("/workspace/src/lib.rs", 1),
+                role: ReferenceRole::Declaration,
+            }),
+            4,
+            &roots,
+            &std::collections::HashMap::new(),
+            limits,
+            2,
+            false,
+        );
+        assert_eq!(first.returned_references, 2);
+        assert_eq!(first.next_cursor.as_deref(), Some("2"));
+        assert_eq!(second.returned_references, 2);
+        assert_eq!(second.next_cursor, None);
+        let mut lines = first
+            .declaration
+            .into_iter()
+            .chain(first.groups.into_iter().flat_map(|group| group.references))
+            .chain(second.declaration.into_iter())
+            .chain(second.groups.into_iter().flat_map(|group| group.references))
+            .map(|reference| reference.location.range.start.line)
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![1, 2, 2, 4]);
     }
 }

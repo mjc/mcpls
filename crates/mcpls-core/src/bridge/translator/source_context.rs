@@ -7,7 +7,8 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::DocumentTracker;
-use crate::bridge::resources::make_source_uri;
+use crate::bridge::resources::{SourceResource, make_source_uri};
+use crate::error::{Error, Result};
 use crate::bridge::state::{path_to_uri, uri_to_path};
 
 const MAX_FRAME_LINES: usize = 12;
@@ -136,7 +137,7 @@ pub(super) async fn resolve_source_context_with_max_lines(
     let total_lines = lines.len();
     let target = range.start.line.saturating_sub(1) as usize;
     let start = declaration_context_start(&lines, target.min(total_lines));
-    let end = (start + max_lines.min(MAX_FRAME_LINES)).min(total_lines);
+    let end = start.saturating_add(max_lines).min(total_lines);
     let selected = &lines[start.min(total_lines)..end];
     let total_bytes = lines
         .iter()
@@ -288,6 +289,48 @@ impl EncodingCtx {
 }
 
 impl super::Translator {
+    pub(crate) async fn read_source_resource(
+        &self,
+        resource: &SourceResource,
+    ) -> Result<SourceFrame> {
+        let (path, version, hash, _) = self.source_snapshot(&resource.path).await?;
+        if hash != resource.snapshot_hash || resource.document_version != version {
+            return Err(Error::McpServer(
+                "stale_resource: source snapshot changed; rerun the semantic request".to_owned(),
+            ));
+        }
+        let uri = path_to_uri(&path)?;
+        let range = Range {
+            start: super::dto::Position2D {
+                line: resource.start_line,
+                character: resource.start_character,
+            },
+            end: super::dto::Position2D {
+                line: resource.end_line,
+                character: resource.end_character,
+            },
+        };
+        let mut budget = SourceBudget::new(usize::MAX);
+        let source = resolve_source_context_with_max_lines(
+            &self.document_tracker,
+            &self.workspace_roots,
+            &[],
+            &uri,
+            range,
+            &mut budget,
+            usize::MAX,
+        )
+        .await;
+        let SourceContext::Available(mut frame) = source else {
+            return Err(Error::McpServer(
+                "deferred source resource is no longer readable".to_owned(),
+            ));
+        };
+        frame.resource = None;
+        frame.truncated = false;
+        Ok(frame)
+    }
+
     pub(crate) async fn source_snapshot(
         &self,
         path: &Path,

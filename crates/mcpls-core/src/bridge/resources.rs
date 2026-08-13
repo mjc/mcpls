@@ -295,6 +295,18 @@ mod tests {
     }
 
     #[test]
+    fn source_resource_uri_round_trips_snapshot_and_range() {
+        let path = Path::new("/workspace/src/λ file.rs");
+        let uri = make_source_uri(path, 2, 3, 4, 5, "abc123", Some(7)).unwrap();
+        let resource = parse_source_uri(&uri).unwrap();
+        assert_eq!(resource.path, path);
+        assert_eq!((resource.start_line, resource.start_character), (2, 3));
+        assert_eq!((resource.end_line, resource.end_character), (4, 5));
+        assert_eq!(resource.snapshot_hash, "abc123");
+        assert_eq!(resource.document_version, Some(7));
+    }
+
+    #[test]
     fn test_parse_uri_rejects_wrong_scheme() {
         let result = parse_uri("file:///home/user/main.rs");
         assert!(result.is_err());
