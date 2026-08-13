@@ -247,6 +247,18 @@ fn file_uri(path: &PathBuf) -> Result<String> {
         .map_err(|()| anyhow::anyhow!("cannot create file URI for {}", path.display()))
 }
 
+fn process_summary(names: Vec<String>) -> Value {
+    let rust_analyzer_count = names
+        .iter()
+        .filter(|name| mcpls_bench::RUST_ANALYZER_NAMES.contains(&name.as_str()))
+        .count();
+    json!({
+        "process_count": names.len(),
+        "process_names": names,
+        "rust_analyzer_count": rust_analyzer_count,
+    })
+}
+
 fn run(args: &Args) -> Result<Value> {
     if !cfg!(target_os = "linux") {
         bail!("PSS measurement requires Linux /proc");
@@ -348,11 +360,15 @@ fn run(args: &Args) -> Result<Value> {
     let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
     let after_ids = descendants(child.0.id());
     let after_kib = pss_kib(&after_ids);
+    let processes = process_summary(mcpls_bench::process_names(&after_ids));
     let result_count = response["result"].as_array().map_or(0, Vec::len);
     let report = json!({
         "profile": args.profile.name(), "roots": roots, "query": args.query,
         "initialized_ms": (initialized_ms * 10.0).round() / 10.0, "pre_query_wait_ms": (pre_query_wait_ms * 10.0).round() / 10.0,
-        "initial_load_complete": initial_load_complete, "quiescent": quiescent, "process_count": after_ids.len(),
+        "initial_load_complete": initial_load_complete, "quiescent": quiescent,
+        "process_count": processes["process_count"],
+        "process_names": processes["process_names"],
+        "rust_analyzer_count": processes["rust_analyzer_count"],
         "pss_before_query_kib": before_kib, "pss_after_query_kib": after_kib, "pss_query_delta_kib": after_kib as i64 - before_kib as i64,
         "query_ms": (query_ms * 10.0).round() / 10.0, "result_count": result_count, "stderr_path": stderr_path,
     });
@@ -418,4 +434,18 @@ fn main() -> Result<()> {
         fs::write(output, format!("{rendered}\n"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_summary;
+
+    #[test]
+    fn process_summary_identifies_analyzer_and_helpers() {
+        let summary = process_summary(vec!["rust-analyzer".to_owned(), "proc-macro".to_owned()]);
+
+        assert_eq!(summary["process_count"], 2);
+        assert_eq!(summary["rust_analyzer_count"], 1);
+        assert_eq!(summary["process_names"][0], "rust-analyzer");
+    }
 }
