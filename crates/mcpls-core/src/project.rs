@@ -5650,6 +5650,10 @@ impl ProjectResidency {
         self.controller.try_acquire_existing(self.group)
     }
 
+    fn remove(&self) {
+        self.controller.remove(self.group);
+    }
+
     async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
         let guard = self.acquire().await;
         ProjectRequest::Resident {
@@ -6019,6 +6023,9 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     channels.publish_failure(state, error.to_string());
+                    if let Some(residency) = residency {
+                        residency.remove();
+                    }
                     let _ = reply.send(Err(error.to_string()));
                 }
             }
@@ -6046,6 +6053,9 @@ async fn handle_project_request(
                 Err(error) => {
                     state.sync_runtime(runtime);
                     channels.publish_failure(state, error.clone());
+                    if let Some(residency) = residency {
+                        residency.remove();
+                    }
                     let _ = reply.send(Err(error));
                 }
             }
