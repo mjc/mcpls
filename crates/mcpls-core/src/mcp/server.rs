@@ -3412,6 +3412,10 @@ try:
                     time.sleep(0.001)
             send({"jsonrpc": "2.0", "id": message["id"], "result": []})
         elif method == "workspace/symbol":
+            if block_root and pathlib.Path.cwd() == block_root:
+                entered.write_text("entered")
+                while not release.exists():
+                    time.sleep(0.001)
             send({"jsonrpc": "2.0", "id": message["id"], "result": [{
                 "name": "fixture_symbol",
                 "kind": 12,
@@ -3815,6 +3819,83 @@ finally:
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
             "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_status_and_actor_recover_when_workspace_symbol_caller_cancels() {
+        let root = TempDir::new().unwrap();
+        write_rust_fixture(root.path());
+        let counter = root.path().join("spawn-count");
+        let entered = root.path().join("request-entered");
+        let release = root.path().join("request-release");
+        let config = write_concurrency_lsp(
+            root.path(),
+            &counter,
+            Some(root.path()),
+            Some(&entered),
+            Some(&release),
+        );
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let project_id = ProjectId::new("blocked").unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server = McplsServer::new_with_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            registry.clone(),
+        );
+        server
+            .project_activate(project_params(project_id.as_str()))
+            .await
+            .unwrap();
+        wait_for_project_ready(&registry, &project_id).await;
+
+        let blocked_server = server.for_session();
+        let blocked_id = project_id.as_str().to_string();
+        let blocked = tokio::spawn(async move {
+            blocked_server
+                .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                    project_id: blocked_id,
+                    query: "fixture".to_string(),
+                    kind_filter: None,
+                    match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                    scope: crate::bridge::WorkspaceSymbolScope::default(),
+                    limit: 20,
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !entered.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace-symbol request did not reach the language server");
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.project_status(project_params(project_id.as_str())),
+        )
+        .await;
+        blocked.abort();
+        let _ = blocked.await;
+        let refresh = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.project_refresh(project_params(project_id.as_str())),
+        )
+        .await;
+        std::fs::write(&release, "release").unwrap();
+
+        assert!(status.is_ok(), "project status waited behind actor work");
+        assert!(
+            refresh.is_ok(),
+            "cancelled workspace-symbol work held the actor"
         );
     }
 

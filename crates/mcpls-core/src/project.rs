@@ -1901,6 +1901,7 @@ impl ProjectRequest {
 pub struct ProjectHandle {
     sender: ProjectRequestSender,
     status: watch::Receiver<ProjectStatus>,
+    state: watch::Receiver<ProjectState>,
     events: broadcast::Sender<ProjectEvent>,
     event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
 }
@@ -1916,6 +1917,10 @@ impl ProjectHandle {
     #[must_use]
     pub fn status(&self) -> watch::Receiver<ProjectStatus> {
         self.status.clone()
+    }
+
+    fn state_snapshot(&self) -> ProjectState {
+        self.state.borrow().clone()
     }
 
     /// Subscribe to typed project lifecycle and failure events.
@@ -5729,31 +5734,35 @@ fn spawn_project_actor_with_runtime(
             )
         },
     );
+    let runtime = match edit_safety {
+        None => ProjectRuntime::new(translator),
+        Some(safety) => ProjectRuntime::with_edit_safety(translator, Some(safety)),
+    };
+    let initial_state = ProjectState::new(ProjectStatus::Starting, runtime.summary());
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
+    let (state_tx, state_rx) = watch::channel(initial_state.clone());
     let (event_tx, _) = broadcast::channel(256);
     let event_sender = event_tx.clone();
     let event_history = std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(256)));
     let channels = ProjectActorChannels {
         status_tx,
+        state_tx,
         event_tx,
         event_history: std::sync::Arc::clone(&event_history),
         accepting,
-    };
-    let runtime = match edit_safety {
-        None => ProjectRuntime::new(translator),
-        Some(safety) => ProjectRuntime::with_edit_safety(translator, Some(safety)),
     };
     tokio::spawn(run_project_actor(
         receiver,
         actor_sender,
         channels,
-        ProjectState::new(ProjectStatus::Starting, runtime.summary()),
+        initial_state,
         runtime,
         residency,
     ));
     ProjectHandle {
         sender,
         status: status_rx,
+        state: state_rx,
         events: event_sender,
         event_history,
     }
@@ -5761,6 +5770,7 @@ fn spawn_project_actor_with_runtime(
 
 struct ProjectActorChannels {
     status_tx: watch::Sender<ProjectStatus>,
+    state_tx: watch::Sender<ProjectState>,
     event_tx: broadcast::Sender<ProjectEvent>,
     event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
     accepting: std::sync::Arc<AtomicBool>,
@@ -5799,10 +5809,15 @@ impl ProjectActorChannels {
     fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
         state.status = status;
         let _ = self.status_tx.send(status);
+        self.publish_state(state);
         self.publish(ProjectEvent::StatusChanged {
             status,
             last_error: state.last_error.clone(),
         });
+    }
+
+    fn publish_state(&self, state: &ProjectState) {
+        self.state_tx.send_replace(state.clone());
     }
 
     fn publish_failure(&self, state: &mut ProjectState, error: impl Into<String>) {
@@ -5829,7 +5844,7 @@ async fn run_project_actor(
         {
             resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
         }
-        if handle_project_request(
+        let stop = handle_project_request(
             request,
             &actor_sender,
             &channels,
@@ -5837,8 +5852,10 @@ async fn run_project_actor(
             &mut runtime,
             residency.as_ref(),
         )
-        .await
-        {
+        .await;
+        state.sync_runtime(&runtime);
+        channels.publish_state(&state);
+        if stop {
             break;
         }
     }
@@ -6271,13 +6288,16 @@ async fn handle_project_request(
             limit,
             match_mode,
             scope,
-            reply,
+            mut reply,
         } => {
-            let _ = reply.send(
-                runtime
-                    .workspace_symbol(query, kind_filter, limit, match_mode, scope)
-                    .await,
-            );
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.workspace_symbol(query, kind_filter, limit, match_mode, scope) => result,
+            };
+            let _ = reply.send(result);
         }
         ProjectRequest::InspectSymbol { request, mut reply } => {
             if reply.is_closed() {
@@ -7891,18 +7911,16 @@ impl ProjectRegistry {
         persisted
     }
 
-    /// Query a project's actor state without holding the registry lock during the await.
+    /// Read a project's last published actor state without waiting behind actor work.
     ///
     /// # Errors
     ///
     /// Returns an error when the project is not registered or its actor is unavailable.
     pub async fn status(&self, id: &ProjectId) -> Result<ProjectState, ProjectRegistryError> {
         let (_, actors) = self.actor_entries(id).await?;
-        let mut states = Vec::with_capacity(actors.len());
-        for (actor, _) in actors {
-            states.push(actor.query().await?);
-        }
-        Ok(ProjectState::aggregate(states))
+        Ok(ProjectState::aggregate(
+            actors.into_iter().map(|(actor, _)| actor.state_snapshot()),
+        ))
     }
 
     /// Return negotiated capabilities from every active actor group.
@@ -8788,9 +8806,14 @@ mod tests {
         };
         let (actor_sender, _actor_receiver) = mpsc::channel(1);
         let (status_tx, _) = watch::channel(ProjectStatus::Ready);
+        let (state_tx, _) = watch::channel(ProjectState::new(
+            ProjectStatus::Ready,
+            ProjectRuntimeSummary::default(),
+        ));
         let (event_tx, _) = broadcast::channel(1);
         let channels = ProjectActorChannels {
             status_tx,
+            state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
             accepting: std::sync::Arc::new(AtomicBool::new(true)),
@@ -9586,9 +9609,14 @@ mod tests {
     #[allow(clippy::large_futures)]
     async fn project_actor_delivers_active_mutation_after_response_cancellation() {
         let (status_tx, _) = watch::channel(ProjectStatus::Starting);
+        let (state_tx, _) = watch::channel(ProjectState::new(
+            ProjectStatus::Starting,
+            ProjectRuntimeSummary::default(),
+        ));
         let (event_tx, _) = broadcast::channel(1);
         let channels = ProjectActorChannels {
             status_tx,
+            state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
             accepting: std::sync::Arc::new(AtomicBool::new(true)),
@@ -10908,9 +10936,12 @@ while True:
             .unwrap();
         let mut runtime = ProjectRuntime::new(translator);
         let (status_tx, _) = watch::channel(ProjectStatus::Ready);
+        let (state_tx, _) =
+            watch::channel(ProjectState::new(ProjectStatus::Ready, runtime.summary()));
         let (event_tx, _) = broadcast::channel(1);
         let channels = ProjectActorChannels {
             status_tx,
+            state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
             accepting: std::sync::Arc::new(AtomicBool::new(true)),
@@ -11447,6 +11478,10 @@ while True:
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (_, state) = watch::channel(ProjectState::new(
+            ProjectStatus::Starting,
+            ProjectRuntimeSummary::default(),
+        ));
         let (events, _) = broadcast::channel(1);
         registry.projects.write().await.insert(
             project_id.clone(),
@@ -11456,6 +11491,7 @@ while True:
                     actor: ProjectHandle {
                         sender: ProjectRequestSender::new(sender),
                         status,
+                        state,
                         events,
                         event_history: std::sync::Arc::new(std::sync::Mutex::new(
                             ProjectEventHistory::new(1),
@@ -11508,10 +11544,15 @@ while True:
             }
         });
         let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (_, state) = watch::channel(ProjectState::new(
+            ProjectStatus::Starting,
+            ProjectRuntimeSummary::default(),
+        ));
         let (events, _) = broadcast::channel(1);
         let actor = ProjectHandle {
             sender: ProjectRequestSender::new(sender),
             status,
+            state,
             events,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
         };
@@ -12146,10 +12187,15 @@ while True:
             }
         });
         let (_, status) = watch::channel(ProjectStatus::Starting);
+        let (_, state) = watch::channel(ProjectState::new(
+            ProjectStatus::Starting,
+            ProjectRuntimeSummary::default(),
+        ));
         let (events, _) = broadcast::channel(1);
         let actor = ProjectHandle {
             sender: ProjectRequestSender::new(sender),
             status,
+            state,
             events,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
         };
