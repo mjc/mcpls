@@ -1060,10 +1060,9 @@ impl McplsServer {
         cancellation: CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         if !self.context.supports_mutation_approval() {
-            return Err(McpError::invalid_params(
-                "mutating apply requires client elicitation support; the edit plan was not applied",
-                None,
-            ));
+            return self
+                .apply_project_plan_direct(params, request_state, input_responses, cancellation)
+                .await;
         }
         if cancellation.is_cancelled() {
             return Err(McpError::invalid_params(
@@ -1111,6 +1110,56 @@ impl McplsServer {
                 None,
             )),
         }
+    }
+
+    /// Apply a session-owned plan after a legacy client dispatches the
+    /// correctly annotated mutating tool call through its own approval gate.
+    async fn apply_project_plan_direct(
+        &self,
+        params: WorkspaceEditApplyParams,
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        match (request_state, input_responses) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "inputResponses requires the matching requestState",
+                    None,
+                ));
+            }
+            (Some(_), None) => {
+                return Err(McpError::invalid_params(
+                    "requestState requires inputResponses",
+                    None,
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "this client does not support elicitation retries; call apply without requestState",
+                    None,
+                ));
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(McpError::invalid_params(
+                "mutating apply was cancelled before filesystem changes",
+                None,
+            ));
+        }
+        let id = parse_project_id(params.project_id)?;
+        let plan_id = PlanId::parse(params.plan_id)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        if !self.context.claim_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit plan is not owned by this MCP session",
+                None,
+            ));
+        }
+        self.apply_project_plan_claimed(&id, plan_id)
+            .await?
+            .into_call_tool_result()
     }
 
     async fn prepare_mutation_approval(
@@ -7673,10 +7722,10 @@ while True:
     }
 
     #[tokio::test]
-    async fn mutating_apply_without_elicitation_fails_without_writing() {
+    async fn mutating_apply_without_elicitation_uses_the_approved_tool_call() {
         let (root, server, plan_id) = approval_fixture().await;
         server.context.set_client_capabilities(None, true);
-        let error = server
+        let result = server
             .workspace_edit_apply_tool(
                 Parameters(WorkspaceEditApplyParams {
                     project_id: "project".to_owned(),
@@ -7687,11 +7736,11 @@ while True:
                 CancellationToken::new(),
             )
             .await
-            .expect_err("clients without elicitation must not mutate");
-        assert!(error.message.contains("elicitation"));
+            .unwrap();
+        assert!(matches!(result, CallToolResponse::Complete(_)));
         assert_eq!(
             std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
-            "before\n"
+            "after\n"
         );
     }
 
