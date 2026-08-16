@@ -3395,6 +3395,7 @@ struct ProjectRuntime {
     code_actions: CodeActionStore,
     symbol_handles: SymbolHandleStore,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -3610,6 +3611,7 @@ struct SymbolHandleStore {
 struct StoredDeferredResult {
     value: serde_json::Value,
     created_at: Instant,
+    scope: String,
 }
 
 struct DeferredResultStore {
@@ -3633,10 +3635,11 @@ impl DeferredResultStore {
             .retain(|_, result| now.duration_since(result.created_at) < self.ttl);
     }
 
-    fn insert(
+    fn insert_scoped(
         &mut self,
         value: serde_json::Value,
         snapshot_hash: String,
+        scope: &str,
     ) -> DeferredResourceReference {
         self.prune();
         while self.entries.len() >= self.max_entries {
@@ -3657,6 +3660,7 @@ impl DeferredResultStore {
             StoredDeferredResult {
                 value,
                 created_at: Instant::now(),
+                scope: scope.to_owned(),
             },
         );
         DeferredResourceReference {
@@ -3666,6 +3670,10 @@ impl DeferredResultStore {
             document_version: None,
             total_bytes,
         }
+    }
+
+    fn invalidate_scope(&mut self, scope: &str) {
+        self.entries.retain(|_, result| result.scope != scope);
     }
 
     fn read(&mut self, token: &str) -> Result<serde_json::Value, String> {
@@ -3831,17 +3839,19 @@ impl ProjectRuntime {
 
     #[cfg(test)]
     fn with_edit_safety(translator: Translator, edit_safety: Option<EditSafetyConfig>) -> Self {
-        Self::with_deferred_results(
+        Self::with_deferred_results_scoped(
             translator,
             edit_safety,
             std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new())),
+            None,
         )
     }
 
-    fn with_deferred_results(
+    fn with_deferred_results_scoped(
         translator: Translator,
         edit_safety: Option<EditSafetyConfig>,
         deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+        deferred_scope: Option<String>,
     ) -> Self {
         Self {
             translator,
@@ -3850,6 +3860,7 @@ impl ProjectRuntime {
             code_actions: CodeActionStore::new(),
             symbol_handles: SymbolHandleStore::new(),
             deferred_results,
+            deferred_scope,
             inline_module_checks: HashMap::new(),
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -4599,7 +4610,11 @@ impl ProjectRuntime {
             .deferred_results
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(value, snapshot_hash.to_owned());
+            .insert_scoped(
+                value,
+                snapshot_hash.to_owned(),
+                self.deferred_scope.as_deref().unwrap_or_default(),
+            );
         *section = crate::bridge::InspectSection::deferred(
             provider,
             section.total,
@@ -5811,6 +5826,24 @@ fn spawn_project_actor_with_deferred_results(
     residency: Option<ProjectResidency>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
 ) -> ProjectHandle {
+    spawn_project_actor_with_deferred_results_scoped(
+        capacity,
+        translator,
+        edit_safety,
+        residency,
+        deferred_results,
+        None,
+    )
+}
+
+fn spawn_project_actor_with_deferred_results_scoped(
+    capacity: usize,
+    translator: Translator,
+    edit_safety: Option<EditSafetyConfig>,
+    residency: Option<ProjectResidency>,
+    deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    deferred_scope: Option<String>,
+) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.downgrade();
     let accepting = std::sync::Arc::new(AtomicBool::new(true));
@@ -5829,7 +5862,12 @@ fn spawn_project_actor_with_deferred_results(
             )
         },
     );
-    let runtime = ProjectRuntime::with_deferred_results(translator, edit_safety, deferred_results);
+    let runtime = ProjectRuntime::with_deferred_results_scoped(
+        translator,
+        edit_safety,
+        deferred_results,
+        deferred_scope,
+    );
     let initial_state = ProjectState::new(ProjectStatus::Starting, runtime.summary());
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (state_tx, state_rx) = watch::channel(initial_state.clone());
@@ -7366,18 +7404,20 @@ async fn shutdown_project_actors(actors: &[ProjectActorEntry]) {
 impl ProjectRegistry {
     fn spawn_actor(
         &self,
+        project_id: &ProjectId,
         root: &CanonicalRoot,
         translator_template: Option<&TranslatorTemplate>,
     ) -> ProjectHandle {
         let Some(template) = translator_template else {
             let mut translator = Translator::new();
             translator.set_workspace_roots(vec![root.as_path().to_path_buf()]);
-            return spawn_project_actor_with_deferred_results(
+            return spawn_project_actor_with_deferred_results_scoped(
                 self.actor_capacity,
                 translator,
                 None,
                 None,
                 self.deferred_results.clone(),
+                Some(project_id.to_string()),
             );
         };
         let residency = template
@@ -7386,12 +7426,13 @@ impl ProjectRegistry {
                 controller: self.rust_residency.clone(),
                 group: RustGroupId(self.next_rust_group_id.fetch_add(1, Ordering::Relaxed)),
             });
-        spawn_project_actor_with_deferred_results(
+        spawn_project_actor_with_deferred_results_scoped(
             self.actor_capacity,
             template.translator_for_root(root.as_path().to_path_buf()),
             template.edit_safety().cloned(),
             residency,
             self.deferred_results.clone(),
+            Some(project_id.to_string()),
         )
     }
 
@@ -7708,7 +7749,11 @@ impl ProjectRegistry {
                     requested_root: identity.root().as_path().to_path_buf(),
                 });
             }
-            let actor = self.spawn_actor(identity.root(), translator_template.as_deref());
+            let actor = self.spawn_actor(
+                identity.id(),
+                identity.root(),
+                translator_template.as_deref(),
+            );
             let mutation = std::sync::Arc::new(Mutex::new(()));
             drop(projects);
             let mut projects = self.projects.write().await;
@@ -7745,7 +7790,7 @@ impl ProjectRegistry {
 
         let primary_root = identity.root.clone();
         let project_id = identity.id().clone();
-        let actor = self.spawn_actor(&primary_root, translator_template.as_deref());
+        let actor = self.spawn_actor(&project_id, &primary_root, translator_template.as_deref());
         let mutation = std::sync::Arc::new(Mutex::new(()));
         let mut entry = ProjectEntry::new(
             identity,
@@ -8356,7 +8401,7 @@ impl ProjectRegistry {
         let mut config = old_config.unwrap_or_default();
         config.cargo_features = Some(profile);
         let replacements = self
-            .build_cargo_feature_replacements(&config, snapshots)
+            .build_cargo_feature_replacements(id, &config, snapshots)
             .await?;
         let Some(old_entry) = self.swap_project_actors(id, replacements, config).await? else {
             return Err(ProjectRegistryError::ProjectNotFound(id.clone()));
@@ -8367,6 +8412,10 @@ impl ProjectRegistry {
             return Err(error);
         }
 
+        self.deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_scope(id.as_str());
         shutdown_project_actors(&old_entry.actors).await;
         self.status(id).await
     }
@@ -8397,6 +8446,7 @@ impl ProjectRegistry {
 
     async fn build_cargo_feature_replacements(
         &self,
+        id: &ProjectId,
         config: &ProjectConfig,
         snapshots: Vec<CargoFeatureActorSnapshot>,
     ) -> Result<Vec<ProjectActorEntry>, ProjectRegistryError> {
@@ -8415,7 +8465,7 @@ impl ProjectRegistry {
                 .or_else(|| self.translator_template.as_deref().cloned())
                 .unwrap_or_default()
                 .with_project_config(config);
-            let actor = self.spawn_actor(first_root, Some(&template));
+            let actor = self.spawn_actor(id, first_root, Some(&template));
             if let Err(error) = add_actor_roots(&actor, &snapshot.roots).await {
                 let _ = actor.shutdown().await;
                 shutdown_project_actors(&replacements).await;
@@ -9046,9 +9096,10 @@ mod tests {
     #[tokio::test]
     async fn deferred_resource_reads_survive_actor_lifecycle_changes() {
         let registry = ProjectRegistry::new(2);
-        let reference = registry.deferred_results.lock().unwrap().insert(
+        let reference = registry.deferred_results.lock().unwrap().insert_scoped(
             serde_json::json!({"references": [1, 2]}),
             "snapshot".to_owned(),
+            "",
         );
 
         let token = reference
@@ -9059,6 +9110,31 @@ mod tests {
         assert_eq!(
             registry.read_deferred_resource(&token).unwrap(),
             serde_json::json!({"references": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn deferred_resource_invalidation_is_scoped_to_a_project() {
+        let mut store = DeferredResultStore::new();
+        let first = store.insert_scoped(
+            serde_json::json!({"project": "first"}),
+            "snapshot-first".to_owned(),
+            "first",
+        );
+        let second = store.insert_scoped(
+            serde_json::json!({"project": "second"}),
+            "snapshot-second".to_owned(),
+            "second",
+        );
+        let first_token = first.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        let second_token = second.uri.strip_prefix("mcpls-deferred:///").unwrap();
+
+        store.invalidate_scope("first");
+
+        assert!(store.read(first_token).is_err());
+        assert_eq!(
+            store.read(second_token).unwrap(),
+            serde_json::json!({"project": "second"})
         );
     }
 
@@ -11886,6 +11962,65 @@ while True:
         assert_eq!(
             registry.cargo_features(&project_id).await.unwrap(),
             Some(profile.normalized())
+        );
+    }
+
+    #[tokio::test]
+    async fn cargo_feature_update_invalidates_only_that_projects_deferred_resources() {
+        let first_root = TempDir::new().unwrap();
+        let second_root = TempDir::new().unwrap();
+        let first_id = ProjectId::new("first-profile").unwrap();
+        let second_id = ProjectId::new("second-profile").unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                first_id.clone(),
+                CanonicalRoot::new(first_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                second_id.clone(),
+                CanonicalRoot::new(second_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let first_reference = registry.deferred_results.lock().unwrap().insert_scoped(
+            serde_json::json!("first"),
+            "first".to_owned(),
+            first_id.as_str(),
+        );
+        let second_reference = registry.deferred_results.lock().unwrap().insert_scoped(
+            serde_json::json!("second"),
+            "second".to_owned(),
+            second_id.as_str(),
+        );
+        let first_token = first_reference
+            .uri
+            .strip_prefix("mcpls-deferred:///")
+            .unwrap();
+        let second_token = second_reference
+            .uri
+            .strip_prefix("mcpls-deferred:///")
+            .unwrap();
+
+        registry
+            .update_cargo_features(
+                &first_id,
+                crate::config::CargoFeatureProfile {
+                    features: vec!["serde".to_owned()],
+                    all_features: false,
+                    no_default_features: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(registry.read_deferred_resource(first_token).is_err());
+        assert_eq!(
+            registry.read_deferred_resource(second_token).unwrap(),
+            serde_json::json!("second")
         );
     }
 
