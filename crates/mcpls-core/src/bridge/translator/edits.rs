@@ -97,6 +97,29 @@ fn validate_rename_params(new_name: &str) -> Result<()> {
     Ok(())
 }
 
+async fn normalize_text_edit(
+    ctx: &EncodingCtx,
+    uri: &lsp_types::Uri,
+    edit: lsp_types::TextEdit,
+) -> TextEdit {
+    TextEdit {
+        range: ctx.normalize_range(uri, edit.range).await,
+        new_text: edit.new_text,
+    }
+}
+
+async fn normalize_text_edits(
+    ctx: &EncodingCtx,
+    uri: &lsp_types::Uri,
+    edits: Vec<lsp_types::TextEdit>,
+) -> Vec<TextEdit> {
+    let mut normalized = Vec::with_capacity(edits.len());
+    for edit in edits {
+        normalized.push(normalize_text_edit(ctx, uri, edit).await);
+    }
+    normalized
+}
+
 /// Convert LSP code action to MCP code action. `uri` is the queried
 /// document's own URI, used for the action's `diagnostics` (always scoped to
 /// the requested document); `edit.changes` carries its own per-file URIs.
@@ -131,13 +154,7 @@ async fn convert_code_action(
                 Some(changes_map) => {
                     let mut result = Vec::with_capacity(changes_map.len());
                     for (uri, edits) in changes_map {
-                        let mut text_edits = Vec::with_capacity(edits.len());
-                        for e in edits {
-                            text_edits.push(TextEdit {
-                                range: ctx.normalize_range(&uri, e.range).await,
-                                new_text: e.new_text,
-                            });
-                        }
+                        let text_edits = normalize_text_edits(ctx, &uri, edits).await;
                         result.push(DocumentChanges {
                             uri: uri.to_string(),
                             edits: text_edits,
@@ -254,14 +271,12 @@ impl Translator {
                     let mut text_edits = Vec::with_capacity(tde.edits.len());
                     for one_of in tde.edits {
                         text_edits.push(match one_of {
-                            lsp_types::OneOf::Left(te) => TextEdit {
-                                range: ctx.normalize_range(edit_uri, te.range).await,
-                                new_text: te.new_text,
-                            },
-                            lsp_types::OneOf::Right(ate) => TextEdit {
-                                range: ctx.normalize_range(edit_uri, ate.text_edit.range).await,
-                                new_text: ate.text_edit.new_text,
-                            },
+                            lsp_types::OneOf::Left(te) => {
+                                normalize_text_edit(&ctx, edit_uri, te).await
+                            }
+                            lsp_types::OneOf::Right(ate) => {
+                                normalize_text_edit(&ctx, edit_uri, ate.text_edit).await
+                            }
                         });
                     }
                     result_changes.push(DocumentChanges {
@@ -323,13 +338,7 @@ impl Translator {
 
         let edits = response.unwrap_or_default();
 
-        let mut result_edits = Vec::with_capacity(edits.len());
-        for edit in edits {
-            result_edits.push(TextEdit {
-                range: ctx.normalize_range(&response_uri, edit.range).await,
-                new_text: edit.new_text,
-            });
-        }
+        let result_edits = normalize_text_edits(&ctx, &response_uri, edits).await;
         let result = FormatDocumentResult {
             edits: result_edits,
         };

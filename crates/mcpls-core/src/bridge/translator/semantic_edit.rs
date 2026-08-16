@@ -894,21 +894,7 @@ impl Translator {
             .await?;
         let edits = edits
             .into_iter()
-            .map(|edit| {
-                let new_text = if edit.insert_text_format == Some(InsertTextFormat::SNIPPET) {
-                    plain_text_snippet(&edit.new_text).ok_or_else(|| {
-                        Error::InvalidToolParams(
-                            "move-item edit contains unresolved snippet placeholders".to_string(),
-                        )
-                    })?
-                } else {
-                    edit.new_text
-                };
-                Ok(lsp_types::TextEdit {
-                    range: edit.range,
-                    new_text,
-                })
-            })
+            .map(plain_text_move_item_edit)
             .collect::<Result<Vec<_>>>()?;
         Ok(SupportedWorkspaceEdit {
             supported: true,
@@ -1207,6 +1193,22 @@ fn workspace_edit_for(uri: lsp_types::Uri, edits: Vec<lsp_types::TextEdit>) -> W
         document_changes: None,
         change_annotations: None,
     }
+}
+
+fn plain_text_move_item_edit(edit: SnippetTextEdit) -> Result<lsp_types::TextEdit> {
+    let new_text = if edit.insert_text_format == Some(InsertTextFormat::SNIPPET) {
+        plain_text_snippet(&edit.new_text).ok_or_else(|| {
+            Error::InvalidToolParams(
+                "move-item edit contains unresolved snippet placeholders".to_string(),
+            )
+        })?
+    } else {
+        edit.new_text
+    };
+    Ok(lsp_types::TextEdit {
+        range: edit.range,
+        new_text,
+    })
 }
 
 fn validate_code_action_params(
