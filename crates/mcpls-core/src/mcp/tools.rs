@@ -682,6 +682,23 @@ pub struct ProjectIdParams {
     pub project_id: String,
 }
 
+/// Parameters for replacing one project's Rust Cargo feature profile.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Replace a registered project's rust-analyzer Cargo feature profile.")]
+pub struct ProjectCargoFeaturesParams {
+    /// Stable project identifier.
+    pub project_id: String,
+    /// Explicit Cargo feature names.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Ask Cargo to enable every feature.
+    #[serde(default)]
+    pub all_features: bool,
+    /// Ask Cargo to disable default features.
+    #[serde(default)]
+    pub no_default_features: bool,
+}
+
 /// Parameters previewing an LSP workspace edit for one project.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Preview a project-scoped LSP WorkspaceEdit without changing files.")]

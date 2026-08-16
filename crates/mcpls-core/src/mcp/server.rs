@@ -41,12 +41,12 @@ use super::tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
     FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
     HoverParams, InlayHintsParams, InspectSymbolParams, MoveInlineModulePreviewParams,
-    MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectIdParams,
-    ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
-    RenameParams, RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
-    SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
-    StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
-    WorkspaceEditPreviewParams, WorkspaceSymbolParams,
+    MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams,
+    ProjectIdParams, ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams,
+    ReferencesParams, RenameParams, RenamePreviewParams, SemanticPositionParams,
+    SemanticResourceReadParams, SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams,
+    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
+    WorkspaceEditApplyParams, WorkspaceEditPreviewParams, WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -872,7 +872,21 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let actor_groups = actor_group_states(actor_group_roots);
-        encode_json(&project_state_json(identity, state, &actor_groups))
+        let mut value = project_state_json(identity, state, &actor_groups);
+        let cargo_features = self
+            .context
+            .project_registry
+            .cargo_features(project_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "cargo_features".to_owned(),
+                serde_json::to_value(cargo_features)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+            );
+        }
+        encode_json(&value)
     }
 
     async fn attach_subscription(
@@ -1921,6 +1935,42 @@ impl McplsServer {
             .context
             .project_registry
             .restart(&id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        self.project_state_json(&id, &identity, &state).await
+    }
+
+    /// Replace one project's Cargo feature profile and restart its actors.
+    #[tool(
+        description = "Replace the Cargo feature profile for a registered Rust project. Existing project settings are preserved; language-server actors are replaced atomically and the new profile is persisted."
+    )]
+    async fn project_configure_cargo_features(
+        &self,
+        Parameters(ProjectCargoFeaturesParams {
+            project_id,
+            features,
+            all_features,
+            no_default_features,
+        }): Parameters<ProjectCargoFeaturesParams>,
+    ) -> Result<Json<StructuredObject>, McpError> {
+        let id = parse_project_id(project_id)?;
+        let state = self
+            .context
+            .project_registry
+            .update_cargo_features(
+                &id,
+                crate::config::CargoFeatureProfile {
+                    features,
+                    all_features,
+                    no_default_features,
+                },
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let identity = self
+            .context
+            .project_registry
+            .identity(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         self.project_state_json(&id, &identity, &state).await
@@ -6273,6 +6323,37 @@ while True:
             .unwrap();
         assert!(state.contains("Failed"));
         assert!(state.contains("rust"));
+    }
+
+    #[tokio::test]
+    async fn project_configure_cargo_features_returns_effective_profile() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        server
+            .project_add(project_add_params("fixture", root.path()))
+            .await
+            .unwrap();
+
+        let result = server
+            .project_configure_cargo_features(Parameters(ProjectCargoFeaturesParams {
+                project_id: "fixture".to_owned(),
+                features: vec!["zeta".to_owned(), "alpha".to_owned(), "alpha".to_owned()],
+                all_features: false,
+                no_default_features: true,
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            result["cargo_features"],
+            serde_json::json!({
+                "features": ["alpha", "zeta"],
+                "all_features": false,
+                "no_default_features": true
+            })
+        );
     }
 
     #[tokio::test]

@@ -6823,6 +6823,12 @@ struct ProjectActorEntry {
     roots: Vec<CanonicalRoot>,
 }
 
+struct CargoFeatureActorSnapshot {
+    mutation: MutationGate,
+    roots: Vec<CanonicalRoot>,
+    translator_template: Option<std::sync::Arc<TranslatorTemplate>>,
+}
+
 impl ProjectActorEntry {
     fn new(
         actor: ProjectHandle,
@@ -7336,6 +7342,25 @@ async fn shutdown_actor_with_timeout(actor: ProjectHandle, timeout: Duration) ->
     tokio::time::timeout(timeout, actor.shutdown())
         .await
         .map_or(ShutdownAttempt::TimedOut, ShutdownAttempt::Completed)
+}
+
+async fn add_actor_roots(
+    actor: &ProjectHandle,
+    roots: &[CanonicalRoot],
+) -> Result<(), ProjectRegistryError> {
+    for root in roots.iter().skip(1) {
+        actor
+            .add_workspace_root(root.as_path().to_path_buf())
+            .await
+            .map_err(ProjectRegistryError::from)?;
+    }
+    Ok(())
+}
+
+async fn shutdown_project_actors(actors: &[ProjectActorEntry]) {
+    for actor in actors {
+        let _ = actor.actor.shutdown().await;
+    }
 }
 
 impl ProjectRegistry {
@@ -8311,129 +8336,146 @@ impl ProjectRegistry {
     ///
     /// Returns an actor, persistence, or project-not-found error when the
     /// replacement cannot be completed.
-    #[allow(clippy::too_many_lines)]
     pub async fn update_cargo_features(
         &self,
         id: &ProjectId,
         profile: crate::config::CargoFeatureProfile,
     ) -> Result<ProjectState, ProjectRegistryError> {
         let profile = profile.normalized();
-        let (old_config, snapshots) = {
-            let projects = self.projects.read().await;
-            let project = projects
-                .get(id)
-                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
-            let snapshot = (
-                project.config.clone(),
-                project
-                    .actors
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.actor.clone(),
-                            entry.mutation.clone(),
-                            entry.roots.clone(),
-                            entry.translator_template.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            drop(projects);
-            snapshot
-        };
+        let (old_config, snapshots) = self.cargo_feature_snapshot(id).await?;
         let _mutations = self
             .lock_mutation_gates(
                 snapshots
                     .iter()
-                    .map(|(_, mutation, _, _)| mutation.clone())
+                    .map(|snapshot| snapshot.mutation.clone())
                     .collect(),
             )
             .await;
 
         let mut config = old_config.unwrap_or_default();
         config.cargo_features = Some(profile);
+        let replacements = self
+            .build_cargo_feature_replacements(&config, snapshots)
+            .await?;
+        let Some(old_entry) = self.swap_project_actors(id, replacements, config).await? else {
+            return Err(ProjectRegistryError::ProjectNotFound(id.clone()));
+        };
+        if let Err(error) = self.persist().await {
+            let replacements = self.rollback_project_actors(id, old_entry).await;
+            shutdown_project_actors(&replacements).await;
+            return Err(error);
+        }
+
+        shutdown_project_actors(&old_entry.actors).await;
+        self.status(id).await
+    }
+
+    async fn cargo_feature_snapshot(
+        &self,
+        id: &ProjectId,
+    ) -> Result<(Option<ProjectConfig>, Vec<CargoFeatureActorSnapshot>), ProjectRegistryError> {
+        let projects = self.projects.read().await;
+        let project = projects
+            .get(id)
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        let snapshot = (
+            project.config.clone(),
+            project
+                .actors
+                .iter()
+                .map(|entry| CargoFeatureActorSnapshot {
+                    mutation: entry.mutation.clone(),
+                    roots: entry.roots.clone(),
+                    translator_template: entry.translator_template.clone(),
+                })
+                .collect(),
+        );
+        drop(projects);
+        Ok(snapshot)
+    }
+
+    async fn build_cargo_feature_replacements(
+        &self,
+        config: &ProjectConfig,
+        snapshots: Vec<CargoFeatureActorSnapshot>,
+    ) -> Result<Vec<ProjectActorEntry>, ProjectRegistryError> {
         let mut replacements = Vec::with_capacity(snapshots.len());
-        let mut replacement_handles: Vec<ProjectHandle> = Vec::with_capacity(snapshots.len());
-        for (_, mutation, roots, current_template) in snapshots {
-            let template = current_template
-                .as_deref()
-                .cloned()
-                .or_else(|| self.translator_template.as_deref().cloned())
-                .unwrap_or_default()
-                .with_project_config(&config);
-            let Some(first_root) = roots.first() else {
-                for handle in &replacement_handles {
-                    let _ = handle.shutdown().await;
-                }
+        for snapshot in snapshots {
+            let Some(first_root) = snapshot.roots.first() else {
+                shutdown_project_actors(&replacements).await;
                 return Err(ProjectRegistryError::Actor(ProjectActorError::Operation(
                     "project actor has no workspace roots".to_owned(),
                 )));
             };
+            let template = snapshot
+                .translator_template
+                .as_deref()
+                .cloned()
+                .or_else(|| self.translator_template.as_deref().cloned())
+                .unwrap_or_default()
+                .with_project_config(config);
             let actor = self.spawn_actor(first_root, Some(&template));
-            for root in roots.iter().skip(1) {
-                if let Err(error) = actor.add_workspace_root(root.as_path().to_path_buf()).await {
-                    let _ = actor.shutdown().await;
-                    for handle in &replacement_handles {
-                        let _ = handle.shutdown().await;
-                    }
-                    return Err(error.into());
-                }
+            if let Err(error) = add_actor_roots(&actor, &snapshot.roots).await {
+                let _ = actor.shutdown().await;
+                shutdown_project_actors(&replacements).await;
+                return Err(error);
             }
-            let root_paths = roots
+            let roots = snapshot
+                .roots
                 .iter()
                 .map(|root| root.as_path().to_path_buf())
                 .collect::<Vec<_>>();
-            if let Err(error) = actor.activate_workspace_roots(root_paths).await {
+            if let Err(error) = actor.activate_workspace_roots(roots).await {
                 let _ = actor.shutdown().await;
-                for handle in &replacement_handles {
-                    let _ = handle.shutdown().await;
-                }
+                shutdown_project_actors(&replacements).await;
                 return Err(error.into());
             }
             let compatibility =
                 rust_project_compatibility_key(first_root.as_path(), Some(&template)).await;
-            replacement_handles.push(actor.clone());
             replacements.push(ProjectActorEntry {
                 actor,
-                mutation,
+                mutation: snapshot.mutation,
                 compatibility: ProjectCompatibility::Resolved(compatibility),
                 translator_template: Some(std::sync::Arc::new(template)),
-                roots,
+                roots: snapshot.roots,
             });
         }
+        Ok(replacements)
+    }
 
-        let old_entry = {
-            let mut projects = self.projects.write().await;
-            let Some(project) = projects.get_mut(id) else {
-                drop(projects);
-                for handle in &replacement_handles {
-                    let _ = handle.shutdown().await;
-                }
-                return Err(ProjectRegistryError::ProjectNotFound(id.clone()));
-            };
-            ProjectEntry {
-                identity: project.identity.clone(),
-                actors: std::mem::replace(&mut project.actors, replacements),
-                config: project.config.replace(config),
-            }
-        };
-        if let Err(error) = self.persist().await {
-            let mut projects = self.projects.write().await;
-            if let Some(project) = projects.get_mut(id) {
-                project.actors = old_entry.actors;
-                project.config = old_entry.config;
-            }
+    async fn swap_project_actors(
+        &self,
+        id: &ProjectId,
+        replacements: Vec<ProjectActorEntry>,
+        config: ProjectConfig,
+    ) -> Result<Option<ProjectEntry>, ProjectRegistryError> {
+        let mut projects = self.projects.write().await;
+        let Some(project) = projects.get_mut(id) else {
             drop(projects);
-            for handle in replacement_handles {
-                let _ = handle.shutdown().await;
-            }
-            return Err(error);
-        }
+            shutdown_project_actors(&replacements).await;
+            return Ok(None);
+        };
+        Ok(Some(ProjectEntry {
+            identity: project.identity.clone(),
+            actors: std::mem::replace(&mut project.actors, replacements),
+            config: project.config.replace(config),
+        }))
+    }
 
-        for actor in old_entry.actors {
-            let _ = actor.actor.shutdown().await;
-        }
-        self.status(id).await
+    async fn rollback_project_actors(
+        &self,
+        id: &ProjectId,
+        old_entry: ProjectEntry,
+    ) -> Vec<ProjectActorEntry> {
+        let mut projects = self.projects.write().await;
+        let Some(project) = projects.get_mut(id) else {
+            drop(projects);
+            shutdown_project_actors(&old_entry.actors).await;
+            return Vec::new();
+        };
+        let replacements = std::mem::replace(&mut project.actors, old_entry.actors);
+        project.config = old_entry.config;
+        replacements
     }
 
     /// Refresh a project's actor state.
