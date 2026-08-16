@@ -8278,6 +8278,164 @@ impl ProjectRegistry {
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
 
+    /// Return the effective Cargo feature profile for a registered project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectRegistryError::ProjectNotFound`] when the project is
+    /// not registered.
+    pub async fn cargo_features(
+        &self,
+        id: &ProjectId,
+    ) -> Result<Option<crate::config::CargoFeatureProfile>, ProjectRegistryError> {
+        self.projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| {
+                project
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.cargo_features.clone())
+            })
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
+    }
+
+    /// Replace a project's Rust Cargo feature profile and its actor runtimes.
+    ///
+    /// New actors are fully activated before they replace the old actors. A
+    /// failed activation or persistence write leaves the existing project
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, persistence, or project-not-found error when the
+    /// replacement cannot be completed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn update_cargo_features(
+        &self,
+        id: &ProjectId,
+        profile: crate::config::CargoFeatureProfile,
+    ) -> Result<ProjectState, ProjectRegistryError> {
+        let profile = profile.normalized();
+        let (old_config, snapshots) = {
+            let projects = self.projects.read().await;
+            let project = projects
+                .get(id)
+                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+            let snapshot = (
+                project.config.clone(),
+                project
+                    .actors
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.actor.clone(),
+                            entry.mutation.clone(),
+                            entry.roots.clone(),
+                            entry.translator_template.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            drop(projects);
+            snapshot
+        };
+        let _mutations = self
+            .lock_mutation_gates(
+                snapshots
+                    .iter()
+                    .map(|(_, mutation, _, _)| mutation.clone())
+                    .collect(),
+            )
+            .await;
+
+        let mut config = old_config.unwrap_or_default();
+        config.cargo_features = Some(profile);
+        let mut replacements = Vec::with_capacity(snapshots.len());
+        let mut replacement_handles: Vec<ProjectHandle> = Vec::with_capacity(snapshots.len());
+        for (_, mutation, roots, current_template) in snapshots {
+            let template = current_template
+                .as_deref()
+                .cloned()
+                .or_else(|| self.translator_template.as_deref().cloned())
+                .unwrap_or_default()
+                .with_project_config(&config);
+            let Some(first_root) = roots.first() else {
+                for handle in &replacement_handles {
+                    let _ = handle.shutdown().await;
+                }
+                return Err(ProjectRegistryError::Actor(ProjectActorError::Operation(
+                    "project actor has no workspace roots".to_owned(),
+                )));
+            };
+            let actor = self.spawn_actor(first_root, Some(&template));
+            for root in roots.iter().skip(1) {
+                if let Err(error) = actor.add_workspace_root(root.as_path().to_path_buf()).await {
+                    let _ = actor.shutdown().await;
+                    for handle in &replacement_handles {
+                        let _ = handle.shutdown().await;
+                    }
+                    return Err(error.into());
+                }
+            }
+            let root_paths = roots
+                .iter()
+                .map(|root| root.as_path().to_path_buf())
+                .collect::<Vec<_>>();
+            if let Err(error) = actor.activate_workspace_roots(root_paths).await {
+                let _ = actor.shutdown().await;
+                for handle in &replacement_handles {
+                    let _ = handle.shutdown().await;
+                }
+                return Err(error.into());
+            }
+            let compatibility =
+                rust_project_compatibility_key(first_root.as_path(), Some(&template)).await;
+            replacement_handles.push(actor.clone());
+            replacements.push(ProjectActorEntry {
+                actor,
+                mutation,
+                compatibility: ProjectCompatibility::Resolved(compatibility),
+                translator_template: Some(std::sync::Arc::new(template)),
+                roots,
+            });
+        }
+
+        let old_entry = {
+            let mut projects = self.projects.write().await;
+            let Some(project) = projects.get_mut(id) else {
+                drop(projects);
+                for handle in &replacement_handles {
+                    let _ = handle.shutdown().await;
+                }
+                return Err(ProjectRegistryError::ProjectNotFound(id.clone()));
+            };
+            ProjectEntry {
+                identity: project.identity.clone(),
+                actors: std::mem::replace(&mut project.actors, replacements),
+                config: project.config.replace(config),
+            }
+        };
+        if let Err(error) = self.persist().await {
+            let mut projects = self.projects.write().await;
+            if let Some(project) = projects.get_mut(id) {
+                project.actors = old_entry.actors;
+                project.config = old_entry.config;
+            }
+            drop(projects);
+            for handle in replacement_handles {
+                let _ = handle.shutdown().await;
+            }
+            return Err(error);
+        }
+
+        for actor in old_entry.actors {
+            let _ = actor.actor.shutdown().await;
+        }
+        self.status(id).await
+    }
+
     /// Refresh a project's actor state.
     ///
     /// # Errors
@@ -11660,6 +11818,32 @@ while True:
             .await
             .unwrap();
         assert!(store.load().unwrap().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_registry_updates_cargo_features_without_replacing_identity() {
+        let root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("cargo-profile").unwrap();
+        let identity =
+            ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
+        let registry = ProjectRegistry::new(2);
+        registry.add(identity.clone()).await.unwrap();
+
+        let profile = crate::config::CargoFeatureProfile {
+            features: vec!["serde".to_owned(), "alloc".to_owned(), "serde".to_owned()],
+            all_features: false,
+            no_default_features: true,
+        };
+        registry
+            .update_cargo_features(&project_id, profile.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(registry.identity(&project_id).await.unwrap(), identity);
+        assert_eq!(
+            registry.cargo_features(&project_id).await.unwrap(),
+            Some(profile.normalized())
+        );
     }
 
     #[tokio::test]
