@@ -1329,7 +1329,11 @@ fn plain_text_snippet(snippet: &str) -> Option<String> {
     let mut chars = snippet.chars().peekable();
     while let Some(character) = chars.next() {
         if character == '\\' {
-            output.push(chars.next()?);
+            if let Some(next) = chars.next_if(|character| matches!(character, '\\' | '$' | '}')) {
+                output.push(next);
+            } else {
+                output.push('\\');
+            }
         } else if character == '$' {
             match chars.peek() {
                 Some('$') => {
@@ -1535,6 +1539,13 @@ mod tests {
         assert_eq!(plain_text_snippet(concat!("$", "{1:name}")), None);
         assert_eq!(plain_text_snippet("$1"), None);
         assert_eq!(plain_text_snippet(concat!("$", "{0:default}")), None);
+    }
+
+    #[test]
+    fn rust_literal_escapes_survive_move_item_snippet_cleanup() {
+        let source = r#"let value = "\"";"#;
+
+        assert_eq!(plain_text_snippet(source), Some(source.to_string()));
     }
 
     #[test]

@@ -43,6 +43,51 @@ fn previews_disk_text_edit_without_writing() {
 }
 
 #[test]
+fn preview_and_apply_preserve_rust_literal_bytes_across_workspace_edit_transport() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("src.rs");
+    fs::write(&file, "before\n").unwrap();
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let expected = r###"let quote = "\"";
+let slash = '\\';
+let path = "C:\\tmp";
+let raw = r#"quoted \" text"#;
+let multiline = "first
+second";
+"###;
+    let edit = WorkspaceEdit {
+        changes: Some(HashMap::from([(
+            path_to_uri(&file).unwrap(),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(1, 0),
+                ),
+                new_text: expected.to_string(),
+            }],
+        )])),
+        document_changes: None,
+        change_annotations: None,
+    };
+    let edit: WorkspaceEdit = serde_json::from_value(serde_json::to_value(edit).unwrap()).unwrap();
+
+    let artifact = preview_workspace_edit(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits::default(),
+    )
+    .unwrap();
+    assert!(artifact.plan.safe_to_apply());
+    assert_eq!(artifact.plan.files()[0].planned_content(), expected);
+
+    crate::edit_apply::apply_plan(&boundary, &artifact.plan).unwrap();
+    assert_eq!(fs::read_to_string(file).unwrap(), expected);
+}
+
+#[test]
 fn previews_text_edit_after_ordered_create() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("created.rs");
