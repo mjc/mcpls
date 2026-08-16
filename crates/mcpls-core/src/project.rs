@@ -1488,10 +1488,6 @@ enum ProjectRequest {
         resource: SourceResource,
         reply: oneshot::Sender<Result<SourceFrame, String>>,
     },
-    ReadDeferredResource {
-        token: String,
-        reply: oneshot::Sender<Result<serde_json::Value, String>>,
-    },
     ResolveSymbolHandle {
         symbol_handle: SymbolHandle,
         reply: oneshot::Sender<Result<ResolvedSymbolTarget, String>>,
@@ -1795,7 +1791,6 @@ impl ProjectRequest {
                 | Self::SemanticDiscovery { .. }
                 | Self::WorkspaceSymbol { .. }
                 | Self::InspectSymbol { .. }
-                | Self::ReadDeferredResource { .. }
                 | Self::CodeActions { .. }
                 | Self::CodeActionList { .. }
                 | Self::PrepareCallHierarchy { .. }
@@ -1915,7 +1910,6 @@ impl ProjectRequest {
             Self::Definition { reply, .. } => reply.is_closed(),
             Self::References { reply, .. } => reply.is_closed(),
             Self::ReadSourceResource { reply, .. } => reply.is_closed(),
-            Self::ReadDeferredResource { reply, .. } => reply.is_closed(),
             Self::ResolveSymbolHandle { reply, .. } => reply.is_closed(),
             Self::Diagnostics { reply, .. } | Self::CachedDiagnostics { reply, .. } => {
                 reply.is_closed()
@@ -2232,21 +2226,6 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::ReadSourceResource { resource, reply })
-            .await
-            .map_err(|_| ProjectActorError::Closed)?;
-        response
-            .await
-            .map_err(|_| ProjectActorError::Cancelled)?
-            .map_err(ProjectActorError::Operation)
-    }
-
-    pub(crate) async fn read_deferred_resource(
-        &self,
-        token: String,
-    ) -> Result<serde_json::Value, ProjectActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(ProjectRequest::ReadDeferredResource { token, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3415,7 +3394,7 @@ struct ProjectRuntime {
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
     symbol_handles: SymbolHandleStore,
-    deferred_results: DeferredResultStore,
+    deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -3845,18 +3824,32 @@ impl CodeActionStore {
 }
 
 impl ProjectRuntime {
+    #[cfg(test)]
     fn new(translator: Translator) -> Self {
         Self::with_edit_safety(translator, None)
     }
 
+    #[cfg(test)]
     fn with_edit_safety(translator: Translator, edit_safety: Option<EditSafetyConfig>) -> Self {
+        Self::with_deferred_results(
+            translator,
+            edit_safety,
+            std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new())),
+        )
+    }
+
+    fn with_deferred_results(
+        translator: Translator,
+        edit_safety: Option<EditSafetyConfig>,
+        deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    ) -> Self {
         Self {
             translator,
             edit_plans: EditPlanStore::for_project(),
             edit_safety,
             code_actions: CodeActionStore::new(),
             symbol_handles: SymbolHandleStore::new(),
-            deferred_results: DeferredResultStore::new(),
+            deferred_results,
             inline_module_checks: HashMap::new(),
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -4587,12 +4580,8 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn read_deferred_resource(&mut self, token: &str) -> Result<serde_json::Value, String> {
-        self.deferred_results.read(token)
-    }
-
     fn defer_inspect_section<T: Serialize>(
-        &mut self,
+        &self,
         section: &mut crate::bridge::InspectSection<T>,
         snapshot_hash: &str,
     ) {
@@ -4608,6 +4597,8 @@ impl ProjectRuntime {
             .unwrap_or_else(|| "mcpls".to_owned());
         let reference = self
             .deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(value, snapshot_hash.to_owned());
         *section = crate::bridge::InspectSection::deferred(
             provider,
@@ -5804,6 +5795,22 @@ fn spawn_project_actor_with_runtime(
     edit_safety: Option<EditSafetyConfig>,
     residency: Option<ProjectResidency>,
 ) -> ProjectHandle {
+    spawn_project_actor_with_deferred_results(
+        capacity,
+        translator,
+        edit_safety,
+        residency,
+        std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new())),
+    )
+}
+
+fn spawn_project_actor_with_deferred_results(
+    capacity: usize,
+    translator: Translator,
+    edit_safety: Option<EditSafetyConfig>,
+    residency: Option<ProjectResidency>,
+    deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.downgrade();
     let accepting = std::sync::Arc::new(AtomicBool::new(true));
@@ -5822,10 +5829,7 @@ fn spawn_project_actor_with_runtime(
             )
         },
     );
-    let runtime = match edit_safety {
-        None => ProjectRuntime::new(translator),
-        Some(safety) => ProjectRuntime::with_edit_safety(translator, Some(safety)),
-    };
+    let runtime = ProjectRuntime::with_deferred_results(translator, edit_safety, deferred_results);
     let initial_state = ProjectState::new(ProjectStatus::Starting, runtime.summary());
     let (status_tx, status_rx) = watch::channel(ProjectStatus::Starting);
     let (state_tx, state_rx) = watch::channel(initial_state.clone());
@@ -6256,9 +6260,6 @@ async fn handle_project_request(
         }
         ProjectRequest::ReadSourceResource { resource, reply } => {
             let _ = reply.send(runtime.read_source_resource(resource).await);
-        }
-        ProjectRequest::ReadDeferredResource { token, reply } => {
-            let _ = reply.send(runtime.read_deferred_resource(&token));
         }
         ProjectRequest::ResolveSymbolHandle {
             symbol_handle,
@@ -7162,6 +7163,7 @@ pub struct ProjectRegistry {
     shutdown_timeout: Duration,
     rust_residency: RustResidencyController,
     next_rust_group_id: std::sync::Arc<AtomicU64>,
+    deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -7343,7 +7345,15 @@ impl ProjectRegistry {
         translator_template: Option<&TranslatorTemplate>,
     ) -> ProjectHandle {
         let Some(template) = translator_template else {
-            return spawn_project_actor_for_root(self.actor_capacity, root);
+            let mut translator = Translator::new();
+            translator.set_workspace_roots(vec![root.as_path().to_path_buf()]);
+            return spawn_project_actor_with_deferred_results(
+                self.actor_capacity,
+                translator,
+                None,
+                None,
+                self.deferred_results.clone(),
+            );
         };
         let residency = template
             .language_applies_to_root("rust", root.as_path())
@@ -7351,11 +7361,12 @@ impl ProjectRegistry {
                 controller: self.rust_residency.clone(),
                 group: RustGroupId(self.next_rust_group_id.fetch_add(1, Ordering::Relaxed)),
             });
-        spawn_project_actor_with_runtime(
+        spawn_project_actor_with_deferred_results(
             self.actor_capacity,
             template.translator_for_root(root.as_path().to_path_buf()),
             template.edit_safety().cloned(),
             residency,
+            self.deferred_results.clone(),
         )
     }
 
@@ -7374,6 +7385,9 @@ impl ProjectRegistry {
             shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
             rust_residency: RustResidencyController::new(DEFAULT_RUST_RESIDENCY_LIMIT),
             next_rust_group_id: std::sync::Arc::new(AtomicU64::new(1)),
+            deferred_results: std::sync::Arc::new(
+                std::sync::Mutex::new(DeferredResultStore::new()),
+            ),
         }
     }
 
@@ -8562,25 +8576,11 @@ impl ProjectRegistry {
         Err("invalid_symbol_handle: unknown or forged handle; rerun symbol discovery".to_owned())
     }
 
-    pub(crate) async fn read_deferred_resource(
-        &self,
-        token: String,
-    ) -> Result<serde_json::Value, String> {
-        let actors = self
-            .projects
-            .read()
-            .await
-            .values()
-            .flat_map(|project| project.actors.iter().map(|entry| entry.actor.clone()))
-            .collect::<Vec<_>>();
-        for actor in actors {
-            match actor.read_deferred_resource(token.clone()).await {
-                Ok(value) => return Ok(value),
-                Err(error) if error.to_string().starts_with("stale_resource") => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Err("stale_resource: deferred result is missing or expired".to_owned())
+    pub(crate) fn read_deferred_resource(&self, token: &str) -> Result<serde_json::Value, String> {
+        self.deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read(token)
     }
 
     /// Return the number of actor groups backing one logical project.
@@ -8840,6 +8840,25 @@ mod tests {
                 .is_err()
         );
         forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_resource_reads_survive_actor_lifecycle_changes() {
+        let registry = ProjectRegistry::new(2);
+        let reference = registry.deferred_results.lock().unwrap().insert(
+            serde_json::json!({"references": [1, 2]}),
+            "snapshot".to_owned(),
+        );
+
+        let token = reference
+            .uri
+            .strip_prefix("mcpls-deferred:///")
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            registry.read_deferred_resource(&token).unwrap(),
+            serde_json::json!({"references": [1, 2]})
+        );
     }
 
     #[tokio::test]

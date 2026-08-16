@@ -2727,8 +2727,7 @@ impl McplsServer {
                 let value = self
                     .context
                     .project_registry
-                    .read_deferred_resource(token)
-                    .await
+                    .read_deferred_resource(&token)
                     .map_err(|error| McpError::invalid_params(error, None))?;
                 serde_json::to_string(&value)
             }
@@ -2776,9 +2775,9 @@ impl McplsServer {
         .into())
     }
 
-    async fn read_deferred_resource(
+    fn read_deferred_resource(
         &self,
-        token: String,
+        token: &str,
         uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
@@ -2786,7 +2785,6 @@ impl McplsServer {
             .context
             .project_registry
             .read_deferred_resource(token)
-            .await
             .map_err(|error| McpError::invalid_params(error, None))?;
         let json = serde_json::to_string(&value)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -2993,9 +2991,7 @@ impl ServerHandler for McplsServer {
                     .await;
             }
             SessionResource::Deferred(token) => {
-                return self
-                    .read_deferred_resource(token, request.uri, supports_cache_hints)
-                    .await;
+                return self.read_deferred_resource(&token, request.uri, supports_cache_hints);
             }
         };
 
