@@ -68,6 +68,36 @@ pub struct ServerConfig {
 }
 
 /// Optional configuration supplied when registering one project at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CargoFeatureProfile {
+    /// Explicit Cargo feature names passed to rust-analyzer.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Ask Cargo to enable every feature.
+    #[serde(default)]
+    pub all_features: bool,
+    /// Ask Cargo to disable default features.
+    #[serde(default)]
+    pub no_default_features: bool,
+}
+
+impl CargoFeatureProfile {
+    /// Return a stable feature ordering for compatibility and persistence.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        let mut features = self.features.clone();
+        features.sort();
+        features.dedup();
+        Self {
+            features,
+            all_features: self.all_features,
+            no_default_features: self.no_default_features,
+        }
+    }
+}
+
+/// Optional configuration supplied when registering one project at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
@@ -86,6 +116,9 @@ pub struct ProjectConfig {
     /// Project-specific edit-safety policies replacing daemon defaults.
     #[serde(default)]
     pub edit_safety: Option<EditSafetyConfig>,
+    /// Effective Cargo feature profile for the project's Rust analyzer.
+    #[serde(default)]
+    pub cargo_features: Option<CargoFeatureProfile>,
 }
 
 impl ProjectConfig {
@@ -99,6 +132,7 @@ impl ProjectConfig {
                 None => true,
                 Some(config) => config.is_empty(),
             }
+            && self.cargo_features.is_none()
             && !self.persist_environment
     }
 
@@ -986,6 +1020,23 @@ mod tests {
     fn test_default_position_encodings() {
         let encodings = default_position_encodings();
         assert_eq!(encodings, vec!["utf-8", "utf-16"]);
+    }
+
+    #[test]
+    fn project_config_deserializes_a_cargo_feature_profile() {
+        let config: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "cargo_features": {
+                "features": ["serde", "cli"],
+                "all_features": false,
+                "no_default_features": true
+            }
+        }))
+        .unwrap();
+
+        let profile = config.cargo_features.unwrap();
+        assert_eq!(profile.features, vec!["serde", "cli"]);
+        assert!(!profile.all_features);
+        assert!(profile.no_default_features);
     }
 
     #[test]

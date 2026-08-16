@@ -11897,6 +11897,7 @@ while True:
             redaction_patterns: None,
             persist_environment: false,
             edit_safety: None,
+            cargo_features: None,
         };
 
         registry
@@ -12060,6 +12061,7 @@ while True:
                     redaction_patterns: None,
                     persist_environment: false,
                     edit_safety: None,
+                    cargo_features: None,
                 }),
             )
             .await

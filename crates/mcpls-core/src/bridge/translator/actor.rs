@@ -13,7 +13,8 @@ use super::{ActiveLanguageAlias, Translator};
 use crate::bridge::notifications::RedactionPolicy;
 use crate::bridge::{DocumentTracker, NotificationCache, lock_std, uri_to_path};
 use crate::config::{
-    LspServerConfig, ProjectConfig, ServerId, ToolRouter, default_position_encodings,
+    CargoFeatureProfile, LspServerConfig, ProjectConfig, ServerId, ToolRouter,
+    default_position_encodings,
 };
 use crate::error::{Error, Result};
 use crate::lsp::{
@@ -162,6 +163,9 @@ impl TranslatorTemplate {
                 }
             }
         }
+        if let Some(profile) = &config.cargo_features {
+            self.apply_cargo_feature_profile(profile);
+        }
         if let Some(max_depth) = config.heuristics_max_depth {
             self.heuristics_max_depth = Some(max_depth);
         }
@@ -172,6 +176,37 @@ impl TranslatorTemplate {
             self.edit_safety = Some(edit_safety.clone());
         }
         self
+    }
+
+    fn apply_cargo_feature_profile(&mut self, profile: &CargoFeatureProfile) {
+        let Some(server) = self
+            .lsp_configs
+            .iter_mut()
+            .find(|config| config.language_id.eq_ignore_ascii_case("rust"))
+        else {
+            return;
+        };
+        let mut options = server
+            .initialization_options
+            .take()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut cargo = options
+            .remove("cargo")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let profile = profile.normalized();
+        cargo.insert("features".to_string(), serde_json::json!(profile.features));
+        cargo.insert(
+            "allFeatures".to_string(),
+            serde_json::json!(profile.all_features),
+        );
+        cargo.insert(
+            "noDefaultFeatures".to_string(),
+            serde_json::json!(profile.no_default_features),
+        );
+        options.insert("cargo".to_string(), serde_json::Value::Object(cargo));
+        server.initialization_options = Some(serde_json::Value::Object(options));
     }
 
     pub(crate) const fn edit_safety(&self) -> Option<&crate::config::EditSafetyConfig> {
@@ -1176,6 +1211,36 @@ mod tests {
                 .args,
             vec!["--log-file=mcpls-test.log"]
         );
+    }
+
+    #[test]
+    fn project_cargo_features_merge_into_rust_analyzer_initialization() {
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![LspServerConfig::rust_analyzer()], Some(10));
+
+        let merged = translator
+            .configuration_template()
+            .with_project_config(&ProjectConfig {
+                cargo_features: Some(CargoFeatureProfile {
+                    features: vec!["zeta".to_string(), "alpha".to_string(), "alpha".to_string()],
+                    all_features: false,
+                    no_default_features: true,
+                }),
+                ..ProjectConfig::default()
+            });
+        let options = merged
+            .rust_server_config()
+            .unwrap()
+            .initialization_options
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(
+            options["cargo"]["features"],
+            serde_json::json!(["alpha", "zeta"])
+        );
+        assert!(!options["cargo"]["allFeatures"].as_bool().unwrap());
+        assert!(options["cargo"]["noDefaultFeatures"].as_bool().unwrap());
     }
 
     #[test]
