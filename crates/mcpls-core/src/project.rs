@@ -5693,7 +5693,12 @@ async fn handle_server_exit(
                     if let Some(guard) = residency.try_acquire_existing() {
                         Some(guard)
                     } else {
-                        Some(residency.acquire().await)
+                        Some(
+                            residency
+                                .controller
+                                .acquire_for(residency.group, RustResidencyMode::Activate)
+                                .await,
+                        )
                     }
                 }
                 None => None,
@@ -5762,10 +5767,6 @@ struct ProjectResidency {
 }
 
 impl ProjectResidency {
-    async fn acquire(&self) -> residency::RustResidencyGuard {
-        self.controller.acquire(self.group).await
-    }
-
     fn try_acquire_existing(&self) -> Option<residency::RustResidencyGuard> {
         self.controller.try_acquire_existing(self.group)
     }

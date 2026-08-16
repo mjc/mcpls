@@ -192,6 +192,7 @@ impl RustResidencyController {
             .insert(group, sender);
     }
 
+    #[cfg(test)]
     pub(super) async fn acquire(&self, group: RustGroupId) -> RustResidencyGuard {
         self.acquire_for(group, RustResidencyMode::Resume).await
     }
