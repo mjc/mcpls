@@ -45,7 +45,7 @@ use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
 use crate::rust_refactor::{logical_module_name, move_inline_module_preview_with_source};
 use crate::workspace_edit::{EditOperation, normalize};
 use lsp_types::WorkspaceEdit;
-use residency::{RustGroupId, RustResidencyController};
+use residency::{RustGroupId, RustResidencyController, RustResidencyMode};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1206,10 +1206,10 @@ impl ProjectRequestSender {
             return Err(mpsc::error::SendError(request));
         }
 
-        if request.uses_rust_residency()
+        if let Some(mode) = request.rust_residency_mode()
             && let Some(residency) = &self.residency
         {
-            request = residency.resident_request(request).await;
+            request = residency.resident_request(request, mode).await;
         }
 
         let permit = tokio::select! {
@@ -1763,11 +1763,12 @@ impl ProjectRequest {
         }
     }
 
-    const fn uses_rust_residency(&self) -> bool {
-        !matches!(
-            self.rust_residency_requirement(),
-            RustResidencyRequirement::None
-        )
+    const fn rust_residency_mode(&self) -> Option<RustResidencyMode> {
+        match self.rust_residency_requirement() {
+            RustResidencyRequirement::None => None,
+            RustResidencyRequirement::Resume => Some(RustResidencyMode::Resume),
+            RustResidencyRequirement::Activate => Some(RustResidencyMode::Activate),
+        }
     }
 
     const fn resumes_rust_runtime(&self) -> bool {
@@ -5701,9 +5702,12 @@ impl ProjectResidency {
         self.controller.remove(self.group);
     }
 
-    async fn resident_request(&self, request: ProjectRequest) -> ProjectRequest {
-        assert!(request.uses_rust_residency());
-        let guard = self.acquire().await;
+    async fn resident_request(
+        &self,
+        request: ProjectRequest,
+        mode: RustResidencyMode,
+    ) -> ProjectRequest {
+        let guard = self.controller.acquire_for(self.group, mode).await;
         ProjectRequest::Resident {
             request: Box::new(request),
             guard,

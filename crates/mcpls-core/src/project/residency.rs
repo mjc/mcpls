@@ -23,6 +23,12 @@ struct ResidentGroup {
     last_used: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RustResidencyMode {
+    Resume,
+    Activate,
+}
+
 #[derive(Debug)]
 struct RustResidencyBudget {
     limit: usize,
@@ -176,14 +182,26 @@ impl RustResidencyController {
     }
 
     pub(super) async fn acquire(&self, group: RustGroupId) -> RustResidencyGuard {
+        self.acquire_for(group, RustResidencyMode::Resume).await
+    }
+
+    pub(super) async fn acquire_for(
+        &self,
+        group: RustGroupId,
+        mode: RustResidencyMode,
+    ) -> RustResidencyGuard {
         let mut excluded = HashSet::new();
         loop {
             let transition = self.inner.transition.lock().await;
             let idle_timeout = self.state().budget.idle_timeout;
+            let minimum_idle = match mode {
+                RustResidencyMode::Resume => idle_timeout,
+                RustResidencyMode::Activate => Duration::ZERO,
+            };
             let decision =
                 self.state()
                     .budget
-                    .pin_with_minimum_idle(group, &excluded, idle_timeout);
+                    .pin_with_minimum_idle(group, &excluded, minimum_idle);
             match decision {
                 ResidencyDecision::Admit | ResidencyDecision::Reuse => {
                     return self.guard(group);
@@ -391,6 +409,33 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), controller.acquire(RustGroupId(2)))
                 .await
                 .expect("activation should be admitted after the idle timeout");
+
+        suspension.await.unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn explicit_activation_evicts_a_recent_unpinned_group() {
+        let controller =
+            RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let suspension = tokio::spawn(async move {
+            let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+                panic!("expected suspension request");
+            };
+            reply.send(Ok(())).unwrap();
+        });
+        let guard = tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.acquire_for(RustGroupId(2), RustResidencyMode::Activate),
+        )
+        .await
+        .expect("explicit activation should evict without waiting for idle timeout");
 
         suspension.await.unwrap();
         drop(guard);
