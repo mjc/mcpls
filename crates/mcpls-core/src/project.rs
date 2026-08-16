@@ -729,6 +729,51 @@ impl ProjectStatus {
     }
 }
 
+/// Why a project is currently dormant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDormancyReason {
+    /// The residency budget suspended an idle actor group.
+    ResidencyEviction,
+    /// The project was restored from persisted registration state.
+    Restored,
+}
+
+impl ProjectDormancyReason {
+    /// Return the stable wire spelling for this dormancy reason.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResidencyEviction => "residency_eviction",
+            Self::Restored => "restored",
+        }
+    }
+}
+
+/// Metadata describing the current dormant state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectDormancy {
+    reason: ProjectDormancyReason,
+    idle_for: Option<Duration>,
+}
+
+impl ProjectDormancy {
+    const fn new(reason: ProjectDormancyReason, idle_for: Option<Duration>) -> Self {
+        Self { reason, idle_for }
+    }
+
+    /// Return why the project became dormant.
+    #[must_use]
+    pub const fn reason(self) -> ProjectDormancyReason {
+        self.reason
+    }
+
+    /// Return how long the evicted group had been idle, when known.
+    #[must_use]
+    pub const fn idle_for(self) -> Option<Duration> {
+        self.idle_for
+    }
+}
+
 /// Typed events emitted by a project actor for session-facing delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -952,6 +997,7 @@ impl ProjectEventHistory {
 pub struct ProjectState {
     status: ProjectStatus,
     last_error: Option<String>,
+    dormancy: Option<ProjectDormancy>,
     runtime: ProjectRuntimeSummary,
 }
 
@@ -960,6 +1006,7 @@ impl ProjectState {
         Self {
             status,
             last_error: None,
+            dormancy: None,
             runtime,
         }
     }
@@ -974,6 +1021,12 @@ impl ProjectState {
     #[must_use]
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Return metadata for the current dormant state, when available.
+    #[must_use]
+    pub const fn dormancy(&self) -> Option<ProjectDormancy> {
+        self.dormancy
     }
 
     /// Return the project-local runtime summary owned by the actor.
@@ -1014,6 +1067,7 @@ impl ProjectState {
         if state_priority >= project_status_priority(self.status) {
             self.status = state.status;
             self.last_error = state.last_error;
+            self.dormancy = state.dormancy;
         }
         self.runtime.merge(state.runtime);
     }
@@ -1209,7 +1263,12 @@ impl ProjectRequestSender {
         if let Some(mode) = request.rust_residency_mode()
             && let Some(residency) = &self.residency
         {
-            request = residency.resident_request(request, mode).await;
+            request = match mode {
+                RustResidencyMode::Touch => residency.touch_request(request),
+                RustResidencyMode::Resume | RustResidencyMode::Activate => {
+                    residency.resident_request(request, mode).await
+                }
+            };
         }
 
         let permit = tokio::select! {
@@ -1688,12 +1747,14 @@ enum ProjectRequest {
     },
     Suspend {
         reply: oneshot::Sender<Result<(), ()>>,
+        dormancy: ProjectDormancy,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RustResidencyRequirement {
     None,
+    Touch,
     Resume,
     Activate,
 }
@@ -1758,14 +1819,25 @@ impl ProjectRequest {
             }
         ) {
             RustResidencyRequirement::Resume
-        } else {
+        } else if matches!(
+            self,
+            Self::Resident { .. }
+                | Self::SetStatus { .. }
+                | Self::Suspend { .. }
+                | Self::ServerExited { .. }
+                | Self::Shutdown { .. }
+                | Self::Fail { .. }
+        ) {
             RustResidencyRequirement::None
+        } else {
+            RustResidencyRequirement::Touch
         }
     }
 
     const fn rust_residency_mode(&self) -> Option<RustResidencyMode> {
         match self.rust_residency_requirement() {
             RustResidencyRequirement::None => None,
+            RustResidencyRequirement::Touch => Some(RustResidencyMode::Touch),
             RustResidencyRequirement::Resume => Some(RustResidencyMode::Resume),
             RustResidencyRequirement::Activate => Some(RustResidencyMode::Activate),
         }
@@ -5713,6 +5785,16 @@ impl ProjectResidency {
             guard,
         }
     }
+
+    fn touch_request(&self, request: ProjectRequest) -> ProjectRequest {
+        let Some(guard) = self.try_acquire_existing() else {
+            return request;
+        };
+        ProjectRequest::Resident {
+            request: Box::new(request),
+            guard,
+        }
+    }
 }
 
 fn spawn_project_actor_with_runtime(
@@ -5813,6 +5895,13 @@ impl ProjectActorChannels {
 
     fn publish_status(&self, state: &mut ProjectState, status: ProjectStatus) {
         state.status = status;
+        if status == ProjectStatus::Dormant {
+            state
+                .dormancy
+                .get_or_insert(ProjectDormancy::new(ProjectDormancyReason::Restored, None));
+        } else {
+            state.dormancy = None;
+        }
         let _ = self.status_tx.send(status);
         self.publish_state(state);
         self.publish(ProjectEvent::StatusChanged {
@@ -6019,6 +6108,7 @@ async fn suspend_project_runtime(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &mut ProjectRuntime,
+    dormancy: ProjectDormancy,
 ) -> Result<(), ()> {
     if runtime.has_dirty_documents() {
         return Err(());
@@ -6033,6 +6123,7 @@ async fn suspend_project_runtime(
         return Err(());
     }
     state.sync_runtime(runtime);
+    state.dormancy = Some(dormancy);
     channels.publish_status(state, ProjectStatus::Dormant);
     Ok(())
 }
@@ -6061,8 +6152,8 @@ async fn handle_project_request(
             state.sync_runtime(runtime);
             let _ = reply.send(state.clone());
         }
-        ProjectRequest::Suspend { reply } => {
-            let _ = reply.send(suspend_project_runtime(channels, state, runtime).await);
+        ProjectRequest::Suspend { reply, dormancy } => {
+            let _ = reply.send(suspend_project_runtime(channels, state, runtime, dormancy).await);
         }
         ProjectRequest::Activate { root, reply } => {
             if runtime.activation_is_reusable(state.status, std::slice::from_ref(&root)) {
@@ -8785,7 +8876,7 @@ mod tests {
         );
 
         drop(second_guard);
-        let Some(ProjectRequest::Suspend { reply }) = second_receiver.recv().await else {
+        let Some(ProjectRequest::Suspend { reply, .. }) = second_receiver.recv().await else {
             panic!("expected the pinned resident group to be evicted");
         };
         reply.send(Ok(())).unwrap();
@@ -8836,7 +8927,7 @@ mod tests {
             let controller = controller.clone();
             async move { controller.acquire(RustGroupId(2)).await }
         });
-        let Some(ProjectRequest::Suspend { reply }) = victim_receiver.recv().await else {
+        let Some(ProjectRequest::Suspend { reply, .. }) = victim_receiver.recv().await else {
             panic!("expected eviction to suspend the victim");
         };
 
@@ -9742,7 +9833,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let ProjectRequest::Suspend { reply } = suspend else {
+        let ProjectRequest::Suspend { reply, .. } = suspend else {
             panic!("expected eviction only after the queued request completed");
         };
         reply.send(Ok(())).unwrap();
@@ -9752,6 +9843,42 @@ mod tests {
             second_receiver.recv().await.unwrap(),
             ProjectRequest::Resident { .. }
         ));
+    }
+
+    #[test]
+    fn project_request_modes_distinguish_activation_from_activity() {
+        let (query_reply, _query_response) = oneshot::channel();
+        assert_eq!(
+            ProjectRequest::Query { reply: query_reply }.rust_residency_mode(),
+            Some(RustResidencyMode::Touch)
+        );
+
+        let (activate_reply, _activate_response) = oneshot::channel();
+        assert_eq!(
+            ProjectRequest::Activate {
+                root: PathBuf::from("project"),
+                reply: activate_reply,
+            }
+            .rust_residency_mode(),
+            Some(RustResidencyMode::Activate)
+        );
+    }
+
+    #[tokio::test]
+    async fn touching_a_resident_project_request_does_not_wait_for_capacity() {
+        let controller =
+            RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
+        let (channel, _receiver) = mpsc::channel(1);
+        let residency = ProjectResidency {
+            controller: controller.clone(),
+            group: RustGroupId(1),
+        };
+        controller.register(RustGroupId(1), channel.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let (reply, _response) = oneshot::channel();
+        let touched = residency.touch_request(ProjectRequest::Query { reply });
+        assert!(matches!(touched, ProjectRequest::Resident { .. }));
     }
 
     #[tokio::test]
@@ -10960,12 +11087,50 @@ while True:
         let mut state = ProjectState::new(ProjectStatus::Ready, runtime.summary());
 
         assert!(
-            suspend_project_runtime(&channels, &mut state, &mut runtime)
-                .await
-                .is_err()
+            suspend_project_runtime(
+                &channels,
+                &mut state,
+                &mut runtime,
+                ProjectDormancy::new(ProjectDormancyReason::Restored, None),
+            )
+            .await
+            .is_err()
         );
         assert_eq!(state.status(), ProjectStatus::Ready);
         assert_eq!(runtime.summary().open_document_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn residency_suspension_records_dormancy_reason_and_idle_duration() {
+        let mut runtime = ProjectRuntime::new(Translator::new());
+        let (status_tx, _) = watch::channel(ProjectStatus::Ready);
+        let (state_tx, _) =
+            watch::channel(ProjectState::new(ProjectStatus::Ready, runtime.summary()));
+        let (event_tx, _) = broadcast::channel(1);
+        let channels = ProjectActorChannels {
+            status_tx,
+            state_tx,
+            event_tx,
+            event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
+            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+        };
+        let mut state = ProjectState::new(ProjectStatus::Ready, runtime.summary());
+        let idle_for = Duration::from_secs(60 * 60);
+
+        suspend_project_runtime(
+            &channels,
+            &mut state,
+            &mut runtime,
+            ProjectDormancy::new(ProjectDormancyReason::ResidencyEviction, Some(idle_for)),
+        )
+        .await
+        .unwrap();
+
+        let dormancy = state
+            .dormancy()
+            .expect("residency suspension should report dormancy");
+        assert_eq!(dormancy.reason(), ProjectDormancyReason::ResidencyEviction);
+        assert_eq!(dormancy.idle_for(), Some(idle_for));
     }
 
     #[test]

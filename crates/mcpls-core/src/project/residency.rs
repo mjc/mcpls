@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
-use super::ProjectRequest;
+use super::{ProjectDormancy, ProjectDormancyReason, ProjectRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct RustGroupId(pub(super) u64);
@@ -25,6 +25,7 @@ struct ResidentGroup {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RustResidencyMode {
+    Touch,
     Resume,
     Activate,
 }
@@ -120,17 +121,27 @@ impl RustResidencyBudget {
         self.residents.remove(&group);
     }
 
+    fn idle_for(&self, group: RustGroupId) -> Duration {
+        self.residents
+            .get(&group)
+            .map_or(Duration::ZERO, |resident| resident.last_used.elapsed())
+    }
+
     #[cfg(test)]
     fn resident_count(&self) -> usize {
         self.residents.len()
     }
 
-    fn next_idle_delay(&self, excluded: &HashSet<RustGroupId>) -> Option<Duration> {
+    fn next_idle_delay(
+        &self,
+        excluded: &HashSet<RustGroupId>,
+        minimum_idle: Duration,
+    ) -> Option<Duration> {
         self.residents
             .iter()
             .filter(|(candidate, resident)| resident.pins == 0 && !excluded.contains(candidate))
             .map(|(_, resident)| {
-                self.idle_timeout
+                minimum_idle
                     .checked_sub(resident.last_used.elapsed())
                     .unwrap_or_default()
             })
@@ -195,6 +206,9 @@ impl RustResidencyController {
             let transition = self.inner.transition.lock().await;
             let idle_timeout = self.state().budget.idle_timeout;
             let minimum_idle = match mode {
+                RustResidencyMode::Touch => {
+                    unreachable!("touch mode must use try_acquire_existing")
+                }
                 RustResidencyMode::Resume => idle_timeout,
                 RustResidencyMode::Activate => Duration::ZERO,
             };
@@ -207,6 +221,7 @@ impl RustResidencyController {
                     return self.guard(group);
                 }
                 ResidencyDecision::Evict(victim) => {
+                    let idle_for = self.state().budget.idle_for(victim);
                     let sender = self
                         .state()
                         .actors
@@ -218,7 +233,13 @@ impl RustResidencyController {
                     };
                     let (reply, response) = oneshot::channel();
                     if sender
-                        .send(ProjectRequest::Suspend { reply })
+                        .send(ProjectRequest::Suspend {
+                            reply,
+                            dormancy: ProjectDormancy::new(
+                                ProjectDormancyReason::ResidencyEviction,
+                                Some(idle_for),
+                            ),
+                        })
                         .await
                         .is_err()
                     {
@@ -243,7 +264,7 @@ impl RustResidencyController {
                     let delay = self
                         .state()
                         .budget
-                        .next_idle_delay(&excluded)
+                        .next_idle_delay(&excluded, minimum_idle)
                         .unwrap_or(Duration::from_secs(1));
                     drop(transition);
                     tokio::select! {
@@ -376,7 +397,7 @@ mod tests {
         drop(controller.acquire(RustGroupId(1)).await);
 
         let suspension = tokio::spawn(async move {
-            let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+            let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
                 panic!("expected suspension request");
             };
             reply.send(Ok(())).unwrap();
@@ -400,7 +421,7 @@ mod tests {
         drop(controller.acquire(RustGroupId(1)).await);
 
         let suspension = tokio::spawn(async move {
-            let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+            let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
                 panic!("expected suspension request");
             };
             reply.send(Ok(())).unwrap();
@@ -425,7 +446,7 @@ mod tests {
         drop(controller.acquire(RustGroupId(1)).await);
 
         let suspension = tokio::spawn(async move {
-            let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+            let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
                 panic!("expected suspension request");
             };
             reply.send(Ok(())).unwrap();
@@ -456,7 +477,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(!second.is_finished());
 
-        let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+        let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
             panic!("expected suspension request after the idle timeout");
         };
         reply.send(Ok(())).unwrap();
@@ -483,9 +504,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!second.is_finished());
         drop(first_guard);
-        let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+        let Some(ProjectRequest::Suspend { reply, dormancy }) = first_receiver.recv().await else {
             panic!("expected suspension request");
         };
+        assert_eq!(dormancy.reason(), ProjectDormancyReason::ResidencyEviction);
+        assert!(dormancy.idle_for().is_some());
         reply.send(Ok(())).unwrap();
 
         let second_guard = tokio::time::timeout(Duration::from_secs(1), second)
@@ -508,7 +531,7 @@ mod tests {
             async move { controller.acquire(RustGroupId(2)).await }
         });
 
-        let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+        let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
             panic!("expected suspension request");
         };
         reply.send(Err(())).unwrap();

@@ -259,6 +259,12 @@ fn project_state_json(
         "repository_root": identity.repository_identity().map(GitRepositoryIdentity::common_dir),
         "status": state.status().as_str(),
         "last_error": state.last_error(),
+        "dormancy": state.dormancy().map(|dormancy| serde_json::json!({
+            "reason": dormancy.reason().as_str(),
+            "idle_for_ms": dormancy
+                .idle_for()
+                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+        })),
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),
         "open_document_count": state.open_document_count(),
@@ -4379,6 +4385,40 @@ finally:
         assert_eq!(error.data.as_ref().unwrap()["code"], "operation_failed");
         assert_eq!(error.data.as_ref().unwrap()["retryable"], true);
         assert!(error.data.as_ref().unwrap()["action"].is_string());
+    }
+
+    #[tokio::test]
+    async fn project_status_reports_dormancy_metadata() {
+        let server = create_test_server();
+        let root = TempDir::new().unwrap();
+        server
+            .project_add(Parameters(ProjectAddParams {
+                project_id: "dormant".to_string(),
+                root: root.path().display().to_string(),
+                config: None,
+            }))
+            .await
+            .unwrap();
+        let actor = server
+            .context
+            .project_registry
+            .actor_for_project(&ProjectId::new("dormant").unwrap())
+            .await
+            .unwrap();
+        actor
+            .set_status(crate::project::ProjectStatus::Dormant)
+            .await
+            .unwrap();
+
+        let status = server
+            .project_status(Parameters(ProjectIdParams {
+                project_id: "dormant".to_string(),
+            }))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["dormancy"]["reason"], "restored");
+        assert!(status["dormancy"]["idle_for_ms"].is_null());
     }
 
     #[tokio::test]
