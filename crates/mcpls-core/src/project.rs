@@ -8322,6 +8322,7 @@ impl ProjectRegistry {
                     .config
                     .as_ref()
                     .and_then(|config| config.cargo_features.clone())
+                    .map(|profile| profile.normalized())
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
