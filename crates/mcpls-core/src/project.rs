@@ -3360,6 +3360,7 @@ struct InlineModuleSemanticCheck {
 const LANGUAGE_SERVER_EXITED: &str = "language server exited";
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
+const DEFAULT_RUST_RESIDENCY_LIMIT: usize = 5;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
     Duration::from_millis(500),
@@ -7275,7 +7276,7 @@ impl ProjectRegistry {
             persistence_error: std::sync::Arc::new(RwLock::new(None)),
             lifecycle: std::sync::Arc::new(RegistryLifecycle::default()),
             shutdown_timeout: DEFAULT_PROJECT_SHUTDOWN_TIMEOUT,
-            rust_residency: RustResidencyController::new(1),
+            rust_residency: RustResidencyController::new(DEFAULT_RUST_RESIDENCY_LIMIT),
             next_rust_group_id: std::sync::Arc::new(AtomicU64::new(1)),
         }
     }
@@ -7303,6 +7304,12 @@ impl ProjectRegistry {
     #[must_use]
     pub fn with_rust_residency_limit(mut self, limit: usize) -> Self {
         self.rust_residency = RustResidencyController::new(limit);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rust_residency_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.rust_residency = RustResidencyController::with_idle_timeout(1, timeout);
         self
     }
 
@@ -8793,7 +8800,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_exit_recovery_does_not_wait_behind_eviction_transition() {
-        let controller = RustResidencyController::new(1);
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::ZERO);
         let (victim_sender, mut victim_receiver) = mpsc::channel(1);
         let (replacement_sender, _replacement_receiver) = mpsc::channel(1);
         controller.register(RustGroupId(1), victim_sender.downgrade());

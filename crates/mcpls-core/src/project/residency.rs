@@ -46,14 +46,6 @@ impl RustResidencyBudget {
         self.pin_with_minimum_idle(group, excluded, self.idle_timeout)
     }
 
-    fn pin_for_activation(
-        &mut self,
-        group: RustGroupId,
-        excluded: &HashSet<RustGroupId>,
-    ) -> ResidencyDecision {
-        self.pin_with_minimum_idle(group, excluded, Duration::ZERO)
-    }
-
     fn pin_with_minimum_idle(
         &mut self,
         group: RustGroupId,
@@ -161,7 +153,7 @@ impl RustResidencyController {
         Self::with_idle_timeout(limit, DEFAULT_IDLE_TIMEOUT)
     }
 
-    fn with_idle_timeout(limit: usize, idle_timeout: Duration) -> Self {
+    pub(super) fn with_idle_timeout(limit: usize, idle_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(RustResidencyInner {
                 state: StdMutex::new(RustResidencyState {
@@ -187,7 +179,11 @@ impl RustResidencyController {
         let mut excluded = HashSet::new();
         loop {
             let transition = self.inner.transition.lock().await;
-            let decision = self.state().budget.pin_for_activation(group, &excluded);
+            let idle_timeout = self.state().budget.idle_timeout;
+            let decision =
+                self.state()
+                    .budget
+                    .pin_with_minimum_idle(group, &excluded, idle_timeout);
             match decision {
                 ResidencyDecision::Admit | ResidencyDecision::Reuse => {
                     return self.guard(group);
@@ -377,9 +373,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_request_evicts_a_recent_unpinned_group() {
-        let controller =
-            RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
+    async fn activation_waits_for_idle_timeout_before_eviction() {
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::from_millis(20));
         let (first_sender, mut first_receiver) = mpsc::channel(1);
         let (second_sender, _second_receiver) = mpsc::channel(1);
         controller.register(RustGroupId(1), first_sender.downgrade());
@@ -395,9 +390,35 @@ mod tests {
         let guard =
             tokio::time::timeout(Duration::from_secs(1), controller.acquire(RustGroupId(2)))
                 .await
-                .expect("a cold request should not wait for the idle timeout");
+                .expect("activation should be admitted after the idle timeout");
 
         suspension.await.unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn cold_request_waits_for_idle_timeout_before_eviction() {
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::from_millis(20));
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let controller_for_request = controller.clone();
+        let second =
+            tokio::spawn(async move { controller_for_request.acquire(RustGroupId(2)).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!second.is_finished());
+
+        let Some(ProjectRequest::Suspend { reply }) = first_receiver.recv().await else {
+            panic!("expected suspension request after the idle timeout");
+        };
+        reply.send(Ok(())).unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("cold request should be admitted after the idle timeout")
+            .unwrap();
         drop(guard);
     }
 

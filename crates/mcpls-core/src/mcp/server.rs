@@ -3716,7 +3716,8 @@ finally:
         let counter = first_root.path().join("spawn-count");
         let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
-            .with_rust_residency_limit(1);
+            .with_rust_residency_limit(1)
+            .with_rust_residency_idle_timeout(std::time::Duration::ZERO);
         let (first_id, second_id) =
             add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
@@ -3762,7 +3763,8 @@ finally:
         let counter = first_root.path().join("spawn-count");
         let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
-            .with_rust_residency_limit(1);
+            .with_rust_residency_limit(1)
+            .with_rust_residency_idle_timeout(std::time::Duration::ZERO);
         let (first_id, second_id) =
             add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
@@ -3856,15 +3858,14 @@ finally:
         std::fs::write(&release, "release").unwrap();
         blocked.await.unwrap().unwrap();
         let second_result =
-            tokio::time::timeout(std::time::Duration::from_secs(3), second_request).await;
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second_request).await;
         assert!(
-            second_result.is_ok(),
-            "second request remained queued after the first completed"
+            second_result.is_err(),
+            "recently used residency was evicted before the idle timeout"
         );
-        let second_result = second_result.unwrap().unwrap().unwrap();
-        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
-        assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
-        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+        second_request.abort();
+        second_request.await.unwrap_err();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
             "1"
@@ -3957,7 +3958,8 @@ finally:
         write_rust_fixture(second_root.path());
         let counter = first_root.path().join("spawn-count");
         let config = write_concurrency_lsp(first_root.path(), &counter, None, None, None);
-        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config))
+            .with_rust_residency_idle_timeout(std::time::Duration::ZERO);
         let (first_id, second_id) =
             add_two_projects(&registry, first_root.path(), second_root.path()).await;
         let server =
