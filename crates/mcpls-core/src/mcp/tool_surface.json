@@ -13212,6 +13212,46 @@
     }
   },
   {
+    "name": "project_configure_cargo_features",
+    "description": "Replace the Cargo feature profile for a registered Rust project. Existing project settings are preserved; language-server actors are replaced atomically and the new profile is persisted.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "all_features": {
+          "default": false,
+          "description": "Ask Cargo to enable every feature.",
+          "type": "boolean"
+        },
+        "features": {
+          "default": [],
+          "description": "Explicit Cargo feature names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "no_default_features": {
+          "default": false,
+          "description": "Ask Cargo to disable default features.",
+          "type": "boolean"
+        },
+        "project_id": {
+          "description": "Stable project identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  {
     "name": "project_list",
     "description": "List registered projects and their canonical roots.",
     "inputSchema": {
