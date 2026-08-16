@@ -263,7 +263,7 @@ fn project_state_json(
             "reason": dormancy.reason().as_str(),
             "idle_for_ms": dormancy
                 .idle_for()
-                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
         })),
         "configured_language_servers": state.runtime().configured_language_ids(),
         "active_language_servers": state.runtime().active_language_ids(),

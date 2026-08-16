@@ -11126,9 +11126,9 @@ while True:
         .await
         .unwrap();
 
-        let dormancy = state
-            .dormancy()
-            .expect("residency suspension should report dormancy");
+        let Some(dormancy) = state.dormancy() else {
+            panic!("residency suspension should report dormancy");
+        };
         assert_eq!(dormancy.reason(), ProjectDormancyReason::ResidencyEviction);
         assert_eq!(dormancy.idle_for(), Some(idle_for));
     }
