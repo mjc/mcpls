@@ -257,6 +257,19 @@ fn apply_builtin_precedence(configs: &[LspServerConfig]) -> Vec<LspServerConfig>
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct PlannedServer {
+    config: LspServerConfig,
+    workspace_roots: Vec<PathBuf>,
+}
+
+fn planned_server_roots(servers: &[PlannedServer]) -> HashMap<ServerId, Vec<PathBuf>> {
+    servers
+        .iter()
+        .map(|server| (server.config.id(), server.workspace_roots.clone()))
+        .collect()
+}
+
 fn active_builtin_aliases(
     configs: &[LspServerConfig],
     successful: &HashSet<ServerId>,
@@ -355,14 +368,8 @@ impl Translator {
             return false;
         }
         let configs = lock_std(&self.project_lsp_configs).clone();
-        let current = configs
-            .iter()
-            .filter_map(|config| {
-                let server_roots = self.server_workspace_roots(config, roots);
-                (!server_roots.is_empty()).then(|| (config.id(), server_roots))
-            })
-            .collect::<HashMap<_, _>>();
-        *lock_std(&self.evaluated_lsp_roots) == current
+        let current = self.applicable_servers(&configs, roots);
+        *lock_std(&self.evaluated_lsp_roots) == planned_server_roots(&current)
     }
 
     /// Return whether this translator owns exactly these logical project roots.
@@ -494,25 +501,19 @@ impl Translator {
             return Err(Error::NoServerConfigured);
         }
         lock_std(&self.active_language_aliases).clear();
-        let configs = lock_std(&self.project_lsp_configs)
+        let all_configs = lock_std(&self.project_lsp_configs).clone();
+        let servers = self.applicable_servers(&all_configs, &roots);
+        let configs = servers
             .iter()
-            .filter(|config| {
-                roots
-                    .iter()
-                    .any(|root| config.should_spawn(root, self.heuristics_max_depth))
-            })
-            .cloned()
+            .map(|server| server.config.clone())
             .collect::<Vec<_>>();
-        *lock_std(&self.evaluated_lsp_roots) = configs
-            .iter()
-            .map(|config| (config.id(), self.server_workspace_roots(config, &roots)))
-            .collect();
+        *lock_std(&self.evaluated_lsp_roots) = planned_server_roots(&servers);
         let router = ToolRouter::from_configs(configs.iter())?;
         *lock_std(&self.router) = router;
 
-        let configured_ids = configs
+        let configured_ids = servers
             .iter()
-            .map(LspServerConfig::id)
+            .map(|server| server.config.id())
             .collect::<HashSet<_>>();
         let stale_ids = lock_std(&self.lsp_servers)
             .keys()
@@ -536,10 +537,9 @@ impl Translator {
             return Ok(ProjectActivation::structural_only());
         }
 
-        let pending = configs
+        let pending = servers
             .iter()
-            .filter(|config| !self.can_reuse_server(config, &roots))
-            .cloned()
+            .filter(|server| !self.can_reuse_server(server))
             .collect::<Vec<_>>();
         if pending.is_empty() {
             let active_ids = lock_std(&self.lsp_servers).keys().cloned().collect();
@@ -555,13 +555,13 @@ impl Translator {
 
         let replaced = pending
             .iter()
-            .filter_map(|config| lock_std(&self.lsp_servers).remove(&config.id()))
+            .filter_map(|server| lock_std(&self.lsp_servers).remove(&server.config.id()))
             .collect::<Vec<_>>();
         for server in replaced {
             let _ = server.shutdown().await;
         }
-        for config in &pending {
-            let id = config.id();
+        for server in &pending {
+            let id = server.config.id();
             lock_std(&self.lsp_clients).remove(&id);
             lock_std(&self.project_lsp_roots).remove(&id);
         }
@@ -569,15 +569,15 @@ impl Translator {
         self.set_expected_servers(
             pending
                 .iter()
-                .filter(|config| config.language_id.eq_ignore_ascii_case("rust"))
-                .map(LspServerConfig::id)
+                .filter(|server| server.config.language_id.eq_ignore_ascii_case("rust"))
+                .map(|server| server.config.id())
                 .collect(),
         );
         let mut project_environments = HashMap::new();
         let mut init_configs = Vec::with_capacity(pending.len());
-        for config in &pending {
-            let server_roots = self.server_workspace_roots(config, &roots);
-            let mut server_config = config.clone();
+        for server in pending {
+            let server_roots = server.workspace_roots.clone();
+            let mut server_config = server.config.clone();
             if let Some(root) = server_roots.first() {
                 if !project_environments.contains_key(root) {
                     project_environments.insert(root.clone(), load_project_environment(root).await);
@@ -930,14 +930,29 @@ impl Translator {
             .collect()
     }
 
-    fn can_reuse_server(&self, config: &LspServerConfig, roots: &[PathBuf]) -> bool {
-        let id = config.id();
+    fn can_reuse_server(&self, server: &PlannedServer) -> bool {
+        let id = server.config.id();
         lock_std(&self.lsp_clients).contains_key(&id)
             && lock_std(&self.project_lsp_roots)
                 .get(&id)
-                .is_some_and(|existing| {
-                    same_workspace_roots(existing, &self.server_workspace_roots(config, roots))
+                .is_some_and(|existing| same_workspace_roots(existing, &server.workspace_roots))
+    }
+
+    fn applicable_servers(
+        &self,
+        configs: &[LspServerConfig],
+        roots: &[PathBuf],
+    ) -> Vec<PlannedServer> {
+        configs
+            .iter()
+            .filter_map(|config| {
+                let workspace_roots = self.server_workspace_roots(config, roots);
+                (!workspace_roots.is_empty()).then(|| PlannedServer {
+                    config: config.clone(),
+                    workspace_roots,
                 })
+            })
+            .collect()
     }
 
     fn server_workspace_roots(&self, config: &LspServerConfig, roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -1278,24 +1293,27 @@ mod tests {
     }
 
     #[test]
-    fn nested_marker_uses_effective_project_root_for_rust_analyzer() {
+    fn server_plan_uses_nested_marker_and_excludes_irrelevant_config() {
         let outer = TempDir::new().expect("temporary workspace");
         let nested = outer.path().join("pkgs/ai-integrations");
         std::fs::create_dir_all(&nested).expect("nested project directory");
         std::fs::write(nested.join("Cargo.toml"), "[workspace]\n").expect("nested Cargo manifest");
 
-        let config = LspServerConfig::rust_analyzer();
+        let rust = LspServerConfig::rust_analyzer();
+        let go = LspServerConfig::gopls();
         let mut translator = Translator::new();
-        translator.set_lsp_configs(vec![config.clone()], Some(10));
+        translator.set_lsp_configs(vec![rust.clone(), go.clone()], Some(10));
         let requested = vec![outer.path().to_path_buf()];
-        let effective = translator.server_workspace_roots(&config, &requested);
-
+        let servers = translator.applicable_servers(&[rust.clone(), go], &requested);
         assert!(
             translator
                 .configuration_template()
                 .language_applies_to_root("rust", outer.path())
         );
-        assert_eq!(effective, vec![nested]);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].config.id(), rust.id());
+        assert_eq!(servers[0].workspace_roots, vec![nested]);
     }
 
     #[tokio::test]
