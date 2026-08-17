@@ -5696,7 +5696,7 @@ async fn handle_server_exit(
         ProjectStatus::Ready | ProjectStatus::Degraded => {
             let _recovery_guard = match residency {
                 Some(residency) => {
-                    if let Some(guard) = residency.try_acquire_existing() {
+                    if let Some(guard) = residency.try_acquire_existing_for_recovery() {
                         Some(guard)
                     } else {
                         Some(
@@ -5775,6 +5775,11 @@ struct ProjectResidency {
 impl ProjectResidency {
     fn try_acquire_existing(&self) -> Option<residency::RustResidencyGuard> {
         self.controller.try_acquire_existing(self.group)
+    }
+
+    fn try_acquire_existing_for_recovery(&self) -> Option<residency::RustResidencyGuard> {
+        self.controller
+            .try_acquire_existing_for_recovery(self.group)
     }
 
     fn remove(&self) {

@@ -281,6 +281,18 @@ impl RustResidencyController {
     }
 
     pub(super) fn try_acquire_existing(&self, group: RustGroupId) -> Option<RustResidencyGuard> {
+        let _transition = self.inner.transition.try_lock().ok()?;
+        self.try_acquire_existing_unchecked(group)
+    }
+
+    pub(super) fn try_acquire_existing_for_recovery(
+        &self,
+        group: RustGroupId,
+    ) -> Option<RustResidencyGuard> {
+        self.try_acquire_existing_unchecked(group)
+    }
+
+    fn try_acquire_existing_unchecked(&self, group: RustGroupId) -> Option<RustResidencyGuard> {
         self.state()
             .budget
             .pin_existing(group)
@@ -409,6 +421,38 @@ mod tests {
                 .expect("second group should be admitted after suspension");
 
         suspension.await.unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn existing_requests_cannot_pin_a_group_during_eviction() {
+        let controller = RustResidencyController::with_idle_timeout(1, Duration::ZERO);
+        let (first_sender, mut first_receiver) = mpsc::channel(1);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        controller.register(RustGroupId(1), first_sender.downgrade());
+        controller.register(RustGroupId(2), second_sender.downgrade());
+        drop(controller.acquire(RustGroupId(1)).await);
+
+        let replacement = tokio::spawn({
+            let controller = controller.clone();
+            async move {
+                controller
+                    .acquire_for(RustGroupId(2), RustResidencyMode::Activate)
+                    .await
+            }
+        });
+        let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
+            panic!("expected eviction suspension request");
+        };
+        assert!(
+            controller.try_acquire_existing(RustGroupId(1)).is_none(),
+            "a request must not pin a victim while eviction is in progress"
+        );
+        reply.send(Ok(())).unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement should be admitted after suspension")
+            .unwrap();
         drop(guard);
     }
 
