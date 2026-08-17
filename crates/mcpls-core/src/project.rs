@@ -5651,6 +5651,9 @@ async fn recover_project_after_server_exit(
         ));
         channels.publish_status(state, ProjectStatus::Restarting);
         tokio::time::sleep(attempt.delay).await;
+        if !channels.accepting.load(Ordering::Acquire) {
+            return;
+        }
         match runtime.restart().await {
             Ok(notification_receivers) => {
                 state.last_error = None;
@@ -11202,6 +11205,47 @@ while True:
 
         assert_eq!(state.status(), ProjectStatus::Ready);
         assert_eq!(state.runtime().generation(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_actor_shutdown_cancels_pending_server_exit_recovery() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let counter = root.path().join("spawn-count");
+        let lsp = root.path().join("counting-lsp.py");
+        fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], Some(3));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        actor.activate(root.path().to_path_buf()).await.unwrap();
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+
+        actor
+            .sender
+            .send(ProjectRequest::ServerExited { generation: 1 })
+            .await
+            .unwrap();
+        actor.shutdown().await.unwrap();
+
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+        assert_eq!(actor.status().borrow().clone(), ProjectStatus::Stopped);
     }
 
     #[test]
