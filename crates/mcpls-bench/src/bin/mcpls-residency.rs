@@ -35,11 +35,11 @@ fn register_groups(
     client: &mut McpClient,
     groups: &[ProjectGroup],
     prefix: &str,
-) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
+    registered_ids: &mut Vec<String>,
+) -> Result<()> {
     for group in groups {
         let project_id = format!("{prefix}-{}", group.project_id);
-        ids.push(project_id.clone());
+        registered_ids.push(project_id.clone());
         for root in &group.roots {
             client.tool(
                 "project_add",
@@ -47,7 +47,7 @@ fn register_groups(
             )?;
         }
     }
-    Ok(ids)
+    Ok(())
 }
 
 fn remove_groups(client: &mut McpClient, project_ids: &[String]) {
@@ -104,7 +104,7 @@ fn run(args: &Args) -> Result<Value> {
     let mut project_ids = Vec::new();
     let result = (|| {
         client.initialize()?;
-        project_ids = register_groups(&mut client, &groups, &args.project_prefix)?;
+        register_groups(&mut client, &groups, &args.project_prefix, &mut project_ids)?;
         let registered = registered_states(&mut client, &project_ids)?;
         let daemon_status = client.tool("server_status", json!({}))?;
         let mut report = json!({
