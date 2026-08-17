@@ -455,7 +455,9 @@ impl Translator {
 
     /// Record the workspace roots owned by one active server.
     pub fn register_server_roots(&self, server_id: impl Into<ServerId>, roots: Vec<PathBuf>) {
-        lock_std(&self.project_lsp_roots).insert(server_id.into(), roots);
+        let server_id = server_id.into();
+        lock_std(&self.evaluated_lsp_roots).insert(server_id.clone(), roots.clone());
+        lock_std(&self.project_lsp_roots).insert(server_id, roots);
     }
 
     /// Start every applicable server for one project root.
@@ -1333,7 +1335,6 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         translator.register_client(rust.id(), client);
         translator.register_server_roots(rust.id(), roots.clone());
-        lock_std(&translator.evaluated_lsp_roots).insert(rust.id(), roots.clone());
 
         assert!(translator.has_active_workspace_roots(&roots));
 
