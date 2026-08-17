@@ -8403,6 +8403,17 @@ impl ProjectRegistry {
         let replacements = self
             .build_cargo_feature_replacements(id, &config, snapshots)
             .await?;
+        self.replace_project_actors_transactionally(id, replacements, config)
+            .await?;
+        self.status(id).await
+    }
+
+    async fn replace_project_actors_transactionally(
+        &self,
+        id: &ProjectId,
+        replacements: Vec<ProjectActorEntry>,
+        config: ProjectConfig,
+    ) -> Result<(), ProjectRegistryError> {
         let Some(old_entry) = self.swap_project_actors(id, replacements, config).await? else {
             return Err(ProjectRegistryError::ProjectNotFound(id.clone()));
         };
@@ -8417,7 +8428,7 @@ impl ProjectRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .invalidate_scope(id.as_str());
         shutdown_project_actors(&old_entry.actors).await;
-        self.status(id).await
+        Ok(())
     }
 
     async fn cargo_feature_snapshot(
