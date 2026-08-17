@@ -1174,6 +1174,13 @@ struct ProjectRequestGate {
 }
 
 impl ProjectRequestGate {
+    fn new() -> Self {
+        Self {
+            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            rejected: std::sync::Arc::new(Notify::new()),
+        }
+    }
+
     fn reject_new_work(&self) {
         self.accepting.store(false, Ordering::Release);
         self.rejected.notify_waiters();
@@ -1202,29 +1209,22 @@ struct ProjectRequestSender {
 impl ProjectRequestSender {
     #[cfg(test)]
     fn new(sender: mpsc::Sender<ProjectRequest>) -> Self {
-        Self::with_accepting(sender, None, std::sync::Arc::new(AtomicBool::new(true)))
+        Self::with_gate(sender, None, ProjectRequestGate::new())
     }
 
     #[cfg(test)]
     fn with_residency(sender: mpsc::Sender<ProjectRequest>, residency: ProjectResidency) -> Self {
-        Self::with_accepting(
-            sender,
-            Some(residency),
-            std::sync::Arc::new(AtomicBool::new(true)),
-        )
+        Self::with_gate(sender, Some(residency), ProjectRequestGate::new())
     }
 
-    fn with_accepting(
+    const fn with_gate(
         sender: mpsc::Sender<ProjectRequest>,
         residency: Option<ProjectResidency>,
-        accepting: std::sync::Arc<AtomicBool>,
+        gate: ProjectRequestGate,
     ) -> Self {
         Self {
             sender,
-            gate: ProjectRequestGate {
-                accepting,
-                rejected: std::sync::Arc::new(Notify::new()),
-            },
+            gate,
             residency,
         }
     }
@@ -5650,8 +5650,14 @@ async fn recover_project_after_server_exit(
             attempt.number
         ));
         channels.publish_status(state, ProjectStatus::Restarting);
-        tokio::time::sleep(attempt.delay).await;
-        if !channels.accepting.load(Ordering::Acquire) {
+        if !channels.gate.is_accepting() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(attempt.delay) => {}
+            () = channels.gate.wait_for_rejection() => return,
+        }
+        if !channels.gate.is_accepting() {
             return;
         }
         match runtime.restart().await {
@@ -5854,20 +5860,16 @@ fn spawn_project_actor_with_deferred_results_scoped(
 ) -> ProjectHandle {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let actor_sender = sender.downgrade();
-    let accepting = std::sync::Arc::new(AtomicBool::new(true));
+    let gate = ProjectRequestGate::new();
     if let Some(residency) = &residency {
         residency
             .controller
             .register(residency.group, actor_sender.clone());
     }
     let sender = residency.as_ref().map_or_else(
-        || ProjectRequestSender::with_accepting(sender.clone(), None, accepting.clone()),
+        || ProjectRequestSender::with_gate(sender.clone(), None, gate.clone()),
         |residency| {
-            ProjectRequestSender::with_accepting(
-                sender.clone(),
-                Some(residency.clone()),
-                accepting.clone(),
-            )
+            ProjectRequestSender::with_gate(sender.clone(), Some(residency.clone()), gate.clone())
         },
     );
     let runtime = ProjectRuntime::with_deferred_results_scoped(
@@ -5887,7 +5889,7 @@ fn spawn_project_actor_with_deferred_results_scoped(
         state_tx,
         event_tx,
         event_history: std::sync::Arc::clone(&event_history),
-        accepting,
+        gate,
     };
     tokio::spawn(run_project_actor(
         receiver,
@@ -5911,7 +5913,7 @@ struct ProjectActorChannels {
     state_tx: watch::Sender<ProjectState>,
     event_tx: broadcast::Sender<ProjectEvent>,
     event_history: std::sync::Arc<std::sync::Mutex<ProjectEventHistory>>,
-    accepting: std::sync::Arc<AtomicBool>,
+    gate: ProjectRequestGate,
 }
 
 impl ProjectActorChannels {
@@ -6047,14 +6049,14 @@ async fn next_project_request(
 fn spawn_notification_forwarders(
     notification_receivers: Vec<(ServerId, mpsc::Receiver<LspNotification>)>,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
-    accepting: &std::sync::Arc<AtomicBool>,
+    gate: &ProjectRequestGate,
     generation: u64,
 ) {
     for (server_id, receiver) in notification_receivers {
         let sender = actor_sender.clone();
-        let accepting = accepting.clone();
+        let gate = gate.clone();
         tokio::spawn(forward_lsp_notifications(
-            server_id, receiver, sender, accepting, generation,
+            server_id, receiver, sender, gate, generation,
         ));
     }
 }
@@ -6063,10 +6065,13 @@ async fn forward_lsp_notifications(
     server_id: ServerId,
     mut receiver: mpsc::Receiver<LspNotification>,
     sender: mpsc::WeakSender<ProjectRequest>,
-    accepting: std::sync::Arc<AtomicBool>,
+    gate: ProjectRequestGate,
     generation: u64,
 ) {
     while let Some(notification) = receiver.recv().await {
+        if !gate.is_accepting() {
+            break;
+        }
         let Some(sender) = sender.upgrade() else {
             break;
         };
@@ -6082,7 +6087,7 @@ async fn forward_lsp_notifications(
             break;
         }
     }
-    if accepting.load(Ordering::Acquire)
+    if gate.is_accepting()
         && let Some(sender) = sender.upgrade()
     {
         // Closing a receiver is also the normal result of intentional eviction.
@@ -6105,7 +6110,7 @@ fn mark_project_started(
     spawn_notification_forwarders(
         activation.into_notification_receivers(),
         actor_sender,
-        &channels.accepting,
+        &channels.gate,
         runtime.generation(),
     );
     publish_project_readiness(channels, state, runtime, health);
@@ -9067,12 +9072,13 @@ mod tests {
     async fn server_exit_forwarder_does_not_pin_after_intentional_shutdown() {
         let (request_sender, mut request_receiver) = mpsc::channel(1);
         let (notification_sender, notification_receiver) = mpsc::channel(1);
+        let gate = ProjectRequestGate::new();
 
         let forwarder = tokio::spawn(forward_lsp_notifications(
             "rust".into(),
             notification_receiver,
             request_sender.downgrade(),
-            std::sync::Arc::new(AtomicBool::new(true)),
+            gate,
             7,
         ));
         drop(notification_sender);
@@ -9092,16 +9098,16 @@ mod tests {
     async fn server_exit_forwarder_suppresses_exit_after_shutdown_begins() {
         let (request_sender, mut request_receiver) = mpsc::channel(1);
         let (notification_sender, notification_receiver) = mpsc::channel(1);
-        let accepting = std::sync::Arc::new(AtomicBool::new(true));
+        let gate = ProjectRequestGate::new();
 
         let forwarder = tokio::spawn(forward_lsp_notifications(
             "rust".into(),
             notification_receiver,
             request_sender.downgrade(),
-            accepting.clone(),
+            gate.clone(),
             8,
         ));
-        accepting.store(false, Ordering::Release);
+        gate.reject_new_work();
         drop(notification_sender);
 
         assert!(
@@ -9234,7 +9240,7 @@ mod tests {
             state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
-            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            gate: ProjectRequestGate::new(),
         };
         let mut state = ProjectState::new(ProjectStatus::Ready, ProjectRuntimeSummary::default());
         let mut runtime = ProjectRuntime::new(Translator::new());
@@ -10067,7 +10073,7 @@ mod tests {
             state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
-            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            gate: ProjectRequestGate::new(),
         };
         let (sender, _receiver) = mpsc::channel(1);
         let actor_sender = sender.downgrade();
@@ -11242,7 +11248,10 @@ while True:
             .send(ProjectRequest::ServerExited { generation: 1 })
             .await
             .unwrap();
-        actor.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(50), actor.shutdown())
+            .await
+            .expect("shutdown should cancel pending recovery promptly")
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
         assert_eq!(actor.status().borrow().clone(), ProjectStatus::Stopped);
@@ -11512,7 +11521,7 @@ while True:
             state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
-            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            gate: ProjectRequestGate::new(),
         };
         let mut state = ProjectState::new(ProjectStatus::Ready, runtime.summary());
 
@@ -11542,7 +11551,7 @@ while True:
             state_tx,
             event_tx,
             event_history: std::sync::Arc::new(std::sync::Mutex::new(ProjectEventHistory::new(1))),
-            accepting: std::sync::Arc::new(AtomicBool::new(true)),
+            gate: ProjectRequestGate::new(),
         };
         let mut state = ProjectState::new(ProjectStatus::Ready, runtime.summary());
         let idle_for = Duration::from_secs(60 * 60);
