@@ -11160,7 +11160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_actor_becomes_ready_when_initial_rust_indexing_finishes() {
+    async fn project_actor_ignores_server_quiescence_until_initial_rust_indexing_finishes() {
         let translator = Translator::new();
         translator.set_expected_languages(HashSet::from(["rust".to_string()]));
         let actor = spawn_project_actor_with_translator(2, translator);
@@ -11175,6 +11175,26 @@ mod tests {
                     Some(serde_json::json!({
                         "health": "ok",
                         "quiescent": false
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.query().await.unwrap().status(),
+            ProjectStatus::Starting
+        );
+
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                server_id: ServerId::from("rust"),
+                notification: LspNotification::parse(
+                    "experimental/serverStatus",
+                    Some(serde_json::json!({
+                        "health": "ok",
+                        "quiescent": true
                     })),
                 ),
             })
@@ -11270,6 +11290,8 @@ while True:
         }})
         send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
               "params": {"health": "ok", "quiescent": True}})
+        send({"jsonrpc": "2.0", "method": "$/progress",
+              "params": {"token": "rustAnalyzer/Indexing", "value": {"kind": "end"}}})
     elif message.get("method") == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break
@@ -11324,6 +11346,8 @@ while True:
         }})
         send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
               "params": {"health": "ok", "quiescent": True}})
+        send({"jsonrpc": "2.0", "method": "$/progress",
+              "params": {"token": "rustAnalyzer/Indexing", "value": {"kind": "end"}}})
     elif message.get("method") == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         break

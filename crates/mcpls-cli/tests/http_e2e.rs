@@ -522,6 +522,7 @@ fn main() {
             let id = request_id(&message).unwrap();
             send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"capabilities\":{{\"positionEncoding\":\"utf-8\"}}}}}}", id));
             send("{\"jsonrpc\":\"2.0\",\"method\":\"experimental/serverStatus\",\"params\":{\"health\":\"ok\",\"quiescent\":true}}");
+            send("{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":\"rustAnalyzer/Indexing\",\"value\":{\"kind\":\"end\"}}}");
         } else if message.contains("\"method\":\"shutdown\"") {
             let id = request_id(&message).unwrap();
             send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}}", id));

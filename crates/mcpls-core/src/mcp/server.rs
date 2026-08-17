@@ -3506,6 +3506,8 @@ try:
             }})
             send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
                   "params": {"health": "ok", "quiescent": True}})
+            send({"jsonrpc": "2.0", "method": "$/progress",
+                  "params": {"token": "rustAnalyzer/Indexing", "value": {"kind": "end"}}})
         elif method == "textDocument/documentSymbol":
             if block_root and pathlib.Path.cwd() == block_root:
                 entered.write_text("entered")
@@ -5133,6 +5135,8 @@ while True:
         }})
         send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
               "params": {"health": "ok", "quiescent": True}})
+        send({"jsonrpc": "2.0", "method": "$/progress",
+              "params": {"token": "rustAnalyzer/Indexing", "value": {"kind": "end"}}})
         send({"jsonrpc": "2.0", "id": "watch-register", "method": "client/registerCapability",
               "params": {"registrations": [{
                   "id": "rust-files", "method": "workspace/didChangeWatchedFiles",

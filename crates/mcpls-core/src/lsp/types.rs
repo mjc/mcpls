@@ -125,18 +125,16 @@ pub enum LspNotification {
 
 impl LspNotification {
     /// Whether this notification proves Rust Analyzer's initial semantic index
-    /// is available. Quiescence is only a fallback for empty/older workspaces;
-    /// unrelated background work may keep it false indefinitely.
+    /// is available. The user-facing server status is deliberately ignored:
+    /// quiescence does not describe semantic readiness.
     #[must_use]
     pub fn completes_initial_load(&self) -> bool {
-        match self {
-            Self::Progress { token, value } => {
-                token.as_str() == Some("rustAnalyzer/Indexing")
+        matches!(
+            self,
+            Self::Progress { token, value }
+                if token.as_str() == Some("rustAnalyzer/Indexing")
                     && value.get("kind").and_then(serde_json::Value::as_str) == Some("end")
-            }
-            Self::ServerStatus(status) => status.quiescent,
-            _ => false,
-        }
+        )
     }
 
     /// Parse a notification from method name and params.
