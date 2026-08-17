@@ -358,11 +358,22 @@ impl McpClient {
         let (headers, body) = response
             .split_once("\r\n\r\n")
             .context("invalid HTTP response")?;
-        if !headers
+        let status_line = headers
             .lines()
             .next()
-            .is_some_and(|line| line.contains(" 200 "))
-        {
+            .context("HTTP response has no status")?;
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok());
+        let accepted = status_code.is_some_and(|code| {
+            if notification {
+                (200..300).contains(&code)
+            } else {
+                code == 200
+            }
+        });
+        if !accepted {
             bail!("{method} failed: {headers}");
         }
         for header in headers.lines().skip(1) {
@@ -454,9 +465,14 @@ mod tests {
                 } else {
                     format!("data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{result}}}\n")
                 };
+                let status = if request == 1 {
+                    "202 Accepted"
+                } else {
+                    "200 OK"
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nMcp-Session-Id: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\nMcp-Session-Id: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 )
