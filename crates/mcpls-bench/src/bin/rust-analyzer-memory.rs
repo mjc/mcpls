@@ -134,6 +134,12 @@ fn respond_to_server_request(client: &mut LspClient, message: &Value) -> Result<
     )
 }
 
+fn completes_initial_load(message: &Value) -> bool {
+    message["method"] == "$/progress"
+        && message["params"]["token"] == "rustAnalyzer/Indexing"
+        && message["params"]["value"]["kind"] == "end"
+}
+
 fn handle_message(
     client: &mut LspClient,
     message: &Value,
@@ -145,14 +151,8 @@ fn handle_message(
     }
     if message["method"] == "experimental/serverStatus" {
         *quiescent = message["params"]["quiescent"].as_bool().unwrap_or(false);
-        *initial_load_complete |= *quiescent;
     }
-    if message["method"] == "$/progress"
-        && message["params"]["token"] == "rustAnalyzer/Indexing"
-        && message["params"]["value"]["kind"] == "end"
-    {
-        *initial_load_complete = true;
-    }
+    *initial_load_complete |= completes_initial_load(message);
     Ok(())
 }
 
@@ -438,7 +438,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::process_summary;
+    use super::{completes_initial_load, process_summary};
 
     #[test]
     fn process_summary_identifies_analyzer_and_helpers() {
@@ -447,5 +447,28 @@ mod tests {
         assert_eq!(summary["process_count"], 2);
         assert_eq!(summary["rust_analyzer_count"], 1);
         assert_eq!(summary["process_names"][0], "rust-analyzer");
+    }
+
+    #[test]
+    fn server_quiescence_is_not_initial_load_completion() {
+        let status = serde_json::json!({
+            "method": "experimental/serverStatus",
+            "params": {"health": "ok", "quiescent": true}
+        });
+
+        assert!(!completes_initial_load(&status));
+    }
+
+    #[test]
+    fn indexing_end_completes_initial_load() {
+        let progress = serde_json::json!({
+            "method": "$/progress",
+            "params": {
+                "token": "rustAnalyzer/Indexing",
+                "value": {"kind": "end"}
+            }
+        });
+
+        assert!(completes_initial_load(&progress));
     }
 }
