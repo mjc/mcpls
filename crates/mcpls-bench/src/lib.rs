@@ -313,10 +313,10 @@ impl McpClient {
             .and_then(|items| items.iter().find(|item| item["type"] == "text"))
             .and_then(|item| item["text"].as_str())
             .map(str::trim);
-        if let Some(text) = text {
-            if let Ok(value) = serde_json::from_str(text) {
-                return Ok(value);
-            }
+        if let Some(text) = text
+            && let Ok(value) = serde_json::from_str(text)
+        {
+            return Ok(value);
         }
         result
             .get("structuredContent")
