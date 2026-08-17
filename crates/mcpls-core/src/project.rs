@@ -3746,6 +3746,16 @@ fn missing_call_hierarchy_item() -> crate::bridge::InspectSection<crate::bridge:
     )
 }
 
+async fn inspect_if_requested<T>(
+    requested: bool,
+    request: impl Future<Output = Result<T, String>>,
+) -> Option<Result<T, String>> {
+    if !requested {
+        return None;
+    }
+    Some(request.await)
+}
+
 impl SymbolHandleStore {
     fn new() -> Self {
         Self {
@@ -4985,12 +4995,120 @@ impl ProjectRuntime {
             per_file: request.budget.max_items,
             per_symbol: request.budget.max_items,
         };
+        let wants_hover = request.wants(InspectSymbolSectionKind::Declaration)
+            || request.wants(InspectSymbolSectionKind::Hover);
+        let wants_definitions = request.wants(InspectSymbolSectionKind::Definitions);
+        let wants_implementations = request.wants(InspectSymbolSectionKind::Implementations);
+        let wants_references = request.wants(InspectSymbolSectionKind::References);
+        let wants_calls = request.wants(InspectSymbolSectionKind::Calls);
+        let wants_tests = request.wants(InspectSymbolSectionKind::Tests);
+        let wants_runnables = request.wants(InspectSymbolSectionKind::Runnables);
+        let wants_diagnostics = request.wants(InspectSymbolSectionKind::Diagnostics);
+        let diagnostics_options = DiagnosticOptions {
+            item_limit: request.budget.max_items,
+            byte_limit: request.budget.max_bytes,
+            ..DiagnosticOptions::default()
+        };
 
-        if request.wants(InspectSymbolSectionKind::Declaration)
-            || request.wants(InspectSymbolSectionKind::Hover)
-        {
-            match self.hover(file_path.clone(), line, character).await {
+        let hover_request = Box::pin(async {
+            self.translator
+                .handle_hover(file_path.clone(), line, character)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let definitions_request = Box::pin(async {
+            self.translator
+                .handle_definition(file_path.clone(), line, character)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let implementations_request = Box::pin(async {
+            self.translator
+                .handle_implementation(file_path.clone(), line, character)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let references_request = Box::pin(async {
+            self.translator
+                .handle_references_page(file_path.clone(), line, character, true, limits, Some(0))
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let calls_request = Box::pin(async {
+            let prepared = self
+                .translator
+                .handle_call_hierarchy_prepare(file_path.clone(), line, character)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(first) = prepared.items.first() else {
+                return Ok(missing_call_hierarchy_item());
+            };
+            let provider = prepared.provider;
+            let item = serde_json::to_value(first).map_err(|error| error.to_string())?;
+            let (incoming, outgoing) = tokio::join!(
+                self.translator.handle_incoming_calls(item.clone(), limits),
+                self.translator.handle_outgoing_calls(item, limits),
+            );
+            let incoming = incoming.map_err(|error| error.to_string())?;
+            let outgoing = outgoing.map_err(|error| error.to_string())?;
+            let total = incoming.total_calls + outgoing.total_calls;
+            let returned = incoming.returned_calls + outgoing.returned_calls;
+            let truncated = incoming.truncated || outgoing.truncated;
+            Ok(InspectSection::available(
+                provider,
+                total,
+                returned,
+                truncated,
+                InspectCalls { incoming, outgoing },
+            ))
+        });
+        let tests_request = Box::pin(async {
+            self.translator
+                .request_semantic_discovery(
+                    file_path.clone(),
+                    line,
+                    character,
+                    SemanticDiscoveryKind::RelatedTests,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let runnables_request = Box::pin(async {
+            self.translator
+                .request_semantic_discovery(
+                    file_path.clone(),
+                    line,
+                    character,
+                    SemanticDiscoveryKind::Runnables,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let diagnostics_request = Box::pin(async {
+            self.translator
+                .handle_cached_diagnostics(&file_path, diagnostics_options)
+                .await
+                .map_err(|error| error.to_string())
+        });
+        let (hover, definitions, implementations, references, calls, tests, runnables, diagnostics) = tokio::join!(
+            inspect_if_requested(wants_hover, hover_request),
+            inspect_if_requested(wants_definitions, definitions_request),
+            inspect_if_requested(wants_implementations, implementations_request),
+            inspect_if_requested(wants_references, references_request),
+            inspect_if_requested(wants_calls, calls_request),
+            inspect_if_requested(wants_tests, tests_request),
+            inspect_if_requested(wants_runnables, runnables_request),
+            inspect_if_requested(wants_diagnostics, diagnostics_request),
+        );
+
+        if let Some(hover) = hover {
+            match hover {
                 Ok(hover) => {
+                    let mut hover = hover;
+                    let target = hover.range.as_ref().map_or((line, character), |range| {
+                        (range.start.line, range.start.character)
+                    });
+                    hover.symbol_handle = self.source_handle(&hover.source, target.0, target.1);
                     if request.wants(InspectSymbolSectionKind::Declaration) {
                         sections.declaration = InspectSection::available(
                             hover.provider.clone(),
@@ -5020,117 +5138,110 @@ impl ProjectRuntime {
                 }
             }
         }
-        if request.wants(InspectSymbolSectionKind::Definitions) {
-            sections.definitions = match self.definition(file_path.clone(), line, character).await {
-                Ok(result) => InspectSection::available(
-                    result.provider.clone(),
-                    result.locations.len(),
-                    result.locations.len(),
-                    result.truncated,
-                    result,
-                ),
-                Err(error) => InspectSection::unavailable(error),
-            };
-        }
-        if request.wants(InspectSymbolSectionKind::Implementations) {
-            sections.implementations = match self
-                .go_to_implementation(file_path.clone(), line, character)
-                .await
-            {
-                Ok(result) => InspectSection::available(
-                    result.provider.clone(),
-                    result.locations.len(),
-                    result.locations.len(),
-                    result.truncated,
-                    result,
-                ),
-                Err(error) => InspectSection::unavailable(error),
-            };
-        }
-        if request.wants(InspectSymbolSectionKind::References) {
-            sections.references = match self
-                .references(file_path.clone(), line, character, true, limits, Some(0))
-                .await
-            {
-                Ok(result) => InspectSection::available(
-                    result.provider.clone(),
-                    result.total_references,
-                    result.returned_references,
-                    result.truncated,
-                    result,
-                ),
-                Err(error) => InspectSection::unavailable(error),
-            };
-        }
-        if request.wants(InspectSymbolSectionKind::Calls) {
-            sections.calls = match self
-                .prepare_call_hierarchy(file_path.clone(), line, character)
-                .await
-            {
-                Ok(prepared) if prepared.items.is_empty() => missing_call_hierarchy_item(),
-                Ok(prepared) => {
-                    let provider = prepared.provider.clone();
-                    let item = serde_json::to_value(&prepared.items[0])
-                        .map_err(|error| error.to_string())?;
-                    match (
-                        self.incoming_calls(item.clone(), limits).await,
-                        self.outgoing_calls(item, limits).await,
-                    ) {
-                        (Ok(incoming), Ok(outgoing)) => {
-                            let total = incoming.total_calls + outgoing.total_calls;
-                            let returned = incoming.returned_calls + outgoing.returned_calls;
-                            let truncated = incoming.truncated || outgoing.truncated;
-                            InspectSection::available(
-                                provider,
-                                total,
-                                returned,
-                                truncated,
-                                InspectCalls { incoming, outgoing },
-                            )
-                        }
-                        (Err(error), _) | (_, Err(error)) => InspectSection::unavailable(error),
-                    }
+        if let Some(definitions) = definitions {
+            sections.definitions = match definitions {
+                Ok(mut result) => {
+                    self.attach_location_handles(&mut result.locations);
+                    InspectSection::available(
+                        result.provider.clone(),
+                        result.locations.len(),
+                        result.locations.len(),
+                        result.truncated,
+                        result,
+                    )
                 }
                 Err(error) => InspectSection::unavailable(error),
             };
         }
-        for (kind, section) in [
-            (InspectSymbolSectionKind::Tests, &mut sections.tests),
-            (InspectSymbolSectionKind::Runnables, &mut sections.runnables),
-        ] {
-            if !request.wants(kind) {
-                continue;
-            }
-            let discovery_kind = if kind == InspectSymbolSectionKind::Tests {
-                SemanticDiscoveryKind::RelatedTests
-            } else {
-                SemanticDiscoveryKind::Runnables
+        if let Some(implementations) = implementations {
+            sections.implementations = match implementations {
+                Ok(mut result) => {
+                    self.attach_location_handles(&mut result.locations);
+                    InspectSection::available(
+                        result.provider.clone(),
+                        result.locations.len(),
+                        result.locations.len(),
+                        result.truncated,
+                        result,
+                    )
+                }
+                Err(error) => InspectSection::unavailable(error),
             };
-            *section = match self
-                .semantic_discovery(file_path.clone(), line, character, discovery_kind)
-                .await
-            {
+        }
+        if let Some(references) = references {
+            sections.references = match references {
+                Ok(mut result) => {
+                    for group in &mut result.groups {
+                        for reference in &mut group.references {
+                            self.attach_location_handle(&mut reference.location);
+                        }
+                    }
+                    InspectSection::available(
+                        result.provider.clone(),
+                        result.total_references,
+                        result.returned_references,
+                        result.truncated,
+                        result,
+                    )
+                }
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        if let Some(calls) = calls {
+            sections.calls = match calls {
+                Ok(mut section) => {
+                    if let Some(calls) = section.data.as_mut() {
+                        for call in &mut calls.incoming.calls {
+                            let item = &mut call.from;
+                            item.symbol_handle = item.source.as_ref().and_then(|source| {
+                                self.source_handle(
+                                    source,
+                                    item.selection_range.start.line,
+                                    item.selection_range.start.character,
+                                )
+                            });
+                        }
+                        for call in &mut calls.outgoing.calls {
+                            let item = &mut call.to;
+                            item.symbol_handle = item.source.as_ref().and_then(|source| {
+                                self.source_handle(
+                                    source,
+                                    item.selection_range.start.line,
+                                    item.selection_range.start.character,
+                                )
+                            });
+                        }
+                    }
+                    section
+                }
+                Err(error) => InspectSection::unavailable(error),
+            };
+        }
+        for (result, section) in [
+            (tests, &mut sections.tests),
+            (runnables, &mut sections.runnables),
+        ] {
+            let Some(result) = result else { continue };
+            *section = match result {
                 Ok(result) if !result.supported => InspectSection::unsupported(
                     result.provider,
                     "provider does not support section",
                 ),
-                Ok(result) => InspectSection::available(
-                    result.provider.clone(),
-                    result.runnables.len(),
-                    result.runnables.len(),
-                    result.truncated,
-                    result,
-                ),
+                Ok(mut result) => {
+                    self.attach_location_handles(&mut result.locations);
+                    InspectSection::available(
+                        result.provider.clone(),
+                        result.runnables.len(),
+                        result.runnables.len(),
+                        result.truncated,
+                        result,
+                    )
+                }
                 Err(error) => InspectSection::unavailable(error),
             };
         }
-        if request.wants(InspectSymbolSectionKind::Diagnostics) {
-            let options = DiagnosticOptions {
-                item_limit: request.budget.max_items,
-                byte_limit: request.budget.max_bytes,
-                ..DiagnosticOptions::default()
-            };
-            sections.diagnostics = match self.cached_diagnostics(&file_path, options).await {
+        if let Some(diagnostics) = diagnostics {
+            sections.diagnostics = match diagnostics {
                 Ok(mut result) => {
                     result.diagnostics.retain(|diagnostic| {
                         symbol_range
@@ -9139,8 +9250,11 @@ async fn load_persisted_state(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
+    use tokio::io::BufReader;
+    use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
 
@@ -9542,6 +9656,128 @@ mod tests {
         );
         assert_eq!(result.sections.references.returned, 0);
         assert!(result.returned_bytes <= result.budget.max_bytes);
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_fetches_independent_sections_concurrently() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn inspected() {}\n").unwrap();
+        let uri = crate::bridge::path_to_uri(&source).unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+            implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(
+                true,
+            )),
+            references_provider: Some(lsp_types::OneOf::Left(true)),
+            definition_provider: Some(lsp_types::OneOf::Left(true)),
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) = translator_with_capabilities(&root, &server_id, capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let (release_server, hold_server) = oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let writer = Arc::new(TokioMutex::new(read_half_stdin));
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut requests = 0;
+            let mut responses = Vec::new();
+            while requests < 7 {
+                let message = read_framed_message(&mut reader).await;
+                let Some(id) = message.get("id").cloned() else {
+                    continue;
+                };
+                requests += 1;
+                let method = message["method"].as_str().unwrap().to_owned();
+                let uri = uri.clone();
+                let writer = Arc::clone(&writer);
+                responses.push(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let result = match method.as_str() {
+                        "textDocument/hover" => serde_json::json!({
+                            "contents": {"kind": "plaintext", "value": "inspected"}
+                        }),
+                        "textDocument/prepareCallHierarchy" => serde_json::json!([{
+                            "name": "inspected",
+                            "kind": 12,
+                            "uri": uri,
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 17}
+                            },
+                            "selectionRange": {
+                                "start": {"line": 0, "character": 3},
+                                "end": {"line": 0, "character": 12}
+                            }
+                        }]),
+                        "textDocument/definition" => serde_json::Value::Null,
+                        _ => serde_json::json!([]),
+                    };
+                    let mut writer = writer.lock().await;
+                    write_response(&mut *writer, &id, result).await;
+                }));
+            }
+            for response in responses {
+                response.await.unwrap();
+            }
+            let _ = hold_server.await;
+        });
+
+        let mut runtime = ProjectRuntime::new(translator);
+        let (_, _, source_hash, _) = runtime.translator.source_snapshot(&source).await.unwrap();
+        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
+            source,
+            1,
+            4,
+            SourceSnapshot::Hash(source_hash),
+        ));
+        let started = Instant::now();
+        let result = runtime
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: Some(handle),
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 5,
+                sections: vec![
+                    crate::bridge::InspectSymbolSectionKind::Declaration,
+                    crate::bridge::InspectSymbolSectionKind::Implementations,
+                    crate::bridge::InspectSymbolSectionKind::References,
+                    crate::bridge::InspectSymbolSectionKind::Calls,
+                ],
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 30_000,
+                    max_items: 80,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(450),
+            "independent sections ran serially in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result.sections.calls.completeness,
+            crate::bridge::InspectSectionCompleteness::Complete,
+            "{:?}",
+            result.sections.calls.reason
+        );
+        release_server.send(()).unwrap();
+        responder.await.unwrap();
     }
 
     #[test]

@@ -38,7 +38,7 @@ mod source_context;
 mod symbols;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod testing;
+pub(crate) mod testing;
 
 pub use actor::*;
 pub use dto::*;

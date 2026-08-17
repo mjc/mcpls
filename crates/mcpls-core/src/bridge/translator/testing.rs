@@ -88,11 +88,11 @@ pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticIn
     }
 }
 
-pub(super) struct FakeServer {
-    _write_half: Child,
-    _read_half: Child,
-    pub(super) read_half_stdin: ChildStdin,
-    pub(super) write_stdout: ChildStdout,
+pub(crate) struct FakeServer {
+    pub(crate) _write_half: Child,
+    pub(crate) _read_half: Child,
+    pub(crate) read_half_stdin: ChildStdin,
+    pub(crate) write_stdout: ChildStdout,
 }
 
 pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
@@ -133,7 +133,7 @@ pub(super) fn fake_lsp_client() -> (LspClient, FakeServer) {
 /// `reader` must be reused across calls, not recreated per message: a
 /// fresh `BufReader` would silently drop any bytes of a later message it
 /// over-read into its internal buffer while parsing an earlier one.
-pub(super) async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> JsonValue {
+pub(crate) async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>) -> JsonValue {
     let mut content_length = None;
     let mut line = String::new();
     loop {
@@ -154,7 +154,7 @@ pub(super) async fn read_framed_message(reader: &mut BufReader<&mut ChildStdout>
 }
 
 /// Writes a framed JSON-RPC success response, as a real LSP server would.
-pub(super) async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
+pub(crate) async fn write_response(stdin: &mut ChildStdin, id: &JsonValue, result: JsonValue) {
     let message = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -193,7 +193,7 @@ pub(super) async fn write_error_response(
 /// Builds a single-server translator routed to `server_id` for every tool,
 /// with a registered `LspServer` fixture carrying `capabilities` (default
 /// capabilities advertise nothing).
-pub(super) fn translator_with_capabilities(
+pub(crate) fn translator_with_capabilities(
     dir: &TempDir,
     server_id: &ServerId,
     capabilities: lsp_types::ServerCapabilities,
