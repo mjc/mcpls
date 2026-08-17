@@ -714,6 +714,21 @@ impl Translator {
     ///
     /// Returns an error when reactivation fails.
     pub async fn add_workspace_root(&mut self, root: PathBuf) -> Result<ProjectActivation> {
+        self.add_workspace_root_cancelled(root, CancellationToken::new())
+            .await
+    }
+
+    /// Add a root while honoring a caller-owned cancellation signal during
+    /// any required server replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when replacement activation fails.
+    pub async fn add_workspace_root_cancelled(
+        &mut self,
+        root: PathBuf,
+        cancellation: CancellationToken,
+    ) -> Result<ProjectActivation> {
         if self.workspace_roots.contains(&root) {
             return Ok(ProjectActivation::ready());
         }
@@ -725,7 +740,8 @@ impl Translator {
             return Ok(ProjectActivation::ready());
         }
         self.shutdown().await?;
-        self.activate_project_with_roots(roots).await
+        self.activate_project_with_roots_cancelled(roots, cancellation)
+            .await
     }
 
     /// Return this translator's interior-mutable document tracker.

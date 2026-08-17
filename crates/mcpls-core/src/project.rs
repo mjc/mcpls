@@ -5573,7 +5573,7 @@ impl ProjectRuntime {
             return self.activate_workspace_roots(roots, cancellation).await;
         }
         self.translator
-            .add_workspace_root(root)
+            .add_workspace_root_cancelled(root, cancellation)
             .await
             .map_err(|error| error.to_string())
     }
