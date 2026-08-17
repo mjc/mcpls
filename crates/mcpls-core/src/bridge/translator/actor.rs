@@ -270,20 +270,21 @@ fn planned_server_roots(servers: &[PlannedServer]) -> HashMap<ServerId, Vec<Path
         .collect()
 }
 
-fn active_builtin_aliases(
-    configs: &[LspServerConfig],
+fn active_builtin_aliases<'a>(
+    configs: impl IntoIterator<Item = &'a LspServerConfig>,
     successful: &HashSet<ServerId>,
     roots_by_id: &HashMap<ServerId, Vec<PathBuf>>,
 ) -> Vec<ActiveLanguageAlias> {
+    let configs = configs.into_iter().collect::<Vec<_>>();
     let mut aliases = Vec::new();
-    for specialist in configs {
+    for specialist in configs.iter().copied() {
         if !successful.contains(&specialist.id()) {
             continue;
         }
         let Some(profile) = specialist.builtin_profile() else {
             continue;
         };
-        for generic in configs.iter().filter(|generic| {
+        for generic in configs.iter().copied().filter(|generic| {
             profile
                 .supersedes
                 .iter()
@@ -505,12 +506,9 @@ impl Translator {
         lock_std(&self.active_language_aliases).clear();
         let all_configs = lock_std(&self.project_lsp_configs).clone();
         let servers = self.applicable_servers(&all_configs, &roots);
-        let configs = servers
-            .iter()
-            .map(|server| server.config.clone())
-            .collect::<Vec<_>>();
+        drop(all_configs);
         *lock_std(&self.evaluated_lsp_roots) = planned_server_roots(&servers);
-        let router = ToolRouter::from_configs(configs.iter())?;
+        let router = ToolRouter::from_configs(servers.iter().map(|server| &server.config))?;
         *lock_std(&self.router) = router;
 
         let configured_ids = servers
@@ -532,7 +530,7 @@ impl Translator {
             lock_std(&self.server_configs).remove(&id);
             self.document_tracker.forget_server(&id);
         }
-        if configs.is_empty() {
+        if servers.is_empty() {
             self.clear_expected_servers();
             self.actor_notification_cache.set_diagnostics_route_count(0);
             self.set_workspace_roots(roots);
@@ -547,7 +545,7 @@ impl Translator {
             let active_ids = lock_std(&self.lsp_servers).keys().cloned().collect();
             let active_roots = lock_std(&self.project_lsp_roots).clone();
             lock_std(&self.active_language_aliases).clone_from(&active_builtin_aliases(
-                &configs,
+                servers.iter().map(|server| &server.config),
                 &active_ids,
                 &active_roots,
             ));
@@ -679,7 +677,7 @@ impl Translator {
         }
         let active_roots = lock_std(&self.project_lsp_roots).clone();
         lock_std(&self.active_language_aliases).clone_from(&active_builtin_aliases(
-            &configs,
+            servers.iter().map(|server| &server.config),
             &successful,
             &active_roots,
         ));
