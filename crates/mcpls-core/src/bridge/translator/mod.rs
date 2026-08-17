@@ -129,6 +129,9 @@ pub struct Translator {
     project_lsp_configs: Arc<StdMutex<Vec<LspServerConfig>>>,
     /// Workspace roots used by each active project server.
     project_lsp_roots: Arc<StdMutex<HashMap<ServerId, Vec<PathBuf>>>>,
+    /// Effective roots evaluated for every applicable project server.
+    /// Includes unavailable optional servers so reuse stays stable after evaluation.
+    evaluated_lsp_roots: Arc<StdMutex<HashMap<ServerId, Vec<PathBuf>>>>,
     /// Values removed from actor-delivered server output.
     redaction_policy: RedactionPolicy,
     /// Maximum marker-search depth for project activation.
@@ -174,6 +177,7 @@ impl Translator {
             actor_notification_cache: NotificationCache::new(),
             project_lsp_configs: Arc::new(StdMutex::new(Vec::new())),
             project_lsp_roots: Arc::new(StdMutex::new(HashMap::new())),
+            evaluated_lsp_roots: Arc::new(StdMutex::new(HashMap::new())),
             redaction_policy: RedactionPolicy::default(),
             heuristics_max_depth: None,
             position_encodings: crate::config::default_position_encodings(),

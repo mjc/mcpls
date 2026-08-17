@@ -351,23 +351,18 @@ impl Translator {
     /// Return whether active servers already own exactly these roots.
     #[must_use]
     pub fn has_active_workspace_roots(&self, roots: &[PathBuf]) -> bool {
-        let clients = lock_std(&self.lsp_clients);
-        let registered_roots = lock_std(&self.project_lsp_roots);
-        let configs = lock_std(&self.project_lsp_configs);
-        !clients.is_empty()
-            && self.has_workspace_roots(roots)
-            && clients.keys().all(|id| {
-                configs
-                    .iter()
-                    .find(|config| config.id() == *id)
-                    .zip(registered_roots.get(id))
-                    .is_some_and(|(config, registered)| {
-                        same_workspace_roots(
-                            registered,
-                            &self.server_workspace_roots(config, roots),
-                        )
-                    })
+        if !self.has_workspace_roots(roots) || lock_std(&self.lsp_clients).is_empty() {
+            return false;
+        }
+        let configs = lock_std(&self.project_lsp_configs).clone();
+        let current = configs
+            .iter()
+            .filter_map(|config| {
+                let server_roots = self.server_workspace_roots(config, roots);
+                (!server_roots.is_empty()).then(|| (config.id(), server_roots))
             })
+            .collect::<HashMap<_, _>>();
+        *lock_std(&self.evaluated_lsp_roots) == current
     }
 
     /// Return whether this translator owns exactly these logical project roots.
@@ -508,6 +503,10 @@ impl Translator {
             })
             .cloned()
             .collect::<Vec<_>>();
+        *lock_std(&self.evaluated_lsp_roots) = configs
+            .iter()
+            .map(|config| (config.id(), self.server_workspace_roots(config, &roots)))
+            .collect();
         let router = ToolRouter::from_configs(configs.iter())?;
         *lock_std(&self.router) = router;
 
@@ -703,6 +702,7 @@ impl Translator {
         self.shutdown_servers().await;
         lock_std(&self.lsp_clients).clear();
         lock_std(&self.project_lsp_roots).clear();
+        lock_std(&self.evaluated_lsp_roots).clear();
         lock_std(&self.active_language_aliases).clear();
         self.clear_expected_servers();
         Ok(())
@@ -1298,6 +1298,33 @@ mod tests {
         assert_eq!(effective, vec![nested]);
     }
 
+    #[tokio::test]
+    async fn newly_applicable_server_invalidates_active_root_reuse() {
+        use crate::bridge::translator::testing::fake_lsp_client;
+
+        let root = TempDir::new().expect("temporary workspace");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n")
+            .expect("Rust workspace marker");
+
+        let rust = LspServerConfig::rust_analyzer();
+        let go = LspServerConfig::gopls();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![rust.clone(), go.clone()], Some(10));
+        let roots = vec![root.path().to_path_buf()];
+        translator.set_workspace_roots(roots.clone());
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(rust.id(), client);
+        translator.register_server_roots(rust.id(), roots.clone());
+        lock_std(&translator.evaluated_lsp_roots).insert(rust.id(), roots.clone());
+
+        assert!(translator.has_active_workspace_roots(&roots));
+
+        std::fs::write(root.path().join("go.mod"), "module example.test\n")
+            .expect("Go workspace marker");
+        assert_eq!(translator.server_workspace_roots(&go, &roots), roots);
+
+        assert!(!translator.has_active_workspace_roots(&roots));
+    }
     #[tokio::test]
     async fn unavailable_optional_builtin_keeps_project_structural_only() {
         let root = TempDir::new().expect("temporary project");
