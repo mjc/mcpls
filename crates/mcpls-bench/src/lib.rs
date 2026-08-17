@@ -312,8 +312,17 @@ impl McpClient {
             .as_array()
             .and_then(|items| items.iter().find(|item| item["type"] == "text"))
             .and_then(|item| item["text"].as_str())
-            .context("MCP tool returned no text content")?;
-        serde_json::from_str(text).with_context(|| format!("parsing {name} result"))
+            .map(str::trim);
+        if let Some(text) = text {
+            if let Ok(value) = serde_json::from_str(text) {
+                return Ok(value);
+            }
+        }
+        result
+            .get("structuredContent")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .with_context(|| format!("parsing {name} result"))
     }
 
     fn request(
@@ -456,7 +465,7 @@ mod tests {
                     .read_exact(&mut request_body)
                     .expect("read test body");
                 let result = if request == 2 {
-                    r#"{"content":[{"type":"text","text":"{\"ok\":true}"}]}"#
+                    r#"{"content":[{"type":"text","text":"Structured result available in structuredContent."}],"structuredContent":{"ok":true}}"#
                 } else {
                     "{}"
                 };
