@@ -3399,6 +3399,7 @@ struct ProjectRuntime {
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
+    activation_health: ActivationHealth,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
 }
@@ -3874,9 +3875,18 @@ impl ProjectRuntime {
             deferred_results,
             deferred_scope,
             inline_module_checks: HashMap::new(),
+            activation_health: ActivationHealth::Ready,
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
         }
+    }
+
+    const fn record_activation(&mut self, health: ActivationHealth) {
+        self.activation_health = health;
+    }
+
+    fn readiness_status(&self) -> ProjectStatus {
+        activation_status(self.activation_health, self.translator.is_initializing())
     }
 
     const fn begin_transition(&mut self) {
@@ -6237,14 +6247,14 @@ fn mark_project_started(
     runtime: &mut ProjectRuntime,
 ) {
     runtime.reset_automatic_restart();
-    let health = activation.health();
+    runtime.record_activation(activation.health());
     spawn_notification_forwarders(
         activation.into_notification_receivers(),
         actor_sender,
         &channels.gate,
         runtime.generation(),
     );
-    publish_project_readiness(channels, state, runtime, health);
+    publish_project_readiness(channels, state, runtime);
 }
 
 const fn activation_status(health: ActivationHealth, initializing: bool) -> ProjectStatus {
@@ -6264,13 +6274,9 @@ fn publish_project_readiness(
     channels: &ProjectActorChannels,
     state: &mut ProjectState,
     runtime: &ProjectRuntime,
-    health: ActivationHealth,
 ) {
     state.sync_runtime(runtime);
-    channels.publish_status(
-        state,
-        activation_status(health, runtime.translator.is_initializing()),
-    );
+    channels.publish_status(state, runtime.readiness_status());
 }
 
 async fn stop_project_runtime(
@@ -6931,12 +6937,7 @@ async fn handle_project_request(
             let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, &server_id, notification);
             if was_initializing && !runtime.translator.is_initializing() {
-                let health = if state.status == ProjectStatus::Degraded {
-                    ActivationHealth::Degraded
-                } else {
-                    ActivationHealth::Ready
-                };
-                publish_project_readiness(channels, state, runtime, health);
+                publish_project_readiness(channels, state, runtime);
             }
         }
         ProjectRequest::ServerExited { generation } => {
@@ -11485,6 +11486,54 @@ while True:
         .await
         .unwrap();
         assert_eq!(state.runtime().generation(), first.runtime().generation());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn degraded_activation_stays_degraded_after_initial_indexing() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let counter = root.path().join("spawn-count");
+        let lsp = root.path().join("ready-lsp.py");
+        fs::write(&lsp, DUPLICATE_ACTIVATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut ready = crate::config::LspServerConfig::rust_analyzer();
+        ready.command = lsp.display().to_string();
+        ready.heuristics = None;
+        ready.env = HashMap::from([(
+            "MCPLS_SPAWN_COUNTER".to_string(),
+            counter.display().to_string(),
+        )]);
+        let mut unavailable = ready.clone();
+        unavailable.language_id = "unavailable".to_string();
+        unavailable.command = "/definitely/missing/mcpls-lsp".to_string();
+        unavailable.env.clear();
+
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![ready, unavailable], Some(3));
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        actor.activate(root.path().to_path_buf()).await.unwrap();
+        let state = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() != ProjectStatus::Starting {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(state.status(), ProjectStatus::Degraded);
     }
 
     #[tokio::test]
