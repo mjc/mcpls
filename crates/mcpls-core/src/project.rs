@@ -9302,6 +9302,36 @@ mod tests {
     }
 
     #[test]
+    fn project_actor_replacements_start_without_semantic_handles_or_edit_plans() {
+        let mut old_runtime = ProjectRuntime::new(Translator::new());
+        let handle = old_runtime.symbol_handles.insert(StoredSymbolTarget::new(
+            PathBuf::from("src/lib.rs"),
+            1,
+            2,
+            SourceSnapshot::Version(1),
+        ));
+        let plan = EditPlan::new(
+            "project".to_owned(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                PathBuf::from("src/lib.rs"),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace".to_owned()],
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        old_runtime.edit_plans.insert(plan).unwrap();
+
+        let mut replacement_runtime = ProjectRuntime::new(Translator::new());
+        assert!(replacement_runtime.symbol_handles.resolve(&handle).is_err());
+        assert!(replacement_runtime.edit_plans.get(&plan_id).is_none());
+    }
+
+    #[test]
     fn cancelled_inspect_symbol_request_is_discarded_before_actor_work() {
         let (reply, response) = oneshot::channel();
         drop(response);
@@ -10909,6 +10939,49 @@ while True:
         break
 "#;
 
+    #[cfg(unix)]
+    const PROFILE_FAILURE_LSP: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+def read_message():
+    headers = b""
+    while b"\r\n\r\n" not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(message):
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    if message.get("method") == "initialize":
+        if "bad-feature" in json.dumps(message.get("params")):
+            sys.exit(2)
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {
+            "capabilities": {"positionEncoding": "utf-8"}
+        }})
+        send({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+              "params": {"health": "ok", "quiescent": True}})
+    elif message.get("method") == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+        break
+"#;
+
     fn write_compatible_roots_with_changed_manifests(roots: &[&Path]) {
         for root in roots {
             fs::write(
@@ -11946,7 +12019,22 @@ while True:
         let identity =
             ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
         let registry = ProjectRegistry::new(2);
-        registry.add(identity.clone()).await.unwrap();
+        let actor = registry.add(identity.clone()).await.unwrap();
+        let plan = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                root.path().join("lib.rs"),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "fn stale_target() {}\n",
+                "fn fresh_target() {}\n",
+            )],
+            vec!["replace stale target".to_owned()],
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        actor.store_edit_plan(plan).await.unwrap();
 
         let profile = crate::config::CargoFeatureProfile {
             features: vec!["serde".to_owned(), "alloc".to_owned(), "serde".to_owned()],
@@ -11961,6 +12049,144 @@ while True:
         assert_eq!(registry.identity(&project_id).await.unwrap(), identity);
         assert_eq!(
             registry.cargo_features(&project_id).await.unwrap(),
+            Some(profile.normalized())
+        );
+        let replacement = registry.actor_for_project(&project_id).await.unwrap();
+        assert!(
+            replacement
+                .inspect_edit_plan(plan_id, project_id.to_string())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_feature_update_rolls_back_after_failed_activation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        let lsp = root.path().join("profile-failure-lsp.py");
+        fs::write(&lsp, PROFILE_FAILURE_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut server = crate::config::LspServerConfig::rust_analyzer();
+        server.command = lsp.display().to_string();
+        server.heuristics = None;
+        let old_profile = crate::config::CargoFeatureProfile {
+            features: vec!["good-feature".to_owned()],
+            all_features: false,
+            no_default_features: false,
+        };
+        let registry = ProjectRegistry::new(4);
+        let project_id = ProjectId::new("rollback-profile").unwrap();
+        let actor = registry
+            .add_with_config(
+                ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap()),
+                Some(ProjectConfig {
+                    lsp_servers: Some(vec![server]),
+                    heuristics_max_depth: Some(3),
+                    redaction_patterns: None,
+                    persist_environment: false,
+                    edit_safety: None,
+                    cargo_features: Some(old_profile.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let state = registry.activate(&project_id).await.unwrap();
+        assert!(matches!(
+            state.status(),
+            ProjectStatus::Starting | ProjectStatus::Ready
+        ));
+        let state = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = actor.query().await.unwrap();
+                if state.status() == ProjectStatus::Ready {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.status(), ProjectStatus::Ready);
+
+        let result = registry
+            .update_cargo_features(
+                &project_id,
+                crate::config::CargoFeatureProfile {
+                    features: vec!["bad-feature".to_owned()],
+                    all_features: false,
+                    no_default_features: false,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectRegistryError::Actor(ProjectActorError::Operation(_)))
+        ));
+        assert_eq!(
+            registry.cargo_features(&project_id).await.unwrap(),
+            Some(old_profile)
+        );
+        let current = registry.actor_for_project(&project_id).await.unwrap();
+        assert!(current.sender.same_channel(&actor.sender));
+        assert_eq!(
+            current.query().await.unwrap().status(),
+            ProjectStatus::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn project_registry_restores_persisted_cargo_feature_profile() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let store = ProjectRegistrationStore::new(root.path().join("state/projects.json"));
+        let profile = crate::config::CargoFeatureProfile {
+            features: vec!["serde".to_owned(), "alloc".to_owned()],
+            all_features: false,
+            no_default_features: true,
+        };
+        let registry = ProjectRegistry::new(2).with_persistence(store.clone());
+        registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    ProjectId::new("persisted-profile").unwrap(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ),
+                Some(ProjectConfig {
+                    cargo_features: Some(profile.clone()),
+                    ..ProjectConfig::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let restored = ProjectRegistry::new(2).with_persistence(store);
+        assert_eq!(restored.restore_from_persistence().await.unwrap(), 1);
+        assert_eq!(
+            restored
+                .cargo_features(&ProjectId::new("persisted-profile").unwrap())
+                .await
+                .unwrap(),
             Some(profile.normalized())
         );
     }
@@ -12923,6 +13149,80 @@ while True:
         let (resolved_id, resolved_actor) = registry.project_for_path(&file).await.unwrap();
         assert_eq!(resolved_id, project_id);
         assert!(resolved_actor.sender.same_channel(&actor.sender));
+    }
+
+    #[tokio::test]
+    async fn linked_worktrees_share_only_when_cargo_profiles_match() {
+        let (repository, worktrees, roots) = compatible_worktree_fixture();
+        let project_id = ProjectId::new("profile-linked").unwrap();
+        let mut server = crate::config::LspServerConfig::rust_analyzer();
+        server.command = "rust-analyzer".to_owned();
+        server.heuristics = None;
+        let mut template_source = Translator::new();
+        template_source.set_lsp_configs(vec![server], Some(3));
+        let registry =
+            ProjectRegistry::with_translator_template(4, template_source.configuration_template());
+        let same_profile = ProjectConfig {
+            cargo_features: Some(crate::config::CargoFeatureProfile {
+                features: vec!["shared".to_owned()],
+                all_features: false,
+                no_default_features: false,
+            }),
+            ..ProjectConfig::default()
+        };
+        let different_profile = ProjectConfig {
+            cargo_features: Some(crate::config::CargoFeatureProfile {
+                features: vec!["isolated".to_owned()],
+                all_features: false,
+                no_default_features: false,
+            }),
+            ..ProjectConfig::default()
+        };
+        let repository_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        registry
+            .add_with_config(
+                ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(&roots[0]).unwrap())
+                    .with_repository_identity(repository_identity),
+                Some(same_profile.clone()),
+            )
+            .await
+            .unwrap();
+
+        let linked_identity = GitRepositoryIdentity::discover(worktrees[0].path())
+            .unwrap()
+            .unwrap();
+        let shared = registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktrees[0].path()).unwrap(),
+                )
+                .with_repository_identity(linked_identity),
+                Some(same_profile),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 1);
+        assert_eq!(shared.query().await.unwrap().workspace_roots().len(), 2);
+
+        let isolated_identity = GitRepositoryIdentity::discover(worktrees[1].path())
+            .unwrap()
+            .unwrap();
+        let isolated = registry
+            .add_with_config(
+                ProjectIdentity::new(
+                    project_id.clone(),
+                    CanonicalRoot::new(worktrees[1].path()).unwrap(),
+                )
+                .with_repository_identity(isolated_identity),
+                Some(different_profile),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 2);
+        assert!(!shared.sender.same_channel(&isolated.sender));
     }
 
     #[cfg(unix)]
