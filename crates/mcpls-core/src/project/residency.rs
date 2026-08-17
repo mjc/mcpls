@@ -277,6 +277,7 @@ impl RustResidencyController {
             .actors
             .get(&victim)
             .and_then(mpsc::WeakSender::upgrade)?;
+        drop(state);
         Some((sender, idle_for))
     }
 
