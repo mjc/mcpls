@@ -213,49 +213,25 @@ impl RustResidencyController {
                 RustResidencyMode::Resume => idle_timeout,
                 RustResidencyMode::Activate => Duration::ZERO,
             };
-            let decision =
-                self.state()
-                    .budget
-                    .pin_with_minimum_idle(group, &excluded, minimum_idle);
+            let decision = self.pin_group(group, &excluded, minimum_idle);
             match decision {
                 ResidencyDecision::Admit | ResidencyDecision::Reuse => {
                     return self.guard(group);
                 }
                 ResidencyDecision::Evict(victim) => {
-                    let idle_for = self.state().budget.idle_for(victim);
-                    let sender = self
-                        .state()
-                        .actors
-                        .get(&victim)
-                        .and_then(mpsc::WeakSender::upgrade);
-                    let Some(sender) = sender else {
+                    let Some((sender, idle_for)) = self.eviction_target(victim) else {
                         self.remove(victim);
                         continue;
                     };
-                    let (reply, response) = oneshot::channel();
-                    if sender
-                        .send(ProjectRequest::Suspend {
-                            reply,
-                            dormancy: ProjectDormancy::new(
-                                ProjectDormancyReason::ResidencyEviction,
-                                Some(idle_for),
-                            ),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        self.remove(victim);
-                        continue;
-                    }
-                    match response.await {
-                        Ok(Ok(())) => {
-                            self.state().budget.replace(victim, group);
+                    match self.suspend_victim(sender, idle_for).await {
+                        SuspensionOutcome::Completed => {
+                            self.replace_group(victim, group);
                             return self.guard(group);
                         }
-                        Ok(Err(())) => {
+                        SuspensionOutcome::Refused => {
                             excluded.insert(victim);
                         }
-                        Err(_) => self.remove(victim),
+                        SuspensionOutcome::Unavailable => self.remove(victim),
                     }
                 }
                 ResidencyDecision::Wait => {
@@ -278,6 +254,60 @@ impl RustResidencyController {
             }
             drop(transition);
         }
+    }
+
+    fn pin_group(
+        &self,
+        group: RustGroupId,
+        excluded: &HashSet<RustGroupId>,
+        minimum_idle: Duration,
+    ) -> ResidencyDecision {
+        self.state()
+            .budget
+            .pin_with_minimum_idle(group, excluded, minimum_idle)
+    }
+
+    fn eviction_target(
+        &self,
+        victim: RustGroupId,
+    ) -> Option<(mpsc::Sender<ProjectRequest>, Duration)> {
+        let state = self.state();
+        let idle_for = state.budget.idle_for(victim);
+        let sender = state
+            .actors
+            .get(&victim)
+            .and_then(mpsc::WeakSender::upgrade)?;
+        Some((sender, idle_for))
+    }
+
+    async fn suspend_victim(
+        &self,
+        sender: mpsc::Sender<ProjectRequest>,
+        idle_for: Duration,
+    ) -> SuspensionOutcome {
+        let (reply, response) = oneshot::channel();
+        if sender
+            .send(ProjectRequest::Suspend {
+                reply,
+                dormancy: ProjectDormancy::new(
+                    ProjectDormancyReason::ResidencyEviction,
+                    Some(idle_for),
+                ),
+            })
+            .await
+            .is_err()
+        {
+            return SuspensionOutcome::Unavailable;
+        }
+        match response.await {
+            Ok(Ok(())) => SuspensionOutcome::Completed,
+            Ok(Err(())) => SuspensionOutcome::Refused,
+            Err(_) => SuspensionOutcome::Unavailable,
+        }
+    }
+
+    fn replace_group(&self, victim: RustGroupId, group: RustGroupId) {
+        self.state().budget.replace(victim, group);
     }
 
     pub(super) fn try_acquire_existing(&self, group: RustGroupId) -> Option<RustResidencyGuard> {
@@ -320,6 +350,13 @@ impl RustResidencyController {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuspensionOutcome {
+    Completed,
+    Refused,
+    Unavailable,
 }
 
 pub(super) struct RustResidencyGuard {
