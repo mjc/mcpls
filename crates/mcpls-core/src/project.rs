@@ -3,6 +3,7 @@
 mod residency;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::DeferredResourceReference;
 use crate::bridge::convert_code_action_or_command;
@@ -5547,9 +5549,10 @@ impl ProjectRuntime {
     async fn activate_workspace_roots(
         &mut self,
         roots: Vec<PathBuf>,
+        cancellation: CancellationToken,
     ) -> Result<ProjectActivation, String> {
         self.translator
-            .activate_project_with_roots(roots)
+            .activate_project_with_roots_cancelled(roots, cancellation)
             .await
             .map_err(|error| error.to_string())
     }
@@ -5558,6 +5561,7 @@ impl ProjectRuntime {
         &mut self,
         root: PathBuf,
         status: ProjectStatus,
+        cancellation: CancellationToken,
     ) -> Result<ProjectActivation, String> {
         if status == ProjectStatus::Degraded
             && !self.has_active_workspace_roots(self.translator.workspace_roots())
@@ -5566,7 +5570,7 @@ impl ProjectRuntime {
             if !roots.contains(&root) {
                 roots.push(root);
             }
-            return self.activate_workspace_roots(roots).await;
+            return self.activate_workspace_roots(roots, cancellation).await;
         }
         self.translator
             .add_workspace_root(root)
@@ -5574,7 +5578,10 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    async fn restart(&mut self) -> Result<ProjectActivation, String> {
+    async fn restart(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<ProjectActivation, String> {
         let roots = self.translator.workspace_roots().to_vec();
         if roots.is_empty() {
             return Ok(ProjectActivation::ready());
@@ -5583,10 +5590,7 @@ impl ProjectRuntime {
             return Ok(ProjectActivation::ready());
         }
         self.shutdown().await?;
-        self.translator
-            .activate_project_with_roots(roots)
-            .await
-            .map_err(|error| error.to_string())
+        self.activate_workspace_roots(roots, cancellation).await
     }
 
     fn summary(&self) -> ProjectRuntimeSummary {
@@ -5633,6 +5637,7 @@ fn diagnostics_are_error_free(result: &DiagnosticsResult) -> bool {
         .all(|diagnostic| !matches!(diagnostic.severity, DiagnosticSeverity::Error))
 }
 
+#[allow(clippy::large_futures)]
 async fn recover_project_after_server_exit(
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
     channels: &ProjectActorChannels,
@@ -5660,7 +5665,14 @@ async fn recover_project_after_server_exit(
         if !channels.gate.is_accepting() {
             return;
         }
-        match runtime.restart().await {
+        let cancellation = CancellationToken::new();
+        match run_cancellable_transition(
+            &channels.gate,
+            cancellation.clone(),
+            runtime.restart(cancellation),
+        )
+        .await
+        {
             Ok(notification_receivers) => {
                 state.last_error = None;
                 mark_project_started(
@@ -5688,6 +5700,7 @@ async fn recover_project_after_server_exit(
     }
 }
 
+#[allow(clippy::large_futures)]
 async fn handle_server_exit(
     generation: u64,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
@@ -6024,7 +6037,14 @@ async fn resume_project_runtime(
     runtime.begin_transition();
     state.last_error = None;
     channels.publish_status(state, ProjectStatus::Starting);
-    match runtime.activate_workspace_roots(roots).await {
+    let cancellation = CancellationToken::new();
+    match run_cancellable_transition(
+        &channels.gate,
+        cancellation.clone(),
+        runtime.activate_workspace_roots(roots, cancellation),
+    )
+    .await
+    {
         Ok(activation) => {
             mark_project_started(activation, actor_sender, channels, state, runtime);
         }
@@ -6184,10 +6204,38 @@ async fn suspend_project_runtime(
     Ok(())
 }
 
+const PROJECT_SHUTDOWN_CANCELLED: &str = "project shutdown requested";
+
+async fn run_cancellable_transition<T, F>(
+    gate: &ProjectRequestGate,
+    cancellation: CancellationToken,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    if !gate.is_accepting() {
+        cancellation.cancel();
+        let _ = operation.await;
+        return Err(PROJECT_SHUTDOWN_CANCELLED.to_string());
+    }
+
+    tokio::select! {
+        result = &mut operation => result,
+        () = gate.wait_for_rejection() => {
+            cancellation.cancel();
+            let _ = operation.await;
+            Err(PROJECT_SHUTDOWN_CANCELLED.to_string())
+        }
+    }
+}
+
 // This exhaustive dispatcher keeps actor state transitions in one place; each
 // request arm is intentionally small and independently typed.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::large_stack_frames)]
+#[allow(clippy::large_futures)]
 async fn handle_project_request(
     request: ProjectRequest,
     actor_sender: &mpsc::WeakSender<ProjectRequest>,
@@ -6220,7 +6268,14 @@ async fn handle_project_request(
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
-            match runtime.translator.activate_project(root).await {
+            let cancellation = CancellationToken::new();
+            match run_cancellable_transition(
+                &channels.gate,
+                cancellation.clone(),
+                runtime.activate_workspace_roots(vec![root], cancellation),
+            )
+            .await
+            {
                 Ok(notification_receivers) => {
                     mark_project_started(
                         notification_receivers,
@@ -6233,11 +6288,11 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    channels.publish_failure(state, error.to_string());
+                    channels.publish_failure(state, error.clone());
                     if let Some(residency) = residency {
                         residency.remove();
                     }
-                    let _ = reply.send(Err(error.to_string()));
+                    let _ = reply.send(Err(error));
                 }
             }
         }
@@ -6250,7 +6305,14 @@ async fn handle_project_request(
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
-            match runtime.activate_workspace_roots(roots).await {
+            let cancellation = CancellationToken::new();
+            match run_cancellable_transition(
+                &channels.gate,
+                cancellation.clone(),
+                runtime.activate_workspace_roots(roots, cancellation),
+            )
+            .await
+            {
                 Ok(notification_receivers) => {
                     mark_project_started(
                         notification_receivers,
@@ -6614,7 +6676,14 @@ async fn handle_project_request(
             runtime.begin_transition();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Restarting);
-            match runtime.add_workspace_root(root, previous_status).await {
+            let cancellation = CancellationToken::new();
+            match run_cancellable_transition(
+                &channels.gate,
+                cancellation.clone(),
+                runtime.add_workspace_root(root, previous_status, cancellation),
+            )
+            .await
+            {
                 Ok(notification_receivers) => {
                     mark_project_started(
                         notification_receivers,
@@ -6781,7 +6850,14 @@ async fn handle_project_request(
             state.sync_runtime(runtime);
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Restarting);
-            match runtime.restart().await {
+            let cancellation = CancellationToken::new();
+            match run_cancellable_transition(
+                &channels.gate,
+                cancellation.clone(),
+                runtime.restart(cancellation),
+            )
+            .await
+            {
                 Ok(notification_receivers) => {
                     mark_project_started(
                         notification_receivers,
@@ -9253,7 +9329,7 @@ mod tests {
             panic!("expected eviction to suspend the victim");
         };
 
-        let recovery = tokio::time::timeout(
+        let recovery = Box::pin(tokio::time::timeout(
             Duration::from_secs(1),
             handle_server_exit(
                 0,
@@ -9263,7 +9339,7 @@ mod tests {
                 &mut runtime,
                 Some(&residency),
             ),
-        )
+        ))
         .await;
         assert!(recovery.is_ok(), "server-exit recovery deadlocked");
 
@@ -9626,19 +9702,18 @@ mod tests {
             SourceSnapshot::Version(1),
         ));
 
-        let result = runtime
-            .inspect_symbol(InspectSymbolRequest {
-                symbol_handle: Some(handle),
-                query: None,
-                kind: None,
-                path: None,
-                container: None,
-                candidate_limit: 10,
-                sections: vec![crate::bridge::InspectSymbolSectionKind::Diagnostics],
-                budget: crate::bridge::InspectSymbolBudget::default(),
-            })
-            .await
-            .unwrap();
+        let result = Box::pin(runtime.inspect_symbol(InspectSymbolRequest {
+            symbol_handle: Some(handle),
+            query: None,
+            kind: None,
+            path: None,
+            container: None,
+            candidate_limit: 10,
+            sections: vec![crate::bridge::InspectSymbolSectionKind::Diagnostics],
+            budget: crate::bridge::InspectSymbolBudget::default(),
+        }))
+        .await
+        .unwrap();
 
         assert!(matches!(
             result.resolution,
@@ -10965,6 +11040,17 @@ while True:
 "#;
 
     #[cfg(unix)]
+    const CANCELLABLE_INITIALIZATION_LSP: &str = r#"#!/usr/bin/env python3
+import os
+import pathlib
+import time
+
+pathlib.Path(os.environ["MCPLS_PID_FILE"]).write_text(str(os.getpid()))
+while True:
+    time.sleep(1)
+"#;
+
+    #[cfg(unix)]
     const PROFILE_FAILURE_LSP: &str = r#"#!/usr/bin/env python3
 import json
 import sys
@@ -11248,12 +11334,68 @@ while True:
             .send(ProjectRequest::ServerExited { generation: 1 })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_millis(50), actor.shutdown())
-            .await
-            .expect("shutdown should cancel pending recovery promptly")
-            .unwrap();
+        let shutdown = tokio::time::timeout(Duration::from_millis(50), actor.shutdown()).await;
+        assert!(
+            shutdown.is_ok(),
+            "shutdown should cancel pending recovery promptly"
+        );
+        shutdown.unwrap().unwrap();
 
         assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+        assert_eq!(actor.status().borrow().clone(), ProjectStatus::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_actor_shutdown_cancels_initialization_and_reaps_lsp() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let pid_file = root.path().join("lsp.pid");
+        let lsp = root.path().join("blocked-lsp.py");
+        fs::write(&lsp, CANCELLABLE_INITIALIZATION_LSP).unwrap();
+        let mut permissions = fs::metadata(&lsp).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lsp, permissions).unwrap();
+
+        let mut config = crate::config::LspServerConfig::rust_analyzer();
+        config.command = lsp.display().to_string();
+        config.heuristics = None;
+        config.timeout_seconds = 30;
+        config.env =
+            HashMap::from([("MCPLS_PID_FILE".to_string(), pid_file.display().to_string())]);
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator.set_lsp_configs(vec![config], Some(3));
+        let actor = spawn_project_actor_with_translator(2, translator);
+
+        let activation = {
+            let actor = actor.clone();
+            let root = root.path().to_path_buf();
+            tokio::spawn(async move { actor.activate(root).await })
+        };
+        let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(pid) = fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let shutdown = tokio::time::timeout(Duration::from_secs(1), actor.shutdown()).await;
+        assert!(
+            shutdown.is_ok(),
+            "shutdown should cancel blocked initialization"
+        );
+        shutdown.unwrap().unwrap();
+        assert!(activation.await.unwrap().is_err());
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
         assert_eq!(actor.status().borrow().clone(), ProjectStatus::Stopped);
     }
 

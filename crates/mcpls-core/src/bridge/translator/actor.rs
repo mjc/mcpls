@@ -8,6 +8,7 @@ use lsp_types::{
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::{ActiveLanguageAlias, Translator};
 use crate::bridge::notifications::RedactionPolicy;
@@ -477,6 +478,23 @@ impl Translator {
         &mut self,
         roots: Vec<PathBuf>,
     ) -> Result<ProjectActivation> {
+        self.activate_project_with_roots_cancelled(roots, CancellationToken::new())
+            .await
+    }
+
+    /// Start every applicable server while honoring a caller-owned
+    /// cancellation signal during process initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when every applicable language server fails to start
+    /// or initialization is cancelled.
+    #[allow(clippy::too_many_lines)]
+    pub async fn activate_project_with_roots_cancelled(
+        &mut self,
+        roots: Vec<PathBuf>,
+        cancellation: CancellationToken,
+    ) -> Result<ProjectActivation> {
         if roots.is_empty() {
             return Err(Error::NoServerConfigured);
         }
@@ -602,7 +620,7 @@ impl Translator {
                 ProjectActivation::ready()
             });
         }
-        let result = LspServer::spawn_batch(&init_configs).await;
+        let result = LspServer::spawn_batch_with_cancellation(&init_configs, cancellation).await;
         if result.all_failed() {
             self.clear_expected_servers();
             lock_std(&self.active_language_aliases).clear();

@@ -48,13 +48,13 @@ fn preview_and_apply_preserve_rust_literal_bytes_across_workspace_edit_transport
     let file = root.path().join("src.rs");
     fs::write(&file, "before\n").unwrap();
     let boundary = WorkspaceBoundary::new(root.path()).unwrap();
-    let expected = r###"let quote = "\"";
+    let expected = r##"let quote = "\"";
 let slash = '\\';
 let path = "C:\\tmp";
 let raw = r#"quoted \" text"#;
 let multiline = "first
 second";
-"###;
+"##;
     let edit = WorkspaceEdit {
         changes: Some(HashMap::from([(
             path_to_uri(&file).unwrap(),

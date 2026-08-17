@@ -24,6 +24,7 @@ use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::bridge::try_path_to_uri;
@@ -438,6 +439,20 @@ impl LspServer {
     /// - Initialize request fails or times out
     /// - Server returns error during initialization
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
+        Self::spawn_with_cancellation(config, CancellationToken::new()).await
+    }
+
+    /// Spawn and initialize an LSP server, stopping and reaping it when the
+    /// caller cancels initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server cannot spawn, initialize, or is
+    /// cancelled before initialization completes.
+    pub async fn spawn_with_cancellation(
+        config: ServerInitConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
         info!(
             "Spawning LSP server: {} {:?}",
             config.server_config.command, config.server_config.args
@@ -478,6 +493,13 @@ impl LspServer {
         })?;
         let mut process = LspProcess::isolated(child);
 
+        if cancellation.is_cancelled() {
+            process.terminate().await;
+            return Err(Error::LspInitFailed {
+                message: "LSP initialization cancelled".to_string(),
+            });
+        }
+
         let stdin = process
             .child
             .stdin
@@ -498,14 +520,21 @@ impl LspServer {
             config.workspace_roots.clone(),
         );
 
-        let (capabilities, position_encoding, server_name) =
-            match Self::initialize(&client, &config).await {
-                Ok(initialized) => initialized,
-                Err(error) => {
-                    process.terminate().await;
-                    return Err(error);
-                }
-            };
+        let (capabilities, position_encoding, server_name) = match tokio::select! {
+            result = Self::initialize(&client, &config) => result,
+            () = cancellation.cancelled() => {
+                process.terminate().await;
+                return Err(Error::LspInitFailed {
+                    message: "LSP initialization cancelled".to_string(),
+                });
+            }
+        } {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                process.terminate().await;
+                return Err(error);
+            }
+        };
 
         info!("LSP server initialized successfully");
 
@@ -888,13 +917,25 @@ impl LspServer {
     /// # }
     /// ```
     pub async fn spawn_batch(configs: &[ServerInitConfig]) -> ServerInitResult {
+        Self::spawn_batch_with_cancellation(configs, CancellationToken::new()).await
+    }
+
+    /// Spawn multiple LSP servers while honoring a caller-owned cancellation
+    /// signal and reaping every server that initialized before cancellation.
+    pub async fn spawn_batch_with_cancellation(
+        configs: &[ServerInitConfig],
+        cancellation: CancellationToken,
+    ) -> ServerInitResult {
         let mut result = ServerInitResult::new();
-        let attempts = configs.iter().cloned().map(|config| async move {
-            let server_id = config.server_config.id();
-            let language_id = config.server_config.language_id.clone();
-            let command = config.server_config.command.clone();
-            let outcome = Self::spawn(config).await;
-            (server_id, language_id, command, outcome)
+        let attempts = configs.iter().cloned().map(|config| {
+            let cancellation = cancellation.clone();
+            async move {
+                let server_id = config.server_config.id();
+                let language_id = config.server_config.language_id.clone();
+                let command = config.server_config.command.clone();
+                let outcome = Self::spawn_with_cancellation(config, cancellation).await;
+                (server_id, language_id, command, outcome)
+            }
         });
 
         for (server_id, language_id, command, outcome) in futures::future::join_all(attempts).await
@@ -921,6 +962,13 @@ impl LspServer {
                         message: e.to_string(),
                     });
                 }
+            }
+        }
+
+        if cancellation.is_cancelled() {
+            let servers = std::mem::take(&mut result.servers);
+            for server in servers.into_values() {
+                let _ = server.shutdown().await;
             }
         }
 
