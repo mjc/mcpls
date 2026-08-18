@@ -12977,6 +12977,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "description": "Snapshot-bound cursor returned by a previous page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Project owning `symbol_handle` when coordinates are omitted.",
           "type": [
@@ -13140,9 +13147,28 @@
           "$ref": "#/$defs/NavigationKind",
           "description": "Relationship represented by the returned items."
         },
+        "next_cursor": {
+          "description": "Cursor for the next deterministic page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable protocol provider identity.",
           "type": "string"
+        },
+        "returned_items": {
+          "description": "Items returned in this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_items": {
+          "description": "Total items in the prepared snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "truncated": {
           "description": "Whether item or response budgets omitted target data.",
@@ -13153,6 +13179,8 @@
         "provider",
         "kind",
         "items",
+        "total_items",
+        "returned_items",
         "truncated"
       ],
       "type": "object"
