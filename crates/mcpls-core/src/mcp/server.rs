@@ -815,7 +815,7 @@ impl McplsServer {
                 .semantic_target(params.project_id, params.symbol_handle, String::new(), 0, 0)
                 .await?;
             let item = actor
-                .prepare_call_hierarchy(file_path, line, character)
+                .prepare_call_hierarchy(file_path, line, character, None)
                 .await
                 .map_err(|error| McpError::invalid_params(error.to_string(), None))?
                 .items
@@ -2509,6 +2509,7 @@ impl McplsServer {
             line,
             character,
             project_id,
+            page_token,
             symbol_handle,
         }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<Json<crate::bridge::CallHierarchyPrepareResult>, McpError> {
@@ -2516,7 +2517,7 @@ impl McplsServer {
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
         let result = actor
-            .prepare_call_hierarchy(file_path, line, character)
+            .prepare_call_hierarchy(file_path, line, character, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -6861,6 +6862,7 @@ while True:
                 line: 1,
                 character: 5,
                 project_id: None,
+                page_token: None,
                 symbol_handle: None,
             }))
             .await;
@@ -7154,6 +7156,7 @@ while True:
             line: 10,
             character: 5,
             project_id: None,
+            page_token: None,
             symbol_handle: None,
         });
         let result = server.prepare_call_hierarchy(params).await;

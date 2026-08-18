@@ -485,6 +485,8 @@ pub struct CallHierarchyPrepareParams {
     pub character: u32,
     /// Project owning `symbol_handle` when coordinates are omitted.
     pub project_id: Option<String>,
+    /// Snapshot-bound cursor returned by a previous page.
+    pub page_token: Option<String>,
     /// Snapshot-bound handle returned by a prior semantic result.
     pub symbol_handle: Option<SymbolHandle>,
 }

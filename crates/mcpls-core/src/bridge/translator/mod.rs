@@ -41,6 +41,7 @@ mod symbols;
 pub(crate) mod testing;
 
 pub use actor::*;
+pub(crate) use call_hierarchy::page_items;
 pub use dto::*;
 pub use semantic_edit::*;
 

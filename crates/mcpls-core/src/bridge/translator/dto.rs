@@ -1152,6 +1152,13 @@ pub struct CallHierarchyPrepareResult {
     pub kind: NavigationKind,
     /// List of callable items at the position.
     pub items: Vec<CallHierarchyItemResult>,
+    /// Total items in the prepared snapshot.
+    pub total_items: usize,
+    /// Items returned in this page.
+    pub returned_items: usize,
+    /// Cursor for the next deterministic page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     /// Whether item or response budgets omitted target data.
     pub truncated: bool,
 }

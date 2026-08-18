@@ -17,7 +17,12 @@ use super::routing::MAX_POSITION_VALUE;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
-const MAX_PREPARED_ITEMS: usize = 64;
+/// Split a prepared item snapshot into a deterministic page and remainder.
+pub(crate) fn page_items<T>(mut items: Vec<T>, page_size: usize) -> (Vec<T>, Option<Vec<T>>) {
+    let split_at = items.len().min(page_size.max(1));
+    let remaining = items.split_off(split_at);
+    (items, (!remaining.is_empty()).then_some(remaining))
+}
 
 /// Whether a server's capabilities advertise `callHierarchyProvider` support.
 ///
@@ -173,10 +178,10 @@ impl Translator {
 
         // Pre-allocate and build result
         let lsp_items = response.unwrap_or_default();
-        let truncated_items = lsp_items.len() > MAX_PREPARED_ITEMS;
-        let mut items = Vec::with_capacity(lsp_items.len().min(MAX_PREPARED_ITEMS));
+        let total_items = lsp_items.len();
+        let mut items = Vec::with_capacity(total_items);
         let mut source_budget = super::source_context::SourceBudget::default();
-        for item in lsp_items.into_iter().take(MAX_PREPARED_ITEMS) {
+        for item in lsp_items {
             items.push(
                 convert_call_hierarchy_item(item, &ctx, &self.workspace_roots, &mut source_budget)
                     .await,
@@ -186,7 +191,10 @@ impl Translator {
         Ok(CallHierarchyPrepareResult {
             provider: "standard_lsp".to_owned(),
             kind: NavigationKind::CallHierarchy,
-            truncated: truncated_items || source_budget.truncated(),
+            total_items,
+            returned_items: items.len(),
+            next_cursor: None,
+            truncated: source_budget.truncated(),
             items,
         })
     }
@@ -508,13 +516,24 @@ mod tests {
             .collect();
 
         let (first, remaining) = page_items(items, 2);
-        assert_eq!(first.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["item-0", "item-1"]);
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["item-0", "item-1"]
+        );
 
         let (second, remaining) = page_items(remaining.expect("next page"), 2);
-        assert_eq!(second.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["item-2"]);
+        assert_eq!(
+            second
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["item-2"]
+        );
         assert!(remaining.is_none());
     }
-
 
     use crate::bridge::translator::dto::{Position2D, Range};
     use crate::bridge::translator::testing::*;

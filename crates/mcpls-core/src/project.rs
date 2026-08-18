@@ -10,6 +10,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+const CALL_HIERARCHY_PAGE_SIZE: usize = 64;
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
@@ -18,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bridge::DeferredResourceReference;
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::resources::SourceResource;
-use crate::bridge::translator::DiagnosticOptions;
+use crate::bridge::translator::{CallHierarchyItemResult, DiagnosticOptions, page_items};
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
@@ -1600,6 +1602,7 @@ enum ProjectRequest {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<CallHierarchyPrepareResult, String>>,
     },
     IncomingCalls {
@@ -2707,6 +2710,7 @@ impl ProjectHandle {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<CallHierarchyPrepareResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2714,6 +2718,7 @@ impl ProjectHandle {
                 file_path,
                 line,
                 character,
+                page_token,
                 reply,
             })
             .await
@@ -3842,6 +3847,17 @@ impl CodeActionStore {
             .remove(id)
             .ok_or_else(|| format!("code action reference is missing or expired: {id}"))
     }
+}
+
+fn call_hierarchy_snapshot_hash(items: &[CallHierarchyItemResult]) -> String {
+    items
+        .iter()
+        .find_map(|item| match &item.source {
+            Some(SourceContext::Available(frame)) => Some(frame.content_hash.clone()),
+            Some(SourceContext::Deferred { resource }) => Some(resource.snapshot_hash.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 impl ProjectRuntime {
@@ -5441,22 +5457,107 @@ impl ProjectRuntime {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<CallHierarchyPrepareResult, String> {
-        let mut result = self
-            .translator
-            .handle_call_hierarchy_prepare(file_path, line, character)
-            .await
-            .map_err(|error| error.to_string())?;
-        for item in &mut result.items {
-            item.symbol_handle = item.source.as_ref().and_then(|source| {
-                self.source_handle(
-                    source,
-                    item.selection_range.start.line,
-                    item.selection_range.start.character,
+        let (provider, kind, total_items, truncated, snapshot_hash, items) =
+            if let Some(page_token) = page_token {
+                let token = page_token
+                    .strip_prefix("mcpls-deferred:///")
+                    .ok_or_else(|| "invalid call hierarchy page token".to_owned())?;
+                let value = self
+                    .deferred_results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .read(token)?;
+                let provider = value
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "invalid call hierarchy page payload".to_owned())?
+                    .to_owned();
+                let kind = serde_json::from_value(
+                    value
+                        .get("kind")
+                        .cloned()
+                        .ok_or_else(|| "invalid call hierarchy page payload".to_owned())?,
                 )
+                .map_err(|error| format!("invalid call hierarchy page kind: {error}"))?;
+                let total_items = value
+                    .get("total_items")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| "invalid call hierarchy page count".to_owned())?;
+                let truncated = value
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let snapshot_hash = value
+                    .get("snapshot_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let items = serde_json::from_value(
+                    value
+                        .get("items")
+                        .cloned()
+                        .ok_or_else(|| "invalid call hierarchy page items".to_owned())?,
+                )
+                .map_err(|error| format!("invalid call hierarchy page items: {error}"))?;
+                (provider, kind, total_items, truncated, snapshot_hash, items)
+            } else {
+                let mut result = self
+                    .translator
+                    .handle_call_hierarchy_prepare(file_path, line, character)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for item in &mut result.items {
+                    item.symbol_handle = item.source.as_ref().and_then(|source| {
+                        self.source_handle(
+                            source,
+                            item.selection_range.start.line,
+                            item.selection_range.start.character,
+                        )
+                    });
+                }
+                let snapshot_hash = call_hierarchy_snapshot_hash(&result.items);
+                (
+                    result.provider,
+                    result.kind,
+                    result.total_items,
+                    result.truncated,
+                    snapshot_hash,
+                    result.items,
+                )
+            };
+
+        let (items, remaining) = page_items(items, CALL_HIERARCHY_PAGE_SIZE);
+        let next_cursor = remaining.map(|items| {
+            let value = serde_json::json!({
+                "provider": provider,
+                "kind": kind,
+                "total_items": total_items,
+                "truncated": truncated,
+                "snapshot_hash": snapshot_hash,
+                "items": items,
             });
-        }
-        Ok(result)
+            let scope = self.deferred_scope.as_deref().unwrap_or_default();
+            self.deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped(value, snapshot_hash.clone(), scope)
+                .uri
+        });
+
+        let has_next_page = next_cursor.is_some();
+
+        Ok(CallHierarchyPrepareResult {
+            provider,
+            kind,
+            total_items,
+            returned_items: items.len(),
+            next_cursor,
+            truncated: truncated || has_next_page,
+            items,
+        })
     }
 
     async fn incoming_calls(
@@ -6698,11 +6799,12 @@ async fn handle_project_request(
             file_path,
             line,
             character,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .prepare_call_hierarchy(file_path, line, character)
+                    .prepare_call_hierarchy(file_path, line, character, page_token)
                     .await,
             );
         }
@@ -10952,7 +11054,7 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle
-            .prepare_call_hierarchy(file.display().to_string(), 1, 5)
+            .prepare_call_hierarchy(file.display().to_string(), 1, 5, None)
             .await;
 
         assert!(matches!(
