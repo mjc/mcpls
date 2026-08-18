@@ -9485,6 +9485,89 @@ mod tests {
             serde_json::json!({"project": "first"})
         );
     }
+    #[tokio::test]
+    async fn call_hierarchy_cursor_pages_preserve_counts_and_identity() {
+        let items: Vec<_> = (0..65)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("item-{index}"),
+                    "kind": 12,
+                    "uri": format!("file:///item-{index}.rs"),
+                    "range": {
+                        "start": {"line": 1, "character": 1},
+                        "end": {"line": 1, "character": 4}
+                    },
+                    "selectionRange": {
+                        "start": {"line": 1, "character": 1},
+                        "end": {"line": 1, "character": 4}
+                    },
+                    "path": format!("/item-{index}.rs"),
+                    "source": {
+                        "status": "deferred",
+                        "resource": {
+                            "uri": format!("mcpls-source:///item-{index}.rs"),
+                            "kind": "source_context",
+                            "snapshot_hash": "snapshot"
+                        }
+                    },
+                    "symbol_handle": format!("handle-{index}")
+                })
+            })
+            .collect();
+        let deferred_results =
+            std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let mut runtime = ProjectRuntime::with_deferred_results_scoped(
+            Translator::new(),
+            None,
+            deferred_results,
+            Some("project".to_owned()),
+        );
+        let reference = runtime.deferred_results.lock().unwrap().insert_scoped(
+            serde_json::json!({
+                "provider": "standard_lsp",
+                "kind": "call_hierarchy",
+                "total_items": 65,
+                "truncated": false,
+                "snapshot_hash": "snapshot",
+                "items": items,
+            }),
+            "snapshot".to_owned(),
+            "project",
+        );
+
+        let first = runtime
+            .prepare_call_hierarchy(String::new(), 0, 0, Some(reference.uri))
+            .await
+            .unwrap();
+        assert_eq!(first.total_items, 65);
+        assert_eq!(first.returned_items, 64);
+        assert_eq!(first.items.first().unwrap().name, "item-0");
+        assert_eq!(first.items.last().unwrap().name, "item-63");
+        let next_cursor = first.next_cursor.clone().unwrap();
+
+        let second = runtime
+            .prepare_call_hierarchy(String::new(), 0, 0, Some(next_cursor))
+            .await
+            .unwrap();
+        assert_eq!(second.total_items, 65);
+        assert_eq!(second.returned_items, 1);
+        assert_eq!(second.items[0].name, "item-64");
+        assert_eq!(second.items[0].path.as_deref(), Some("/item-64.rs"));
+        assert_eq!(
+            second.items[0]
+                .symbol_handle
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("handle-64")
+        );
+        assert!(matches!(
+            second.items[0].source.as_ref(),
+            Some(crate::bridge::SourceContext::Deferred { resource })
+                if resource.snapshot_hash == "snapshot"
+        ));
+        assert!(second.next_cursor.is_none());
+    }
 
     #[tokio::test]
     async fn server_exit_recovery_acquires_residency_after_exit_is_authoritative() {

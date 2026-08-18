@@ -1120,7 +1120,7 @@ pub struct CallHierarchyItemResult {
     /// URI of the document.
     pub uri: String,
     /// Human-readable filesystem path for file-backed targets.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Range of the symbol.
     pub range: Range,
@@ -1133,10 +1133,10 @@ pub struct CallHierarchyItemResult {
     #[serde(rename = "selectionRange")]
     pub selection_range: Range,
     /// Bounded source text for the callable item.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceContext>,
     /// Snapshot-bound target for coordinate-free semantic follow-ups.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_handle: Option<SymbolHandle>,
     /// Opaque data to pass to incoming/outgoing calls.
     #[serde(skip_serializing_if = "Option::is_none")]
