@@ -50,6 +50,7 @@ use super::tools::{
 };
 #[cfg(test)]
 use crate::bridge::Translator;
+use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
@@ -2776,6 +2777,7 @@ impl McplsServer {
     ) -> Result<Json<SemanticResourceReadResult>, McpError> {
         let resource = parse_session_resource_uri(&uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let mut response_uri = uri;
         let text = match resource {
             SessionResource::Source(source) => {
                 let actor = self
@@ -2787,6 +2789,16 @@ impl McplsServer {
                     .read_source_resource(source)
                     .await
                     .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                response_uri = make_source_uri(
+                    Path::new(&frame.path),
+                    frame.range.start.line,
+                    frame.range.start.character,
+                    frame.range.end.line,
+                    frame.range.end.character,
+                    &frame.content_hash,
+                    frame.document_version,
+                )
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
                 serde_json::to_string(&frame)
             }
             SessionResource::Deferred(token) => {
@@ -2809,7 +2821,7 @@ impl McplsServer {
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
         encode_tool_result(Ok::<_, String>(SemanticResourceReadResult {
-            uri,
+            uri: response_uri,
             mime_type: "application/json".to_owned(),
             text,
         }))
@@ -2820,7 +2832,7 @@ impl McplsServer {
     async fn read_source_resource(
         &self,
         resource: crate::bridge::resources::SourceResource,
-        uri: String,
+        _uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
         let actor = self
@@ -2832,10 +2844,20 @@ impl McplsServer {
             .read_source_resource(resource)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let fresh_uri = make_source_uri(
+            Path::new(&frame.path),
+            frame.range.start.line,
+            frame.range.start.character,
+            frame.range.end.line,
+            frame.range.end.character,
+            &frame.content_hash,
+            frame.document_version,
+        )
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let json = serde_json::to_string(&frame)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
-            vec![ResourceContents::text(json, uri)],
+            vec![ResourceContents::text(json, fresh_uri)],
             supports_cache_hints,
         )
         .into())

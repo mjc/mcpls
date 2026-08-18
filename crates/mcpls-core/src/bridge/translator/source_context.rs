@@ -289,6 +289,7 @@ impl EncodingCtx {
     }
 }
 
+#[cfg(test)]
 fn source_snapshot_matches(
     resource: &SourceResource,
     current_version: Option<i32>,
@@ -305,12 +306,7 @@ impl super::Translator {
         &self,
         resource: &SourceResource,
     ) -> Result<SourceFrame> {
-        let (path, version, hash, _) = self.source_snapshot(&resource.path).await?;
-        if !source_snapshot_matches(resource, version, &hash) {
-            return Err(Error::McpServer(
-                "stale_resource: source snapshot changed; rerun the semantic request".to_owned(),
-            ));
-        }
+        let (path, _, _, _) = self.source_snapshot(&resource.path).await?;
         let uri = path_to_uri(&path)?;
         let range = Range {
             start: super::dto::Position2D {
@@ -409,6 +405,32 @@ mod tests {
             ..resource
         };
         assert!(!source_snapshot_matches(&versioned, Some(8), "abc"));
+    }
+
+    #[tokio::test]
+    async fn stale_source_resource_replays_against_current_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        tokio::fs::write(&path, "fn old_name() {}\n").await.unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, version, snapshot_hash, _) = translator.source_snapshot(&path).await.unwrap();
+        let resource = SourceResource {
+            path: path.clone(),
+            start_line: 1,
+            start_character: 1,
+            end_line: 1,
+            end_character: 20,
+            snapshot_hash,
+            document_version: version,
+        };
+        tokio::fs::write(&path, "fn new_name() {}\n").await.unwrap();
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert!(frame.text.contains("new_name"), "{}", frame.text);
+        assert_ne!(frame.content_hash, resource.snapshot_hash);
     }
 
     #[tokio::test]
