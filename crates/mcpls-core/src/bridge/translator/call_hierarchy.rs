@@ -18,7 +18,7 @@ use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
 /// Split a prepared item snapshot into a deterministic page and remainder.
-pub(crate) fn page_items<T>(mut items: Vec<T>, page_size: usize) -> (Vec<T>, Option<Vec<T>>) {
+pub fn page_items<T>(mut items: Vec<T>, page_size: usize) -> (Vec<T>, Option<Vec<T>>) {
     let split_at = items.len().min(page_size.max(1));
     let remaining = items.split_off(split_at);
     (items, (!remaining.is_empty()).then_some(remaining))

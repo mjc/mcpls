@@ -3700,7 +3700,7 @@ impl DeferredResultStore {
         self.prune();
         self.entries
             .get(token)
-            .filter(|result| scope.map_or(true, |scope| result.scope == scope))
+            .filter(|result| scope.is_none_or(|scope| result.scope == scope))
             .map(|result| result.value.clone())
             .ok_or_else(|| "stale_resource: deferred result is missing or expired".to_owned())
     }

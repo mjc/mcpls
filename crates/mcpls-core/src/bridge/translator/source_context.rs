@@ -297,7 +297,7 @@ fn source_snapshot_matches(
     resource.snapshot_hash == current_hash
         && resource
             .document_version
-            .map_or(true, |version| Some(version) == current_version)
+            .is_none_or(|version| Some(version) == current_version)
 }
 
 impl super::Translator {
