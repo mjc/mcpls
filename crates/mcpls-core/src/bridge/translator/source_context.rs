@@ -377,6 +377,28 @@ mod tests {
             end: Position2D { line, character: 2 },
         }
     }
+    #[test]
+    fn unversioned_source_resource_accepts_matching_open_snapshot() {
+        let resource = SourceResource {
+            path: "/workspace/src/lib.rs".into(),
+            start_line: 1,
+            start_character: 1,
+            end_line: 1,
+            end_character: 2,
+            snapshot_hash: "abc".to_owned(),
+            document_version: None,
+        };
+
+        assert!(source_snapshot_matches(&resource, Some(7), "abc"));
+        assert!(!source_snapshot_matches(&resource, Some(7), "changed"));
+
+        let versioned = SourceResource {
+            document_version: Some(7),
+            ..resource
+        };
+        assert!(!source_snapshot_matches(&versioned, Some(8), "abc"));
+    }
+
 
     #[tokio::test]
     async fn resolves_authorized_disk_source_with_complete_metadata() {
