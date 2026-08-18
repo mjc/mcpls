@@ -289,13 +289,24 @@ impl EncodingCtx {
     }
 }
 
+fn source_snapshot_matches(
+    resource: &SourceResource,
+    current_version: Option<i32>,
+    current_hash: &str,
+) -> bool {
+    resource.snapshot_hash == current_hash
+        && resource
+            .document_version
+            .map_or(true, |version| Some(version) == current_version)
+}
+
 impl super::Translator {
     pub(crate) async fn read_source_resource(
         &self,
         resource: &SourceResource,
     ) -> Result<SourceFrame> {
         let (path, version, hash, _) = self.source_snapshot(&resource.path).await?;
-        if hash != resource.snapshot_hash || resource.document_version != version {
+        if !source_snapshot_matches(resource, version, &hash) {
             return Err(Error::McpServer(
                 "stale_resource: source snapshot changed; rerun the semantic request".to_owned(),
             ));
@@ -377,6 +388,7 @@ mod tests {
             end: Position2D { line, character: 2 },
         }
     }
+
     #[test]
     fn unversioned_source_resource_accepts_matching_open_snapshot() {
         let resource = SourceResource {
@@ -398,7 +410,6 @@ mod tests {
         };
         assert!(!source_snapshot_matches(&versioned, Some(8), "abc"));
     }
-
 
     #[tokio::test]
     async fn resolves_authorized_disk_source_with_complete_metadata() {
