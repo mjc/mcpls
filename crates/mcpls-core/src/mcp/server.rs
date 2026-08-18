@@ -2513,9 +2513,24 @@ impl McplsServer {
             symbol_handle,
         }): Parameters<CallHierarchyPrepareParams>,
     ) -> Result<Json<crate::bridge::CallHierarchyPrepareResult>, McpError> {
-        let (actor, file_path, line, character) = self
-            .semantic_target(project_id, symbol_handle, file_path, line, character)
-            .await?;
+        let (actor, file_path, line, character) = if page_token.is_some() {
+            let actor = if let Some(project_id) = project_id {
+                let id = parse_project_id(project_id)?;
+                self.context.required_actor_for_project(&id).await
+            } else if file_path.is_empty() {
+                return Err(McpError::invalid_params(
+                    "page_token requires project_id or file_path".to_owned(),
+                    None,
+                ));
+            } else {
+                self.context.required_actor_for_path(&file_path).await
+            }
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            (actor, file_path, line, character)
+        } else {
+            self.semantic_target(project_id, symbol_handle, file_path, line, character)
+                .await?
+        };
         let result = actor
             .prepare_call_hierarchy(file_path, line, character, page_token)
             .await
@@ -7161,6 +7176,23 @@ while True:
         });
         let result = server.prepare_call_hierarchy(params).await;
         assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn page_token_does_not_require_coordinates() {
+        let server = create_test_server();
+        let result = server
+            .prepare_call_hierarchy(Parameters(CallHierarchyPrepareParams {
+                file_path: String::new(),
+                line: 0,
+                character: 0,
+                project_id: Some("missing".to_owned()),
+                page_token: Some("mcpls-deferred:///missing".to_owned()),
+                symbol_handle: None,
+            }))
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(!error.contains("file_path, line, and character"));
     }
 
     #[tokio::test]
