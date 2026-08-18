@@ -3685,9 +3685,22 @@ impl DeferredResultStore {
     }
 
     fn read(&mut self, token: &str) -> Result<serde_json::Value, String> {
+        self.read_with_scope(token, None)
+    }
+
+    fn read_scoped(&mut self, token: &str, scope: &str) -> Result<serde_json::Value, String> {
+        self.read_with_scope(token, Some(scope))
+    }
+
+    fn read_with_scope(
+        &mut self,
+        token: &str,
+        scope: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         self.prune();
         self.entries
             .get(token)
+            .filter(|result| scope.map_or(true, |scope| result.scope == scope))
             .map(|result| result.value.clone())
             .ok_or_else(|| "stale_resource: deferred result is missing or expired".to_owned())
     }
@@ -5464,11 +5477,12 @@ impl ProjectRuntime {
                 let token = page_token
                     .strip_prefix("mcpls-deferred:///")
                     .ok_or_else(|| "invalid call hierarchy page token".to_owned())?;
+                let scope = self.deferred_scope.as_deref().unwrap_or_default();
                 let value = self
                     .deferred_results
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .read(token)?;
+                    .read_scoped(token, scope)?;
                 let provider = value
                     .get("provider")
                     .and_then(serde_json::Value::as_str)
@@ -9453,6 +9467,22 @@ mod tests {
         assert_eq!(
             store.read(second_token).unwrap(),
             serde_json::json!({"project": "second"})
+        );
+    }
+    #[test]
+    fn deferred_resource_reads_reject_wrong_scope() {
+        let mut store = DeferredResultStore::new();
+        let reference = store.insert_scoped(
+            serde_json::json!({"project": "first"}),
+            "snapshot-first".to_owned(),
+            "first",
+        );
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+
+        assert!(store.read_scoped(token, "second").is_err());
+        assert_eq!(
+            store.read_scoped(token, "first").unwrap(),
+            serde_json::json!({"project": "first"})
         );
     }
 
