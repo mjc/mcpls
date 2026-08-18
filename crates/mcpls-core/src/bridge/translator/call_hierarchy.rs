@@ -501,6 +501,20 @@ mod tests {
             data: None,
         }
     }
+    #[test]
+    fn prepared_items_page_without_duplicates() {
+        let items = (0..3)
+            .map(|index| call_item(&format!("item-{index}"), format!("file:///item-{index}.rs")))
+            .collect();
+
+        let (first, remaining) = page_items(items, 2);
+        assert_eq!(first.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["item-0", "item-1"]);
+
+        let (second, remaining) = page_items(remaining.expect("next page"), 2);
+        assert_eq!(second.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["item-2"]);
+        assert!(remaining.is_none());
+    }
+
 
     use crate::bridge::translator::dto::{Position2D, Range};
     use crate::bridge::translator::testing::*;
