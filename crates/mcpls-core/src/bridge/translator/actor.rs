@@ -549,6 +549,7 @@ impl Translator {
                 &active_ids,
                 &active_roots,
             ));
+            self.clear_expected_servers();
             self.set_workspace_roots(roots);
             return Ok(ProjectActivation::ready());
         }
@@ -690,6 +691,7 @@ impl Translator {
             .count();
         self.actor_notification_cache
             .set_diagnostics_route_count(diagnostics_routes);
+        self.clear_expected_servers();
         Ok(ProjectActivation::new(receivers, health))
     }
 
@@ -1342,6 +1344,35 @@ mod tests {
 
         assert!(!translator.has_active_workspace_roots(&roots));
     }
+    #[tokio::test]
+    async fn reused_activation_clears_initializing_state() {
+        use crate::bridge::translator::testing::fake_lsp_client;
+
+        let root = TempDir::new().expect("temporary workspace");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n")
+            .expect("Rust workspace marker");
+
+        let rust = LspServerConfig::rust_analyzer();
+        let mut translator = Translator::new();
+        translator.set_lsp_configs(vec![rust.clone()], Some(10));
+        let roots = vec![root.path().to_path_buf()];
+        translator.set_workspace_roots(roots.clone());
+        let (client, _server) = fake_lsp_client();
+        translator.register_client(rust.id(), client);
+        translator.register_server_roots(rust.id(), roots.clone());
+        translator.set_expected_servers(HashSet::from([rust.id()]));
+
+        translator
+            .activate_project_with_roots_cancelled(
+                roots,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("reused server activation");
+
+        assert!(!translator.is_initializing());
+    }
+
     #[tokio::test]
     async fn unavailable_optional_builtin_keeps_project_structural_only() {
         let root = TempDir::new().expect("temporary project");

@@ -11678,7 +11678,7 @@ while True:
         let actor = spawn_project_actor_with_translator(2, translator);
 
         let first = actor.activate(root.path().to_path_buf()).await.unwrap();
-        assert_eq!(first.status(), ProjectStatus::Starting);
+        assert_eq!(first.status(), ProjectStatus::Ready);
         assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
 
         let second = actor.activate(root.path().to_path_buf()).await.unwrap();
