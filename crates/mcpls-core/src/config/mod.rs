@@ -295,14 +295,12 @@ pub struct WorkspaceConfig {
     #[serde(default = "default_heuristics_max_depth")]
     pub heuristics_max_depth: usize,
 
-    /// Maximum number of documents `DocumentTracker` will keep open
-    /// simultaneously. A `textDocument/didOpen`-triggering tool call (hover,
-    /// definition, diagnostics, etc.) for a document beyond this count fails
-    /// with `DocumentLimitExceeded`. Documents stay tracked for the whole
-    /// mcpls process lifetime (there is no eviction), so once the ceiling is
-    /// reached, opening any further new path fails until either the process
-    /// is restarted or this limit is raised; already-tracked paths are
-    /// unaffected. `0` disables the limit.
+    /// Maximum number of clean documents `DocumentTracker` keeps in its
+    /// working set simultaneously. When a semantic tool needs a new path at
+    /// capacity, the least-recently-used clean document is evicted and its
+    /// language servers receive `textDocument/didClose`. Dirty documents are
+    /// retained; if every tracked document is dirty, admission fails safely.
+    /// `0` disables the limit.
     /// Default: 100
     #[serde(default = "default_max_documents")]
     pub max_documents: usize,

@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
+
 use super::Translator;
 use crate::bridge::lock_std;
 use crate::bridge::state::detect_language;
@@ -203,6 +205,7 @@ impl Translator {
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
+        self.reclaim_document_capacity(&validated_path).await?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
@@ -230,11 +233,43 @@ impl Translator {
             .resolve_validated_client_for_file(file_path, tool)
             .await?;
         self.require_capability(&server_id, capability, supported)?;
+        self.reclaim_document_capacity(&validated_path).await?;
         let uri = self
             .document_tracker
             .ensure_open(&validated_path, &server_id, &client)
             .await?;
         Ok((server_id, client, uri))
+    }
+
+    async fn reclaim_document_capacity(&self, path: &Path) -> Result<()> {
+        if !self.document_tracker.needs_capacity_reclamation(path) {
+            return Ok(());
+        }
+        let Some(document) = self.document_tracker.evict_lru_clean() else {
+            if !self.document_tracker.needs_capacity_reclamation(path) {
+                return Ok(());
+            }
+            return Err(Error::DocumentLimitExceeded {
+                current: self.document_tracker.len(),
+                max: self.resource_limits.max_documents,
+            });
+        };
+        for (id, client) in self.clients_for_language(document.language_id()) {
+            if document.synced_version(&id).is_none() {
+                continue;
+            }
+            client
+                .notify(
+                    "textDocument/didClose",
+                    DidCloseTextDocumentParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: document.uri().clone(),
+                        },
+                    },
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Verify the routed server advertises support for a capability before

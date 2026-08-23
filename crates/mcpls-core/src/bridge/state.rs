@@ -127,6 +127,7 @@ pub struct DocumentState {
     content: String,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
+    last_used: u64,
 }
 
 impl DocumentState {
@@ -140,6 +141,7 @@ impl DocumentState {
             content,
             disk: None,
             synced: HashMap::new(),
+            last_used: 0,
         }
     }
 
@@ -271,6 +273,7 @@ pub struct DocumentTracker {
     /// Open documents by file path. Locked only for the short, synchronous
     /// section that touches it — never held across an `await`.
     documents: StdMutex<HashMap<PathBuf, DocumentState>>,
+    access_counter: StdMutex<u64>,
     /// Per-path locks serializing [`Self::ensure_open`] calls for the same
     /// path, so calls for different paths never wait on each other. See
     /// `lock_path` for how entries are created and evicted.
@@ -294,6 +297,7 @@ impl DocumentTracker {
     pub fn new(limits: ResourceLimits, extension_map: HashMap<String, String>) -> Self {
         Self {
             documents: StdMutex::new(HashMap::new()),
+            access_counter: StdMutex::new(0),
             path_locks: StdMutex::new(HashMap::new()),
             generations: StdMutex::new(HashMap::new()),
             limits,
@@ -379,6 +383,38 @@ impl DocumentTracker {
         documents.insert(path, state);
         drop(documents);
         Ok(uri)
+    }
+
+    /// Evict the least-recently-used clean document when the configured
+    /// working-set limit is full. Dirty documents are never discarded.
+    pub(crate) fn evict_lru_clean(&self) -> Option<DocumentState> {
+        if self.limits.max_documents == 0 {
+            return None;
+        }
+        let mut documents = lock_std(&self.documents);
+        if documents.len() < self.limits.max_documents {
+            return None;
+        }
+        let victim = documents
+            .iter()
+            .filter(|(_, state)| state.disk.is_some())
+            .min_by_key(|(_, state)| state.last_used)
+            .map(|(path, _)| path.clone())?;
+        documents.remove(&victim)
+    }
+
+    pub(crate) fn needs_capacity_reclamation(&self, path: &Path) -> bool {
+        self.limits.max_documents > 0
+            && !lock_std(&self.documents).contains_key(path)
+            && self.len() >= self.limits.max_documents
+    }
+
+    fn touch(&self, path: &Path) {
+        let mut counter = lock_std(&self.access_counter);
+        *counter = counter.saturating_add(1);
+        if let Some(state) = lock_std(&self.documents).get_mut(path) {
+            state.last_used = *counter;
+        }
     }
 
     /// Update a document's content and increment its version.
@@ -599,8 +635,13 @@ impl DocumentTracker {
         let _path_guard = self.lock_path(path).await;
         let generation = self.generation(server);
         let decision = self.disk_phase(path).await?;
-        self.sync_phase(path, server, lsp_client, decision, generation)
-            .await
+        let result = self
+            .sync_phase(path, server, lsp_client, decision, generation)
+            .await;
+        if result.is_ok() {
+            self.touch(path);
+        }
+        result
     }
 
     /// Push the authoritative in-memory state of an already tracked document
@@ -1306,6 +1347,7 @@ mod tests {
             content: "fn main() {}".to_string(),
             disk: None,
             synced: HashMap::new(),
+            last_used: 0,
         };
 
         #[allow(clippy::redundant_clone)]
@@ -1711,6 +1753,51 @@ mod tests {
 
         let result = tracker.open(PathBuf::from("/test/file6.rs"), "content".to_string());
         assert!(matches!(result, Err(Error::DocumentLimitExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn evicts_least_recently_used_clean_document_at_capacity() {
+        let dir = TempDir::new().unwrap();
+        let limits = ResourceLimits {
+            max_documents: 2,
+            max_file_size: 1000,
+        };
+        let tracker = DocumentTracker::new(limits, HashMap::new());
+        let server = ServerId::from("rust");
+        let (client, _guard) = fake_lsp_client();
+        let first = dir.path().join("first.rs");
+        let second = dir.path().join("second.rs");
+        let third = dir.path().join("third.rs");
+        for (path, text) in [(&first, "fn first() {}"), (&second, "fn second() {}")] {
+            std::fs::write(path, text).unwrap();
+            tracker.ensure_open(path, &server, &client).await.unwrap();
+        }
+        tracker.ensure_open(&first, &server, &client).await.unwrap();
+        let evicted = tracker.evict_lru_clean().unwrap();
+        assert_eq!(evicted.uri(), &path_to_uri(&second).unwrap());
+        std::fs::write(&third, "fn third() {}").unwrap();
+        tracker.ensure_open(&third, &server, &client).await.unwrap();
+        assert!(tracker.get(&first).is_some());
+        assert!(tracker.get(&second).is_none());
+    }
+
+    #[test]
+    fn does_not_evict_dirty_documents() {
+        let tracker = DocumentTracker::new(
+            ResourceLimits {
+                max_documents: 1,
+                max_file_size: 1000,
+            },
+            HashMap::new(),
+        );
+        let path = PathBuf::from("/test/dirty.rs");
+        tracker
+            .open(path.clone(), "fn old() {}".to_string())
+            .unwrap();
+        tracker.update(&path, "fn unsaved() {}".to_string());
+        assert!(tracker.needs_capacity_reclamation(&PathBuf::from("/test/new.rs")));
+        assert!(tracker.evict_lru_clean().is_none());
+        assert!(tracker.get(&path).is_some());
     }
 
     #[test]
