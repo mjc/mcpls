@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout_at};
 use tracing::{debug, error, trace, warn};
 
 use crate::config::LspServerConfig;
@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::lsp::notification::NonBlockingNotificationSink;
 #[cfg(test)]
 use crate::lsp::notification::non_blocking_notification_channel;
-use crate::lsp::transport::LspTransport;
+use crate::lsp::transport::{LspReader, LspTransport, LspWriter};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
 };
@@ -64,6 +64,8 @@ const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 /// value today. See [`LspClient::completion_timeout`].
 const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 
+const OUTBOUND_TRANSPORT_QUEUE_CAPACITY: usize = 100;
+
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 
@@ -86,7 +88,7 @@ pub struct LspClient {
     request_counter: Arc<AtomicI64>,
 
     /// Command sender for outbound messages.
-    command_tx: mpsc::Sender<ClientCommand>,
+    command_queue: LspCommandQueue,
 
     /// Requests awaiting a response, shared with the background message loop.
     ///
@@ -111,7 +113,7 @@ impl Clone for LspClient {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             request_counter: Arc::clone(&self.request_counter),
-            command_tx: self.command_tx.clone(),
+            command_queue: self.command_queue.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
             receiver_task: None,
         }
@@ -129,6 +131,7 @@ enum ClientCommand {
     SendNotification {
         method: String,
         params: Option<Value>,
+        response_tx: oneshot::Sender<Result<()>>,
     },
     /// Rescan active dynamic watched-file registrations and flush matching notifications.
     SynchronizeWatchedFiles {
@@ -139,6 +142,78 @@ enum ClientCommand {
     CancelRequest { id: RequestId },
     /// Shutdown the client.
     Shutdown,
+}
+
+#[derive(Clone, Debug)]
+struct LspCommandQueue {
+    sender: mpsc::Sender<ClientCommand>,
+}
+
+impl LspCommandQueue {
+    const fn new(sender: mpsc::Sender<ClientCommand>) -> Self {
+        Self { sender }
+    }
+
+    async fn send_until(
+        &self,
+        command: ClientCommand,
+        deadline: Instant,
+        timeout_duration: Duration,
+    ) -> Result<()> {
+        timeout_at(deadline, self.sender.send(command))
+            .await
+            .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
+            .map_err(|_| Error::ServerTerminated)
+    }
+
+    fn try_send(&self, command: ClientCommand) {
+        let _ = self.sender.try_send(command);
+    }
+}
+
+struct OutboundBatch {
+    messages: Vec<Value>,
+    written_tx: Option<oneshot::Sender<Result<usize>>>,
+}
+
+impl OutboundBatch {
+    fn one(message: Value) -> Self {
+        Self {
+            messages: vec![message],
+            written_tx: None,
+        }
+    }
+}
+
+async fn lsp_writer_loop(
+    mut writer: LspWriter,
+    mut outbound_rx: mpsc::Receiver<OutboundBatch>,
+) -> Result<()> {
+    while let Some(batch) = outbound_rx.recv().await {
+        let mut sent = 0usize;
+        for message in &batch.messages {
+            if let Err(error) = writer.send(message).await {
+                if let Some(written_tx) = batch.written_tx {
+                    let _ = written_tx.send(Err(Error::Transport(error.to_string())));
+                }
+                return Err(error);
+            }
+            sent = sent.saturating_add(1);
+        }
+        if let Some(written_tx) = batch.written_tx {
+            let _ = written_tx.send(Ok(sent));
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_outbound(
+    outbound_tx: &mpsc::Sender<OutboundBatch>,
+    batch: OutboundBatch,
+) -> std::result::Result<(), OutboundBatch> {
+    outbound_tx
+        .try_send(batch)
+        .map_err(tokio::sync::mpsc::error::TrySendError::into_inner)
 }
 
 fn cancel_request_notification(id: &RequestId) -> Value {
@@ -165,7 +240,7 @@ impl LspClient {
             config,
             state: Arc::new(Mutex::new(super::ServerState::Uninitialized)),
             request_counter: Arc::new(AtomicI64::new(1)),
-            command_tx,
+            command_queue: LspCommandQueue::new(command_tx),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             receiver_task: None,
         }
@@ -194,7 +269,7 @@ impl LspClient {
             config,
             state,
             request_counter,
-            command_tx,
+            command_queue: LspCommandQueue::new(command_tx),
             pending_requests,
             receiver_task: Some(receiver_task),
         }
@@ -227,7 +302,7 @@ impl LspClient {
             config,
             state,
             request_counter,
-            command_tx,
+            command_queue: LspCommandQueue::new(command_tx),
             pending_requests,
             receiver_task: Some(receiver_task),
         }
@@ -380,15 +455,19 @@ impl LspClient {
 
             debug!("Sending request: {} (id={:?})", method, id);
 
-            self.command_tx
-                .send(ClientCommand::SendRequest {
-                    request,
-                    response_tx,
-                })
-                .await
-                .map_err(|_| Error::ServerTerminated)?;
+            let deadline = Instant::now() + timeout_duration;
+            self.command_queue
+                .send_until(
+                    ClientCommand::SendRequest {
+                        request,
+                        response_tx,
+                    },
+                    deadline,
+                    timeout_duration,
+                )
+                .await?;
 
-            let outcome = match timeout(timeout_duration, response_rx).await {
+            let outcome = match timeout_at(deadline, response_rx).await {
                 Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
                 Err(_elapsed) => {
                     // Remove the pending sender before returning so a timed-out
@@ -396,10 +475,8 @@ impl LspClient {
                     // is saturated. Cancellation stays detached so queue
                     // pressure cannot extend the caller's request deadline.
                     self.pending_requests.lock().await.remove(&id);
-                    let command_tx = self.command_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = command_tx.send(ClientCommand::CancelRequest { id }).await;
-                    });
+                    self.command_queue
+                        .try_send(ClientCommand::CancelRequest { id });
                     return Err(Error::Timeout(timeout_duration.as_secs()));
                 }
             };
@@ -477,16 +554,27 @@ impl LspClient {
         P: Serialize,
     {
         let params_value = serde_json::to_value(params)?;
+        let timeout_duration = self.request_timeout();
+        let deadline = Instant::now() + timeout_duration;
 
         debug!("Sending notification: {}", method);
 
-        self.command_tx
-            .send(ClientCommand::SendNotification {
-                method: method.to_string(),
-                params: Some(params_value),
-            })
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_queue
+            .send_until(
+                ClientCommand::SendNotification {
+                    method: method.to_string(),
+                    params: Some(params_value),
+                    response_tx,
+                },
+                deadline,
+                timeout_duration,
+            )
+            .await?;
+        timeout_at(deadline, response_rx)
             .await
-            .map_err(|_| Error::ServerTerminated)?;
+            .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
+            .map_err(|_| Error::ServerTerminated)??;
 
         Ok(())
     }
@@ -500,14 +588,18 @@ impl LspClient {
         timeout_duration: Duration,
     ) -> Result<(usize, usize)> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::SynchronizeWatchedFiles {
-                changed_paths: changed_paths.to_vec(),
-                response_tx,
-            })
-            .await
-            .map_err(|_| Error::ServerTerminated)?;
-        timeout(timeout_duration, response_rx)
+        let deadline = Instant::now() + timeout_duration;
+        self.command_queue
+            .send_until(
+                ClientCommand::SynchronizeWatchedFiles {
+                    changed_paths: changed_paths.to_vec(),
+                    response_tx,
+                },
+                deadline,
+                timeout_duration,
+            )
+            .await?;
+        timeout_at(deadline, response_rx)
             .await
             .map_err(|_| Error::Timeout(timeout_duration.as_secs()))?
             .map_err(|_| Error::ServerTerminated)?
@@ -523,7 +615,15 @@ impl LspClient {
     pub async fn shutdown(mut self) -> Result<()> {
         debug!("Shutting down LSP client");
 
-        let _ = self.command_tx.send(ClientCommand::Shutdown).await;
+        let timeout_duration = self.request_timeout();
+        let _ = self
+            .command_queue
+            .send_until(
+                ClientCommand::Shutdown,
+                Instant::now() + timeout_duration,
+                timeout_duration,
+            )
+            .await;
 
         if let Some(task) = self.receiver_task.take() {
             task.await
@@ -542,25 +642,39 @@ impl LspClient {
     /// - Inbound responses and server notifications
     /// - Matching responses to pending requests
     async fn message_loop(
-        mut transport: LspTransport,
+        transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_sink: Option<NonBlockingNotificationSink>,
         workspace_roots: Vec<std::path::PathBuf>,
     ) -> Result<()> {
         debug!("Message loop started");
+        let (writer, mut reader) = transport.split();
+        let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_TRANSPORT_QUEUE_CAPACITY);
+        let mut writer_task = tokio::spawn(lsp_writer_loop(writer, outbound_rx));
         let (watch_signal_tx, mut watch_signal_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
         let mut watch_registry = WatchRegistry::new(workspace_roots, watch_signal_tx)
             .map_err(|error| Error::Transport(error.message))?;
         let result = Self::message_loop_inner(
-            &mut transport,
+            &mut reader,
             &mut command_rx,
             &pending_requests,
             notification_sink.as_ref(),
             &mut watch_registry,
             &mut watch_signal_rx,
+            &outbound_tx,
         )
         .await;
+        drop(outbound_tx);
+        let writer_result = if let Ok(joined) =
+            timeout_at(Instant::now() + Duration::from_secs(5), &mut writer_task).await
+        {
+            joined.map_err(|error| Error::Transport(format!("LSP writer task failed: {error}")))?
+        } else {
+            writer_task.abort();
+            Err(Error::Timeout(5))
+        };
+        let result = result.and(writer_result);
         if let Err(ref e) = result {
             error!("Message loop exiting with error: {}", e);
         } else {
@@ -583,33 +697,51 @@ impl LspClient {
 
     #[allow(clippy::too_many_lines)]
     async fn message_loop_inner(
-        transport: &mut LspTransport,
+        reader: &mut LspReader,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
         notification_sink: Option<&NonBlockingNotificationSink>,
         watch_registry: &mut WatchRegistry,
         watch_signal_rx: &mut mpsc::Receiver<WatchSignal>,
+        outbound_tx: &mpsc::Sender<OutboundBatch>,
     ) -> Result<()> {
         loop {
             tokio::select! {
                 Some(command) = command_rx.recv() => {
                     match command {
                         ClientCommand::SendRequest { request, response_tx } => {
+                            let id = request.id.clone();
                             pending_requests.lock().await.insert(
-                                request.id.clone(),
+                                id.clone(),
                                 response_tx,
                             );
 
                             let value = serde_json::to_value(&request)?;
-                            transport.send(&value).await?;
+                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).is_err() {
+                                let response_tx = pending_requests.lock().await.remove(&id);
+                                if let Some(response_tx) = response_tx {
+                                    let _ = response_tx.send(Err(Error::Transport(
+                                        "outbound LSP transport queue is full or closed".to_string(),
+                                    )));
+                                }
+                            }
                         }
-                        ClientCommand::SendNotification { method, params } => {
+                        ClientCommand::SendNotification { method, params, response_tx } => {
                             let notification = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "method": method,
                                 "params": params,
                             });
-                            transport.send(&notification).await?;
+                            let result = enqueue_outbound(
+                                outbound_tx,
+                                OutboundBatch::one(notification),
+                            )
+                            .map_err(|_| {
+                                Error::Transport(
+                                    "outbound LSP transport queue is full or closed".to_string(),
+                                )
+                            });
+                            let _ = response_tx.send(result);
                         }
                         ClientCommand::SynchronizeWatchedFiles {
                             changed_paths,
@@ -627,26 +759,49 @@ impl LspClient {
                                     continue;
                                 }
                             };
-                            let mut sent = 0usize;
-                            for event in events {
-                                if !watch_registry.accepts(&event) {
-                                    continue;
-                                }
-                                if let Err(error) = transport.send(&serde_json::json!({
+                            let messages = events
+                                .into_iter()
+                                .filter(|event| watch_registry.accepts(event))
+                                .map(|event| serde_json::json!({
                                     "jsonrpc": JSONRPC_VERSION,
                                     "method": "workspace/didChangeWatchedFiles",
                                     "params": event.params,
-                                })).await {
-                                    let _ = response_tx.send(Err(Error::Transport(error.to_string())));
-                                    return Err(error);
-                                }
-                                sent = sent.saturating_add(1);
+                                }))
+                                .collect::<Vec<_>>();
+                            let (written_tx, written_rx) = oneshot::channel();
+                            if enqueue_outbound(
+                                outbound_tx,
+                                OutboundBatch {
+                                    messages,
+                                    written_tx: Some(written_tx),
+                                },
+                            )
+                            .is_err()
+                            {
+                                let _ = response_tx.send(Err(Error::Transport(
+                                    "outbound LSP transport queue is full or closed".to_string(),
+                                )));
+                                continue;
                             }
-                            let _ = response_tx.send(Ok((registrations, sent)));
+                            tokio::spawn(async move {
+                                let result = written_rx
+                                    .await
+                                    .map_err(|_| Error::ServerTerminated)
+                                    .and_then(|result| result)
+                                    .map(|sent| (registrations, sent));
+                                let _ = response_tx.send(result);
+                            });
                         }
                         ClientCommand::CancelRequest { id } => {
                             pending_requests.lock().await.remove(&id);
-                            transport.send(&cancel_request_notification(&id)).await?;
+                            if enqueue_outbound(
+                                outbound_tx,
+                                OutboundBatch::one(cancel_request_notification(&id)),
+                            )
+                            .is_err()
+                            {
+                                warn!("Dropping LSP cancellation because the transport queue is full");
+                            }
                         }
                         ClientCommand::Shutdown => {
                             debug!("Client shutdown requested");
@@ -663,18 +818,30 @@ impl LspClient {
                             continue;
                         }
                     };
-                    for event in events {
-                        if watch_registry.accepts(&event) {
-                            transport.send(&serde_json::json!({
+                    let messages = events
+                        .into_iter()
+                        .filter(|event| watch_registry.accepts(event))
+                        .map(|event| serde_json::json!({
                                 "jsonrpc": JSONRPC_VERSION,
                                 "method": "workspace/didChangeWatchedFiles",
                                 "params": event.params,
-                            })).await?;
-                        }
+                            }))
+                        .collect::<Vec<_>>();
+                    if !messages.is_empty()
+                        && enqueue_outbound(
+                            outbound_tx,
+                            OutboundBatch {
+                                messages,
+                                written_tx: None,
+                            },
+                        )
+                        .is_err()
+                    {
+                        warn!("Dropping watched-file notification because the transport queue is full");
                     }
                 }
 
-                message = transport.receive() => {
+                message = reader.receive() => {
                     let message = match message {
                         Ok(m) => m,
                         Err(e) => {
@@ -728,7 +895,9 @@ impl LspClient {
                                 watch_registry,
                             );
                             let value = serde_json::to_value(&response)?;
-                            transport.send(&value).await?;
+                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).is_err() {
+                                warn!("Dropping LSP server response because the transport queue is full");
+                            }
                         }
                         InboundMessage::Notification(notification) => {
                             debug!("Received notification: {}", notification.method);
@@ -1235,6 +1404,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn request_timeout_includes_outbound_queue_admission() {
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        command_tx.send(ClientCommand::Shutdown).await.unwrap();
+        let client = LspClient {
+            config: LspServerConfig::rust_analyzer(),
+            state: Arc::new(Mutex::new(super::super::ServerState::Ready)),
+            request_counter: Arc::new(AtomicI64::new(1)),
+            command_queue: LspCommandQueue::new(command_tx),
+            pending_requests,
+            receiver_task: None,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.request::<_, Value>(
+                "textDocument/hover",
+                serde_json::json!({}),
+                Duration::from_millis(20),
+            ),
+        )
+        .await;
+        let Ok(result) = result else {
+            panic!("the request deadline must include queue admission");
+        };
+
+        assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+    }
+
     /// #249 continuation: a client about to be discarded (e.g. superseded by
     /// a respawned replacement) must fail every still-pending request
     /// immediately rather than leaving callers to wait out their timeout.
@@ -1247,7 +1446,7 @@ mod tests {
             config: LspServerConfig::rust_analyzer(),
             state: Arc::new(Mutex::new(super::super::ServerState::Ready)),
             request_counter: Arc::new(AtomicI64::new(1)),
-            command_tx,
+            command_queue: LspCommandQueue::new(command_tx),
             pending_requests: Arc::clone(&pending_requests),
             receiver_task: None,
         };
@@ -1519,6 +1718,45 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(result, serde_json::json!([]));
+        }
+
+        #[tokio::test]
+        async fn blocked_transport_write_does_not_block_lsp_responses() {
+            let (client, mut server) = fake_lsp_client();
+            let request_client = client.clone();
+            let request_task = tokio::spawn(async move {
+                request_client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(1),
+                    )
+                    .await
+            });
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+
+            client
+                .notify(
+                    "workspace/didChangeConfiguration",
+                    serde_json::json!({ "blocked": "x".repeat(2 * 1024 * 1024) }),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!({ "contents": "ready" }),
+            )
+            .await;
+
+            let result = tokio::time::timeout(Duration::from_millis(200), request_task).await;
+            let Ok(result) = result else {
+                panic!("a blocked LSP write must not stop the response reader");
+            };
+            let result = result.unwrap().unwrap();
+            assert_eq!(result["contents"], "ready");
         }
 
         #[tokio::test]

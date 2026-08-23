@@ -14,9 +14,10 @@ and are never silently converted into writes.
 
 The daemon defaults to `refactor`. Preview is the normal response for rename,
 formatting, and code actions; an apply request must name a plan created by the
-same MCP session. A plan is single-use and expires after a short bounded
-period. The plan records the project ID, canonical roots, operation list,
-preconditions, and policy mode.
+same MCP session. A plan can commit only once and expires after a short bounded
+period. A same-session retry after commit returns the original bounded receipt
+without applying the operation again. The plan records the project ID,
+canonical roots, operation list, preconditions, and policy mode.
 
 ## Preconditions and authority
 
@@ -49,11 +50,12 @@ failure.
 
 Plans are session-scoped to avoid a confused-deputy apply across MCP clients.
 Reconnects must create a new preview. The project actor owns the plan store and
-serializes applies with other project mutations.
+serializes applies with other project mutations. It records committed plans
+before post-commit language-server synchronization, so a cancelled or timed-out
+client can safely retry and learn the committed result.
 
 ## Limits and unsupported protocol features
 
 Plans have bounded file count, byte count, operation count, and lifetime.
 Annotations that cannot be validated, resource operations without explicit
 policy support, and command execution are rejected rather than guessed.
-

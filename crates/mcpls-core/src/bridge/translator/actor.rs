@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ActiveLanguageAlias, Translator};
 use crate::bridge::notifications::RedactionPolicy;
-use crate::bridge::{DocumentTracker, NotificationCache, lock_std, uri_to_path};
+use crate::bridge::{
+    DocumentTracker, EncodingConverter, NotificationCache, PositionEncoding, lock_std, uri_to_path,
+};
 use crate::config::{
     CargoFeatureProfile, LspServerConfig, ProjectConfig, ServerId, ToolRouter,
     default_position_encodings,
@@ -314,6 +316,65 @@ fn builtin_command_available(
 ) -> bool {
     !config.is_optional_builtin_profile()
         || resolve_command(&config.command, project_environment).is_file()
+}
+
+fn incremental_content_change(
+    original: &str,
+    updated: &str,
+    encoding: PositionEncoding,
+) -> TextDocumentContentChangeEvent {
+    let mut prefix = original
+        .bytes()
+        .zip(updated.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while prefix > 0 && (!original.is_char_boundary(prefix) || !updated.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+
+    let max_suffix = original.len().min(updated.len()).saturating_sub(prefix);
+    let mut suffix = original
+        .bytes()
+        .rev()
+        .zip(updated.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(left, right)| left == right)
+        .count();
+    while suffix > 0
+        && (!original.is_char_boundary(original.len() - suffix)
+            || !updated.is_char_boundary(updated.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
+    let start = lsp_position_at(original, prefix, encoding);
+    let end = lsp_position_at(original, original.len() - suffix, encoding);
+    let range = start
+        .zip(end)
+        .map(|(start, end)| lsp_types::Range { start, end });
+    TextDocumentContentChangeEvent {
+        range,
+        range_length: None,
+        text: if range.is_some() {
+            updated[prefix..updated.len() - suffix].to_string()
+        } else {
+            updated.to_string()
+        },
+    }
+}
+
+fn lsp_position_at(
+    text: &str,
+    byte_offset: usize,
+    encoding: PositionEncoding,
+) -> Option<lsp_types::Position> {
+    let before = text.get(..byte_offset)?;
+    let line = u32::try_from(before.bytes().filter(|byte| *byte == b'\n').count()).ok()?;
+    let line_start = before.rfind('\n').map_or(0, |offset| offset + 1);
+    let character = EncodingConverter::new(encoding)
+        .byte_offset_to_character(&text[line_start..byte_offset], byte_offset - line_start)
+        .ok()?;
+    Some(lsp_types::Position::new(line, character))
 }
 
 impl Translator {
@@ -872,6 +933,7 @@ impl Translator {
             )));
         }
         let language_id = document.language_id().to_string();
+        let original_content = document.content().to_string();
         let next_version = self
             .document_tracker
             .update(path, content.clone())
@@ -879,6 +941,11 @@ impl Translator {
         let mut failures = Vec::new();
         let clients = self.clients_for_language(&language_id);
         for (id, client) in clients {
+            let content_change = incremental_content_change(
+                &original_content,
+                &content,
+                self.position_encoding_for(&id),
+            );
             if let Err(error) = client
                 .notify(
                     "textDocument/didChange",
@@ -887,11 +954,7 @@ impl Translator {
                             uri: document.uri().clone(),
                             version: next_version,
                         },
-                        content_changes: vec![TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text: content.clone(),
-                        }],
+                        content_changes: vec![content_change],
                     },
                 )
                 .await
@@ -1146,6 +1209,23 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn open_document_change_is_incremental_and_encoding_safe() {
+        let original = "zero\nalpha 😀 omega\nlast\n";
+        let updated = "zero\nalpha 😀 inserted omega\nlast\n";
+
+        let change = incremental_content_change(original, updated, PositionEncoding::Utf16);
+
+        assert_eq!(change.text, "inserted ");
+        assert_eq!(
+            change.range,
+            Some(lsp_types::Range {
+                start: lsp_types::Position::new(1, 9),
+                end: lsp_types::Position::new(1, 9),
+            })
+        );
+    }
 
     #[test]
     fn builtin_specialist_profiles_supersede_generic_profiles() {

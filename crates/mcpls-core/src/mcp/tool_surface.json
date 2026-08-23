@@ -1,7 +1,7 @@
 [
   {
     "name": "code_action_apply",
-    "description": "Apply a code action preview plan owned by this MCP session.",
+    "description": "Apply a code action preview plan owned by this MCP session. Retries after commit return the original receipt without applying again.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -29,7 +29,7 @@
       "title": "Apply code action",
       "readOnlyHint": false,
       "destructiveHint": true,
-      "idempotentHint": false
+      "idempotentHint": true
     }
   },
   {
@@ -2124,7 +2124,7 @@
   },
   {
     "name": "format_apply",
-    "description": "Apply a formatting plan returned by format_preview. Plans are single-use and revalidated before any file is replaced.",
+    "description": "Apply a formatting plan returned by format_preview. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -2152,7 +2152,7 @@
       "title": "Apply formatting",
       "readOnlyHint": false,
       "destructiveHint": true,
-      "idempotentHint": false
+      "idempotentHint": true
     }
   },
   {
@@ -13894,7 +13894,7 @@
   },
   {
     "name": "rename_apply",
-    "description": "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced.",
+    "description": "Apply a rename plan returned by rename_preview. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -13922,7 +13922,7 @@
       "title": "Apply rename",
       "readOnlyHint": false,
       "destructiveHint": true,
-      "idempotentHint": false
+      "idempotentHint": true
     }
   },
   {
@@ -14216,7 +14216,7 @@
   },
   {
     "name": "workspace_edit_apply",
-    "description": "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced.",
+    "description": "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -14244,7 +14244,7 @@
       "title": "Apply workspace edit",
       "readOnlyHint": false,
       "destructiveHint": true,
-      "idempotentHint": false
+      "idempotentHint": true
     }
   },
   {

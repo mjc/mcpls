@@ -1812,12 +1812,12 @@ impl McplsServer {
     #[tool(
         name = "workspace_edit_apply",
         output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
-        description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. Plans are single-use and are revalidated before any file is replaced.",
+        description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply workspace edit",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false
+            idempotent_hint = true
         )
     )]
     async fn workspace_edit_apply_tool(
@@ -1849,12 +1849,12 @@ impl McplsServer {
     #[tool(
         name = "rename_apply",
         output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
-        description = "Apply a rename plan returned by rename_preview. Plans are single-use and revalidated before any file is replaced.",
+        description = "Apply a rename plan returned by rename_preview. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply rename",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false
+            idempotent_hint = true
         )
     )]
     async fn rename_apply_tool(
@@ -1886,12 +1886,12 @@ impl McplsServer {
     #[tool(
         name = "format_apply",
         output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
-        description = "Apply a formatting plan returned by format_preview. Plans are single-use and revalidated before any file is replaced.",
+        description = "Apply a formatting plan returned by format_preview. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply formatting",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false
+            idempotent_hint = true
         )
     )]
     async fn format_apply_tool(
@@ -2468,12 +2468,12 @@ impl McplsServer {
     #[tool(
         name = "code_action_apply",
         output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
-        description = "Apply a code action preview plan owned by this MCP session.",
+        description = "Apply a code action preview plan owned by this MCP session. Retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply code action",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false
+            idempotent_hint = true
         )
     )]
     async fn code_action_apply_tool(
@@ -4803,7 +4803,7 @@ finally:
     }
 
     #[tokio::test]
-    async fn workspace_edit_apply_consumes_project_owned_plan() {
+    async fn workspace_edit_apply_retries_return_the_committed_receipt() {
         let root = TempDir::new().unwrap();
         let file = root.path().join("src.rs");
         std::fs::write(&file, "before\n").unwrap();
@@ -4882,8 +4882,14 @@ finally:
                 project_id: "project".to_string(),
                 plan_id,
             }))
-            .await;
-        assert!(second.is_err());
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second, result);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
+            "after\n"
+        );
     }
 
     #[tokio::test]
@@ -5617,13 +5623,14 @@ while True:
             .unwrap();
         let format: serde_json::Value = serde_json::from_str(&format).unwrap();
         assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
-        server
+        let formatted = server
             .format_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: format["plan_id"].as_str().unwrap().to_string(),
             }))
             .await
             .unwrap();
+        let formatted: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert_eq!(fs::read_to_string(&source).unwrap(), "formatted\n");
         assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
 
@@ -6035,13 +6042,17 @@ while True:
             .unwrap();
         assert_eq!(fs::read_to_string(&renamed).unwrap(), "moved\n");
 
-        let stale_result = server
+        let request_count = fs::read_to_string(&counter).unwrap();
+        let retried = server
             .format_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: format["plan_id"].as_str().unwrap().to_string(),
             }))
-            .await;
-        assert!(stale_result.is_err());
+            .await
+            .unwrap();
+        let retried: serde_json::Value = serde_json::from_str(&retried).unwrap();
+        assert_eq!(retried, formatted);
+        assert_eq!(fs::read_to_string(&counter).unwrap(), request_count);
     }
 
     #[cfg(unix)]

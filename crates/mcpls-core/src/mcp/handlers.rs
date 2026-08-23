@@ -4,7 +4,7 @@
 //! The actual tool implementations use the `#[tool]` macro from rmcp
 //! and are defined in the `server` module.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -22,6 +22,31 @@ use crate::transport::{self, SessionManagerHandle, TransportSnapshot};
 
 pub(super) const APPROVAL_INPUT_ID: &str = "approval";
 pub(super) const APPROVAL_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_CLAIMED_PLAN_IDS: usize = 256;
+
+#[derive(Debug, Default)]
+struct SessionEditPlans {
+    owned: HashSet<PlanId>,
+    claimed: VecDeque<PlanId>,
+}
+
+impl SessionEditPlans {
+    fn remember(&mut self, plan_id: PlanId) {
+        self.claimed.retain(|claimed| claimed != &plan_id);
+        self.owned.insert(plan_id);
+    }
+
+    fn claim(&mut self, plan_id: &PlanId) -> bool {
+        if !self.owned.remove(plan_id) {
+            return self.claimed.contains(plan_id);
+        }
+        if self.claimed.len() >= MAX_CLAIMED_PLAN_IDS {
+            self.claimed.pop_front();
+        }
+        self.claimed.push_back(plan_id.clone());
+        true
+    }
+}
 
 /// Authenticated, non-source state carried through one approval round trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,8 +83,8 @@ pub struct HandlerContext {
     pub(crate) session_manager: SessionManagerHandle,
     /// Monotonic daemon start point shared by session clones.
     pub(crate) started_at: Instant,
-    /// Edit plans previewed by this MCP session.
-    owned_plan_ids: Mutex<HashSet<PlanId>>,
+    /// Previewed and claimed edit plans owned by this MCP session.
+    edit_plans: Mutex<SessionEditPlans>,
     /// Seals and authenticates MRTR approval state for this session.
     approval_codec: RequestStateCodec,
     /// Accepted approval nonces awaiting one retry; consumed atomically.
@@ -120,7 +145,7 @@ impl HandlerContext {
             transport,
             session_manager,
             started_at: Instant::now(),
-            owned_plan_ids: Mutex::new(HashSet::new()),
+            edit_plans: Mutex::new(SessionEditPlans::default()),
             approval_codec: RequestStateCodec::new(approval_key),
             pending_approvals: Mutex::new(HashSet::new()),
             client_supports_form_elicitation: RwLock::new(if cfg!(test) {
@@ -139,17 +164,17 @@ impl HandlerContext {
 
     /// Remember a plan returned by a preview in this session.
     pub(crate) async fn remember_plan(&self, plan_id: PlanId) {
-        self.owned_plan_ids.lock().await.insert(plan_id);
+        self.edit_plans.lock().await.remember(plan_id);
     }
 
     /// Claim a plan for application, consuming this session's ownership token.
     pub(crate) async fn claim_plan(&self, plan_id: &PlanId) -> bool {
-        self.owned_plan_ids.lock().await.remove(plan_id)
+        self.edit_plans.lock().await.claim(plan_id)
     }
 
     /// Return whether this session owns a plan without consuming its token.
     pub(crate) async fn owns_plan(&self, plan_id: &PlanId) -> bool {
-        self.owned_plan_ids.lock().await.contains(plan_id)
+        self.edit_plans.lock().await.owned.contains(plan_id)
     }
 
     /// Capture whether the connected client can answer form elicitation.
@@ -310,7 +335,21 @@ mod tests {
         context.remember_plan(plan_id.clone()).await;
 
         assert!(context.claim_plan(&plan_id).await);
-        assert!(!context.claim_plan(&plan_id).await);
+        assert!(context.claim_plan(&plan_id).await);
         assert!(!session.claim_plan(&plan_id).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_observe_one_atomic_claim() {
+        let subscriptions = Arc::new(ResourceSubscriptions::new());
+        let context = HandlerContext::from_registry(subscriptions, ProjectRegistry::new(32));
+        let plan_id = PlanId::new();
+        context.remember_plan(plan_id.clone()).await;
+
+        let (first, retry) =
+            tokio::join!(context.claim_plan(&plan_id), context.claim_plan(&plan_id),);
+
+        assert!(first);
+        assert!(retry);
     }
 }

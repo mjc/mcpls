@@ -33,6 +33,18 @@ pub struct LspTransport {
     pending_frame: Option<(usize, usize)>,
 }
 
+#[derive(Debug)]
+pub(super) struct LspWriter {
+    stdin: ChildStdin,
+}
+
+#[derive(Debug)]
+pub(super) struct LspReader {
+    stdout: BufReader<ChildStdout>,
+    read_buffer: Vec<u8>,
+    pending_frame: Option<(usize, usize)>,
+}
+
 impl LspTransport {
     /// Create transport from child process stdio.
     ///
@@ -50,6 +62,19 @@ impl LspTransport {
         }
     }
 
+    pub(super) fn split(self) -> (LspWriter, LspReader) {
+        (
+            LspWriter { stdin: self.stdin },
+            LspReader {
+                stdout: self.stdout,
+                read_buffer: self.read_buffer,
+                pending_frame: self.pending_frame,
+            },
+        )
+    }
+}
+
+impl LspWriter {
     /// Send message to LSP server.
     ///
     /// Formats the message with proper Content-Length header and sends it
@@ -61,7 +86,7 @@ impl LspTransport {
     /// - Message serialization fails
     /// - Writing to stdin fails
     /// - Flushing stdin fails
-    pub async fn send(&mut self, message: &Value) -> Result<()> {
+    pub(super) async fn send(&mut self, message: &Value) -> Result<()> {
         let content = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", content.len());
 
@@ -73,7 +98,9 @@ impl LspTransport {
 
         Ok(())
     }
+}
 
+impl LspReader {
     /// Receive next message from LSP server.
     ///
     /// Reads headers, extracts Content-Length, reads exact message content,
@@ -87,7 +114,7 @@ impl LspTransport {
     /// - Reading message content fails
     /// - JSON parsing fails
     /// - Message format is invalid
-    pub async fn receive(&mut self) -> Result<InboundMessage> {
+    pub(super) async fn receive(&mut self) -> Result<InboundMessage> {
         loop {
             let content = loop {
                 if let Some(content) = self.try_read_content()? {

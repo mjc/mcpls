@@ -2953,11 +2953,13 @@ fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {
             .contains("renamed_target")
     );
 
-    let stale = client.call_tool(
+    let retry = call_json(
+        client,
         "workspace_edit_apply",
         &json!({"project_id": "second", "plan_id": rename_plan}),
-    );
-    assert!(stale.is_err(), "a consumed edit plan must be rejected");
+    )
+    .unwrap();
+    assert_eq!(retry, applied, "a committed edit plan retry is idempotent");
 }
 
 fn format_and_restart(client: &mut McpClient, fixture: &MultiProjectFixture) {

@@ -39,7 +39,7 @@ use crate::edit_apply::{
     ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
 };
 use crate::edit_backup::BackupPolicy;
-use crate::edit_paths::WorkspaceBoundary;
+use crate::edit_paths::{FileOperation, WorkspaceBoundary};
 use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{
     EditProducer, PreviewArtifact, PreviewLimits, VerificationStatus, preview_workspace_edit,
@@ -1301,7 +1301,7 @@ impl ProjectRequestSender {
 }
 
 /// Result of consuming and applying one project-owned edit plan.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppliedEditPlan {
     /// Opaque identifier of the consumed plan.
     pub plan_id: PlanId,
@@ -3404,6 +3404,7 @@ struct ProjectRuntime {
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
+    applied_edit_receipts: VecDeque<AppliedEditPlan>,
     activation_health: ActivationHealth,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -3421,6 +3422,7 @@ struct InlineModuleSemanticCheck {
 const LANGUAGE_SERVER_EXITED: &str = "language server exited";
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
+const MAX_APPLIED_EDIT_RECEIPTS: usize = 256;
 const DEFAULT_RUST_RESIDENCY_LIMIT: usize = 5;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
@@ -3874,6 +3876,7 @@ impl ProjectRuntime {
             deferred_results,
             deferred_scope,
             inline_module_checks: HashMap::new(),
+            applied_edit_receipts: VecDeque::new(),
             activation_health: ActivationHealth::Ready,
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -4448,6 +4451,13 @@ impl ProjectRuntime {
         session_id: Option<String>,
         principal: Option<String>,
     ) -> Result<AppliedEditPlan, String> {
+        if let Some(applied) = self
+            .applied_edit_receipts
+            .iter()
+            .find(|applied| &applied.plan_id == plan_id)
+        {
+            return Ok(applied.clone());
+        }
         let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
         let backup_policy = self.configure_edit_safety(&boundary)?;
         let plan = self
@@ -4483,7 +4493,49 @@ impl ProjectRuntime {
                 return Err(self.record_edit_failure(audit, error.to_string()));
             }
         };
+        let audit_failure = self
+            .edit_plans
+            .record_audit_with_policy(audit.clone().committed(committed_files.clone()))
+            .err()
+            .map(|error| error.to_string());
+        if audit_failure.is_some() {
+            self.edit_plans
+                .record_audit(audit.committed(committed_files.clone()));
+        }
+        let (provider_synchronization, verification) = self
+            .synchronize_applied_edit(
+                &resource_operations,
+                &text_changes,
+                open_documents,
+                semantic_check.as_ref(),
+                audit_failure,
+            )
+            .await;
+        let applied = AppliedEditPlan {
+            plan_id: plan.id().clone(),
+            operations: plan.operations().to_vec(),
+            unified_diff: plan.unified_diff().to_string(),
+            committed_files,
+            verification,
+            provider_synchronization,
+        };
+        if self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS {
+            self.applied_edit_receipts.pop_front();
+        }
+        self.applied_edit_receipts.push_back(applied.clone());
+        Ok(applied)
+    }
+
+    async fn synchronize_applied_edit(
+        &mut self,
+        resource_operations: &[FileOperation],
+        text_changes: &[(PathBuf, String)],
+        open_documents: Vec<(PathBuf, i32, String)>,
+        semantic_check: Option<&InlineModuleSemanticCheck>,
+        audit_failure: Option<String>,
+    ) -> (Vec<ProviderSynchronization>, Option<VerificationStatus>) {
         let mut document_sync_failures = Vec::new();
+        let mut tracker_sync_failures = Vec::new();
         for (path, version, content) in open_documents {
             match self
                 .translator
@@ -4491,18 +4543,14 @@ impl ProjectRuntime {
                 .await
             {
                 Ok(failures) => document_sync_failures.extend(failures),
-                Err(error) => return Err(self.record_edit_failure(audit, error.to_string())),
+                Err(error) => tracker_sync_failures.push(error.to_string()),
             }
         }
         let mut provider_synchronization = self
             .translator
-            .synchronize_resource_operations(&resource_operations)
+            .synchronize_resource_operations(resource_operations)
             .await;
-        for result in self
-            .translator
-            .synchronize_text_changes(&text_changes)
-            .await
-        {
+        for result in self.translator.synchronize_text_changes(text_changes).await {
             merge_provider_synchronization(&mut provider_synchronization, result);
         }
         for (provider, error) in document_sync_failures {
@@ -4525,22 +4573,31 @@ impl ProjectRuntime {
                 });
             }
         }
-        let verification = if let Some(check) = semantic_check.as_ref() {
+        for error in tracker_sync_failures {
+            merge_provider_synchronization(
+                &mut provider_synchronization,
+                ProviderSynchronization {
+                    provider: "document_tracker".to_string(),
+                    synchronized: false,
+                    watched_file_notifications: 0,
+                    message: Some(error),
+                },
+            );
+        }
+        let verification = if let Some(check) = semantic_check {
             Some(self.verify_inline_module_after_apply(check).await)
         } else {
             None
         };
-        self.edit_plans
-            .record_audit_with_policy(audit.committed(committed_files.clone()))
-            .map_err(|error| error.to_string())?;
-        Ok(AppliedEditPlan {
-            plan_id: plan.id().clone(),
-            operations: plan.operations().to_vec(),
-            unified_diff: plan.unified_diff().to_string(),
-            committed_files,
-            verification,
-            provider_synchronization,
-        })
+        if let Some(error) = audit_failure {
+            provider_synchronization.push(ProviderSynchronization {
+                provider: "audit".to_string(),
+                synchronized: false,
+                watched_file_notifications: 0,
+                message: Some(error),
+            });
+        }
+        (provider_synchronization, verification)
     }
 
     async fn hover(
@@ -6236,11 +6293,11 @@ async fn resume_project_runtime(
     state.last_error = None;
     channels.publish_status(state, ProjectStatus::Starting);
     let cancellation = CancellationToken::new();
-    match run_cancellable_transition(
+    match Box::pin(run_cancellable_transition(
         &channels.gate,
         cancellation.clone(),
         runtime.activate_workspace_roots(roots, cancellation),
-    )
+    ))
     .await
     {
         Ok(activation) => {
@@ -12434,6 +12491,42 @@ while True:
                 .join("manifest.json")
                 .is_file()
         );
+    }
+
+    #[tokio::test]
+    async fn committed_edit_plan_retry_returns_the_original_receipt() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("retry.rs");
+        fs::write(&file, "before\n").unwrap();
+        let mut runtime = ProjectRuntime::new(Translator::new());
+        let plan = EditPlan::new(
+            "project".to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                file.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace retry fixture".to_string()],
+            true,
+            Duration::from_secs(60),
+        );
+        let plan_id = plan.id().clone();
+        runtime.store_edit_plan(plan).unwrap();
+
+        let first = runtime
+            .apply_edit_plan_with_context(&plan_id, "project", root.path(), None, None)
+            .await
+            .unwrap();
+        let retry = runtime
+            .apply_edit_plan_with_context(&plan_id, "project", root.path(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(retry, first);
+        assert_eq!(fs::read_to_string(file).unwrap(), "after\n");
+        assert_eq!(runtime.edit_plans.audit_records().count(), 1);
     }
 
     #[tokio::test]
