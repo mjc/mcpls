@@ -3729,36 +3729,6 @@ fn attach_document_symbol_handles(
     }
 }
 
-fn document_symbol_as_workspace_symbol(
-    symbol: crate::bridge::Symbol,
-    path: &Path,
-    uri: &str,
-    project_relative_path: Option<String>,
-) -> crate::bridge::translator::WorkspaceSymbol {
-    crate::bridge::translator::WorkspaceSymbol {
-        name: symbol.name,
-        kind: symbol.kind,
-        location: crate::bridge::Location {
-            path: Some(path.display().to_string()),
-            uri: uri.to_owned(),
-            range: symbol.selection_range,
-            source: symbol
-                .source
-                .unwrap_or(crate::bridge::SourceContext::Unavailable {
-                    reason: crate::bridge::translator::SourceUnavailableReason::NotFound,
-                }),
-            symbol_handle: symbol.symbol_handle,
-        },
-        container_name: symbol.container_name,
-        match_class: symbol
-            .match_class
-            .unwrap_or(crate::bridge::translator::WorkspaceSymbolMatch::Exact),
-        score: symbol.score.unwrap_or(100),
-        project_relative_path,
-        origin: crate::bridge::translator::WorkspaceSymbolOrigin::ProjectLocal,
-    }
-}
-
 fn missing_call_hierarchy_item() -> crate::bridge::InspectSection<crate::bridge::InspectCalls> {
     crate::bridge::InspectSection::unavailable(
         "call hierarchy provider returned no item at the symbol selection",
@@ -4872,6 +4842,24 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    async fn workspace_symbol_in_path(
+        &mut self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
+        path: &Path,
+    ) -> Result<WorkspaceSymbolResult, String> {
+        let mut result = self
+            .translator
+            .handle_workspace_symbol_in_path(query, kind_filter, limit, match_mode, scope, path)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
+        Ok(result)
+    }
+
     // One linear actor operation intentionally makes the snapshot boundary visible.
     #[allow(clippy::too_many_lines)]
     async fn inspect_symbol(
@@ -4914,42 +4902,16 @@ impl ProjectRuntime {
                         .ok_or_else(|| "project has no workspace root".to_owned())?
                         .join(path)
                 };
-                let outline = self
-                    .document_symbols(
-                        path.display().to_string(),
-                        DocumentSymbolOptions {
-                            query: Some(query.clone()),
-                            match_mode: WorkspaceSymbolMatchMode::Exact,
-                            kind_filter: request.kind.clone(),
-                            limit: request.candidate_limit,
-                            include_tests: true,
-                            include_private: true,
-                            include_bodies: true,
-                            ..DocumentSymbolOptions::default()
-                        },
-                    )
-                    .await?;
-                let uri = path_to_uri(&path)
-                    .map_err(|error| error.to_string())?
-                    .to_string();
-                let symbols = outline
-                    .symbols
-                    .into_iter()
-                    .map(|symbol| {
-                        document_symbol_as_workspace_symbol(
-                            symbol,
-                            &path,
-                            &uri,
-                            outline.project_relative_path.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                WorkspaceSymbolResult {
-                    total: outline.total,
-                    returned: symbols.len(),
-                    truncated: outline.truncated,
-                    symbols,
-                }
+                let path = dunce::canonicalize(path).map_err(|error| error.to_string())?;
+                self.workspace_symbol_in_path(
+                    query.clone(),
+                    request.kind.clone(),
+                    request.candidate_limit,
+                    WorkspaceSymbolMatchMode::Exact,
+                    WorkspaceSymbolScope::Project,
+                    &path,
+                )
+                .await?
             } else {
                 self.workspace_symbol(
                     query.clone(),
@@ -9996,51 +9958,108 @@ mod tests {
         responder.await.unwrap();
     }
 
-    #[test]
-    fn inspect_symbol_path_targets_the_identifier_selection() {
-        let whole = crate::bridge::Range {
-            start: crate::bridge::Position2D {
-                line: 1,
-                character: 1,
-            },
-            end: crate::bridge::Position2D {
-                line: 3,
-                character: 2,
-            },
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn inspect_symbol_path_resolution_does_not_request_document_outline() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
         };
-        let selection = crate::bridge::Range {
-            start: crate::bridge::Position2D {
-                line: 2,
-                character: 4,
-            },
-            end: crate::bridge::Position2D {
-                line: 2,
-                character: 13,
-            },
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        let other = root.path().join("other.rs");
+        fs::write(&source, "fn inspected() {}\n").unwrap();
+        fs::write(&other, "fn inspected() {}\n").unwrap();
+        let uri = crate::bridge::path_to_uri(&source).unwrap();
+        let other_uri = crate::bridge::path_to_uri(&other).unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
         };
-        let symbol = crate::bridge::Symbol {
-            name: "inspected".to_owned(),
-            kind: "Function".to_owned(),
-            range: whole,
-            selection_range: selection.clone(),
+        let (translator, server) = translator_with_capabilities(&root, &server_id, capabilities);
+        let FakeServer {
+            _write_half: write_half,
+            _read_half: read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let (method_tx, method_rx) = oneshot::channel();
+        let (release_server, hold_server) = oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let processes = (write_half, read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            loop {
+                let message = read_framed_message(&mut reader).await;
+                let Some(id) = message.get("id") else {
+                    continue;
+                };
+                let method = message["method"].as_str().unwrap().to_owned();
+                method_tx.send(method.clone()).unwrap();
+                let response = if method == "workspace/symbol" {
+                    serde_json::json!([
+                        {
+                            "name": "inspected",
+                            "kind": 12,
+                            "location": {
+                                "uri": other_uri,
+                                "range": {
+                                    "start": {"line": 0, "character": 3},
+                                    "end": {"line": 0, "character": 12}
+                                }
+                            }
+                        },
+                        {
+                            "name": "inspected",
+                            "kind": 12,
+                            "location": {
+                                "uri": uri,
+                                "range": {
+                                    "start": {"line": 0, "character": 3},
+                                    "end": {"line": 0, "character": 12}
+                                }
+                            }
+                        }
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                write_response(&mut read_half_stdin, id, response).await;
+                break;
+            }
+            let _ = hold_server.await;
+            drop(processes);
+        });
+
+        let mut runtime = ProjectRuntime::new(translator);
+        let result = Box::pin(runtime.inspect_symbol(InspectSymbolRequest {
             symbol_handle: None,
-            container_name: None,
-            match_class: None,
-            score: None,
-            source: None,
-            is_private: true,
-            is_test: true,
-            children: None,
+            query: Some("inspected".to_owned()),
+            kind: None,
+            path: Some("lib.rs".to_owned()),
+            container: None,
+            candidate_limit: 1,
+            sections: Vec::new(),
+            budget: crate::bridge::InspectSymbolBudget::default(),
+        }))
+        .await;
+
+        assert_eq!(method_rx.await.unwrap(), "workspace/symbol");
+        let result = result.unwrap();
+        let crate::bridge::InspectSymbolResolution::Selected {
+            symbol: Some(symbol),
+            ..
+        } = result.resolution
+        else {
+            panic!("requested path must select its symbol before applying the candidate limit");
         };
-
-        let selected = document_symbol_as_workspace_symbol(
-            symbol,
-            Path::new("/workspace/lib.rs"),
-            "file:///workspace/lib.rs",
-            Some("lib.rs".to_owned()),
+        assert_eq!(
+            symbol.location.path.as_deref(),
+            Some(source.to_str().unwrap())
         );
-
-        assert_eq!(selected.location.range, selection);
+        release_server.send(()).unwrap();
+        responder.await.unwrap();
     }
 
     #[test]

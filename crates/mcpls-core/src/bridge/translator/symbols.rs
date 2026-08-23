@@ -635,6 +635,47 @@ impl Translator {
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
     ) -> Result<WorkspaceSymbolResult> {
+        self.handle_workspace_symbol_filtered(query, kind_filter, limit, match_mode, scope, None)
+            .await
+    }
+
+    /// Handle workspace symbol search constrained to one canonical source path.
+    ///
+    /// Path filtering happens before the result limit is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::handle_workspace_symbol`].
+    pub(crate) async fn handle_workspace_symbol_in_path(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
+        path: &std::path::Path,
+    ) -> Result<WorkspaceSymbolResult> {
+        self.handle_workspace_symbol_filtered(
+            query,
+            kind_filter,
+            limit,
+            match_mode,
+            scope,
+            Some(path),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_workspace_symbol_filtered(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
+        path: Option<&std::path::Path>,
+    ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref(), limit)?;
         if limit == 0 {
             return Ok(WorkspaceSymbolResult {
@@ -653,8 +694,13 @@ impl Translator {
                 .collect::<Vec<_>>();
             languages.sort_unstable();
             languages.dedup();
+            let path_root = path.map(|path| vec![path.to_path_buf()]);
+            let roots = path_root
+                .as_deref()
+                .unwrap_or(self.workspace_roots.as_slice());
             Ok(self
                 .ast_grep_workspace_symbols(
+                    roots,
                     &languages,
                     &query,
                     kind_filter.as_deref(),
@@ -724,6 +770,9 @@ impl Translator {
         let ctx = self.encoding_ctx(&server_id);
         let mut candidates = Vec::new();
         for sym in response.unwrap_or_default() {
+            if path.is_some_and(|path| uri_to_path(&sym.location.uri).as_deref() != Some(path)) {
+                continue;
+            }
             let Some(match_class) = workspace_symbol_match(&sym.name, &query, match_mode) else {
                 continue;
             };
@@ -750,11 +799,16 @@ impl Translator {
             });
         }
 
+        if path.is_some() && candidates.is_empty() {
+            return fallback().await;
+        }
+
         Ok(finish_workspace_symbols(candidates, limit as usize, &ctx, &self.workspace_roots).await)
     }
 
     async fn ast_grep_workspace_symbols(
         &self,
+        roots: &[std::path::PathBuf],
         languages: &[String],
         query: &str,
         kind_filter: Option<&str>,
@@ -766,14 +820,8 @@ impl Translator {
             .next()
             .map(|character| character.to_string())
             .unwrap_or_default();
-        let matches = ast_grep::search(
-            &self.workspace_roots,
-            languages,
-            &candidate_query,
-            kind_filter,
-            4_096,
-        )
-        .await;
+        let matches =
+            ast_grep::search(roots, languages, &candidate_query, kind_filter, 4_096).await;
         let ctx = EncodingCtx {
             encoding: crate::bridge::encoding::PositionEncoding::Utf8,
             tracker: self.document_tracker.clone(),
