@@ -15,6 +15,9 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
+use crate::lsp::notification::NonBlockingNotificationSink;
+#[cfg(test)]
+use crate::lsp::notification::non_blocking_notification_channel;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
@@ -155,7 +158,7 @@ impl LspClient {
     pub fn new(config: LspServerConfig) -> Self {
         // Placeholder channel - the receiver is intentionally dropped since
         // the client starts uninitialized. A real channel is created when
-        // `from_transport` or `from_transport_with_notifications` is called.
+        // `from_transport` or `from_transport_with_notification_sink` is called.
         let (command_tx, _command_rx) = mpsc::channel(1); // Minimal capacity for placeholder
 
         Self {
@@ -201,10 +204,10 @@ impl LspClient {
     ///
     /// Notifications received from the LSP server will be parsed and sent
     /// through the provided channel.
-    pub(crate) fn from_transport_with_notifications(
+    pub(super) fn from_transport_with_notification_sink(
         config: LspServerConfig,
         transport: LspTransport,
-        notification_tx: mpsc::Sender<LspNotification>,
+        notification_sink: NonBlockingNotificationSink,
         workspace_roots: Vec<std::path::PathBuf>,
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
@@ -216,7 +219,7 @@ impl LspClient {
             transport,
             command_rx,
             Arc::clone(&pending_requests),
-            Some(notification_tx),
+            Some(notification_sink),
             workspace_roots,
         ));
 
@@ -542,7 +545,7 @@ impl LspClient {
         mut transport: LspTransport,
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
-        notification_tx: Option<mpsc::Sender<LspNotification>>,
+        notification_sink: Option<NonBlockingNotificationSink>,
         workspace_roots: Vec<std::path::PathBuf>,
     ) -> Result<()> {
         debug!("Message loop started");
@@ -553,7 +556,7 @@ impl LspClient {
             &mut transport,
             &mut command_rx,
             &pending_requests,
-            notification_tx.as_ref(),
+            notification_sink.as_ref(),
             &mut watch_registry,
             &mut watch_signal_rx,
         )
@@ -583,7 +586,7 @@ impl LspClient {
         transport: &mut LspTransport,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
-        notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        notification_sink: Option<&NonBlockingNotificationSink>,
         watch_registry: &mut WatchRegistry,
         watch_signal_rx: &mut mpsc::Receiver<WatchSignal>,
     ) -> Result<()> {
@@ -734,10 +737,10 @@ impl LspClient {
                             let typed = LspNotification::parse(&notification.method, notification.params);
 
                             // Forward to notification handler if sender is available
-                            if let Some(tx) = notification_tx {
+                            if let Some(sink) = notification_sink {
                                 // Progress reports are noisy and currently have no
                                 // consumer. Preserve only the initial-indexing
-                                // completion signal, and never drop readiness/status.
+                                // completion signal.
                                 let readiness = typed.completes_initial_load();
                                 if matches!(typed, LspNotification::Progress { .. }) && !readiness {
                                     continue;
@@ -754,15 +757,7 @@ impl LspClient {
                                     trace!("Forwarding notification: {:?}", typed);
                                 }
 
-                                if readiness
-                                    || matches!(&typed, LspNotification::ServerStatus(_))
-                                {
-                                    if tx.send(typed).await.is_err() {
-                                        warn!("Notification channel closed, dropping readiness notification");
-                                    }
-                                } else if tx.try_send(typed).is_err() {
-                                    warn!("Notification channel full or closed, dropping notification");
-                                }
+                                sink.forward(typed);
                             }
                         }
                     }
@@ -1310,7 +1305,7 @@ mod tests {
             write_stdout: ChildStdout,
         }
 
-        fn fake_lsp_client() -> (LspClient, FakeServer) {
+        fn fake_lsp_transport() -> (LspTransport, FakeServer) {
             let mut write_half = Command::new("cat")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1329,11 +1324,8 @@ mod tests {
             let read_stdout = read_half.stdout.take().unwrap();
             let read_stdin = read_half.stdin.take().unwrap();
 
-            let transport = LspTransport::new(write_stdin, read_stdout);
-            let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-
             (
-                client,
+                LspTransport::new(write_stdin, read_stdout),
                 FakeServer {
                     _write_half: write_half,
                     _read_half: read_half,
@@ -1341,6 +1333,28 @@ mod tests {
                     write_stdout,
                 },
             )
+        }
+
+        fn fake_lsp_client() -> (LspClient, FakeServer) {
+            let (transport, server) = fake_lsp_transport();
+            (
+                LspClient::from_transport(LspServerConfig::rust_analyzer(), transport),
+                server,
+            )
+        }
+
+        fn fake_lsp_client_with_notifications()
+        -> (LspClient, FakeServer, mpsc::Receiver<LspNotification>) {
+            let (transport, server) = fake_lsp_transport();
+            let (notification_sink, notification_rx) = non_blocking_notification_channel(1);
+            let client = LspClient::from_transport_with_notification_sink(
+                LspServerConfig::rust_analyzer(),
+                transport,
+                notification_sink,
+                Vec::new(),
+            );
+
+            (client, server, notification_rx)
         }
 
         /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
@@ -1450,6 +1464,93 @@ mod tests {
             stdin.write_all(header.as_bytes()).await.unwrap();
             stdin.write_all(content.as_bytes()).await.unwrap();
             stdin.flush().await.unwrap();
+        }
+
+        async fn write_notification(stdin: &mut ChildStdin, method: &str, params: Value) {
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            });
+            let content = serde_json::to_string(&notification).unwrap();
+            let header = format!("Content-Length: {}\r\n\r\n", content.len());
+            stdin.write_all(header.as_bytes()).await.unwrap();
+            stdin.write_all(content.as_bytes()).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        #[tokio::test]
+        #[allow(clippy::expect_used)]
+        async fn full_notification_channel_does_not_block_lsp_responses() {
+            let (client, mut server, _notification_rx) = fake_lsp_client_with_notifications();
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "workspace/symbol",
+                        serde_json::json!({ "query": "SettingsWriteOperation" }),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut reader).await;
+
+            for quiescent in [false, true] {
+                write_notification(
+                    &mut server.read_half_stdin,
+                    "experimental/serverStatus",
+                    serde_json::json!({
+                        "health": "ok",
+                        "quiescent": quiescent,
+                    }),
+                )
+                .await;
+            }
+            write_success_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!([]),
+            )
+            .await;
+
+            let result = tokio::time::timeout(Duration::from_millis(200), request_task)
+                .await
+                .expect("status backpressure must not stall the response pump")
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, serde_json::json!([]));
+        }
+
+        #[tokio::test]
+        async fn readiness_survives_notification_backpressure() {
+            let (_client, mut server, mut notification_rx) = fake_lsp_client_with_notifications();
+            write_notification(
+                &mut server.read_half_stdin,
+                "experimental/serverStatus",
+                serde_json::json!({ "health": "ok", "quiescent": false }),
+            )
+            .await;
+            write_notification(
+                &mut server.read_half_stdin,
+                "$/progress",
+                serde_json::json!({
+                    "token": "rustAnalyzer/Indexing",
+                    "value": { "kind": "end" },
+                }),
+            )
+            .await;
+
+            let status = tokio::time::timeout(Duration::from_millis(200), notification_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(status, LspNotification::ServerStatus(_)));
+            let readiness =
+                tokio::time::timeout(Duration::from_millis(200), notification_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(readiness.completes_initial_load());
         }
 
         #[tokio::test]

@@ -5,6 +5,7 @@
 
 mod client;
 mod lifecycle;
+mod notification;
 mod transport;
 pub(crate) mod types;
 pub(crate) mod watcher;

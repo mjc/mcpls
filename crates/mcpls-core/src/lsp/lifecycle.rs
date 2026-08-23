@@ -31,6 +31,7 @@ use crate::bridge::try_path_to_uri;
 use crate::config::{LspServerConfig, ServerId};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::client::LspClient;
+use crate::lsp::notification::non_blocking_notification_channel;
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 
@@ -512,11 +513,11 @@ impl LspServer {
             .ok_or_else(|| Error::Transport("Failed to capture stdout".to_string()))?;
 
         let transport = LspTransport::new(stdin, stdout);
-        let (notification_tx, notification_rx) = mpsc::channel(64);
-        let client = LspClient::from_transport_with_notifications(
+        let (notification_sink, notification_rx) = non_blocking_notification_channel(64);
+        let client = LspClient::from_transport_with_notification_sink(
             config.server_config.clone(),
             transport,
-            notification_tx,
+            notification_sink,
             config.workspace_roots.clone(),
         );
 
