@@ -30,9 +30,8 @@ use crate::bridge::{
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
     SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
-    SupportedWorkspaceEdit, SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult,
-    WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri,
-    uri_to_path,
+    SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
+    WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1470,6 +1469,39 @@ pub(crate) struct PathRenamePreview {
     pub(crate) semantic_edit_count: usize,
 }
 
+/// One LSP edit request that must be generated and snapshotted atomically.
+pub(crate) enum GeneratedEditRequest {
+    Rename {
+        file_path: String,
+        line: u32,
+        character: u32,
+        new_name: String,
+    },
+    Format {
+        file_path: String,
+        tab_size: u32,
+        insert_spaces: bool,
+    },
+    RangeFormat {
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        tab_size: u32,
+        insert_spaces: bool,
+    },
+    MoveItem {
+        file_path: String,
+        start: (u32, u32),
+        end: (u32, u32),
+        direction: String,
+    },
+}
+
+pub(crate) struct GeneratedEditPreview {
+    pub(crate) supported: bool,
+    pub(crate) artifact: Option<PreviewArtifact>,
+}
+
 /// Coordinate target recovered from an actor-owned snapshot handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedSymbolTarget {
@@ -1573,20 +1605,12 @@ enum ProjectRequest {
         insert_spaces: bool,
         reply: oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
     },
-    RangeFormatWorkspaceEdit {
-        file_path: String,
-        start: (u32, u32),
-        end: (u32, u32),
-        tab_size: u32,
-        insert_spaces: bool,
-        reply: oneshot::Sender<Result<SupportedWorkspaceEdit, String>>,
-    },
-    MoveItemWorkspaceEdit {
-        file_path: String,
-        start: (u32, u32),
-        end: (u32, u32),
-        direction: String,
-        reply: oneshot::Sender<Result<SupportedWorkspaceEdit, String>>,
+    GeneratedEditPreview {
+        project_id: String,
+        request: GeneratedEditRequest,
+        encoding: PositionEncoding,
+        root: PathBuf,
+        reply: oneshot::Sender<Result<GeneratedEditPreview, String>>,
     },
     SemanticDiscovery {
         file_path: String,
@@ -1831,8 +1855,6 @@ impl ProjectRequest {
                 | Self::DocumentSymbols { .. }
                 | Self::FormatDocument { .. }
                 | Self::FormatWorkspaceEdit { .. }
-                | Self::RangeFormatWorkspaceEdit { .. }
-                | Self::MoveItemWorkspaceEdit { .. }
                 | Self::SemanticDiscovery { .. }
                 | Self::WorkspaceSymbol { .. }
                 | Self::InspectSymbol { .. }
@@ -1848,6 +1870,7 @@ impl ProjectRequest {
                 | Self::ApplyEditPlan { .. }
                 | Self::MoveInlineModulePreview { .. }
                 | Self::PathRenamePreview { .. }
+                | Self::GeneratedEditPreview { .. }
         ) || matches!(
             self,
             Self::StructuralReplacePreview {
@@ -1917,8 +1940,7 @@ impl ProjectRequest {
             Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
                 reject!(reply)
             }
-            Self::RangeFormatWorkspaceEdit { reply, .. }
-            | Self::MoveItemWorkspaceEdit { reply, .. } => reject!(reply),
+            Self::GeneratedEditPreview { reply, .. } => reject!(reply),
             Self::SemanticDiscovery { reply, .. } => reject!(reply),
             Self::Completions { reply, .. } => reject!(reply),
             Self::DocumentSymbols { reply, .. } => reject!(reply),
@@ -1964,8 +1986,7 @@ impl ProjectRequest {
             Self::RenameWorkspaceEdit { reply, .. } | Self::FormatWorkspaceEdit { reply, .. } => {
                 reply.is_closed()
             }
-            Self::RangeFormatWorkspaceEdit { reply, .. }
-            | Self::MoveItemWorkspaceEdit { reply, .. } => reply.is_closed(),
+            Self::GeneratedEditPreview { reply, .. } => reply.is_closed(),
             Self::SemanticDiscovery { reply, .. } => reply.is_closed(),
             Self::Completions { reply, .. } => reply.is_closed(),
             Self::DocumentSymbols { reply, .. } => reply.is_closed(),
@@ -2516,46 +2537,21 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
-    pub(crate) async fn range_format_workspace_edit(
+    /// Generate an LSP edit and snapshot its source in one actor request.
+    pub(crate) async fn preview_generated_edit(
         &self,
-        file_path: String,
-        start: (u32, u32),
-        end: (u32, u32),
-        tab_size: u32,
-        insert_spaces: bool,
-    ) -> Result<SupportedWorkspaceEdit, ProjectActorError> {
+        project_id: String,
+        request: GeneratedEditRequest,
+        encoding: PositionEncoding,
+        root: PathBuf,
+    ) -> Result<GeneratedEditPreview, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::RangeFormatWorkspaceEdit {
-                file_path,
-                start,
-                end,
-                tab_size,
-                insert_spaces,
-                reply,
-            })
-            .await
-            .map_err(|_| ProjectActorError::Closed)?;
-        response
-            .await
-            .map_err(|_| ProjectActorError::Cancelled)?
-            .map_err(ProjectActorError::Operation)
-    }
-
-    pub(crate) async fn move_item_workspace_edit(
-        &self,
-        file_path: String,
-        start: (u32, u32),
-        end: (u32, u32),
-        direction: String,
-    ) -> Result<SupportedWorkspaceEdit, ProjectActorError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(ProjectRequest::MoveItemWorkspaceEdit {
-                file_path,
-                start,
-                end,
-                direction,
+            .send(ProjectRequest::GeneratedEditPreview {
+                project_id,
+                request,
+                encoding,
+                root,
                 reply,
             })
             .await
@@ -4069,6 +4065,79 @@ impl ProjectRuntime {
         Ok(artifact)
     }
 
+    async fn preview_generated_edit(
+        &mut self,
+        project_id: &str,
+        request: GeneratedEditRequest,
+        encoding: PositionEncoding,
+        root: &Path,
+    ) -> Result<GeneratedEditPreview, String> {
+        let (supported, edit, create_empty_plan) = match request {
+            GeneratedEditRequest::Rename {
+                file_path,
+                line,
+                character,
+                new_name,
+            } => (
+                true,
+                self.rename_workspace_edit(file_path, line, character, new_name)
+                    .await?,
+                true,
+            ),
+            GeneratedEditRequest::Format {
+                file_path,
+                tab_size,
+                insert_spaces,
+            } => (
+                true,
+                self.format_workspace_edit(file_path, tab_size, insert_spaces)
+                    .await?,
+                true,
+            ),
+            GeneratedEditRequest::RangeFormat {
+                file_path,
+                start,
+                end,
+                tab_size,
+                insert_spaces,
+            } => {
+                let result = self
+                    .translator
+                    .request_range_format_workspace_edit(
+                        file_path,
+                        start,
+                        end,
+                        tab_size,
+                        insert_spaces,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                (result.supported, result.edit, false)
+            }
+            GeneratedEditRequest::MoveItem {
+                file_path,
+                start,
+                end,
+                direction,
+            } => {
+                let result = self
+                    .translator
+                    .request_move_item_workspace_edit(file_path, start, end, &direction)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                (result.supported, result.edit, false)
+            }
+        };
+        let artifact = edit
+            .or_else(|| create_empty_plan.then(WorkspaceEdit::default))
+            .map(|edit| self.preview_edit(project_id, edit, encoding, root))
+            .transpose()?;
+        Ok(GeneratedEditPreview {
+            supported,
+            artifact,
+        })
+    }
+
     async fn structural_replace_preview(
         &mut self,
         project_id: &str,
@@ -5023,33 +5092,6 @@ impl ProjectRuntime {
     ) -> Result<Option<WorkspaceEdit>, String> {
         self.translator
             .request_format_workspace_edit(file_path, tab_size, insert_spaces)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn range_format_workspace_edit(
-        &self,
-        file_path: String,
-        start: (u32, u32),
-        end: (u32, u32),
-        tab_size: u32,
-        insert_spaces: bool,
-    ) -> Result<SupportedWorkspaceEdit, String> {
-        self.translator
-            .request_range_format_workspace_edit(file_path, start, end, tab_size, insert_spaces)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn move_item_workspace_edit(
-        &self,
-        file_path: String,
-        start: (u32, u32),
-        end: (u32, u32),
-        direction: &str,
-    ) -> Result<SupportedWorkspaceEdit, String> {
-        self.translator
-            .request_move_item_workspace_edit(file_path, start, end, direction)
             .await
             .map_err(|error| error.to_string())
     }
@@ -6914,30 +6956,16 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::RangeFormatWorkspaceEdit {
-            file_path,
-            start,
-            end,
-            tab_size,
-            insert_spaces,
+        ProjectRequest::GeneratedEditPreview {
+            project_id,
+            request,
+            encoding,
+            root,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .range_format_workspace_edit(file_path, start, end, tab_size, insert_spaces)
-                    .await,
-            );
-        }
-        ProjectRequest::MoveItemWorkspaceEdit {
-            file_path,
-            start,
-            end,
-            direction,
-            reply,
-        } => {
-            let _ = reply.send(
-                runtime
-                    .move_item_workspace_edit(file_path, start, end, &direction)
+                    .preview_generated_edit(&project_id, request, encoding, &root)
                     .await,
             );
         }
@@ -9430,6 +9458,26 @@ impl ProjectRegistry {
             .map_err(ProjectRegistryError::from)
     }
 
+    /// Generate an LSP edit and retain its snapshot atomically in the actor.
+    pub(crate) async fn preview_generated_edit(
+        &self,
+        id: &ProjectId,
+        request: GeneratedEditRequest,
+        encoding: PositionEncoding,
+    ) -> Result<GeneratedEditPreview, ProjectRegistryError> {
+        let (identity, actor, mutation) = self.entry(id).await?;
+        let _mutation = mutation.lock().await;
+        actor
+            .preview_generated_edit(
+                id.as_str().to_string(),
+                request,
+                encoding,
+                identity.root().as_path().to_path_buf(),
+            )
+            .await
+            .map_err(ProjectRegistryError::from)
+    }
+
     /// Preview an inline Rust module move using the actor's current document state.
     ///
     /// The source path validation, dirty-document lookup, AST extraction, and
@@ -11640,6 +11688,34 @@ mod tests {
 
         let result = handle
             .format_workspace_edit(file.display().to_string(), 4, true)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectActorError::Operation(message)) if message.contains("outside workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn generated_preview_keeps_lsp_generation_and_snapshotting_in_one_actor_request() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let file = outside.path().join("outside.rs");
+        fs::write(&file, "fn outside() {}\n").unwrap();
+        let canonical_root = CanonicalRoot::new(root.path()).unwrap();
+        let handle = spawn_project_actor_for_root(2, &canonical_root);
+
+        let result = handle
+            .preview_generated_edit(
+                "project".to_owned(),
+                GeneratedEditRequest::Format {
+                    file_path: file.display().to_string(),
+                    tab_size: 4,
+                    insert_spaces: true,
+                },
+                PositionEncoding::Utf8,
+                root.path().to_path_buf(),
+            )
             .await;
 
         assert!(matches!(

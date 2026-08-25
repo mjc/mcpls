@@ -57,20 +57,18 @@ use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
-use crate::bridge::{
-    PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SupportedWorkspaceEdit,
-    SymbolHandle,
-};
+use crate::bridge::{PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SymbolHandle};
 use crate::edit_paths::FileOperation;
 use crate::edit_plan::EditPlanApprovalSummary;
 use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
 use crate::project::{
     AppliedEditPlan, ApplyEditPlanOutcome, CanonicalRoot, EditConflict, EditNotReady,
-    GitRepositoryIdentity, PathRenamePreview, PathRenameRequest, ProjectEvent, ProjectEventRecord,
-    ProjectEventSnapshot, ProjectHandle, ProjectId, ProjectIdentity, ProjectQueuePressure,
-    ProjectRegistry, ProjectServerCapability, ProjectState, ProjectStatusCounts,
-    ProjectStatusSummary, StructuralDialect, StructuralPreview, StructuralReplaceRequest,
+    GeneratedEditRequest, GitRepositoryIdentity, PathRenamePreview, PathRenameRequest,
+    ProjectEvent, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle, ProjectId,
+    ProjectIdentity, ProjectQueuePressure, ProjectRegistry, ProjectServerCapability, ProjectState,
+    ProjectStatusCounts, ProjectStatusSummary, StructuralDialect, StructuralPreview,
+    StructuralReplaceRequest,
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
@@ -1126,28 +1124,51 @@ impl McplsServer {
         encode_json(&preview_artifact_json(&artifact, id.as_str()))
     }
 
-    async fn preview_supported_edit(
+    async fn preview_generated_edit(
         &self,
         id: &ProjectId,
-        result: SupportedWorkspaceEdit,
+        request: GeneratedEditRequest,
         encoding: PositionEncoding,
     ) -> Result<Json<StructuredObject>, McpError> {
-        let Some(edit) = result.edit else {
+        let result = self
+            .context
+            .project_registry
+            .preview_generated_edit(id, request, encoding)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let Some(artifact) = result.artifact else {
             return encode_json(&serde_json::json!({
                 "project_id": id.as_str(),
                 "supported": result.supported,
                 "changed": false,
             }));
         };
-        let artifact = self
+        self.context.remember_plan(artifact.plan.id().clone()).await;
+        encode_json(&preview_artifact_json(&artifact, id.as_str()))
+    }
+
+    async fn preview_generated_supported_edit(
+        &self,
+        id: &ProjectId,
+        request: GeneratedEditRequest,
+        encoding: PositionEncoding,
+    ) -> Result<Json<StructuredObject>, McpError> {
+        let result = self
             .context
             .project_registry
-            .preview_edit(id, edit, encoding)
+            .preview_generated_edit(id, request, encoding)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let Some(artifact) = result.artifact else {
+            return encode_json(&serde_json::json!({
+                "project_id": id.as_str(),
+                "supported": result.supported,
+                "changed": false,
+            }));
+        };
         self.context.remember_plan(artifact.plan.id().clone()).await;
         let mut value = preview_artifact_json(&artifact, id.as_str());
-        value["supported"] = serde_json::Value::Bool(true);
+        value["supported"] = serde_json::Value::Bool(result.supported);
         value["changed"] = serde_json::Value::Bool(true);
         encode_json(&value)
     }
@@ -1777,18 +1798,17 @@ impl McplsServer {
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let edit = actor
-            .rename_workspace_edit(file_path, line, character, new_name)
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .unwrap_or_default();
-        self.preview_project_edit(&id, edit, encoding).await
+        self.preview_generated_edit(
+            &id,
+            GeneratedEditRequest::Rename {
+                file_path,
+                line,
+                character,
+                new_name,
+            },
+            encoding,
+        )
+        .await
     }
 
     /// Request document formatting from the project LSP and preview the edit.
@@ -1807,18 +1827,16 @@ impl McplsServer {
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let edit = actor
-            .format_workspace_edit(file_path, tab_size, insert_spaces)
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .unwrap_or_default();
-        self.preview_project_edit(&id, edit, encoding).await
+        self.preview_generated_edit(
+            &id,
+            GeneratedEditRequest::Format {
+                file_path,
+                tab_size,
+                insert_spaces,
+            },
+            encoding,
+        )
+        .await
     }
 
     /// Preview standard range formatting when the project server supports it.
@@ -1831,23 +1849,18 @@ impl McplsServer {
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(params.project_id)?;
         let encoding = parse_position_encoding(params.position_encoding.as_deref())?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = actor
-            .range_format_workspace_edit(
-                params.file_path,
-                (params.start_line, params.start_character),
-                (params.end_line, params.end_character),
-                params.tab_size,
-                params.insert_spaces,
-            )
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        self.preview_supported_edit(&id, result, encoding).await
+        self.preview_generated_supported_edit(
+            &id,
+            GeneratedEditRequest::RangeFormat {
+                file_path: params.file_path,
+                start: (params.start_line, params.start_character),
+                end: (params.end_line, params.end_character),
+                tab_size: params.tab_size,
+                insert_spaces: params.insert_spaces,
+            },
+            encoding,
+        )
+        .await
     }
 
     /// Preview rust-analyzer's syntax-aware item movement extension.
@@ -1860,22 +1873,17 @@ impl McplsServer {
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(params.project_id)?;
         let encoding = parse_position_encoding(params.position_encoding.as_deref())?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = actor
-            .move_item_workspace_edit(
-                params.file_path,
-                (params.start_line, params.start_character),
-                (params.end_line, params.end_character),
-                params.direction,
-            )
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        self.preview_supported_edit(&id, result, encoding).await
+        self.preview_generated_supported_edit(
+            &id,
+            GeneratedEditRequest::MoveItem {
+                file_path: params.file_path,
+                start: (params.start_line, params.start_character),
+                end: (params.end_line, params.end_character),
+                direction: params.direction,
+            },
+            encoding,
+        )
+        .await
     }
 
     /// Preview moving one inline Rust module to its own file.
