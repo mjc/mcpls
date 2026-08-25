@@ -325,7 +325,7 @@ impl EditPlanApprovalSummary {
         for operation in &self.file_operations {
             match operation {
                 FileOperation::Create { path, .. } => {
-                    resources.push(EditResource::exact(path.clone()))
+                    resources.push(EditResource::exact(path.clone()));
                 }
                 FileOperation::Rename { from, to, .. } => {
                     let directory = from.is_dir();

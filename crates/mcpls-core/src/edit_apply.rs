@@ -156,7 +156,7 @@ fn wait_for_test_apply_barrier(plan: &EditPlan) {
 }
 
 #[cfg(not(test))]
-fn wait_for_test_apply_barrier(_plan: &EditPlan) {}
+const fn wait_for_test_apply_barrier(_plan: &EditPlan) {}
 
 fn prepare_backup(
     policy: Option<&BackupPolicy>,

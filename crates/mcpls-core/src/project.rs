@@ -1719,7 +1719,7 @@ enum ProjectRequest {
         reply: oneshot::Sender<Result<ApplyEditPlanOutcome, String>>,
     },
     FinalizeEditPlan {
-        prepared: PreparedEditPlan,
+        prepared: Box<PreparedEditPlan>,
         result: Result<ApplyReport, ApplyError>,
         reply: oneshot::Sender<Result<ApplyEditPlanOutcome, String>>,
     },
@@ -1997,7 +1997,6 @@ impl ProjectRequest {
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
-            Self::FinalizeEditPlan { .. } => false,
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
             Self::ServerCapabilities { reply, .. } => reply.is_closed(),
@@ -2005,7 +2004,8 @@ impl ProjectRequest {
             | Self::Shutdown { .. }
             | Self::Suspend { .. }
             | Self::Notification { .. }
-            | Self::ServerExited { .. } => false,
+            | Self::ServerExited { .. }
+            | Self::FinalizeEditPlan { .. } => false,
         }
     }
 }
@@ -3460,7 +3460,7 @@ struct PreparedEditPlan {
 enum PreparedEditResult {
     AlreadyApplied(AppliedEditPlan),
     AlreadyConflicted(EditConflict),
-    Ready(PreparedEditPlan),
+    Ready(Box<PreparedEditPlan>),
 }
 
 const LANGUAGE_SERVER_EXITED: &str = "language server exited";
@@ -4461,7 +4461,7 @@ impl ProjectRuntime {
         let prepared = match prepared {
             PreparedEditResult::AlreadyApplied(applied) => return Ok(applied),
             PreparedEditResult::AlreadyConflicted(conflict) => return Err(conflict.reason),
-            PreparedEditResult::Ready(prepared) => prepared,
+            PreparedEditResult::Ready(prepared) => *prepared,
         };
         let apply_result = match prepared.backup_policy.as_ref() {
             Some(policy) => apply_plan_with_documents_and_backup(
@@ -4593,7 +4593,7 @@ impl ProjectRuntime {
             })
             .collect::<Vec<_>>();
         let audit = EditAuditRecord::for_plan_with_context(&plan, session_id, principal);
-        Ok(PreparedEditResult::Ready(PreparedEditPlan {
+        Ok(PreparedEditResult::Ready(Box::new(PreparedEditPlan {
             plan,
             boundary,
             backup_policy,
@@ -4604,7 +4604,7 @@ impl ProjectRuntime {
             audit,
             documents: std::sync::Arc::clone(self.translator.document_tracker()),
             lease,
-        }))
+        })))
     }
 
     async fn finish_prepared_edit(
@@ -7269,19 +7269,23 @@ async fn handle_project_request(
                     let sender = actor_sender.clone();
                     tokio::spawn(async move {
                         let worker = tokio::task::spawn_blocking(move || {
-                            let apply_result = match prepared.backup_policy.as_ref() {
-                                Some(policy) => apply_plan_with_documents_and_backup(
-                                    &prepared.boundary,
-                                    &prepared.plan,
-                                    &prepared.documents,
-                                    policy,
-                                ),
-                                None => apply_plan_with_documents(
-                                    &prepared.boundary,
-                                    &prepared.plan,
-                                    &prepared.documents,
-                                ),
-                            };
+                            let apply_result = prepared.backup_policy.as_ref().map_or_else(
+                                || {
+                                    apply_plan_with_documents(
+                                        &prepared.boundary,
+                                        &prepared.plan,
+                                        &prepared.documents,
+                                    )
+                                },
+                                |policy| {
+                                    apply_plan_with_documents_and_backup(
+                                        &prepared.boundary,
+                                        &prepared.plan,
+                                        &prepared.documents,
+                                        policy,
+                                    )
+                                },
+                            );
                             (prepared, apply_result)
                         })
                         .await;
@@ -7316,7 +7320,7 @@ async fn handle_project_request(
             reply,
         } => {
             runtime.active_edit_workers = runtime.active_edit_workers.saturating_sub(1);
-            let result = runtime.finish_prepared_edit(prepared, result).await;
+            let result = runtime.finish_prepared_edit(*prepared, result).await;
             if let Ok(ApplyEditPlanOutcome::Applied(applied)) = &result {
                 channels.publish_applied_edit(applied);
             }
@@ -7805,6 +7809,10 @@ impl RegistryLifecycle {
     }
 }
 
+type EditInFlight = std::sync::Arc<
+    Mutex<HashMap<(String, String), watch::Sender<Option<Result<ApplyEditPlanOutcome, String>>>>>,
+>;
+
 /// Process-wide registry of project identities and their actor handles.
 #[derive(Clone)]
 pub struct ProjectRegistry {
@@ -7820,11 +7828,7 @@ pub struct ProjectRegistry {
     next_rust_group_id: std::sync::Arc<AtomicU64>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     edit_coordinator: std::sync::Arc<EditCoordinator>,
-    edit_in_flight: std::sync::Arc<
-        Mutex<
-            HashMap<(String, String), watch::Sender<Option<Result<ApplyEditPlanOutcome, String>>>>,
-        >,
-    >,
+    edit_in_flight: EditInFlight,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -9250,6 +9254,12 @@ impl ProjectRegistry {
     }
 
     /// Apply a plan with a bounded path-admission wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry or actor error for invalid projects, ownership, or
+    /// filesystem failures. Expected edit contention is returned as a
+    /// successful [`ApplyEditPlanOutcome::NotReady`] value.
     pub async fn apply_edit_plan_with_wait(
         &self,
         id: &ProjectId,
@@ -9260,21 +9270,22 @@ impl ProjectRegistry {
     ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
         let wait = wait.min(MAX_EDIT_ADMISSION_WAIT);
         let key = (id.as_str().to_owned(), plan_id.as_str().to_owned());
-        let (leader, mut follower) = {
+        let (leader, receiver) = {
             let mut in_flight = self.edit_in_flight.lock().await;
-            if let Some(sender) = in_flight.get(&key) {
-                (false, Some(sender.subscribe()))
-            } else {
-                let (sender, receiver) = watch::channel(None);
-                in_flight.insert(key.clone(), sender);
-                (true, Some(receiver))
-            }
+            let existing = in_flight.get(&key).map(watch::Sender::subscribe);
+            let result = existing.map_or_else(
+                || {
+                    let (sender, receiver) = watch::channel(None);
+                    in_flight.insert(key.clone(), sender);
+                    (true, receiver)
+                },
+                |receiver| (false, receiver),
+            );
+            drop(in_flight);
+            result
         };
 
         if !leader {
-            let receiver = follower
-                .take()
-                .expect("in-flight follower always has a completion receiver");
             return self.wait_for_in_flight(plan_id, receiver, wait).await;
         }
 
@@ -9285,7 +9296,8 @@ impl ProjectRegistry {
             .as_ref()
             .map(Clone::clone)
             .map_err(ToString::to_string);
-        if let Some(sender) = self.edit_in_flight.lock().await.remove(&key) {
+        let sender = self.edit_in_flight.lock().await.remove(&key);
+        if let Some(sender) = sender {
             let _ = sender.send(Some(shared));
         }
         result
@@ -9299,7 +9311,8 @@ impl ProjectRegistry {
     ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
         let completion = tokio::time::timeout(wait, async {
             loop {
-                if let Some(result) = receiver.borrow().clone() {
+                let current = receiver.borrow().clone();
+                if let Some(result) = current {
                     return result;
                 }
                 receiver

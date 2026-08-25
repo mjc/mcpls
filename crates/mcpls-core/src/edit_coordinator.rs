@@ -49,19 +49,12 @@ impl EditResource {
 
 /// Expected contention with an edit that already owns an overlapping path.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("edit resources overlap active edit {blocking_owner}: {paths:?}")]
+#[error("edit resources overlap active paths: {paths:?}")]
 pub struct EditContention {
-    blocking_owner: String,
     paths: Vec<PathBuf>,
 }
 
 impl EditContention {
-    /// Return the opaque owner label supplied by the blocking edit.
-    #[must_use]
-    pub fn blocking_owner(&self) -> &str {
-        &self.blocking_owner
-    }
-
     /// Return requested paths that overlap the blocking edit.
     #[must_use]
     pub fn paths(&self) -> &[PathBuf] {
@@ -94,7 +87,8 @@ impl EditCoordinator {
         owner: impl Into<String>,
         resources: impl IntoIterator<Item = EditResource>,
     ) -> Result<EditLease, EditContention> {
-        self.try_acquire_owned(owner.into(), normalized_resources(resources))
+        let _owner = owner.into();
+        self.try_acquire_owned(normalized_resources(resources))
     }
 
     /// Wait up to `max_wait` for every requested resource to become available.
@@ -112,7 +106,7 @@ impl EditCoordinator {
         resources: impl IntoIterator<Item = EditResource>,
         max_wait: Duration,
     ) -> Result<EditLease, EditContention> {
-        let owner = owner.into();
+        let _owner = owner.into();
         let resources = normalized_resources(resources);
         let deadline = Instant::now() + max_wait;
 
@@ -121,7 +115,7 @@ impl EditCoordinator {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let contention = match self.try_acquire_owned(owner.clone(), resources.clone()) {
+            let contention = match self.try_acquire_owned(resources.clone()) {
                 Ok(lease) => return Ok(lease),
                 Err(contention) => contention,
             };
@@ -132,33 +126,24 @@ impl EditCoordinator {
         }
     }
 
-    fn try_acquire_owned(
-        &self,
-        owner: String,
-        resources: Vec<EditResource>,
-    ) -> Result<EditLease, EditContention> {
+    fn try_acquire_owned(&self, resources: Vec<EditResource>) -> Result<EditLease, EditContention> {
         let mut state = lock_state(&self.inner.state);
         for active in &state.active {
             let paths = overlapping_paths(&resources, &active.resources);
             if !paths.is_empty() {
-                return Err(EditContention {
-                    blocking_owner: active.owner.clone(),
-                    paths,
-                });
+                return Err(EditContention { paths });
             }
         }
 
         let token = Arc::new(());
         state.active.push(ActiveEdit {
             token: Arc::clone(&token),
-            owner: owner.clone(),
             resources,
         });
         drop(state);
         Ok(EditLease {
             inner: Arc::clone(&self.inner),
             token,
-            owner,
         })
     }
 }
@@ -169,15 +154,6 @@ impl EditCoordinator {
 pub struct EditLease {
     inner: Arc<CoordinatorInner>,
     token: Arc<()>,
-    owner: String,
-}
-
-impl EditLease {
-    /// Return the opaque owner label supplied during acquisition.
-    #[must_use]
-    pub fn owner(&self) -> &str {
-        &self.owner
-    }
 }
 
 impl Drop for EditLease {
@@ -211,7 +187,6 @@ struct CoordinatorState {
 #[derive(Debug)]
 struct ActiveEdit {
     token: Arc<()>,
-    owner: String,
     resources: Vec<EditResource>,
 }
 
@@ -248,8 +223,7 @@ mod tests {
             .try_acquire("second", [EditResource::exact("src/second.rs")])
             .expect("disjoint edit should be admitted while first is active");
 
-        assert_eq!(first.owner(), "first");
-        assert_eq!(second.owner(), "second");
+        let _ = (first, second);
     }
 
     #[test]
@@ -263,7 +237,6 @@ mod tests {
             .try_acquire("second", [EditResource::exact("src/lib.rs")])
             .unwrap_err();
 
-        assert_eq!(contention.blocking_owner(), "first");
         assert_eq!(contention.paths(), [PathBuf::from("src/lib.rs")]);
     }
 
@@ -278,7 +251,6 @@ mod tests {
             .try_acquire("plan-1", [EditResource::exact("src/lib.rs")])
             .expect_err("an owner label must not make acquisition reentrant");
 
-        assert_eq!(contention.blocking_owner(), "plan-1");
         assert_eq!(contention.paths(), [PathBuf::from("src/lib.rs")]);
 
         drop(first);
@@ -398,7 +370,7 @@ mod tests {
         drop(blocker);
 
         let lease = waiting.await.unwrap().unwrap();
-        assert_eq!(lease.owner(), "waiting");
+        let _ = lease;
     }
 
     #[tokio::test(start_paused = true)]
@@ -424,7 +396,6 @@ mod tests {
         tokio::time::advance(Duration::from_secs(5)).await;
 
         let contention = waiting.await.unwrap().unwrap_err();
-        assert_eq!(contention.blocking_owner(), "blocker");
         assert_eq!(contention.paths(), [PathBuf::from("src/lib.rs")]);
 
         drop(blocker);
@@ -474,6 +445,6 @@ mod tests {
         drop(blocker);
 
         let lease = survivor.await.unwrap().unwrap();
-        assert_eq!(lease.owner(), "survivor");
+        let _ = lease;
     }
 }

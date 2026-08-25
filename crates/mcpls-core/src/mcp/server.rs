@@ -124,16 +124,16 @@ impl<T> Deref for Json<T> {
 }
 
 impl<T> Json<T> {
-    fn new(value: serde_json::Value, legacy: String) -> Self {
+    const fn new(value: serde_json::Value, legacy: String) -> Self {
         Self {
             value,
-            legacy: legacy.clone(),
+            legacy,
             summary: None,
             marker: PhantomData,
         }
     }
 
-    fn with_summary(value: serde_json::Value, legacy: String, summary: String) -> Self {
+    const fn with_summary(value: serde_json::Value, legacy: String, summary: String) -> Self {
         Self {
             value,
             legacy,
@@ -401,12 +401,12 @@ fn project_relative_paths(roots: &[PathBuf], paths: Vec<PathBuf>) -> Vec<String>
         .collect()
 }
 
-fn workspace_edit_apply_json(
+fn workspace_edit_apply_result(
     outcome: ApplyEditPlanOutcome,
     project_id: &str,
     roots: &[PathBuf],
-) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
-    let result = match outcome {
+) -> WorkspaceEditApplyResult {
+    match outcome {
         ApplyEditPlanOutcome::Applied(AppliedEditPlan {
             plan_id,
             operations,
@@ -490,7 +490,15 @@ fn workspace_edit_apply_json(
             },
             changed_paths: project_relative_paths(roots, changed_paths),
         },
-    };
+    }
+}
+
+fn workspace_edit_apply_json(
+    outcome: ApplyEditPlanOutcome,
+    project_id: &str,
+    roots: &[PathBuf],
+) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
+    let result = workspace_edit_apply_result(outcome, project_id, roots);
     let value = serde_json::to_value(&result)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
     // Keep the legacy text channel machine-readable for clients that still
