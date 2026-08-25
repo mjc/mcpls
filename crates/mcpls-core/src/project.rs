@@ -36,10 +36,11 @@ use crate::bridge::{
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
-    ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
+    ApplyError, ApplyReport, apply_plan_with_documents, apply_plan_with_documents_and_backup,
 };
 use crate::edit_backup::BackupPolicy;
-use crate::edit_paths::{FileOperation, WorkspaceBoundary};
+use crate::edit_coordinator::{EditCoordinator, EditLease};
+use crate::edit_paths::{FileOperation, OperationValidationError, WorkspaceBoundary};
 use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{
     EditProducer, PreviewArtifact, PreviewLimits, VerificationStatus, preview_workspace_edit,
@@ -1317,6 +1318,39 @@ pub struct AppliedEditPlan {
     pub provider_synchronization: Vec<ProviderSynchronization>,
 }
 
+/// A successful apply response that did not mutate the workspace yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditNotReady {
+    /// Plan that remains valid for a same-plan retry.
+    pub plan_id: PlanId,
+    /// Caller-visible paths currently held by another edit.
+    pub blocked_paths: Vec<PathBuf>,
+    /// Suggested delay before retrying.
+    pub retry_after_ms: u64,
+}
+
+/// A successful apply response whose immutable plan became stale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditConflict {
+    /// Plan that must be previewed again.
+    pub plan_id: PlanId,
+    /// Paths whose preconditions no longer hold.
+    pub changed_paths: Vec<PathBuf>,
+    /// Stable reason code for clients.
+    pub reason: String,
+}
+
+/// Expected and successful outcomes of a workspace-edit apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyEditPlanOutcome {
+    /// The filesystem transaction committed.
+    Applied(AppliedEditPlan),
+    /// Another edit currently owns an overlapping path set.
+    NotReady(EditNotReady),
+    /// The plan's preconditions changed before it could commit.
+    Conflict(EditConflict),
+}
+
 impl AppliedEditPlan {
     fn project_events(&self) -> [ProjectEvent; 2] {
         [
@@ -1681,7 +1715,13 @@ enum ProjectRequest {
         root: PathBuf,
         session_id: Option<String>,
         principal: Option<String>,
-        reply: oneshot::Sender<Result<AppliedEditPlan, String>>,
+        lease: EditLease,
+        reply: oneshot::Sender<Result<ApplyEditPlanOutcome, String>>,
+    },
+    FinalizeEditPlan {
+        prepared: PreparedEditPlan,
+        result: Result<ApplyReport, ApplyError>,
+        reply: oneshot::Sender<Result<ApplyEditPlanOutcome, String>>,
     },
     PublishEvent {
         event: ProjectEvent,
@@ -1827,6 +1867,7 @@ impl ProjectRequest {
                 | Self::ServerExited { .. }
                 | Self::Shutdown { .. }
                 | Self::Fail { .. }
+                | Self::FinalizeEditPlan { .. }
         ) {
             RustResidencyRequirement::None
         } else {
@@ -1956,6 +1997,7 @@ impl ProjectRequest {
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
+            Self::FinalizeEditPlan { .. } => false,
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
             Self::ServerCapabilities { reply, .. } => reply.is_closed(),
@@ -3184,36 +3226,16 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
-    /// Consume and apply one project-owned workspace edit preview.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the actor is closed, the plan is not owned by the
-    /// project, or filesystem validation/application fails.
-    pub async fn apply_edit_plan(
-        &self,
-        plan_id: PlanId,
-        project_id: String,
-        root: PathBuf,
-    ) -> Result<AppliedEditPlan, ProjectActorError> {
-        self.apply_edit_plan_with_context(plan_id, project_id, root, None, None)
-            .await
-    }
-
-    /// Consume and apply one project-owned workspace edit preview with audit context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the actor is closed, the plan is not owned by the
-    /// project, or filesystem validation/application fails.
-    pub async fn apply_edit_plan_with_context(
+    /// Apply a plan while holding the registry-owned path reservation.
+    pub(crate) async fn apply_edit_plan_with_lease(
         &self,
         plan_id: PlanId,
         project_id: String,
         root: PathBuf,
         session_id: Option<String>,
         principal: Option<String>,
-    ) -> Result<AppliedEditPlan, ProjectActorError> {
+        lease: EditLease,
+    ) -> Result<ApplyEditPlanOutcome, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::ApplyEditPlan {
@@ -3222,6 +3244,7 @@ impl ProjectHandle {
                 root,
                 session_id,
                 principal,
+                lease,
                 reply,
             })
             .await
@@ -3405,6 +3428,8 @@ struct ProjectRuntime {
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     applied_edit_receipts: VecDeque<AppliedEditPlan>,
+    edit_conflicts: VecDeque<EditConflict>,
+    active_edit_workers: usize,
     activation_health: ActivationHealth,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
@@ -3419,9 +3444,29 @@ struct InlineModuleSemanticCheck {
     pre_verification: VerificationStatus,
 }
 
+struct PreparedEditPlan {
+    plan: EditPlan,
+    boundary: WorkspaceBoundary,
+    backup_policy: Option<BackupPolicy>,
+    semantic_check: Option<InlineModuleSemanticCheck>,
+    resource_operations: Vec<FileOperation>,
+    text_changes: Vec<(PathBuf, String)>,
+    open_documents: Vec<(PathBuf, i32, String)>,
+    audit: EditAuditRecord,
+    documents: std::sync::Arc<crate::bridge::DocumentTracker>,
+    lease: EditLease,
+}
+
+enum PreparedEditResult {
+    AlreadyApplied(AppliedEditPlan),
+    AlreadyConflicted(EditConflict),
+    Ready(PreparedEditPlan),
+}
+
 const LANGUAGE_SERVER_EXITED: &str = "language server exited";
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
+const MAX_EDIT_ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_APPLIED_EDIT_RECEIPTS: usize = 256;
 const DEFAULT_RUST_RESIDENCY_LIMIT: usize = 5;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
@@ -3877,6 +3922,8 @@ impl ProjectRuntime {
             deferred_scope,
             inline_module_checks: HashMap::new(),
             applied_edit_receipts: VecDeque::new(),
+            edit_conflicts: VecDeque::new(),
+            active_edit_workers: 0,
             activation_health: ActivationHealth::Ready,
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
@@ -4380,6 +4427,60 @@ impl ProjectRuntime {
         error
     }
 
+    fn remember_edit_conflict(&mut self, conflict: EditConflict) -> EditConflict {
+        self.edit_conflicts
+            .retain(|existing| existing.plan_id != conflict.plan_id);
+        if self.edit_conflicts.len() >= MAX_APPLIED_EDIT_RECEIPTS {
+            self.edit_conflicts.pop_front();
+        }
+        self.edit_conflicts.push_back(conflict.clone());
+        conflict
+    }
+
+    /// Apply a plan directly for the runtime-only test and embedding path.
+    ///
+    /// The project actor uses the same preparation and commit functions, but
+    /// runs the filesystem phase on its bounded blocking worker. Keeping this
+    /// small adapter preserves the runtime API without reintroducing the
+    /// actor-wide mutation lock into production requests.
+    #[cfg(test)]
+    async fn apply_edit_plan_with_context(
+        &mut self,
+        plan_id: &PlanId,
+        project_id: &str,
+        root: &Path,
+        session_id: Option<String>,
+        principal: Option<String>,
+    ) -> Result<AppliedEditPlan, String> {
+        let lease = EditCoordinator::new()
+            .try_acquire(plan_id.as_str(), Vec::new())
+            .map_err(|contention| format!("edit plan is busy: {contention:?}"))?;
+        let prepared = self.prepare_edit_plan_with_context(
+            plan_id, project_id, root, session_id, principal, lease,
+        )?;
+        let prepared = match prepared {
+            PreparedEditResult::AlreadyApplied(applied) => return Ok(applied),
+            PreparedEditResult::AlreadyConflicted(conflict) => return Err(conflict.reason),
+            PreparedEditResult::Ready(prepared) => prepared,
+        };
+        let apply_result = match prepared.backup_policy.as_ref() {
+            Some(policy) => apply_plan_with_documents_and_backup(
+                &prepared.boundary,
+                &prepared.plan,
+                &prepared.documents,
+                policy,
+            ),
+            None => {
+                apply_plan_with_documents(&prepared.boundary, &prepared.plan, &prepared.documents)
+            }
+        };
+        match self.finish_prepared_edit(prepared, apply_result).await? {
+            ApplyEditPlanOutcome::Applied(applied) => Ok(applied),
+            ApplyEditPlanOutcome::Conflict(conflict) => Err(conflict.reason),
+            ApplyEditPlanOutcome::NotReady(_) => Err("edit plan was not ready".to_owned()),
+        }
+    }
+
     async fn verify_inline_module_after_apply(
         &mut self,
         check: &InlineModuleSemanticCheck,
@@ -4443,22 +4544,36 @@ impl ProjectRuntime {
         }
     }
 
-    async fn apply_edit_plan_with_context(
+    fn prepare_edit_plan_with_context(
         &mut self,
         plan_id: &PlanId,
         project_id: &str,
         root: &Path,
         session_id: Option<String>,
         principal: Option<String>,
-    ) -> Result<AppliedEditPlan, String> {
+        lease: EditLease,
+    ) -> Result<PreparedEditResult, String> {
         if let Some(applied) = self
             .applied_edit_receipts
             .iter()
             .find(|applied| &applied.plan_id == plan_id)
         {
-            return Ok(applied.clone());
+            return Ok(PreparedEditResult::AlreadyApplied(applied.clone()));
         }
-        let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        if let Some(conflict) = self
+            .edit_conflicts
+            .iter()
+            .find(|conflict| &conflict.plan_id == plan_id)
+        {
+            return Ok(PreparedEditResult::AlreadyConflicted(conflict.clone()));
+        }
+        let workspace_root = self
+            .edit_plans
+            .get_for_project(plan_id, project_id)
+            .map_err(|error| error.to_string())?
+            .workspace_root()
+            .map_or_else(|| root.to_path_buf(), Path::to_path_buf);
+        let boundary = WorkspaceBoundary::new(workspace_root).map_err(|error| error.to_string())?;
         let backup_policy = self.configure_edit_safety(&boundary)?;
         let plan = self
             .edit_plans
@@ -4478,17 +4593,76 @@ impl ProjectRuntime {
             })
             .collect::<Vec<_>>();
         let audit = EditAuditRecord::for_plan_with_context(&plan, session_id, principal);
-        let apply_result = match backup_policy.as_ref() {
-            Some(policy) => apply_plan_with_documents_and_backup(
-                &boundary,
-                &plan,
-                self.translator.document_tracker(),
-                policy,
-            ),
-            None => apply_plan_with_documents(&boundary, &plan, self.translator.document_tracker()),
-        };
+        Ok(PreparedEditResult::Ready(PreparedEditPlan {
+            plan,
+            boundary,
+            backup_policy,
+            semantic_check,
+            resource_operations,
+            text_changes,
+            open_documents,
+            audit,
+            documents: std::sync::Arc::clone(self.translator.document_tracker()),
+            lease,
+        }))
+    }
+
+    async fn finish_prepared_edit(
+        &mut self,
+        prepared: PreparedEditPlan,
+        apply_result: Result<ApplyReport, ApplyError>,
+    ) -> Result<ApplyEditPlanOutcome, String> {
+        let PreparedEditPlan {
+            plan,
+            boundary: _boundary,
+            backup_policy: _backup_policy,
+            semantic_check,
+            resource_operations,
+            text_changes,
+            open_documents,
+            audit,
+            documents: _documents,
+            lease,
+        } = prepared;
         let ApplyReport { committed_files } = match apply_result {
             Ok(report) => report,
+            Err(ApplyError::Stale(_)) => {
+                let changed_paths = plan
+                    .files()
+                    .iter()
+                    .map(|snapshot| snapshot.path().clone())
+                    .collect();
+                let conflict = self.remember_edit_conflict(EditConflict {
+                    plan_id: plan.id().clone(),
+                    changed_paths,
+                    reason: "snapshot_changed".to_owned(),
+                });
+                drop(lease);
+                return Ok(ApplyEditPlanOutcome::Conflict(conflict));
+            }
+            Err(ApplyError::TopologyChanged { .. }) => {
+                let changed_paths = plan
+                    .files()
+                    .iter()
+                    .map(|snapshot| snapshot.path().clone())
+                    .collect();
+                let conflict = self.remember_edit_conflict(EditConflict {
+                    plan_id: plan.id().clone(),
+                    changed_paths,
+                    reason: "snapshot_changed".to_owned(),
+                });
+                drop(lease);
+                return Ok(ApplyEditPlanOutcome::Conflict(conflict));
+            }
+            Err(ApplyError::Operation(OperationValidationError::DestinationExists(path))) => {
+                let conflict = self.remember_edit_conflict(EditConflict {
+                    plan_id: plan.id().clone(),
+                    changed_paths: vec![path],
+                    reason: "snapshot_changed".to_owned(),
+                });
+                drop(lease);
+                return Ok(ApplyEditPlanOutcome::Conflict(conflict));
+            }
             Err(error) => {
                 return Err(self.record_edit_failure(audit, error.to_string()));
             }
@@ -4502,6 +4676,23 @@ impl ProjectRuntime {
             self.edit_plans
                 .record_audit(audit.committed(committed_files.clone()));
         }
+        // Persist a receipt and release the path lease at the filesystem
+        // commit point. Provider/LSP convergence is best-effort and must not
+        // hold another editor's paths hostage.
+        let mut applied = AppliedEditPlan {
+            plan_id: plan.id().clone(),
+            operations: plan.operations().to_vec(),
+            unified_diff: plan.unified_diff().to_string(),
+            committed_files,
+            verification: None,
+            provider_synchronization: Vec::new(),
+        };
+        if self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS {
+            self.applied_edit_receipts.pop_front();
+        }
+        self.applied_edit_receipts.push_back(applied.clone());
+        drop(lease);
+
         let (provider_synchronization, verification) = self
             .synchronize_applied_edit(
                 &resource_operations,
@@ -4511,19 +4702,16 @@ impl ProjectRuntime {
                 audit_failure,
             )
             .await;
-        let applied = AppliedEditPlan {
-            plan_id: plan.id().clone(),
-            operations: plan.operations().to_vec(),
-            unified_diff: plan.unified_diff().to_string(),
-            committed_files,
-            verification,
-            provider_synchronization,
-        };
-        if self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS {
-            self.applied_edit_receipts.pop_front();
+        applied.verification = verification;
+        applied.provider_synchronization = provider_synchronization;
+        if let Some(receipt) = self
+            .applied_edit_receipts
+            .iter_mut()
+            .find(|receipt| receipt.plan_id == applied.plan_id)
+        {
+            *receipt = applied.clone();
         }
-        self.applied_edit_receipts.push_back(applied.clone());
-        Ok(applied)
+        Ok(ApplyEditPlanOutcome::Applied(applied))
     }
 
     async fn synchronize_applied_edit(
@@ -6252,6 +6440,28 @@ async fn run_project_actor(
 ) {
     while let Some(request) = next_project_request(&mut receiver).await {
         let (request, _residency_guard) = request.into_resident();
+        if matches!(&request, ProjectRequest::Shutdown { .. }) {
+            while runtime.active_edit_workers > 0 {
+                let Some(next) = next_project_request(&mut receiver).await else {
+                    break;
+                };
+                let (next, _residency_guard) = next.into_resident();
+                let stop = handle_project_request(
+                    next,
+                    &actor_sender,
+                    &channels,
+                    &mut state,
+                    &mut runtime,
+                    residency.as_ref(),
+                )
+                .await;
+                state.sync_runtime(&runtime);
+                channels.publish_state(&state);
+                if stop {
+                    break;
+                }
+            }
+        }
         let resumes_runtime = request.resumes_rust_runtime();
         if residency.is_some()
             && resumes_runtime
@@ -7037,12 +7247,77 @@ async fn handle_project_request(
             root,
             session_id,
             principal,
+            lease,
             reply,
         } => {
-            let result = runtime
-                .apply_edit_plan_with_context(&plan_id, &project_id, &root, session_id, principal)
-                .await;
-            if let Ok(applied) = &result {
+            match runtime.prepare_edit_plan_with_context(
+                &plan_id,
+                &project_id,
+                &root,
+                session_id,
+                principal,
+                lease,
+            ) {
+                Ok(PreparedEditResult::AlreadyApplied(applied)) => {
+                    let _ = reply.send(Ok(ApplyEditPlanOutcome::Applied(applied)));
+                }
+                Ok(PreparedEditResult::AlreadyConflicted(conflict)) => {
+                    let _ = reply.send(Ok(ApplyEditPlanOutcome::Conflict(conflict)));
+                }
+                Ok(PreparedEditResult::Ready(prepared)) => {
+                    runtime.active_edit_workers = runtime.active_edit_workers.saturating_add(1);
+                    let sender = actor_sender.clone();
+                    tokio::spawn(async move {
+                        let worker = tokio::task::spawn_blocking(move || {
+                            let apply_result = match prepared.backup_policy.as_ref() {
+                                Some(policy) => apply_plan_with_documents_and_backup(
+                                    &prepared.boundary,
+                                    &prepared.plan,
+                                    &prepared.documents,
+                                    policy,
+                                ),
+                                None => apply_plan_with_documents(
+                                    &prepared.boundary,
+                                    &prepared.plan,
+                                    &prepared.documents,
+                                ),
+                            };
+                            (prepared, apply_result)
+                        })
+                        .await;
+                        match worker {
+                            Ok((prepared, result)) => {
+                                let Some(sender) = sender.upgrade() else {
+                                    return;
+                                };
+                                let _ = sender
+                                    .send(ProjectRequest::FinalizeEditPlan {
+                                        prepared,
+                                        result,
+                                        reply,
+                                    })
+                                    .await;
+                            }
+                            Err(error) => {
+                                let _ =
+                                    reply.send(Err(format!("edit commit worker failed: {error}")));
+                            }
+                        }
+                    });
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+        }
+        ProjectRequest::FinalizeEditPlan {
+            prepared,
+            result,
+            reply,
+        } => {
+            runtime.active_edit_workers = runtime.active_edit_workers.saturating_sub(1);
+            let result = runtime.finish_prepared_edit(prepared, result).await;
+            if let Ok(ApplyEditPlanOutcome::Applied(applied)) = &result {
                 channels.publish_applied_edit(applied);
             }
             let _ = reply.send(result);
@@ -7544,6 +7819,12 @@ pub struct ProjectRegistry {
     rust_residency: RustResidencyController,
     next_rust_group_id: std::sync::Arc<AtomicU64>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    edit_coordinator: std::sync::Arc<EditCoordinator>,
+    edit_in_flight: std::sync::Arc<
+        Mutex<
+            HashMap<(String, String), watch::Sender<Option<Result<ApplyEditPlanOutcome, String>>>>,
+        >,
+    >,
 }
 
 /// Bounded lifecycle counts for cheap daemon health reporting.
@@ -7790,6 +8071,8 @@ impl ProjectRegistry {
             deferred_results: std::sync::Arc::new(
                 std::sync::Mutex::new(DeferredResultStore::new()),
             ),
+            edit_coordinator: std::sync::Arc::new(EditCoordinator::new()),
+            edit_in_flight: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -8925,7 +9208,7 @@ impl ProjectRegistry {
         &self,
         id: &ProjectId,
         plan_id: PlanId,
-    ) -> Result<AppliedEditPlan, ProjectRegistryError> {
+    ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
         self.apply_edit_plan_with_context(id, plan_id, None, None)
             .await
     }
@@ -8955,16 +9238,154 @@ impl ProjectRegistry {
         plan_id: PlanId,
         session_id: Option<String>,
         principal: Option<String>,
-    ) -> Result<AppliedEditPlan, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
-        let _mutation = mutation.lock().await;
+    ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
+        self.apply_edit_plan_with_wait(
+            id,
+            plan_id,
+            session_id,
+            principal,
+            Duration::from_millis(250),
+        )
+        .await
+    }
+
+    /// Apply a plan with a bounded path-admission wait.
+    pub async fn apply_edit_plan_with_wait(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+        session_id: Option<String>,
+        principal: Option<String>,
+        wait: Duration,
+    ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
+        let wait = wait.min(MAX_EDIT_ADMISSION_WAIT);
+        let key = (id.as_str().to_owned(), plan_id.as_str().to_owned());
+        let (leader, mut follower) = {
+            let mut in_flight = self.edit_in_flight.lock().await;
+            if let Some(sender) = in_flight.get(&key) {
+                (false, Some(sender.subscribe()))
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                in_flight.insert(key.clone(), sender);
+                (true, Some(receiver))
+            }
+        };
+
+        if !leader {
+            let receiver = follower
+                .take()
+                .expect("in-flight follower always has a completion receiver");
+            return self.wait_for_in_flight(plan_id, receiver, wait).await;
+        }
+
+        let result = self
+            .apply_edit_plan_leader(id, plan_id.clone(), session_id, principal, wait)
+            .await;
+        let shared = result
+            .as_ref()
+            .map(Clone::clone)
+            .map_err(ToString::to_string);
+        if let Some(sender) = self.edit_in_flight.lock().await.remove(&key) {
+            let _ = sender.send(Some(shared));
+        }
+        result
+    }
+
+    async fn wait_for_in_flight(
+        &self,
+        plan_id: PlanId,
+        mut receiver: watch::Receiver<Option<Result<ApplyEditPlanOutcome, String>>>,
+        wait: Duration,
+    ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
+        let completion = tokio::time::timeout(wait, async {
+            loop {
+                if let Some(result) = receiver.borrow().clone() {
+                    return result;
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| "edit apply coordinator was removed".to_owned())?;
+            }
+        })
+        .await;
+        match completion {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(error)) => Err(ProjectRegistryError::Actor(ProjectActorError::Operation(
+                error,
+            ))),
+            Err(_) => Ok(ApplyEditPlanOutcome::NotReady(EditNotReady {
+                plan_id,
+                blocked_paths: Vec::new(),
+                retry_after_ms: 100,
+            })),
+        }
+    }
+
+    async fn apply_edit_plan_leader(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+        session_id: Option<String>,
+        principal: Option<String>,
+        wait: Duration,
+    ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
+        let (identity, actor, _mutation) = self.entry(id).await?;
+        let summary = match actor
+            .inspect_edit_plan(plan_id.clone(), id.as_str().to_string())
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) if error.to_string().contains("edit plan not found") => {
+                // A committed plan is retained as a receipt by the actor. It
+                // has no live snapshot to reserve, so let the actor resolve
+                // the receipt (or return the original not-found error) rather
+                // than turning an idempotent retry into a protocol failure.
+                let lease = self
+                    .edit_coordinator
+                    .try_acquire(plan_id.as_str(), Vec::new())
+                    .map_err(|contention| {
+                        ProjectRegistryError::Actor(ProjectActorError::Operation(format!(
+                            "edit plan is busy: {contention:?}"
+                        )))
+                    })?;
+                return actor
+                    .apply_edit_plan_with_lease(
+                        plan_id,
+                        id.as_str().to_string(),
+                        identity.root().as_path().to_path_buf(),
+                        session_id,
+                        principal,
+                        lease,
+                    )
+                    .await
+                    .map_err(ProjectRegistryError::from);
+            }
+            Err(error) => return Err(ProjectRegistryError::from(error)),
+        };
+        let resources = summary.coordination_resources();
+        let lease = match self
+            .edit_coordinator
+            .acquire_for(plan_id.as_str(), resources, wait)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(contention) => {
+                return Ok(ApplyEditPlanOutcome::NotReady(EditNotReady {
+                    plan_id,
+                    blocked_paths: contention.paths().to_vec(),
+                    retry_after_ms: 100,
+                }));
+            }
+        };
         actor
-            .apply_edit_plan_with_context(
+            .apply_edit_plan_with_lease(
                 plan_id,
                 id.as_str().to_string(),
                 identity.root().as_path().to_path_buf(),
                 session_id,
                 principal,
+                lease,
             )
             .await
             .map_err(ProjectRegistryError::from)
@@ -12527,6 +12948,144 @@ while True:
         assert_eq!(retry, first);
         assert_eq!(fs::read_to_string(file).unwrap(), "after\n");
         assert_eq!(runtime.edit_plans.audit_records().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_overlaps_disjoint_same_project_commits() {
+        let root = TempDir::new().unwrap();
+        let first_path = root.path().join("first.rs");
+        let second_path = root.path().join("second.rs");
+        fs::write(&first_path, "before first\n").unwrap();
+        fs::write(&second_path, "before second\n").unwrap();
+
+        let registry = ProjectRegistry::new(4);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let first = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                first_path.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before first\n",
+                "after first\n",
+            )],
+            vec!["replace first".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(root.path().to_path_buf());
+        let second = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                second_path.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before second\n",
+                "after second\n",
+            )],
+            vec!["replace second".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(root.path().to_path_buf());
+        let first_id = first.id().clone();
+        let second_id = second.id().clone();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let _barrier =
+            crate::edit_apply::install_test_apply_barrier([first_id.clone(), second_id.clone()], 2);
+        let (first_result, second_result) = tokio::join!(
+            registry.apply_edit_plan_with_context(
+                &project_id,
+                first_id,
+                Some("first-session".to_owned()),
+                None,
+            ),
+            registry.apply_edit_plan_with_context(
+                &project_id,
+                second_id,
+                Some("second-session".to_owned()),
+                None,
+            ),
+        );
+        assert!(matches!(
+            first_result.unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            second_result.unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert_eq!(fs::read_to_string(first_path).unwrap(), "after first\n");
+        assert_eq!(fs::read_to_string(second_path).unwrap(), "after second\n");
+    }
+
+    #[tokio::test]
+    async fn registry_reports_busy_without_consuming_a_plan() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("busy.rs");
+        fs::write(&file, "before\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                file.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before\n",
+                "after\n",
+            )],
+            vec!["replace busy".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(root.path().to_path_buf());
+        let plan_id = plan.id().clone();
+        actor.store_edit_plan(plan).await.unwrap();
+        let blocker = registry
+            .edit_coordinator
+            .try_acquire(
+                "blocker",
+                [crate::edit_coordinator::EditResource::exact(file)],
+            )
+            .unwrap();
+
+        let busy = registry
+            .apply_edit_plan_with_wait(&project_id, plan_id.clone(), None, None, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(busy, ApplyEditPlanOutcome::NotReady(_)));
+        assert!(
+            actor
+                .inspect_edit_plan(plan_id.clone(), project_id.to_string())
+                .await
+                .is_ok()
+        );
+
+        drop(blocker);
+        assert!(matches!(
+            registry
+                .apply_edit_plan_with_context(&project_id, plan_id, None, None)
+                .await
+                .unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
     }
 
     #[tokio::test]

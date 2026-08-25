@@ -301,6 +301,7 @@ impl<'a> PreviewBuilder<'a> {
             safe_to_apply,
             EditLimits::PROJECT.plan_ttl,
         )
+        .with_workspace_root(self.boundary.root().to_path_buf())
         .with_file_operations(self.file_operations);
         Ok(PreviewArtifact {
             plan,

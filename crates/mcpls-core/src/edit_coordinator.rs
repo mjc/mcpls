@@ -268,6 +268,40 @@ mod tests {
     }
 
     #[test]
+    fn the_same_owner_cannot_reenter_an_active_path() {
+        let coordinator = EditCoordinator::new();
+        let first = coordinator
+            .try_acquire("plan-1", [EditResource::exact("src/lib.rs")])
+            .unwrap();
+
+        let contention = coordinator
+            .try_acquire("plan-1", [EditResource::exact("src/lib.rs")])
+            .expect_err("an owner label must not make acquisition reentrant");
+
+        assert_eq!(contention.blocking_owner(), "plan-1");
+        assert_eq!(contention.paths(), [PathBuf::from("src/lib.rs")]);
+
+        drop(first);
+        let _retry = coordinator
+            .try_acquire("plan-1", [EditResource::exact("src/lib.rs")])
+            .expect("the same owner may retry after its original lease is released");
+    }
+
+    #[test]
+    fn callers_must_normalize_path_aliases_before_acquisition() {
+        let coordinator = EditCoordinator::new();
+        let _canonical = coordinator
+            .try_acquire("canonical", [EditResource::exact("workspace/src/lib.rs")])
+            .unwrap();
+
+        let alias = EditResource::exact("workspace/src/../src/lib.rs");
+        assert_eq!(alias.path(), Path::new("workspace/src/../src/lib.rs"));
+        let _alias = coordinator
+            .try_acquire("unnormalized", [alias])
+            .expect("the coordinator compares paths and does not resolve aliases");
+    }
+
+    #[test]
     fn multi_path_acquisition_is_all_or_nothing() {
         let coordinator = EditCoordinator::new();
         let _blocker = coordinator
@@ -370,7 +404,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bounded_wait_returns_contention_at_its_deadline() {
         let coordinator = EditCoordinator::new();
-        let _blocker = coordinator
+        let blocker = coordinator
             .try_acquire("blocker", [EditResource::exact("src/lib.rs")])
             .unwrap();
         let waiting = {
@@ -392,5 +426,54 @@ mod tests {
         let contention = waiting.await.unwrap().unwrap_err();
         assert_eq!(contention.blocking_owner(), "blocker");
         assert_eq!(contention.paths(), [PathBuf::from("src/lib.rs")]);
+
+        drop(blocker);
+        let _next = coordinator
+            .try_acquire("next", [EditResource::exact("src/lib.rs")])
+            .expect("a timed-out waiter must not retain the resource");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_waiter_does_not_consume_the_release_notification() {
+        let coordinator = EditCoordinator::new();
+        let blocker = coordinator
+            .try_acquire("blocker", [EditResource::exact("src/lib.rs")])
+            .unwrap();
+        let cancelled = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .acquire_for(
+                        "cancelled",
+                        [EditResource::exact("src/lib.rs")],
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!cancelled.is_finished());
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+
+        let survivor = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .acquire_for(
+                        "survivor",
+                        [EditResource::exact("src/lib.rs")],
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!survivor.is_finished());
+
+        drop(blocker);
+
+        let lease = survivor.await.unwrap().unwrap();
+        assert_eq!(lease.owner(), "survivor");
     }
 }

@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 use crate::bridge::DocumentSymbolOptions;
@@ -46,7 +47,9 @@ use super::tools::{
     ReferencesParams, RenameParams, RenamePreviewParams, SemanticPositionParams,
     SemanticResourceReadParams, SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams,
     SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
-    WorkspaceEditApplyParams, WorkspaceEditPreviewParams, WorkspaceSymbolParams,
+    WorkspaceEditApplyParams, WorkspaceEditApplyResult, WorkspaceEditContention,
+    WorkspaceEditContentionScope, WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization,
+    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -62,13 +65,12 @@ use crate::edit_paths::FileOperation;
 use crate::edit_plan::EditPlanApprovalSummary;
 use crate::edit_plan::PlanId;
 use crate::edit_preview::PreviewArtifact;
-use crate::project::AppliedEditPlan;
 use crate::project::{
-    CanonicalRoot, GitRepositoryIdentity, PathRenamePreview, PathRenameRequest, ProjectEvent,
-    ProjectEventRecord, ProjectEventSnapshot, ProjectHandle, ProjectId, ProjectIdentity,
-    ProjectQueuePressure, ProjectRegistry, ProjectServerCapability, ProjectState,
-    ProjectStatusCounts, ProjectStatusSummary, StructuralDialect, StructuralPreview,
-    StructuralReplaceRequest,
+    AppliedEditPlan, ApplyEditPlanOutcome, CanonicalRoot, EditConflict, EditNotReady,
+    GitRepositoryIdentity, PathRenamePreview, PathRenameRequest, ProjectEvent, ProjectEventRecord,
+    ProjectEventSnapshot, ProjectHandle, ProjectId, ProjectIdentity, ProjectQueuePressure,
+    ProjectRegistry, ProjectServerCapability, ProjectState, ProjectStatusCounts,
+    ProjectStatusSummary, StructuralDialect, StructuralPreview, StructuralReplaceRequest,
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
@@ -109,6 +111,7 @@ fn parse_structural_dialect(value: &str) -> Result<StructuralDialect, McpError> 
 struct Json<T> {
     value: serde_json::Value,
     legacy: String,
+    summary: Option<String>,
     marker: PhantomData<T>,
 }
 
@@ -121,20 +124,32 @@ impl<T> Deref for Json<T> {
 }
 
 impl<T> Json<T> {
-    const fn new(value: serde_json::Value, legacy: String) -> Self {
+    fn new(value: serde_json::Value, legacy: String) -> Self {
+        Self {
+            value,
+            legacy: legacy.clone(),
+            summary: None,
+            marker: PhantomData,
+        }
+    }
+
+    fn with_summary(value: serde_json::Value, legacy: String, summary: String) -> Self {
         Self {
             value,
             legacy,
+            summary: Some(summary),
             marker: PhantomData,
         }
     }
 
     fn into_result(self, legacy_text: bool) -> CallToolResult {
-        let text = if legacy_text {
-            self.legacy
-        } else {
-            "Structured result available in structuredContent.".to_owned()
-        };
+        let text = self.summary.clone().unwrap_or_else(|| {
+            if legacy_text {
+                self.legacy.clone()
+            } else {
+                "Structured result available in structuredContent.".to_owned()
+            }
+        });
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.structured_content = Some(self.value);
         result
@@ -371,30 +386,142 @@ fn project_events_json(
     })
 }
 
-fn applied_edit_plan_json(result: &AppliedEditPlan, project_id: &str) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "project_id": project_id,
-        "plan_id": result.plan_id.as_str(),
-        "committed_files": result.committed_files,
-        "operations": result.operations,
-        "unified_diff": result.unified_diff,
-    });
-    if let Some(verification) = result.verification {
-        value["verification"] = serde_json::json!(verification.as_str());
-    }
-    if !result.provider_synchronization.is_empty() {
-        value["provider_synchronization"] = serde_json::json!(result.provider_synchronization);
-        value["semantic_state"] = if result
-            .provider_synchronization
-            .iter()
-            .all(|provider| provider.synchronized)
-        {
-            serde_json::Value::String("synchronized".to_string())
-        } else {
-            serde_json::Value::String("degraded".to_string())
-        };
-    }
-    value
+fn project_relative_paths(roots: &[PathBuf], paths: Vec<PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| {
+            roots
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok())
+                .map_or_else(
+                    || "<outside-project>".to_owned(),
+                    |relative| relative.display().to_string(),
+                )
+        })
+        .collect()
+}
+
+fn workspace_edit_apply_json(
+    outcome: ApplyEditPlanOutcome,
+    project_id: &str,
+    roots: &[PathBuf],
+) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
+    let result = match outcome {
+        ApplyEditPlanOutcome::Applied(AppliedEditPlan {
+            plan_id,
+            operations,
+            unified_diff,
+            committed_files,
+            verification,
+            provider_synchronization,
+        }) => {
+            let committed_files = project_relative_paths(roots, committed_files);
+            let semantic_state = (!provider_synchronization.is_empty()).then(|| {
+                if provider_synchronization
+                    .iter()
+                    .all(|provider| provider.synchronized)
+                {
+                    "synchronized".to_owned()
+                } else {
+                    "degraded".to_owned()
+                }
+            });
+            let provider_synchronization = provider_synchronization
+                .into_iter()
+                .map(|provider| WorkspaceEditProviderSynchronization {
+                    provider: provider.provider,
+                    synchronized: provider.synchronized,
+                    watched_file_notifications: provider.watched_file_notifications,
+                    message: provider.message,
+                })
+                .collect();
+            WorkspaceEditApplyResult::Applied {
+                project_id: project_id.to_owned(),
+                plan_id: plan_id.as_str().to_owned(),
+                committed: true,
+                committed_files,
+                operations,
+                unified_diff,
+                verification: verification.map(|status| status.as_str().to_owned()),
+                provider_synchronization,
+                semantic_state,
+            }
+        }
+        ApplyEditPlanOutcome::NotReady(EditNotReady {
+            plan_id,
+            blocked_paths,
+            retry_after_ms,
+        }) => {
+            let blocked_path_count = blocked_paths.len();
+            let blocked_paths = project_relative_paths(roots, blocked_paths)
+                .into_iter()
+                .take(MAX_APPROVAL_ITEMS)
+                .collect();
+            WorkspaceEditApplyResult::NotReady {
+                reason: "edit_in_progress".to_owned(),
+                project_id: project_id.to_owned(),
+                plan_id: plan_id.as_str().to_owned(),
+                committed: false,
+                retry: WorkspaceEditRetry {
+                    action: WorkspaceEditRetryAction::RetryApply,
+                    same_plan: true,
+                    after_ms: Some(retry_after_ms),
+                },
+                contention: WorkspaceEditContention {
+                    scope: WorkspaceEditContentionScope::SameWorktree,
+                    blocked_paths,
+                    blocked_path_count,
+                },
+            }
+        }
+        ApplyEditPlanOutcome::Conflict(EditConflict {
+            plan_id,
+            changed_paths,
+            reason,
+        }) => WorkspaceEditApplyResult::Conflict {
+            reason,
+            project_id: project_id.to_owned(),
+            plan_id: plan_id.as_str().to_owned(),
+            committed: false,
+            retry: WorkspaceEditRetry {
+                action: WorkspaceEditRetryAction::PreviewAgain,
+                same_plan: false,
+                after_ms: None,
+            },
+            changed_paths: project_relative_paths(roots, changed_paths),
+        },
+    };
+    let value = serde_json::to_value(&result)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    // Keep the legacy text channel machine-readable for clients that still
+    // parse tool text, while structuredContent carries the typed result for
+    // negotiated MCP clients.
+    let legacy = serde_json::to_string(&result)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let summary = match &result {
+        WorkspaceEditApplyResult::Applied {
+            plan_id,
+            committed_files,
+            ..
+        } => format!(
+            "Applied edit plan {plan_id}; committed {} file(s).",
+            committed_files.len()
+        ),
+        WorkspaceEditApplyResult::NotReady {
+            plan_id,
+            contention,
+            retry,
+            ..
+        } => format!(
+            "Edit plan {plan_id} is not ready: {} path(s) are in use. Retry the same plan after about {} ms.",
+            contention.blocked_path_count,
+            retry.after_ms.unwrap_or(100)
+        ),
+        WorkspaceEditApplyResult::Conflict { plan_id, .. } => {
+            format!("Edit plan {plan_id} is stale; preview the change again before retrying.")
+        }
+    };
+    Ok(Json::with_summary(value, legacy, summary))
 }
 
 const MAX_APPROVAL_ITEMS: usize = 64;
@@ -1043,33 +1170,52 @@ impl McplsServer {
         &self,
         id: &ProjectId,
         plan_id: PlanId,
-    ) -> Result<Json<StructuredObject>, McpError> {
+        wait_timeout_ms: Option<u64>,
+    ) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
         if !self.context.claim_plan(&plan_id).await {
             return Err(McpError::invalid_params(
                 "edit plan is not owned by this MCP session",
                 None,
             ));
         }
-        self.apply_project_plan_claimed(id, plan_id).await
+        self.apply_project_plan_claimed(id, plan_id, wait_timeout_ms)
+            .await
     }
 
     async fn apply_project_plan_claimed(
         &self,
         id: &ProjectId,
         plan_id: PlanId,
-    ) -> Result<Json<StructuredObject>, McpError> {
-        let result = self
+        wait_timeout_ms: Option<u64>,
+    ) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
+        let roots = self
             .context
             .project_registry
-            .apply_edit_plan_with_context(
+            .identity(id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+            .roots()
+            .iter()
+            .map(|root| root.as_path().to_path_buf())
+            .collect::<Vec<_>>();
+        let outcome = self
+            .context
+            .project_registry
+            .apply_edit_plan_with_wait(
                 id,
-                plan_id,
+                plan_id.clone(),
                 Some(self.context.session_id().to_owned()),
                 None,
+                Duration::from_millis(wait_timeout_ms.unwrap_or(250)),
             )
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_json(&applied_edit_plan_json(&result, id.as_str()))
+        if matches!(outcome, ApplyEditPlanOutcome::NotReady(_)) {
+            self.context.remember_plan(plan_id).await;
+        } else {
+            self.context.finish_plan(&plan_id).await;
+        }
+        workspace_edit_apply_json(outcome, id.as_str(), &roots)
     }
 
     async fn apply_project_plan_with_approval(
@@ -1094,6 +1240,7 @@ impl McplsServer {
         let id = parse_project_id(params.project_id.clone())?;
         let plan_id = PlanId::parse(params.plan_id.clone())
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let wait_timeout_ms = params.wait_timeout_ms;
         let arguments_digest = approval_arguments_digest(id.as_str(), &plan_id);
         let principal = None;
         let binding = approval_binding(
@@ -1119,6 +1266,7 @@ impl McplsServer {
                     sealed,
                     input_responses,
                     cancellation,
+                    wait_timeout_ms,
                 )
                 .await
             }
@@ -1169,8 +1317,13 @@ impl McplsServer {
                 None,
             ));
         }
-        let id = parse_project_id(params.project_id)?;
-        let plan_id = PlanId::parse(params.plan_id)
+        let WorkspaceEditApplyParams {
+            project_id,
+            plan_id,
+            wait_timeout_ms,
+        } = params;
+        let id = parse_project_id(project_id)?;
+        let plan_id = PlanId::parse(plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         if !self.context.claim_plan(&plan_id).await {
             return Err(McpError::invalid_params(
@@ -1178,7 +1331,7 @@ impl McplsServer {
                 None,
             ));
         }
-        self.apply_project_plan_claimed(&id, plan_id)
+        self.apply_project_plan_claimed(&id, plan_id, wait_timeout_ms)
             .await?
             .into_call_tool_result()
     }
@@ -1236,6 +1389,7 @@ impl McplsServer {
         sealed: String,
         input_responses: InputResponses,
         cancellation: CancellationToken,
+        wait_timeout_ms: Option<u64>,
     ) -> Result<CallToolResponse, McpError> {
         let state = self
             .context
@@ -1266,17 +1420,28 @@ impl McplsServer {
                 None,
             ));
         }
-        let summary = self
+        match self
             .context
             .project_registry
             .inspect_edit_plan(request.id, request.plan_id.clone())
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        if summary.snapshot_hashes != state.snapshot_hashes || summary.versions != state.versions {
-            return Err(McpError::invalid_params(
-                "edit plan is stale; preview the change again",
-                None,
-            ));
+        {
+            Ok(summary) => {
+                if summary.snapshot_hashes != state.snapshot_hashes
+                    || summary.versions != state.versions
+                {
+                    return Err(McpError::invalid_params(
+                        "edit plan is stale; preview the change again",
+                        None,
+                    ));
+                }
+            }
+            Err(error) if error.to_string().contains("edit plan not found") => {
+                // A concurrent accepted retry may have claimed the plan. The
+                // sealed snapshot summary remains the integrity check, and
+                // the registry's in-flight join handles the duplicate apply.
+            }
+            Err(error) => return Err(McpError::invalid_params(error.to_string(), None)),
         }
         if cancellation.is_cancelled() {
             return Err(McpError::invalid_params(
@@ -1284,7 +1449,7 @@ impl McplsServer {
                 None,
             ));
         }
-        if !self.context.consume_approval(&state.nonce).await {
+        if !self.context.has_approval(&state.nonce).await {
             return Err(McpError::invalid_params(
                 "approval request has already been consumed",
                 None,
@@ -1297,8 +1462,14 @@ impl McplsServer {
             ));
         }
         let result = self
-            .apply_project_plan_claimed(request.id, request.plan_id.clone())
+            .apply_project_plan_claimed(request.id, request.plan_id.clone(), wait_timeout_ms)
             .await?;
+        if !matches!(
+            result.value.get("status"),
+            Some(serde_json::Value::String(status)) if status == "not_ready"
+        ) {
+            let _ = self.context.consume_approval(&state.nonce).await;
+        }
         result.into_call_tool_result()
     }
 
@@ -1306,11 +1477,16 @@ impl McplsServer {
     async fn apply_project_plan_params(
         &self,
         params: WorkspaceEditApplyParams,
-    ) -> Result<Json<StructuredObject>, McpError> {
-        let id = parse_project_id(params.project_id)?;
-        let plan_id = PlanId::parse(params.plan_id)
+    ) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
+        let WorkspaceEditApplyParams {
+            project_id,
+            plan_id,
+            wait_timeout_ms,
+        } = params;
+        let id = parse_project_id(project_id)?;
+        let plan_id = PlanId::parse(plan_id)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        self.apply_project_plan(&id, plan_id).await
+        self.apply_project_plan(&id, plan_id, wait_timeout_ms).await
     }
 
     /// Create a new MCP server with an empty project registry.
@@ -1811,7 +1987,7 @@ impl McplsServer {
     /// Apply a previously previewed, session-owned workspace edit plan.
     #[tool(
         name = "workspace_edit_apply",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceEditApplyResult>(),
         description = "Apply one workspace edit plan previewed by this MCP session, by project ID and opaque plan ID. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply workspace edit",
@@ -1841,14 +2017,14 @@ impl McplsServer {
     async fn workspace_edit_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
-    ) -> Result<Json<StructuredObject>, McpError> {
+    ) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
         self.apply_project_plan_params(params).await
     }
 
     /// Apply a rename preview through the generic workspace-edit transaction.
     #[tool(
         name = "rename_apply",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceEditApplyResult>(),
         description = "Apply a rename plan returned by rename_preview. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply rename",
@@ -1878,14 +2054,14 @@ impl McplsServer {
     async fn rename_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
-    ) -> Result<Json<StructuredObject>, McpError> {
+    ) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
         self.apply_project_plan_params(params).await
     }
 
     /// Apply a formatting preview through the generic workspace-edit transaction.
     #[tool(
         name = "format_apply",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceEditApplyResult>(),
         description = "Apply a formatting plan returned by format_preview. The first call revalidates before replacing files; retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply formatting",
@@ -1915,7 +2091,7 @@ impl McplsServer {
     async fn format_apply(
         &self,
         Parameters(params): Parameters<WorkspaceEditApplyParams>,
-    ) -> Result<Json<StructuredObject>, McpError> {
+    ) -> Result<Json<WorkspaceEditApplyResult>, McpError> {
         self.apply_project_plan_params(params).await
     }
 
@@ -2467,7 +2643,7 @@ impl McplsServer {
     /// Apply a code action plan previewed by this MCP session.
     #[tool(
         name = "code_action_apply",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<StructuredObject>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceEditApplyResult>(),
         description = "Apply a code action preview plan owned by this MCP session. Retries after commit return the original receipt without applying again.",
         annotations(
             title = "Apply code action",
@@ -2481,6 +2657,7 @@ impl McplsServer {
         Parameters(CodeActionApplyParams {
             project_id,
             plan_id,
+            wait_timeout_ms,
         }): Parameters<CodeActionApplyParams>,
         RequestState(request_state): RequestState,
         ToolInputResponses(input_responses): ToolInputResponses,
@@ -2491,6 +2668,7 @@ impl McplsServer {
             WorkspaceEditApplyParams {
                 project_id,
                 plan_id,
+                wait_timeout_ms,
             },
             request_state,
             input_responses,
@@ -4840,6 +5018,7 @@ finally:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id: plan_id.clone(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -4881,6 +5060,7 @@ finally:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id,
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -4974,6 +5154,7 @@ finally:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id,
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -5032,6 +5213,7 @@ finally:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id: result["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap_err()
@@ -5042,6 +5224,7 @@ finally:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id: result["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -5082,6 +5265,7 @@ finally:
             .rename_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "missing".to_string(),
                 plan_id: "plan-1".to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap_err()
@@ -5095,6 +5279,7 @@ finally:
             .format_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "missing".to_string(),
                 plan_id: "plan-1".to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap_err()
@@ -5412,6 +5597,7 @@ while True:
                 .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                     project_id: "fixture".to_string(),
                     plan_id: preview["plan_id"].as_str().unwrap().to_string(),
+                    wait_timeout_ms: None,
                 }))
                 .await
                 .unwrap(),
@@ -5510,6 +5696,7 @@ while True:
                 .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                     project_id: project_id.as_str().to_string(),
                     plan_id: rename["plan_id"].as_str().unwrap().to_string(),
+                    wait_timeout_ms: None,
                 }))
                 .await
                 .unwrap(),
@@ -5602,6 +5789,7 @@ while True:
             .rename_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: rename["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -5627,6 +5815,7 @@ while True:
             .format_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: format["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -5680,6 +5869,7 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: structural["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -5755,9 +5945,13 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: stale_preview["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
-            .await;
-        assert!(stale_result.is_err());
+            .await
+            .unwrap();
+        let stale_result: serde_json::Value = serde_json::from_str(&stale_result).unwrap();
+        assert_eq!(stale_result["status"], "conflict");
+        assert_eq!(stale_result["retry"]["action"], "preview_again");
         assert_eq!(fs::read_to_string(&source).unwrap(), "structural\n");
         assert_eq!(fs::read_to_string(&sibling).unwrap(), "new_name();\n");
         fs::remove_file(&renamed).unwrap();
@@ -5779,6 +5973,7 @@ while True:
                 .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                     project_id: project_id.as_str().to_string(),
                     plan_id: path_preview["plan_id"].as_str().unwrap().to_string(),
+                    wait_timeout_ms: None,
                 }))
                 .await
                 .unwrap(),
@@ -5839,6 +6034,7 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: fresh_range["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -5847,9 +6043,12 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: ranged["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
-            .await;
-        assert!(stale_range.is_err());
+            .await
+            .unwrap();
+        let stale_range: serde_json::Value = serde_json::from_str(&stale_range).unwrap();
+        assert_eq!(stale_range["status"], "conflict");
 
         let no_range: serde_json::Value = serde_json::from_str(
             &server
@@ -5895,6 +6094,7 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: unicode_range["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -6037,6 +6237,7 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: moved["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -6047,6 +6248,7 @@ while True:
             .format_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: format["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -6222,6 +6424,7 @@ while True:
                 .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                     project_id: project_id.as_str().to_string(),
                     plan_id: preview["plan_id"].as_str().unwrap().to_string(),
+                    wait_timeout_ms: None,
                 }))
                 .await
                 .unwrap(),
@@ -6281,6 +6484,7 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id: result["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -6328,6 +6532,7 @@ while True:
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_string(),
                 plan_id: preview["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
             }))
             .await
             .unwrap();
@@ -7706,7 +7911,7 @@ while True:
             };
             assert_eq!(annotations.read_only_hint, Some(false));
             assert_eq!(annotations.destructive_hint, Some(true));
-            assert_eq!(annotations.idempotent_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(true));
         }
     }
 
@@ -7752,6 +7957,7 @@ while True:
                 Parameters(WorkspaceEditApplyParams {
                     project_id: "project".to_owned(),
                     plan_id,
+                    wait_timeout_ms: None,
                 }),
                 RequestState(None),
                 ToolInputResponses(None),
@@ -7790,6 +7996,7 @@ while True:
             Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_owned(),
                 plan_id: plan_id.clone(),
+                wait_timeout_ms: None,
             })
         };
         let first = server
@@ -7850,6 +8057,7 @@ while True:
             Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_owned(),
                 plan_id: plan_id.clone(),
+                wait_timeout_ms: None,
             })
         };
         let first = server
@@ -7921,6 +8129,7 @@ while True:
                 Parameters(WorkspaceEditApplyParams {
                     project_id: "project".to_owned(),
                     plan_id,
+                    wait_timeout_ms: None,
                 }),
                 RequestState(None),
                 ToolInputResponses(None),
@@ -7942,6 +8151,7 @@ while True:
             Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_owned(),
                 plan_id: plan_id.clone(),
+                wait_timeout_ms: None,
             })
         };
         let first = server
@@ -7990,8 +8200,38 @@ while True:
                 CancellationToken::new(),
             )
             .await
-            .unwrap_err();
-        assert!(stale_retry.message.contains("stale"));
+            .unwrap();
+        let CallToolResponse::Complete(stale_retry) = stale_retry else {
+            panic!("stale apply should return a structured conflict result");
+        };
+        assert_eq!(stale_retry.is_error, Some(false));
+        assert_eq!(
+            stale_retry
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("status")),
+            Some(&serde_json::Value::String("conflict".to_owned()))
+        );
+        server.context.set_client_capabilities(None, false);
+        let replay = server
+            .workspace_edit_apply_tool(
+                params(),
+                RequestState(None),
+                ToolInputResponses(None),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::Complete(replay) = replay else {
+            panic!("terminal conflict should be replayable");
+        };
+        assert_eq!(
+            replay
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("status")),
+            Some(&serde_json::Value::String("conflict".to_owned()))
+        );
         assert_eq!(
             std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
             "changed\n"
@@ -7999,13 +8239,14 @@ while True:
     }
 
     #[tokio::test]
-    async fn mutating_apply_concurrent_retries_commit_at_most_once() {
+    async fn mutating_apply_concurrent_retries_join_one_commit() {
         let (root, server, plan_id) = approval_fixture().await;
         let first = server
             .workspace_edit_apply_tool(
                 Parameters(WorkspaceEditApplyParams {
                     project_id: "project".to_owned(),
                     plan_id: plan_id.clone(),
+                    wait_timeout_ms: None,
                 }),
                 RequestState(None),
                 ToolInputResponses(None),
@@ -8029,6 +8270,7 @@ while True:
             Parameters(WorkspaceEditApplyParams {
                 project_id: "project".to_owned(),
                 plan_id: plan_id.clone(),
+                wait_timeout_ms: None,
             })
         };
         let (left, right) = tokio::join!(
@@ -8045,7 +8287,8 @@ while True:
                 CancellationToken::new(),
             )
         );
-        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert!(left.is_ok());
+        assert!(right.is_ok());
         assert_eq!(
             std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
             "after\n"

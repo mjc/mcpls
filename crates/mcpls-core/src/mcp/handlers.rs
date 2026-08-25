@@ -27,24 +27,33 @@ const MAX_CLAIMED_PLAN_IDS: usize = 256;
 #[derive(Debug, Default)]
 struct SessionEditPlans {
     owned: HashSet<PlanId>,
-    claimed: VecDeque<PlanId>,
+    active: HashSet<PlanId>,
+    terminal: VecDeque<PlanId>,
 }
 
 impl SessionEditPlans {
     fn remember(&mut self, plan_id: PlanId) {
-        self.claimed.retain(|claimed| claimed != &plan_id);
+        self.active.remove(&plan_id);
+        self.terminal.retain(|claimed| claimed != &plan_id);
         self.owned.insert(plan_id);
     }
 
     fn claim(&mut self, plan_id: &PlanId) -> bool {
         if !self.owned.remove(plan_id) {
-            return self.claimed.contains(plan_id);
+            return self.active.contains(plan_id) || self.terminal.contains(plan_id);
         }
-        if self.claimed.len() >= MAX_CLAIMED_PLAN_IDS {
-            self.claimed.pop_front();
-        }
-        self.claimed.push_back(plan_id.clone());
+        self.active.insert(plan_id.clone());
         true
+    }
+
+    fn finish(&mut self, plan_id: &PlanId) {
+        if !self.active.remove(plan_id) {
+            return;
+        }
+        if self.terminal.len() >= MAX_CLAIMED_PLAN_IDS {
+            self.terminal.pop_front();
+        }
+        self.terminal.push_back(plan_id.clone());
     }
 }
 
@@ -172,6 +181,12 @@ impl HandlerContext {
         self.edit_plans.lock().await.claim(plan_id)
     }
 
+    /// Mark a claimed plan terminal after apply or conflict. Busy plans stay
+    /// active so a retry cannot be evicted while another plan is running.
+    pub(crate) async fn finish_plan(&self, plan_id: &PlanId) {
+        self.edit_plans.lock().await.finish(plan_id);
+    }
+
     /// Return whether this session owns a plan without consuming its token.
     pub(crate) async fn owns_plan(&self, plan_id: &PlanId) -> bool {
         self.edit_plans.lock().await.owned.contains(plan_id)
@@ -248,6 +263,12 @@ impl HandlerContext {
     /// Consume one pending nonce exactly once.
     pub(crate) async fn consume_approval(&self, nonce: &str) -> bool {
         self.pending_approvals.lock().await.remove(nonce)
+    }
+
+    /// Check an accepted approval without consuming it. A busy edit keeps its
+    /// approval usable for the same-plan retry.
+    pub(crate) async fn has_approval(&self, nonce: &str) -> bool {
+        self.pending_approvals.lock().await.contains(nonce)
     }
 
     /// Create a session-local context that shares project actors but not

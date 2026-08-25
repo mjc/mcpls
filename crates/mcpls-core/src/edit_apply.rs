@@ -5,6 +5,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
 use crate::bridge::DocumentTracker;
 use crate::edit_backup::{BackupArchive, BackupError, BackupFailureMode, BackupPolicy};
 use crate::edit_paths::PathSafetyError;
@@ -86,12 +91,72 @@ fn apply_plan_internal(
     documents: Option<&DocumentTracker>,
     backup_policy: Option<&BackupPolicy>,
 ) -> Result<ApplyReport, ApplyError> {
+    wait_for_test_apply_barrier(plan);
     let prepared = PreparedPlan::new(boundary, plan, documents)?;
     prepare_backup(backup_policy, boundary, plan)?;
     let staged = prepared.stage()?;
     prepared.revalidate(boundary, &staged, documents)?;
     PreparedPlan::commit(&staged, &prepared.operations)
 }
+
+#[cfg(test)]
+struct TestApplyBarrier {
+    plan_ids: HashSet<String>,
+    barrier: Arc<Barrier>,
+}
+
+#[cfg(test)]
+static TEST_APPLY_BARRIER: OnceLock<Mutex<Option<TestApplyBarrier>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct TestApplyBarrierGuard;
+
+#[cfg(test)]
+pub(crate) fn install_test_apply_barrier(
+    plan_ids: impl IntoIterator<Item = PlanId>,
+    parties: usize,
+) -> TestApplyBarrierGuard {
+    let state = TEST_APPLY_BARRIER.get_or_init(|| Mutex::new(None));
+    *state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TestApplyBarrier {
+        plan_ids: plan_ids
+            .into_iter()
+            .map(|plan_id| plan_id.as_str().to_owned())
+            .collect(),
+        barrier: Arc::new(Barrier::new(parties)),
+    });
+    TestApplyBarrierGuard
+}
+
+#[cfg(test)]
+impl Drop for TestApplyBarrierGuard {
+    fn drop(&mut self) {
+        if let Some(state) = TEST_APPLY_BARRIER.get() {
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn wait_for_test_apply_barrier(plan: &EditPlan) {
+    let barrier = TEST_APPLY_BARRIER.get().and_then(|state| {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|test| test.plan_ids.contains(plan.id().as_str()))
+            .map(|test| Arc::clone(&test.barrier))
+    });
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn wait_for_test_apply_barrier(_plan: &EditPlan) {}
 
 fn prepare_backup(
     policy: Option<&BackupPolicy>,

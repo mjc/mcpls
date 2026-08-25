@@ -12,6 +12,15 @@
         "project_id": {
           "description": "Registered project that owns the plan.",
           "type": "string"
+        },
+        "wait_timeout_ms": {
+          "description": "Optional time to wait for a contending edit before returning `not_ready`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -21,9 +30,282 @@
       "type": "object"
     },
     "outputSchema": {
+      "$defs": {
+        "WorkspaceEditContention": {
+          "description": "Non-sensitive description of paths held by a contending edit.",
+          "properties": {
+            "blocked_path_count": {
+              "description": "Total number of paths blocking this edit, including omitted paths.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked_paths": {
+              "description": "Bounded project-relative paths blocking this edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "$ref": "#/$defs/WorkspaceEditContentionScope",
+              "description": "Scope in which the edit overlaps another operation."
+            }
+          },
+          "required": [
+            "scope",
+            "blocked_paths",
+            "blocked_path_count"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditContentionScope": {
+          "description": "Scope in which workspace edit contention was detected.",
+          "oneOf": [
+            {
+              "const": "same_worktree",
+              "description": "Contention between sessions editing one canonical worktree.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkspaceEditProviderSynchronization": {
+          "description": "Post-commit convergence status for one language server.",
+          "properties": {
+            "message": {
+              "description": "Failure or degradation detail when synchronization was not proven.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "description": "Stable routing identity of the provider.",
+              "type": "string"
+            },
+            "synchronized": {
+              "description": "Whether watched files, document lifecycle, and VFS probes converged.",
+              "type": "boolean"
+            },
+            "watched_file_notifications": {
+              "description": "Number of watched-file notifications flushed to the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "provider",
+            "synchronized",
+            "watched_file_notifications"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetry": {
+          "description": "Retry instructions attached to a non-applied workspace edit result.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/WorkspaceEditRetryAction",
+              "description": "Next operation the client should perform."
+            },
+            "after_ms": {
+              "description": "Suggested delay before retrying, when useful.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "same_plan": {
+              "description": "Whether retrying with the current plan ID is safe.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "same_plan"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetryAction": {
+          "description": "Client action recommended after a non-applied workspace edit result.",
+          "oneOf": [
+            {
+              "const": "retry_apply",
+              "description": "Retry applying the same plan.",
+              "type": "string"
+            },
+            {
+              "const": "preview_again",
+              "description": "Preview the edit again and apply the new plan.",
+              "type": "string"
+            }
+          ]
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": true,
-      "type": "object"
+      "oneOf": [
+        {
+          "description": "The plan was committed atomically.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "committed_files": {
+              "description": "Project-relative paths committed by the edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "operations": {
+              "description": "Human-readable operations captured by the preview.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the committed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owned the plan.",
+              "type": "string"
+            },
+            "provider_synchronization": {
+              "description": "Optional post-commit provider convergence details.",
+              "items": {
+                "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
+              },
+              "type": "array"
+            },
+            "semantic_state": {
+              "description": "Aggregate provider state when synchronization details are present.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "const": "applied",
+              "type": "string"
+            },
+            "unified_diff": {
+              "description": "Unified diff captured by the preview.",
+              "type": "string"
+            },
+            "verification": {
+              "description": "Optional semantic verification outcome.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "project_id",
+            "plan_id",
+            "committed",
+            "committed_files",
+            "operations",
+            "unified_diff"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Another edit currently owns at least one required path.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "contention": {
+              "$ref": "#/$defs/WorkspaceEditContention",
+              "description": "Safe details about the overlapping edit scope."
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the unconsumed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for an idempotent retry."
+            },
+            "status": {
+              "const": "not_ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "contention"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The plan snapshot no longer matches one or more files.",
+          "properties": {
+            "changed_paths": {
+              "description": "Project-relative paths whose snapshots changed.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the rejected plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for producing a fresh plan."
+            },
+            "status": {
+              "const": "conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "changed_paths"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "annotations": {
       "title": "Apply code action",
@@ -2135,6 +2417,15 @@
         "project_id": {
           "description": "Stable project identifier that owns the plan.",
           "type": "string"
+        },
+        "wait_timeout_ms": {
+          "description": "Optional time to wait for a contending edit before returning `not_ready`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2144,9 +2435,282 @@
       "type": "object"
     },
     "outputSchema": {
+      "$defs": {
+        "WorkspaceEditContention": {
+          "description": "Non-sensitive description of paths held by a contending edit.",
+          "properties": {
+            "blocked_path_count": {
+              "description": "Total number of paths blocking this edit, including omitted paths.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked_paths": {
+              "description": "Bounded project-relative paths blocking this edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "$ref": "#/$defs/WorkspaceEditContentionScope",
+              "description": "Scope in which the edit overlaps another operation."
+            }
+          },
+          "required": [
+            "scope",
+            "blocked_paths",
+            "blocked_path_count"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditContentionScope": {
+          "description": "Scope in which workspace edit contention was detected.",
+          "oneOf": [
+            {
+              "const": "same_worktree",
+              "description": "Contention between sessions editing one canonical worktree.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkspaceEditProviderSynchronization": {
+          "description": "Post-commit convergence status for one language server.",
+          "properties": {
+            "message": {
+              "description": "Failure or degradation detail when synchronization was not proven.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "description": "Stable routing identity of the provider.",
+              "type": "string"
+            },
+            "synchronized": {
+              "description": "Whether watched files, document lifecycle, and VFS probes converged.",
+              "type": "boolean"
+            },
+            "watched_file_notifications": {
+              "description": "Number of watched-file notifications flushed to the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "provider",
+            "synchronized",
+            "watched_file_notifications"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetry": {
+          "description": "Retry instructions attached to a non-applied workspace edit result.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/WorkspaceEditRetryAction",
+              "description": "Next operation the client should perform."
+            },
+            "after_ms": {
+              "description": "Suggested delay before retrying, when useful.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "same_plan": {
+              "description": "Whether retrying with the current plan ID is safe.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "same_plan"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetryAction": {
+          "description": "Client action recommended after a non-applied workspace edit result.",
+          "oneOf": [
+            {
+              "const": "retry_apply",
+              "description": "Retry applying the same plan.",
+              "type": "string"
+            },
+            {
+              "const": "preview_again",
+              "description": "Preview the edit again and apply the new plan.",
+              "type": "string"
+            }
+          ]
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": true,
-      "type": "object"
+      "oneOf": [
+        {
+          "description": "The plan was committed atomically.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "committed_files": {
+              "description": "Project-relative paths committed by the edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "operations": {
+              "description": "Human-readable operations captured by the preview.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the committed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owned the plan.",
+              "type": "string"
+            },
+            "provider_synchronization": {
+              "description": "Optional post-commit provider convergence details.",
+              "items": {
+                "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
+              },
+              "type": "array"
+            },
+            "semantic_state": {
+              "description": "Aggregate provider state when synchronization details are present.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "const": "applied",
+              "type": "string"
+            },
+            "unified_diff": {
+              "description": "Unified diff captured by the preview.",
+              "type": "string"
+            },
+            "verification": {
+              "description": "Optional semantic verification outcome.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "project_id",
+            "plan_id",
+            "committed",
+            "committed_files",
+            "operations",
+            "unified_diff"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Another edit currently owns at least one required path.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "contention": {
+              "$ref": "#/$defs/WorkspaceEditContention",
+              "description": "Safe details about the overlapping edit scope."
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the unconsumed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for an idempotent retry."
+            },
+            "status": {
+              "const": "not_ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "contention"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The plan snapshot no longer matches one or more files.",
+          "properties": {
+            "changed_paths": {
+              "description": "Project-relative paths whose snapshots changed.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the rejected plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for producing a fresh plan."
+            },
+            "status": {
+              "const": "conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "changed_paths"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "annotations": {
       "title": "Apply formatting",
@@ -13905,6 +14469,15 @@
         "project_id": {
           "description": "Stable project identifier that owns the plan.",
           "type": "string"
+        },
+        "wait_timeout_ms": {
+          "description": "Optional time to wait for a contending edit before returning `not_ready`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -13914,9 +14487,282 @@
       "type": "object"
     },
     "outputSchema": {
+      "$defs": {
+        "WorkspaceEditContention": {
+          "description": "Non-sensitive description of paths held by a contending edit.",
+          "properties": {
+            "blocked_path_count": {
+              "description": "Total number of paths blocking this edit, including omitted paths.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked_paths": {
+              "description": "Bounded project-relative paths blocking this edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "$ref": "#/$defs/WorkspaceEditContentionScope",
+              "description": "Scope in which the edit overlaps another operation."
+            }
+          },
+          "required": [
+            "scope",
+            "blocked_paths",
+            "blocked_path_count"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditContentionScope": {
+          "description": "Scope in which workspace edit contention was detected.",
+          "oneOf": [
+            {
+              "const": "same_worktree",
+              "description": "Contention between sessions editing one canonical worktree.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkspaceEditProviderSynchronization": {
+          "description": "Post-commit convergence status for one language server.",
+          "properties": {
+            "message": {
+              "description": "Failure or degradation detail when synchronization was not proven.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "description": "Stable routing identity of the provider.",
+              "type": "string"
+            },
+            "synchronized": {
+              "description": "Whether watched files, document lifecycle, and VFS probes converged.",
+              "type": "boolean"
+            },
+            "watched_file_notifications": {
+              "description": "Number of watched-file notifications flushed to the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "provider",
+            "synchronized",
+            "watched_file_notifications"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetry": {
+          "description": "Retry instructions attached to a non-applied workspace edit result.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/WorkspaceEditRetryAction",
+              "description": "Next operation the client should perform."
+            },
+            "after_ms": {
+              "description": "Suggested delay before retrying, when useful.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "same_plan": {
+              "description": "Whether retrying with the current plan ID is safe.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "same_plan"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetryAction": {
+          "description": "Client action recommended after a non-applied workspace edit result.",
+          "oneOf": [
+            {
+              "const": "retry_apply",
+              "description": "Retry applying the same plan.",
+              "type": "string"
+            },
+            {
+              "const": "preview_again",
+              "description": "Preview the edit again and apply the new plan.",
+              "type": "string"
+            }
+          ]
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": true,
-      "type": "object"
+      "oneOf": [
+        {
+          "description": "The plan was committed atomically.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "committed_files": {
+              "description": "Project-relative paths committed by the edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "operations": {
+              "description": "Human-readable operations captured by the preview.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the committed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owned the plan.",
+              "type": "string"
+            },
+            "provider_synchronization": {
+              "description": "Optional post-commit provider convergence details.",
+              "items": {
+                "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
+              },
+              "type": "array"
+            },
+            "semantic_state": {
+              "description": "Aggregate provider state when synchronization details are present.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "const": "applied",
+              "type": "string"
+            },
+            "unified_diff": {
+              "description": "Unified diff captured by the preview.",
+              "type": "string"
+            },
+            "verification": {
+              "description": "Optional semantic verification outcome.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "project_id",
+            "plan_id",
+            "committed",
+            "committed_files",
+            "operations",
+            "unified_diff"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Another edit currently owns at least one required path.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "contention": {
+              "$ref": "#/$defs/WorkspaceEditContention",
+              "description": "Safe details about the overlapping edit scope."
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the unconsumed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for an idempotent retry."
+            },
+            "status": {
+              "const": "not_ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "contention"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The plan snapshot no longer matches one or more files.",
+          "properties": {
+            "changed_paths": {
+              "description": "Project-relative paths whose snapshots changed.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the rejected plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for producing a fresh plan."
+            },
+            "status": {
+              "const": "conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "changed_paths"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "annotations": {
       "title": "Apply rename",
@@ -14227,6 +15073,15 @@
         "project_id": {
           "description": "Stable project identifier that owns the plan.",
           "type": "string"
+        },
+        "wait_timeout_ms": {
+          "description": "Optional time to wait for a contending edit before returning `not_ready`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -14236,9 +15091,282 @@
       "type": "object"
     },
     "outputSchema": {
+      "$defs": {
+        "WorkspaceEditContention": {
+          "description": "Non-sensitive description of paths held by a contending edit.",
+          "properties": {
+            "blocked_path_count": {
+              "description": "Total number of paths blocking this edit, including omitted paths.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked_paths": {
+              "description": "Bounded project-relative paths blocking this edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "$ref": "#/$defs/WorkspaceEditContentionScope",
+              "description": "Scope in which the edit overlaps another operation."
+            }
+          },
+          "required": [
+            "scope",
+            "blocked_paths",
+            "blocked_path_count"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditContentionScope": {
+          "description": "Scope in which workspace edit contention was detected.",
+          "oneOf": [
+            {
+              "const": "same_worktree",
+              "description": "Contention between sessions editing one canonical worktree.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkspaceEditProviderSynchronization": {
+          "description": "Post-commit convergence status for one language server.",
+          "properties": {
+            "message": {
+              "description": "Failure or degradation detail when synchronization was not proven.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "description": "Stable routing identity of the provider.",
+              "type": "string"
+            },
+            "synchronized": {
+              "description": "Whether watched files, document lifecycle, and VFS probes converged.",
+              "type": "boolean"
+            },
+            "watched_file_notifications": {
+              "description": "Number of watched-file notifications flushed to the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "provider",
+            "synchronized",
+            "watched_file_notifications"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetry": {
+          "description": "Retry instructions attached to a non-applied workspace edit result.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/WorkspaceEditRetryAction",
+              "description": "Next operation the client should perform."
+            },
+            "after_ms": {
+              "description": "Suggested delay before retrying, when useful.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "same_plan": {
+              "description": "Whether retrying with the current plan ID is safe.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "same_plan"
+          ],
+          "type": "object"
+        },
+        "WorkspaceEditRetryAction": {
+          "description": "Client action recommended after a non-applied workspace edit result.",
+          "oneOf": [
+            {
+              "const": "retry_apply",
+              "description": "Retry applying the same plan.",
+              "type": "string"
+            },
+            {
+              "const": "preview_again",
+              "description": "Preview the edit again and apply the new plan.",
+              "type": "string"
+            }
+          ]
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "additionalProperties": true,
-      "type": "object"
+      "oneOf": [
+        {
+          "description": "The plan was committed atomically.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "committed_files": {
+              "description": "Project-relative paths committed by the edit.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "operations": {
+              "description": "Human-readable operations captured by the preview.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the committed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owned the plan.",
+              "type": "string"
+            },
+            "provider_synchronization": {
+              "description": "Optional post-commit provider convergence details.",
+              "items": {
+                "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
+              },
+              "type": "array"
+            },
+            "semantic_state": {
+              "description": "Aggregate provider state when synchronization details are present.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "const": "applied",
+              "type": "string"
+            },
+            "unified_diff": {
+              "description": "Unified diff captured by the preview.",
+              "type": "string"
+            },
+            "verification": {
+              "description": "Optional semantic verification outcome.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "project_id",
+            "plan_id",
+            "committed",
+            "committed_files",
+            "operations",
+            "unified_diff"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Another edit currently owns at least one required path.",
+          "properties": {
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "contention": {
+              "$ref": "#/$defs/WorkspaceEditContention",
+              "description": "Safe details about the overlapping edit scope."
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the unconsumed plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for an idempotent retry."
+            },
+            "status": {
+              "const": "not_ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "contention"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The plan snapshot no longer matches one or more files.",
+          "properties": {
+            "changed_paths": {
+              "description": "Project-relative paths whose snapshots changed.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "committed": {
+              "description": "Whether the edit reached the filesystem commit point.",
+              "type": "boolean"
+            },
+            "plan_id": {
+              "description": "Opaque identifier of the rejected plan.",
+              "type": "string"
+            },
+            "project_id": {
+              "description": "Stable project identifier that owns the plan.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Stable machine-readable reason.",
+              "type": "string"
+            },
+            "retry": {
+              "$ref": "#/$defs/WorkspaceEditRetry",
+              "description": "Instructions for producing a fresh plan."
+            },
+            "status": {
+              "const": "conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "project_id",
+            "plan_id",
+            "committed",
+            "retry",
+            "changed_paths"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "annotations": {
       "title": "Apply workspace edit",

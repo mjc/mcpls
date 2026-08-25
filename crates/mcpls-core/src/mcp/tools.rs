@@ -465,6 +465,9 @@ pub struct CodeActionApplyParams {
     pub project_id: String,
     /// Opaque plan ID returned by `code_action_preview`.
     pub plan_id: String,
+    /// Optional time to wait for a contending edit before returning `not_ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_timeout_ms: Option<u64>,
 }
 
 /// Parameters for the `prepare_call_hierarchy` tool.
@@ -722,6 +725,124 @@ pub struct WorkspaceEditApplyParams {
     pub project_id: String,
     /// Opaque plan identifier returned by the preview flow.
     pub plan_id: String,
+    /// Optional time to wait for a contending edit before returning `not_ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_timeout_ms: Option<u64>,
+}
+
+/// Outcome of applying a project-owned workspace edit plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkspaceEditApplyResult {
+    /// The plan was committed atomically.
+    Applied {
+        /// Stable project identifier that owned the plan.
+        project_id: String,
+        /// Opaque identifier of the committed plan.
+        plan_id: String,
+        /// Whether the edit reached the filesystem commit point.
+        committed: bool,
+        /// Project-relative paths committed by the edit.
+        committed_files: Vec<String>,
+        /// Human-readable operations captured by the preview.
+        operations: Vec<String>,
+        /// Unified diff captured by the preview.
+        unified_diff: String,
+        /// Optional semantic verification outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<String>,
+        /// Optional post-commit provider convergence details.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_synchronization: Vec<WorkspaceEditProviderSynchronization>,
+        /// Aggregate provider state when synchronization details are present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        semantic_state: Option<String>,
+    },
+    /// Another edit currently owns at least one required path.
+    NotReady {
+        /// Stable machine-readable reason.
+        reason: String,
+        /// Stable project identifier that owns the plan.
+        project_id: String,
+        /// Opaque identifier of the unconsumed plan.
+        plan_id: String,
+        /// Whether the edit reached the filesystem commit point.
+        committed: bool,
+        /// Instructions for an idempotent retry.
+        retry: WorkspaceEditRetry,
+        /// Safe details about the overlapping edit scope.
+        contention: WorkspaceEditContention,
+    },
+    /// The plan snapshot no longer matches one or more files.
+    Conflict {
+        /// Stable machine-readable reason.
+        reason: String,
+        /// Stable project identifier that owns the plan.
+        project_id: String,
+        /// Opaque identifier of the rejected plan.
+        plan_id: String,
+        /// Whether the edit reached the filesystem commit point.
+        committed: bool,
+        /// Instructions for producing a fresh plan.
+        retry: WorkspaceEditRetry,
+        /// Project-relative paths whose snapshots changed.
+        changed_paths: Vec<String>,
+    },
+}
+
+/// Post-commit convergence status for one language server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceEditProviderSynchronization {
+    /// Stable routing identity of the provider.
+    pub provider: String,
+    /// Whether watched files, document lifecycle, and VFS probes converged.
+    pub synchronized: bool,
+    /// Number of watched-file notifications flushed to the provider.
+    pub watched_file_notifications: usize,
+    /// Failure or degradation detail when synchronization was not proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Retry instructions attached to a non-applied workspace edit result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceEditRetry {
+    /// Next operation the client should perform.
+    pub action: WorkspaceEditRetryAction,
+    /// Whether retrying with the current plan ID is safe.
+    pub same_plan: bool,
+    /// Suggested delay before retrying, when useful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_ms: Option<u64>,
+}
+
+/// Client action recommended after a non-applied workspace edit result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceEditRetryAction {
+    /// Retry applying the same plan.
+    RetryApply,
+    /// Preview the edit again and apply the new plan.
+    PreviewAgain,
+}
+
+/// Non-sensitive description of paths held by a contending edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceEditContention {
+    /// Scope in which the edit overlaps another operation.
+    pub scope: WorkspaceEditContentionScope,
+    /// Bounded project-relative paths blocking this edit.
+    pub blocked_paths: Vec<String>,
+    /// Total number of paths blocking this edit, including omitted paths.
+    pub blocked_path_count: usize,
+}
+
+/// Scope in which workspace edit contention was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceEditContentionScope {
+    /// Contention between sessions editing one canonical worktree.
+    SameWorktree,
 }
 
 /// Empty parameters for listing all registered projects.
@@ -809,5 +930,119 @@ mod tests {
         assert_eq!(params.sections.len(), 3);
         assert_eq!(params.budget.max_bytes, 8192);
         assert_eq!(params.budget.max_items, 7);
+    }
+
+    #[test]
+    fn workspace_edit_apply_result_uses_explicit_statuses() {
+        let applied = WorkspaceEditApplyResult::Applied {
+            project_id: "project".to_owned(),
+            plan_id: "plan".to_owned(),
+            committed: true,
+            committed_files: vec!["src/lib.rs".to_owned()],
+            operations: vec!["edit src/lib.rs".to_owned()],
+            unified_diff: "diff".to_owned(),
+            verification: None,
+            provider_synchronization: Vec::new(),
+            semantic_state: None,
+        };
+        let not_ready = WorkspaceEditApplyResult::NotReady {
+            reason: "edit_in_progress".to_owned(),
+            project_id: "project".to_owned(),
+            plan_id: "plan".to_owned(),
+            committed: false,
+            retry: WorkspaceEditRetry {
+                action: WorkspaceEditRetryAction::RetryApply,
+                same_plan: true,
+                after_ms: Some(100),
+            },
+            contention: WorkspaceEditContention {
+                scope: WorkspaceEditContentionScope::SameWorktree,
+                blocked_paths: vec!["src/lib.rs".to_owned()],
+                blocked_path_count: 1,
+            },
+        };
+        let conflict = WorkspaceEditApplyResult::Conflict {
+            reason: "snapshot_changed".to_owned(),
+            project_id: "project".to_owned(),
+            plan_id: "plan".to_owned(),
+            committed: false,
+            retry: WorkspaceEditRetry {
+                action: WorkspaceEditRetryAction::PreviewAgain,
+                same_plan: false,
+                after_ms: None,
+            },
+            changed_paths: vec!["src/lib.rs".to_owned()],
+        };
+
+        assert_eq!(
+            serde_json::to_value(applied).unwrap(),
+            serde_json::json!({
+                "status": "applied",
+                "project_id": "project",
+                "plan_id": "plan",
+                "committed": true,
+                "committed_files": ["src/lib.rs"],
+                "operations": ["edit src/lib.rs"],
+                "unified_diff": "diff",
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(not_ready).unwrap(),
+            serde_json::json!({
+                "status": "not_ready",
+                "reason": "edit_in_progress",
+                "project_id": "project",
+                "plan_id": "plan",
+                "committed": false,
+                "retry": {
+                    "action": "retry_apply",
+                    "same_plan": true,
+                    "after_ms": 100,
+                },
+                "contention": {
+                    "scope": "same_worktree",
+                    "blocked_paths": ["src/lib.rs"],
+                    "blocked_path_count": 1,
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(conflict).unwrap(),
+            serde_json::json!({
+                "status": "conflict",
+                "reason": "snapshot_changed",
+                "project_id": "project",
+                "plan_id": "plan",
+                "committed": false,
+                "retry": {
+                    "action": "preview_again",
+                    "same_plan": false,
+                },
+                "changed_paths": ["src/lib.rs"],
+            })
+        );
+    }
+
+    #[test]
+    fn apply_wait_timeout_is_optional() {
+        let workspace: WorkspaceEditApplyParams = serde_json::from_value(serde_json::json!({
+            "project_id": "project",
+            "plan_id": "plan",
+        }))
+        .unwrap();
+        let code_action: CodeActionApplyParams = serde_json::from_value(serde_json::json!({
+            "project_id": "project",
+            "plan_id": "plan",
+            "wait_timeout_ms": 250,
+        }))
+        .unwrap();
+
+        assert_eq!(workspace.wait_timeout_ms, None);
+        assert_eq!(code_action.wait_timeout_ms, Some(250));
+
+        let schema = serde_json::to_value(schemars::schema_for!(WorkspaceEditApplyParams)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.iter().any(|field| field == "wait_timeout_ms"));
     }
 }

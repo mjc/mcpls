@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
 
+use crate::edit_coordinator::EditResource;
 use crate::edit_paths::FileOperation;
 use crate::edit_policy::{EditMode, EditPolicy};
 
@@ -283,6 +284,7 @@ impl FileDiffSummary {
 pub struct EditPlan {
     id: PlanId,
     project_id: String,
+    workspace_root: Option<PathBuf>,
     files: Vec<FileSnapshot>,
     operations: Vec<String>,
     file_operations: Vec<FileOperation>,
@@ -311,6 +313,44 @@ pub(crate) struct EditPlanApprovalSummary {
     pub(crate) versions: Vec<Option<i32>>,
 }
 
+impl EditPlanApprovalSummary {
+    /// Return the complete path set that an apply may mutate.
+    pub(crate) fn coordination_resources(&self) -> Vec<EditResource> {
+        let mut resources = self
+            .affected_files
+            .iter()
+            .cloned()
+            .map(EditResource::exact)
+            .collect::<Vec<_>>();
+        for operation in &self.file_operations {
+            match operation {
+                FileOperation::Create { path, .. } => {
+                    resources.push(EditResource::exact(path.clone()))
+                }
+                FileOperation::Rename { from, to, .. } => {
+                    let directory = from.is_dir();
+                    resources.push(if directory {
+                        EditResource::directory(from.clone())
+                    } else {
+                        EditResource::exact(from.clone())
+                    });
+                    resources.push(if directory {
+                        EditResource::directory(to.clone())
+                    } else {
+                        EditResource::exact(to.clone())
+                    });
+                }
+                FileOperation::Delete { path, recursive } => resources.push(if *recursive {
+                    EditResource::directory(path.clone())
+                } else {
+                    EditResource::exact(path.clone())
+                }),
+            }
+        }
+        resources
+    }
+}
+
 impl EditPlan {
     /// Build a plan from exact snapshots and preview metadata.
     #[must_use]
@@ -336,6 +376,7 @@ impl EditPlan {
         Self {
             id: PlanId::new(),
             project_id,
+            workspace_root: None,
             files,
             operations,
             file_operations: Vec::new(),
@@ -360,6 +401,19 @@ impl EditPlan {
     #[must_use]
     pub fn project_id(&self) -> &str {
         &self.project_id
+    }
+
+    /// Bind this plan to the canonical workspace root used during preview.
+    #[must_use]
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
+    }
+
+    /// Return the canonical workspace root captured during preview, when known.
+    #[must_use]
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root.as_deref()
     }
 
     /// Return affected file snapshots.
