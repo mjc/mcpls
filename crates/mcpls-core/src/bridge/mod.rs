@@ -31,11 +31,12 @@ pub use translator::{
     InspectSectionCompleteness, InspectSymbolBudget, InspectSymbolRequest, InspectSymbolResolution,
     InspectSymbolResult, InspectSymbolSectionKind, InspectSymbolSections, Location,
     LocationsResult, OutgoingCallsResult, Position2D, ProjectActivation, ProviderSynchronization,
-    Range, ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
-    SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessagesResult,
-    SignatureHelpResult, SourceContext, SourceFrame, SupportedWorkspaceEdit, Symbol, SymbolHandle,
-    TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
-    WorkspaceSymbolResult, WorkspaceSymbolScope, convert_code_action_or_command,
+    Range, ReferenceUse, ReferencesResult, RenameResult, SemanticDiscoveryKind,
+    SemanticDiscoveryResult, SemanticResultLimits, ServerCapability, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, SourceContext, SourceFrame, SupportedWorkspaceEdit,
+    Symbol, SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
+    convert_code_action_or_command,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

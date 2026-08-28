@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -126,6 +127,12 @@ pub(super) async fn resolve_source_context_with_max_lines(
     } else {
         range.clone()
     };
+    let selected = &lines[start.min(total_lines)..end];
+    let total_bytes = selected
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| numbered_line_bytes(start + offset + 1, line))
+        .sum();
     let deferred = || {
         make_source_uri(
             &canonical_path,
@@ -142,7 +149,7 @@ pub(super) async fn resolve_source_context_with_max_lines(
             kind: "source_context".to_owned(),
             snapshot_hash: content_hash.clone(),
             document_version,
-            total_bytes: Some(content.len()),
+            total_bytes: Some(total_bytes),
         })
     };
     if budget.remaining_bytes == 0 {
@@ -153,12 +160,6 @@ pub(super) async fn resolve_source_context_with_max_lines(
         );
     }
 
-    let selected = &lines[start.min(total_lines)..end];
-    let total_bytes = lines
-        .iter()
-        .enumerate()
-        .map(|(offset, line)| numbered_line_bytes(offset + 1, line))
-        .sum();
     let byte_limit = MAX_FRAME_BYTES.min(budget.remaining_bytes);
     let mut text = String::new();
     let mut returned_lines = 0;
@@ -179,14 +180,14 @@ pub(super) async fn resolve_source_context_with_max_lines(
     let canonical_uri =
         path_to_uri(&canonical_path).map_or_else(|_| uri.to_string(), |uri| uri.to_string());
 
-    let truncated = start > 0 || returned_lines < selected.len() || end < total_lines;
+    let truncated = returned_lines < selected.len();
     budget.truncated |= truncated;
     let resource = truncated.then(deferred).flatten();
     SourceContext::Available(SourceFrame {
         path: canonical_path.to_string_lossy().into_owned(),
         uri: canonical_uri,
         highlighted_range: range.clone(),
-        range,
+        range: resource_range,
         text,
         language_id,
         document_version,
@@ -241,11 +242,10 @@ fn snapshot_authorized_path(
 }
 
 fn authorized(path: &Path, roots: &[PathBuf], approved: &[PathBuf]) -> bool {
-    roots.iter().chain(approved).any(|root| {
-        dunce::canonicalize(root)
-            .ok()
-            .is_some_and(|root| path.starts_with(root))
-    })
+    roots
+        .iter()
+        .chain(approved)
+        .any(|root| dunce::canonicalize(root).is_ok_and(|root| path.starts_with(root)))
 }
 
 fn numbered_line_bytes(line_number: usize, line: &str) -> usize {
@@ -343,7 +343,7 @@ impl super::Translator {
             .max(start);
         let mut text = String::new();
         for (offset, line) in lines[start..end].iter().enumerate() {
-            text.push_str(&format!("{:>4} | {line}\n", start + offset + 1));
+            let _ = writeln!(text, "{:>4} | {line}", start + offset + 1);
         }
         let returned_lines = end - start;
         let returned_bytes = text.len();
@@ -396,7 +396,7 @@ fn language_id(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::format_collect)]
 mod tests {
     use std::collections::HashMap;
 
@@ -469,7 +469,7 @@ mod tests {
         tokio::fs::write(&path, content).await.unwrap();
         let uri = path_to_uri(&path).unwrap();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let mut budget = SourceBudget::new(usize::MAX);
+        let mut budget = SourceBudget::new(0);
         let source = resolve_source_context_with_max_lines(
             &tracker,
             &[root.path().to_path_buf()],
@@ -480,10 +480,9 @@ mod tests {
             3,
         )
         .await;
-        let SourceContext::Available(frame) = source else {
-            panic!("source unavailable")
+        let SourceContext::Deferred { resource } = source else {
+            panic!("source was not deferred")
         };
-        let resource = frame.resource.expect("bounded context resource");
         let resource = crate::bridge::resources::parse_source_uri(&resource.uri).unwrap();
         let mut translator = crate::bridge::Translator::new()
             .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
@@ -501,6 +500,69 @@ mod tests {
         );
         assert!(!replayed.truncated);
         assert!(replayed.resource.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_inline_excerpt_does_not_offer_a_redundant_resource() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        tokio::fs::write(&path, content).await.unwrap();
+        let uri = path_to_uri(&path).unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let mut budget = SourceBudget::new(usize::MAX);
+
+        let source = resolve_source_context_with_max_lines(
+            &tracker,
+            &[root.path().to_path_buf()],
+            &[],
+            &uri,
+            range(10),
+            &mut budget,
+            3,
+        )
+        .await;
+
+        let SourceContext::Available(frame) = source else {
+            panic!("source unavailable")
+        };
+        assert_eq!(frame.range.start.line, 10);
+        assert_eq!(frame.range.end.line, 12);
+        assert_eq!(frame.highlighted_range, range(10));
+        assert_eq!(frame.total_bytes, frame.returned_bytes);
+        assert!(!frame.truncated);
+        assert!(frame.resource.is_none());
+        assert!(!budget.truncated());
+    }
+
+    #[tokio::test]
+    async fn source_resource_replay_is_not_silently_capped_at_four_kibibytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = format!("{}\ntail sentinel\n", "x".repeat(MAX_FRAME_BYTES + 1));
+        tokio::fs::write(&path, &content).await.unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, version, snapshot_hash, _) = translator.source_snapshot(&path).await.unwrap();
+        let resource = SourceResource {
+            path,
+            start_line: 1,
+            start_character: 1,
+            end_line: 2,
+            end_character: 1,
+            snapshot_hash,
+            document_version: version,
+        };
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert!(frame.returned_bytes > MAX_FRAME_BYTES);
+        assert_eq!(frame.returned_lines, 2);
+        assert!(frame.text.contains("tail sentinel"));
+        assert!(!frame.truncated);
     }
 
     #[tokio::test]

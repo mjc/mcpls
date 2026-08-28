@@ -224,25 +224,31 @@ Find all references to a symbol in the workspace.
 
 ### Returns
 
-Array of reference locations:
+References grouped by file and enclosing symbol. File identity and source snapshot metadata are
+returned once per group. Each compact `range` tuple is
+`[start_line, start_character, end_line, end_character]`; nearby source excerpts are merged into
+shared `source.chunks` so every reference remains listed without repeating the same context.
 
 ```json
-[
-  {
-    "uri": "file:///path/to/file1.rs",
-    "range": {
-      "start": { "line": 15, "character": 4 },
-      "end": { "line": 15, "character": 8 }
+{
+  "groups": [{
+    "project_relative_path": "src/lib.rs",
+    "uri": "file:///workspace/src/lib.rs",
+    "references": [
+      { "range": [15, 4, 15, 8], "role": "unknown", "symbol_handle": "..." },
+      { "range": [18, 10, 18, 14], "role": "unknown", "symbol_handle": "..." }
+    ],
+    "source": {
+      "content_hash": "...",
+      "chunks": [{
+        "lines": [13, 24],
+        "text": "  13 | ...\n"
+      }]
     }
-  },
-  {
-    "uri": "file:///path/to/file2.rs",
-    "range": {
-      "start": { "line": 42, "character": 10 },
-      "end": { "line": 42, "character": 14 }
-    }
-  }
-]
+  }],
+  "total_references": 2,
+  "returned_references": 2
+}
 ```
 
 ### Example Use Cases
@@ -269,6 +275,8 @@ Claude: [Uses get_references] The User struct is referenced in 23 locations
 - Searches entire workspace
 - May be slow for frequently-used symbols
 - `include_declaration: true` includes the definition site in results
+- Context omitted by a response budget appears in `source.deferred`; unavailable context never
+  removes the corresponding compact reference from the inventory
 
 ---
 
