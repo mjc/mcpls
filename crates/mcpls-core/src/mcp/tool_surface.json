@@ -13286,6 +13286,10 @@
                 "null"
               ]
             },
+            "is_generated": {
+              "description": "Whether the symbol is under a generated or build-output directory.",
+              "type": "boolean"
+            },
             "kind": {
               "description": "Kind of symbol.",
               "type": "string"
@@ -13327,7 +13331,8 @@
             "location",
             "match_class",
             "score",
-            "origin"
+            "origin",
+            "is_generated"
           ],
           "type": "object"
         },
@@ -15792,6 +15797,10 @@
                 "null"
               ]
             },
+            "is_generated": {
+              "description": "Whether the symbol is under a generated or build-output directory.",
+              "type": "boolean"
+            },
             "kind": {
               "description": "Kind of symbol.",
               "type": "string"
@@ -15833,7 +15842,8 @@
             "location",
             "match_class",
             "score",
-            "origin"
+            "origin",
+            "is_generated"
           ],
           "type": "object"
         },

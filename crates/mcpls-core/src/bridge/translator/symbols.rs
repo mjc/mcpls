@@ -71,6 +71,16 @@ struct WorkspaceSymbolCandidate {
     match_class: WorkspaceSymbolMatch,
     origin: WorkspaceSymbolOrigin,
     project_relative_path: Option<String>,
+    is_generated: bool,
+}
+
+fn is_generated_path(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("target" | "generated" | "build")
+        )
+    })
 }
 
 async fn convert_workspace_symbol(
@@ -88,6 +98,7 @@ async fn convert_workspace_symbol(
         score: symbol.match_class.score(),
         project_relative_path: symbol.project_relative_path,
         origin: symbol.origin,
+        is_generated: symbol.is_generated,
     }
 }
 
@@ -117,6 +128,7 @@ async fn finish_workspace_symbols(
     candidates.sort_by(|left, right| {
         left.match_class
             .cmp(&right.match_class)
+            .then_with(|| left.is_generated.cmp(&right.is_generated))
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.project_relative_path.cmp(&right.project_relative_path))
             .then_with(|| left.location.uri.as_str().cmp(right.location.uri.as_str()))
@@ -778,6 +790,8 @@ impl Translator {
             };
             let (origin, project_relative_path) =
                 workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
+            let is_generated =
+                uri_to_path(&sym.location.uri).is_some_and(|path| is_generated_path(&path));
             if scope == WorkspaceSymbolScope::Project && origin == WorkspaceSymbolOrigin::External {
                 continue;
             }
@@ -796,6 +810,7 @@ impl Translator {
                 match_class,
                 origin,
                 project_relative_path,
+                is_generated,
             });
         }
 
@@ -847,6 +862,7 @@ impl Translator {
             let location = lsp_types::Location { uri, range };
             let (origin, project_relative_path) =
                 workspace_symbol_origin(&location.uri, &self.workspace_roots);
+            let is_generated = is_generated_path(&symbol.path);
             candidates.push(WorkspaceSymbolCandidate {
                 name: symbol.name,
                 kind: kind.to_string(),
@@ -855,6 +871,7 @@ impl Translator {
                 match_class,
                 project_relative_path,
                 origin,
+                is_generated,
             });
         }
         finish_workspace_symbols(candidates, limit, &ctx, &self.workspace_roots).await
@@ -883,6 +900,18 @@ fn ast_grep_symbol_kind(symbol_type: &str) -> Option<&'static str> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn generated_workspace_paths_are_explicitly_classified() {
+        assert!(is_generated_path(std::path::Path::new(
+            "target/debug/gen.rs"
+        )));
+        assert!(is_generated_path(std::path::Path::new(
+            "src/generated/api.rs"
+        )));
+        assert!(is_generated_path(std::path::Path::new("build/ffi.swift")));
+        assert!(!is_generated_path(std::path::Path::new("src/lib.rs")));
+    }
 
     fn outline_symbol(name: &str, kind: &str, children: Option<Vec<Symbol>>) -> Symbol {
         let range = crate::bridge::Range {

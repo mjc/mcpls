@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used)]
 
-use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;

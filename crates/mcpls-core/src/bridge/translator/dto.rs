@@ -681,6 +681,9 @@ pub struct WorkspaceSymbol {
     pub project_relative_path: Option<String>,
     /// Whether the symbol belongs to the registered project or external source.
     pub origin: WorkspaceSymbolOrigin,
+    /// Whether the symbol is under a generated or build-output directory.
+    #[serde(default)]
+    pub is_generated: bool,
 }
 
 /// Requested workspace-symbol name matching behavior.
