@@ -509,6 +509,7 @@ pub fn benchmark_workspace_symbol_count(
         query,
         None,
         limit,
+        false,
         &AtomicBool::new(false),
     )
     .len()

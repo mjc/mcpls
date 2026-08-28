@@ -816,7 +816,14 @@ impl LspServer {
                 .request("shutdown", serde_json::Value::Null, Duration::from_secs(5))
                 .await?;
             self.client.notify("exit", serde_json::Value::Null).await?;
-            self.client.shutdown().await
+            match self.client.shutdown().await {
+                // A server is expected to close its transport after `exit`.
+                // The receiver can observe that EOF before the client-side
+                // shutdown command is processed, so treat that orderly
+                // post-exit termination as a successful handshake.
+                Err(Error::ServerTerminated) => Ok(()),
+                result => result,
+            }
         }
         .await;
 
@@ -1304,7 +1311,9 @@ fn send(body: &str) {
 
 fn main() {
     while let Some(message) = read_message() {
-        if message.contains("\"method\":\"initialize\"") {
+        // Match the method name independent of JSON whitespace; this mock is
+        // intentionally a protocol fixture, not a string-format fixture.
+        if message.contains("initialize") && message.contains("\"id\"") {
             if let Some(path) = env::var_os("MCPLS_SIGNAL_FILE") {
                 fs::write(path, "ready").unwrap();
             }
@@ -1315,10 +1324,10 @@ fn main() {
             }
             let id = request_id(&message).unwrap();
             send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{\"positionEncoding\":\"utf-8\"}}}}}}"));
-        } else if message.contains("\"method\":\"shutdown\"") {
+        } else if message.contains("shutdown") && message.contains("\"id\"") {
             let id = request_id(&message).unwrap();
             send(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":null}}"));
-        } else if message.contains("\"method\":\"exit\"") {
+        } else if message.contains("exit") {
             break;
         }
     }

@@ -811,7 +811,18 @@ impl InspectSymbolRequest {
     /// Return whether the caller selected a section, applying defaults for an empty list.
     #[must_use]
     pub fn wants(&self, section: InspectSymbolSectionKind) -> bool {
-        self.sections.is_empty() || self.sections.contains(&section)
+        if self.sections.is_empty() {
+            matches!(
+                section,
+                InspectSymbolSectionKind::Declaration
+                    | InspectSymbolSectionKind::Implementations
+                    | InspectSymbolSectionKind::References
+                    | InspectSymbolSectionKind::Tests
+                    | InspectSymbolSectionKind::Diagnostics
+            )
+        } else {
+            self.sections.contains(&section)
+        }
     }
 }
 
@@ -1339,4 +1350,51 @@ pub struct InlayHintEntry {
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InspectSymbolRequest, InspectSymbolSectionKind};
+
+    fn request_with_sections(sections: Vec<InspectSymbolSectionKind>) -> InspectSymbolRequest {
+        InspectSymbolRequest {
+            symbol_handle: None,
+            query: Some("symbol".to_owned()),
+            kind: None,
+            path: None,
+            container: None,
+            candidate_limit: 10,
+            sections,
+            budget: super::InspectSymbolBudget::default(),
+        }
+    }
+
+    #[test]
+    fn empty_section_selection_uses_the_bounded_default_bundle() {
+        let request = request_with_sections(Vec::new());
+        for section in [
+            InspectSymbolSectionKind::Declaration,
+            InspectSymbolSectionKind::Implementations,
+            InspectSymbolSectionKind::References,
+            InspectSymbolSectionKind::Tests,
+            InspectSymbolSectionKind::Diagnostics,
+        ] {
+            assert!(request.wants(section));
+        }
+        for section in [
+            InspectSymbolSectionKind::Hover,
+            InspectSymbolSectionKind::Definitions,
+            InspectSymbolSectionKind::Calls,
+            InspectSymbolSectionKind::Runnables,
+        ] {
+            assert!(!request.wants(section));
+        }
+    }
+
+    #[test]
+    fn explicit_section_selection_does_not_expand_to_defaults() {
+        let request = request_with_sections(vec![InspectSymbolSectionKind::Calls]);
+        assert!(request.wants(InspectSymbolSectionKind::Calls));
+        assert!(!request.wants(InspectSymbolSectionKind::References));
+    }
 }
