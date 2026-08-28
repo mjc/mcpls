@@ -1008,6 +1008,18 @@ pub enum InspectSymbolResolution {
         /// Ranked source-bearing candidates; never silently choose one.
         candidates: Vec<WorkspaceSymbol>,
     },
+    /// A previously valid handle no longer matches its source snapshot.
+    ///
+    /// This is an expected refresh condition, not a malformed request. The
+    /// caller should rerun symbol discovery and use the replacement handle.
+    Stale {
+        /// Handle that must be refreshed.
+        symbol_handle: SymbolHandle,
+        /// Human-readable reason for the refresh.
+        reason: String,
+        /// Whether retrying after discovery is safe.
+        retryable: bool,
+    },
     /// No exact candidate matched the supplied constraints.
     NotFound,
 }

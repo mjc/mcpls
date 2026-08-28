@@ -5159,7 +5159,23 @@ impl ProjectRuntime {
         };
 
         let (resolution, target) = if let Some(handle) = request.symbol_handle.clone() {
-            let target = self.resolve_symbol_target(&handle).await?;
+            let target = match self.resolve_symbol_target(&handle).await {
+                Ok(target) => target,
+                Err(error) if error.starts_with("stale_symbol_handle:") => {
+                    return Ok(InspectSymbolResult {
+                        resolution: InspectSymbolResolution::Stale {
+                            symbol_handle: handle,
+                            reason: error,
+                            retryable: true,
+                        },
+                        sections: InspectSymbolSections::default(),
+                        budget: request.budget,
+                        returned_bytes: 0,
+                        truncated: false,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             (
                 InspectSymbolResolution::Selected {
                     symbol: None,
@@ -5220,7 +5236,23 @@ impl ProjectRuntime {
                     let symbol = result.symbols.remove(0);
                     let symbol_range = symbol.location.range.clone();
                     let target = if let Some(handle) = symbol.location.symbol_handle.as_ref() {
-                        let stored = self.resolve_symbol_target(handle).await?;
+                        let stored = match self.resolve_symbol_target(handle).await {
+                            Ok(stored) => stored,
+                            Err(error) if error.starts_with("stale_symbol_handle:") => {
+                                return Ok(InspectSymbolResult {
+                                    resolution: InspectSymbolResolution::Stale {
+                                        symbol_handle: handle.clone(),
+                                        reason: error,
+                                        retryable: true,
+                                    },
+                                    sections: InspectSymbolSections::default(),
+                                    budget: request.budget,
+                                    returned_bytes: 0,
+                                    truncated: false,
+                                });
+                            }
+                            Err(error) => return Err(error),
+                        };
                         Some((
                             stored.file_path.to_string_lossy().into_owned(),
                             stored.line,
@@ -10690,6 +10722,49 @@ mod tests {
 
         let error = runtime.resolve_symbol_target(&handle).await.unwrap_err();
         assert!(error.contains("stale_symbol_handle"));
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_returns_retryable_result_for_stale_handle() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("stale.rs");
+        fs::write(&source, "fn before() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let mut runtime = ProjectRuntime::new(translator);
+        let (_, _, source_hash, _) = runtime.translator.source_snapshot(&source).await.unwrap();
+        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
+            source.clone(),
+            1,
+            4,
+            SourceSnapshot::Hash(source_hash),
+        ));
+        fs::write(&source, "fn after() {}\n").unwrap();
+
+        let result = runtime
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: Some(handle.clone()),
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 5,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            })
+            .await
+            .unwrap();
+        let crate::bridge::InspectSymbolResolution::Stale {
+            symbol_handle,
+            reason,
+            retryable,
+        } = result.resolution
+        else {
+            panic!("stale handles must produce a structured refresh result");
+        };
+        assert_eq!(symbol_handle, handle);
+        assert!(retryable);
+        assert!(reason.starts_with("stale_symbol_handle:"));
     }
 
     #[tokio::test]

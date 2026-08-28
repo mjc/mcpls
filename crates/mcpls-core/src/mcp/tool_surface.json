@@ -12499,6 +12499,34 @@
               "type": "object"
             },
             {
+              "description": "A previously valid handle no longer matches its source snapshot.\n\nThis is an expected refresh condition, not a malformed request. The\ncaller should rerun symbol discovery and use the replacement handle.",
+              "properties": {
+                "reason": {
+                  "description": "Human-readable reason for the refresh.",
+                  "type": "string"
+                },
+                "retryable": {
+                  "description": "Whether retrying after discovery is safe.",
+                  "type": "boolean"
+                },
+                "status": {
+                  "const": "stale",
+                  "type": "string"
+                },
+                "symbol_handle": {
+                  "description": "Handle that must be refreshed.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "symbol_handle",
+                "reason",
+                "retryable"
+              ],
+              "type": "object"
+            },
+            {
               "description": "No exact candidate matched the supplied constraints.",
               "properties": {
                 "status": {
@@ -13287,6 +13315,7 @@
               ]
             },
             "is_generated": {
+              "default": false,
               "description": "Whether the symbol is under a generated or build-output directory.",
               "type": "boolean"
             },
@@ -13331,8 +13360,7 @@
             "location",
             "match_class",
             "score",
-            "origin",
-            "is_generated"
+            "origin"
           ],
           "type": "object"
         },
@@ -15798,6 +15826,7 @@
               ]
             },
             "is_generated": {
+              "default": false,
               "description": "Whether the symbol is under a generated or build-output directory.",
               "type": "boolean"
             },
@@ -15842,8 +15871,7 @@
             "location",
             "match_class",
             "score",
-            "origin",
-            "is_generated"
+            "origin"
           ],
           "type": "object"
         },
