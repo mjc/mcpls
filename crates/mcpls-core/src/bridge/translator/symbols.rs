@@ -647,8 +647,37 @@ impl Translator {
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
     ) -> Result<WorkspaceSymbolResult> {
-        self.handle_workspace_symbol_filtered(query, kind_filter, limit, match_mode, scope, None)
-            .await
+        self.handle_workspace_symbol_with_generated(
+            query,
+            kind_filter,
+            limit,
+            match_mode,
+            scope,
+            false,
+        )
+        .await
+    }
+
+    /// Handle workspace symbol search with explicit generated-file inclusion.
+    pub async fn handle_workspace_symbol_with_generated(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        limit: u32,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
+        include_generated: bool,
+    ) -> Result<WorkspaceSymbolResult> {
+        self.handle_workspace_symbol_filtered(
+            query,
+            kind_filter,
+            limit,
+            match_mode,
+            scope,
+            include_generated,
+            None,
+        )
+        .await
     }
 
     /// Handle workspace symbol search constrained to one canonical source path.
@@ -673,6 +702,7 @@ impl Translator {
             limit,
             match_mode,
             scope,
+            false,
             Some(path),
         )
         .await
@@ -686,6 +716,7 @@ impl Translator {
         limit: u32,
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
+        include_generated: bool,
         path: Option<&std::path::Path>,
     ) -> Result<WorkspaceSymbolResult> {
         validate_workspace_symbol_params(&query, kind_filter.as_deref(), limit)?;
@@ -718,6 +749,7 @@ impl Translator {
                     kind_filter.as_deref(),
                     limit as usize,
                     match_mode,
+                    include_generated,
                 )
                 .await)
         };
@@ -792,6 +824,9 @@ impl Translator {
                 workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
             let is_generated =
                 uri_to_path(&sym.location.uri).is_some_and(|path| is_generated_path(&path));
+            if is_generated && !include_generated {
+                continue;
+            }
             if scope == WorkspaceSymbolScope::Project && origin == WorkspaceSymbolOrigin::External {
                 continue;
             }
@@ -829,14 +864,22 @@ impl Translator {
         kind_filter: Option<&str>,
         limit: usize,
         match_mode: WorkspaceSymbolMatchMode,
+        include_generated: bool,
     ) -> WorkspaceSymbolResult {
         let candidate_query = query
             .chars()
             .next()
             .map(|character| character.to_string())
             .unwrap_or_default();
-        let matches =
-            ast_grep::search(roots, languages, &candidate_query, kind_filter, 4_096).await;
+        let matches = ast_grep::search(
+            roots,
+            languages,
+            &candidate_query,
+            kind_filter,
+            4_096,
+            include_generated,
+        )
+        .await;
         let ctx = EncodingCtx {
             encoding: crate::bridge::encoding::PositionEncoding::Utf8,
             tracker: self.document_tracker.clone(),
@@ -863,6 +906,9 @@ impl Translator {
             let (origin, project_relative_path) =
                 workspace_symbol_origin(&location.uri, &self.workspace_roots);
             let is_generated = is_generated_path(&symbol.path);
+            if is_generated && !include_generated {
+                continue;
+            }
             candidates.push(WorkspaceSymbolCandidate {
                 name: symbol.name,
                 kind: kind.to_string(),
@@ -1310,6 +1356,50 @@ mod tests {
             crate::bridge::SourceContext::Available(_)
         ));
         assert!(result.symbols[0].location.symbol_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn generated_workspace_symbols_require_explicit_opt_in() {
+        let dir = TempDir::new().unwrap();
+        let generated = dir.path().join("generated");
+        fs::create_dir(&generated).unwrap();
+        fs::write(dir.path().join("main.rs"), "fn visible_target() {}\n").unwrap();
+        fs::write(generated.join("api.rs"), "fn generated_target() {}\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let default_result = translator
+            .handle_workspace_symbol(
+                "target".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::Fuzzy,
+                WorkspaceSymbolScope::Project,
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_result.total, 1);
+        assert_eq!(default_result.symbols[0].name, "visible_target");
+
+        let included_result = translator
+            .handle_workspace_symbol_with_generated(
+                "target".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::Fuzzy,
+                WorkspaceSymbolScope::Project,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(included_result.total, 2);
+        assert!(
+            included_result
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "generated_target" && symbol.is_generated)
+        );
     }
 
     #[tokio::test]

@@ -315,6 +315,7 @@ pub async fn search(
     query: &str,
     kind_filter: Option<&str>,
     limit: usize,
+    include_generated: bool,
 ) -> Vec<Symbol> {
     if limit == 0 {
         return Vec::new();
@@ -334,6 +335,7 @@ pub async fn search(
             &query,
             kind_filter.as_deref(),
             limit,
+            include_generated,
             &worker_cancelled,
         )
     })
@@ -358,6 +360,7 @@ fn search_sync(
     query: &str,
     kind_filter: Option<&str>,
     limit: usize,
+    include_generated: bool,
     cancelled: &AtomicBool,
 ) -> Vec<Symbol> {
     if cancelled.load(Ordering::Relaxed) {
@@ -377,7 +380,7 @@ fn search_sync(
     for root in roots {
         for entry in WalkBuilder::new(root)
             .standard_filters(true)
-            .filter_entry(|entry| !is_generated_path(entry.path()))
+            .filter_entry(move |entry| include_generated || !is_generated_path(entry.path()))
             .build()
             .flatten()
         {
@@ -663,6 +666,7 @@ mod tests {
             "fallback",
             None,
             10,
+            false,
             &AtomicBool::new(false),
         );
 
@@ -706,6 +710,7 @@ mod tests {
             "run",
             Some("struct"),
             1,
+            false,
             &AtomicBool::new(false),
         );
 
@@ -734,6 +739,7 @@ mod tests {
             "run",
             None,
             10,
+            false,
             &AtomicBool::new(false),
         );
         assert!(
@@ -748,6 +754,7 @@ mod tests {
             "running",
             None,
             10,
+            false,
             &AtomicBool::new(false),
         );
         assert!(
@@ -776,6 +783,7 @@ mod tests {
             "run",
             None,
             10,
+            false,
             &AtomicBool::new(false),
         );
 
@@ -804,6 +812,7 @@ mod tests {
             "cancelled",
             None,
             10,
+            false,
             &cancelled,
         );
 
@@ -1093,6 +1102,7 @@ mod tests {
             "budget_match",
             None,
             10,
+            false,
             &AtomicBool::new(false),
         );
 

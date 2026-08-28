@@ -1625,6 +1625,7 @@ enum ProjectRequest {
         limit: u32,
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
+        include_generated: bool,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
     InspectSymbol {
@@ -2599,6 +2600,7 @@ impl ProjectHandle {
         limit: u32,
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
+        include_generated: bool,
     ) -> Result<WorkspaceSymbolResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2608,6 +2610,7 @@ impl ProjectHandle {
                 limit,
                 match_mode,
                 scope,
+                include_generated,
                 reply,
             })
             .await
@@ -5119,10 +5122,18 @@ impl ProjectRuntime {
         limit: u32,
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
+        include_generated: bool,
     ) -> Result<WorkspaceSymbolResult, String> {
         let mut result = self
             .translator
-            .handle_workspace_symbol(query, kind_filter, limit, match_mode, scope)
+            .handle_workspace_symbol_with_generated(
+                query,
+                kind_filter,
+                limit,
+                match_mode,
+                scope,
+                include_generated,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
@@ -5222,6 +5233,7 @@ impl ProjectRuntime {
                     request.candidate_limit,
                     WorkspaceSymbolMatchMode::Exact,
                     WorkspaceSymbolScope::Project,
+                    false,
                 )
                 .await?
             };
@@ -7020,6 +7032,7 @@ async fn handle_project_request(
             limit,
             match_mode,
             scope,
+            include_generated,
             mut reply,
         } => {
             if reply.is_closed() {
@@ -7027,7 +7040,7 @@ async fn handle_project_request(
             }
             let result = tokio::select! {
                 () = reply.closed() => return false,
-                result = runtime.workspace_symbol(query, kind_filter, limit, match_mode, scope) => result,
+                result = runtime.workspace_symbol(query, kind_filter, limit, match_mode, scope, include_generated) => result,
             };
             let _ = reply.send(result);
         }
@@ -10333,6 +10346,7 @@ mod tests {
                 10,
                 WorkspaceSymbolMatchMode::default(),
                 WorkspaceSymbolScope::default(),
+                false,
             )
             .await
             .unwrap();
@@ -10373,6 +10387,7 @@ mod tests {
                 10,
                 WorkspaceSymbolMatchMode::Exact,
                 WorkspaceSymbolScope::Project,
+                false,
             )
             .await
             .unwrap()

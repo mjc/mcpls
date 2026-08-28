@@ -360,6 +360,9 @@ pub struct WorkspaceSymbolParams {
     #[schemars(description = "Maximum results to return (default: 100).")]
     #[serde(default = "default_max_results")]
     pub limit: u32,
+    /// Include symbols under generated/build-output directories (default: false).
+    #[serde(default)]
+    pub include_generated: bool,
 }
 
 /// Parameters for a bounded, project-scoped symbol inspection bundle.

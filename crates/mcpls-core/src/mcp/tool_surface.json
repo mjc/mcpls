@@ -15448,6 +15448,11 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "include_generated": {
+          "default": false,
+          "description": "Include symbols under generated/build-output directories (default: false).",
+          "type": "boolean"
+        },
         "kind_filter": {
           "description": "Optional filter by symbol kind (function, class, variable, etc.).",
           "type": [

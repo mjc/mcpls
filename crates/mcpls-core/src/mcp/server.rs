@@ -2504,6 +2504,7 @@ impl McplsServer {
             match_mode,
             scope,
             limit,
+            include_generated,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<crate::bridge::WorkspaceSymbolResult>, McpError> {
         let id = parse_project_id(project_id)?;
@@ -2514,7 +2515,14 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .workspace_symbol(query, kind_filter, limit, match_mode, scope)
+            .workspace_symbol(
+                query,
+                kind_filter,
+                limit,
+                match_mode,
+                scope,
+                include_generated,
+            )
             .await
             .map_err(|error| error.to_string());
 
@@ -3970,6 +3978,7 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             }))
             .await
             .unwrap();
@@ -3983,6 +3992,7 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             }))
             .await
             .unwrap();
@@ -4017,6 +4027,7 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             })),
             server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: second_id.as_str().to_string(),
@@ -4025,6 +4036,7 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             })),
         );
         let first: serde_json::Value = serde_json::from_str(&first.unwrap()).unwrap();
@@ -4131,6 +4143,7 @@ finally:
                     match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                     scope: crate::bridge::WorkspaceSymbolScope::default(),
                     limit: 20,
+                    include_generated: false,
                 }))
                 .await
         });
@@ -4203,6 +4216,7 @@ finally:
                     match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                     scope: crate::bridge::WorkspaceSymbolScope::default(),
                     limit: 20,
+                    include_generated: false,
                 }))
                 .await
         });
@@ -4855,6 +4869,7 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             }))
             .await
             .unwrap();
@@ -6670,6 +6685,7 @@ while True:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             }))
             .await
             .unwrap();
@@ -6771,6 +6787,7 @@ while True:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                include_generated: false,
             }))
             .await
             .unwrap();
@@ -7397,6 +7414,7 @@ while True:
             match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
             scope: crate::bridge::WorkspaceSymbolScope::default(),
             limit: 100,
+            include_generated: false,
         });
         let result = server.workspace_symbol_search(params).await;
         assert!(result.is_err());
