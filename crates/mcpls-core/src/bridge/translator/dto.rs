@@ -311,6 +311,12 @@ pub struct ReferenceSourceChunk {
     pub lines: [u32; 2],
     /// Line-numbered source text.
     pub text: String,
+    /// Per-chunk snapshot hash when a group contains mixed snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Per-chunk document version when a group contains mixed snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
 }
 
 /// Safely known role of a reference.
@@ -940,12 +946,15 @@ pub struct InspectSection<T> {
     pub completeness: InspectSectionCompleteness,
     /// Items available before bounds.
     #[serde(skip_serializing_if = "is_zero")]
+    #[schemars(default)]
     pub total: usize,
     /// Items represented in `data`.
     #[serde(skip_serializing_if = "is_zero")]
+    #[schemars(default)]
     pub returned: usize,
     /// Whether bounds omitted items or source.
     #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub truncated: bool,
     /// Actionable unsupported or unavailable reason.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1107,30 +1116,39 @@ pub enum InspectSymbolResolution {
 pub struct InspectSymbolSections {
     /// Bounded declaration or body source.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub declaration: InspectSection<SourceContext>,
     /// Signature, type, and documentation at the symbol.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub hover: InspectSection<HoverResult>,
     /// Definition targets with bounded source and handles.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub definitions: InspectSection<DefinitionResult>,
     /// Implementation targets with bounded source and handles.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub implementations: InspectSection<LocationsResult>,
     /// Grouped references with bounded call-site source.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub references: InspectSection<ReferencesResult>,
     /// Incoming and outgoing call samples.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub calls: InspectSection<InspectCalls>,
     /// Related tests discovered without executing them.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub tests: InspectSection<crate::bridge::SemanticDiscoveryResult>,
     /// Runnable metadata discovered without executing commands.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub runnables: InspectSection<crate::bridge::SemanticDiscoveryResult>,
     /// Diagnostics intersecting the selected symbol range.
     #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub diagnostics: InspectSection<DiagnosticsResult>,
 }
 

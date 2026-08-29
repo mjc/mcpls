@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -341,11 +340,22 @@ impl super::Translator {
             .unwrap_or(usize::MAX)
             .min(lines.len())
             .max(start);
+        let selected = &lines[start..end];
+        let total_bytes = selected
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| numbered_line_bytes(start + offset + 1, line))
+            .sum();
+        let byte_limit = MAX_RESPONSE_BYTES;
         let mut text = String::new();
-        for (offset, line) in lines[start..end].iter().enumerate() {
-            let _ = writeln!(text, "{:>4} | {line}", start + offset + 1);
+        for (offset, line) in selected.iter().enumerate() {
+            let rendered = format!("{:>4} | {line}\n", start + offset + 1);
+            if text.len() + rendered.len() > byte_limit {
+                break;
+            }
+            text.push_str(&rendered);
         }
-        let returned_lines = end - start;
+        let returned_lines = text.lines().count();
         let returned_bytes = text.len();
         Ok(SourceFrame {
             path: path.to_string_lossy().into_owned(),
@@ -357,10 +367,10 @@ impl super::Translator {
             document_version,
             content_hash,
             returned_lines,
-            total_lines: returned_lines,
+            total_lines: lines.len(),
             returned_bytes,
-            total_bytes: returned_bytes,
-            truncated: false,
+            total_bytes,
+            truncated: returned_lines < selected.len(),
             resource: None,
         })
     }
@@ -493,7 +503,7 @@ mod tests {
         assert_eq!(replayed.range.start.line, 10);
         assert_eq!(replayed.range.end.line, 12);
         assert_eq!(replayed.returned_lines, 3);
-        assert_eq!(replayed.total_lines, 3);
+        assert_eq!(replayed.total_lines, 20);
         assert_eq!(
             replayed.text,
             "  10 | line 10\n  11 | line 11\n  12 | line 12\n"
@@ -563,6 +573,36 @@ mod tests {
         assert_eq!(frame.returned_lines, 2);
         assert!(frame.text.contains("tail sentinel"));
         assert!(!frame.truncated);
+    }
+
+    #[tokio::test]
+    async fn source_resource_replay_is_bounded_and_reports_snapshot_totals() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = (1..=40)
+            .map(|line| format!("line {line}: {}\n", "x".repeat(1_000)))
+            .collect::<String>();
+        tokio::fs::write(&path, &content).await.unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, version, snapshot_hash, _) = translator.source_snapshot(&path).await.unwrap();
+        let resource = SourceResource {
+            path,
+            start_line: 1,
+            start_character: 1,
+            end_line: 40,
+            end_character: 1,
+            snapshot_hash,
+            document_version: version,
+        };
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert!(frame.truncated);
+        assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        assert_eq!(frame.total_lines, 40);
+        assert!(frame.total_bytes > frame.returned_bytes);
     }
 
     #[tokio::test]

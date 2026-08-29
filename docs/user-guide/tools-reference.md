@@ -246,10 +246,22 @@ shared `source.chunks` so every reference remains listed without repeating the s
       }]
     }
   }],
+  "declaration": {
+    "uri": "file:///workspace/src/lib.rs",
+    "range": {
+      "start": { "line": 8, "character": 1 },
+      "end": { "line": 8, "character": 14 }
+    },
+    "source": { "status": "available", "text": "  8 | fn target() {}\n" }
+  },
   "total_references": 2,
   "returned_references": 2
 }
 ```
+
+When `include_declaration` is true, `declaration` is one `Location` object
+separate from `groups`. It identifies the declaration range and carries the same
+source-context and optional `symbol_handle` fields as other locations.
 
 ### Example Use Cases
 

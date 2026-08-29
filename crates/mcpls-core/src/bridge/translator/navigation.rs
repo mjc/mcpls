@@ -722,23 +722,29 @@ fn compact_reference_group(group: ReferenceLocationGroup) -> ReferenceGroup {
 fn collect_reference_source(source: &mut ReferenceSource, context: &SourceContext) {
     match context {
         SourceContext::Available(frame) => {
-            let same_snapshot = source.chunks.is_empty()
+            let has_chunks = !source.chunks.is_empty();
+            let same_snapshot = !has_chunks
                 || (source.content_hash.as_deref() == Some(&frame.content_hash)
                     && source.document_version == frame.document_version);
-            if source.chunks.is_empty() {
+            if !has_chunks {
                 source.content_hash = Some(frame.content_hash.clone());
                 source.document_version = frame.document_version;
-            } else {
-                if source.content_hash.as_deref() != Some(&frame.content_hash) {
-                    source.content_hash = None;
+            } else if !same_snapshot {
+                if let Some(previous_hash) = source.content_hash.take() {
+                    let previous_version = source.document_version.take();
+                    for chunk in &mut source.chunks {
+                        chunk.content_hash = Some(previous_hash.clone());
+                        chunk.document_version = previous_version;
+                    }
                 }
-                if source.document_version != frame.document_version {
-                    source.document_version = None;
-                }
+                source.document_version = None;
             }
+            let mixed_snapshot = has_chunks && (!same_snapshot || source.content_hash.is_none());
             let chunk = ReferenceSourceChunk {
                 lines: [frame.range.start.line, frame.range.end.line],
                 text: frame.text.clone(),
+                content_hash: mixed_snapshot.then(|| frame.content_hash.clone()),
+                document_version: mixed_snapshot.then_some(frame.document_version).flatten(),
             };
             if same_snapshot {
                 push_reference_chunk(&mut source.chunks, chunk);
@@ -1058,6 +1064,43 @@ mod tests {
         assert_eq!(result.groups[0].source.chunks.len(), 1);
         assert!(chunk.text.contains(" 107 |"), "{}", chunk.text);
         assert!(chunk.text.contains(" 118 |"), "{}", chunk.text);
+    }
+
+    #[test]
+    fn mixed_snapshot_chunks_keep_per_chunk_provenance() {
+        let first = available_location("/workspace/src/lib.rs", 100);
+        let mut second = available_location("/workspace/src/lib.rs", 200);
+        let SourceContext::Available(frame) = &mut second.source else {
+            panic!("source unavailable")
+        };
+        frame.content_hash = "b".repeat(64);
+        frame.document_version = Some(2);
+
+        let result = group_references(
+            vec![first, second],
+            None,
+            2,
+            &[std::path::PathBuf::from("/workspace")],
+            &std::collections::HashMap::new(),
+            SemanticResultLimits::default(),
+            false,
+        );
+
+        let source = &result.groups[0].source;
+        let first_hash = "a".repeat(64);
+        let second_hash = "b".repeat(64);
+        assert!(source.content_hash.is_none());
+        assert_eq!(source.chunks.len(), 2);
+        assert_eq!(
+            source.chunks[0].content_hash.as_deref(),
+            Some(first_hash.as_str())
+        );
+        assert_eq!(source.chunks[0].document_version, Some(1));
+        assert_eq!(
+            source.chunks[1].content_hash.as_deref(),
+            Some(second_hash.as_str())
+        );
+        assert_eq!(source.chunks[1].document_version, Some(2));
     }
 
     #[test]

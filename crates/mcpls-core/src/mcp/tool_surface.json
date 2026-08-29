@@ -9252,6 +9252,21 @@
         "ReferenceSourceChunk": {
           "description": "One merged, line-numbered source window shared by nearby references.",
           "properties": {
+            "content_hash": {
+              "description": "Per-chunk snapshot hash when a group contains mixed snapshots.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "document_version": {
+              "description": "Per-chunk document version when a group contains mixed snapshots.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "lines": {
               "description": "Inclusive `[start_line, end_line]` covered by `text`.",
               "items": {
@@ -12016,10 +12031,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12084,10 +12096,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12152,10 +12161,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12220,10 +12226,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12288,10 +12291,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12356,10 +12356,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12424,10 +12421,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12492,10 +12486,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12672,17 +12663,6 @@
               "description": "Related tests discovered without executing them."
             }
           },
-          "required": [
-            "declaration",
-            "hover",
-            "definitions",
-            "implementations",
-            "references",
-            "calls",
-            "tests",
-            "runnables",
-            "diagnostics"
-          ],
           "type": "object"
         },
         "Location": {
@@ -13038,6 +13018,21 @@
         "ReferenceSourceChunk": {
           "description": "One merged, line-numbered source window shared by nearby references.",
           "properties": {
+            "content_hash": {
+              "description": "Per-chunk snapshot hash when a group contains mixed snapshots.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "document_version": {
+              "description": "Per-chunk document version when a group contains mixed snapshots.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "lines": {
               "description": "Inclusive `[start_line, end_line]` covered by `text`.",
               "items": {
