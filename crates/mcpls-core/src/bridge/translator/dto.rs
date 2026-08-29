@@ -259,6 +259,7 @@ pub struct ReferenceGroup {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceUse {
     /// `[start_line, start_character, end_line, end_character]`, all 1-based.
+    #[schemars(with = "[std::num::NonZeroU32; 4]")]
     pub range: [u32; 4],
     /// Semantic role, reported conservatively when unavailable from the server.
     pub role: ReferenceRole,
@@ -306,6 +307,7 @@ pub struct ReferenceSource {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceSourceChunk {
     /// Inclusive `[start_line, end_line]` covered by `text`.
+    #[schemars(with = "[std::num::NonZeroU32; 2]")]
     pub lines: [u32; 2],
     /// Line-numbered source text.
     pub text: String,

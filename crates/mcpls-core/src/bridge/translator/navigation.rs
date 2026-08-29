@@ -772,7 +772,9 @@ fn push_reference_chunk(chunks: &mut Vec<ReferenceSourceChunk>, chunk: Reference
         chunks.push(chunk);
         return;
     }
-    let skipped = previous.lines[1].saturating_sub(chunk.lines[0]) as usize + 1;
+    let skipped = previous.lines[1]
+        .saturating_add(1)
+        .saturating_sub(chunk.lines[0]) as usize;
     for line in chunk.text.lines().skip(skipped) {
         previous.text.push_str(line);
         previous.text.push('\n');
@@ -1035,6 +1037,27 @@ mod tests {
         assert_eq!(adjacent.groups[0].source.chunks[0].lines, [95, 107]);
         assert_eq!(sparse.groups[0].references.len(), 2);
         assert_eq!(sparse.groups[0].source.chunks.len(), 2);
+    }
+
+    #[test]
+    fn adjacent_reference_context_keeps_the_boundary_line() {
+        let result = group_references(
+            vec![
+                available_location("/workspace/src/lib.rs", 100),
+                available_location("/workspace/src/lib.rs", 112),
+            ],
+            None,
+            2,
+            &[std::path::PathBuf::from("/workspace")],
+            &std::collections::HashMap::new(),
+            SemanticResultLimits::default(),
+            false,
+        );
+
+        let chunk = &result.groups[0].source.chunks[0];
+        assert_eq!(result.groups[0].source.chunks.len(), 1);
+        assert!(chunk.text.contains(" 107 |"), "{}", chunk.text);
+        assert!(chunk.text.contains(" 118 |"), "{}", chunk.text);
     }
 
     #[test]

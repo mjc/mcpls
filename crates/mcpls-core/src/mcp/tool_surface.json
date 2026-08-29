@@ -9256,7 +9256,7 @@
               "description": "Inclusive `[start_line, end_line]` covered by `text`.",
               "items": {
                 "format": "uint32",
-                "minimum": 0,
+                "minimum": 1,
                 "type": "integer"
               },
               "maxItems": 2,
@@ -9281,7 +9281,7 @@
               "description": "`[start_line, start_character, end_line, end_character]`, all 1-based.",
               "items": {
                 "format": "uint32",
-                "minimum": 0,
+                "minimum": 1,
                 "type": "integer"
               },
               "maxItems": 4,
@@ -13042,7 +13042,7 @@
               "description": "Inclusive `[start_line, end_line]` covered by `text`.",
               "items": {
                 "format": "uint32",
-                "minimum": 0,
+                "minimum": 1,
                 "type": "integer"
               },
               "maxItems": 2,
@@ -13067,7 +13067,7 @@
               "description": "`[start_line, start_character, end_line, end_character]`, all 1-based.",
               "items": {
                 "format": "uint32",
-                "minimum": 0,
+                "minimum": 1,
                 "type": "integer"
               },
               "maxItems": 4,
