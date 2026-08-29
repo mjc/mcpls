@@ -829,7 +829,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -844,7 +844,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -1312,7 +1312,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -1327,7 +1327,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -1772,7 +1772,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -1787,7 +1787,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -2232,7 +2232,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -2247,7 +2247,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -3367,7 +3367,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -3382,7 +3382,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -3827,7 +3827,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -3842,7 +3842,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -4509,7 +4509,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -4524,7 +4524,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -5048,7 +5048,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -5063,7 +5063,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -5498,7 +5498,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -5513,7 +5513,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -6136,7 +6136,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -6151,7 +6151,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -6616,7 +6616,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -6631,7 +6631,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -7124,7 +7124,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -7139,7 +7139,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -7640,7 +7640,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -7655,7 +7655,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -8305,7 +8305,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -8320,7 +8320,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -8770,7 +8770,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -8785,7 +8785,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -9174,11 +9174,21 @@
                 "$ref": "#/$defs/ReferenceUse"
               },
               "type": "array"
+            },
+            "source": {
+              "$ref": "#/$defs/ReferenceSource",
+              "description": "Source snapshot and merged context shared by the references."
+            },
+            "uri": {
+              "description": "URI shared by every reference in this group.",
+              "type": "string"
             }
           },
           "required": [
             "project_relative_path",
-            "references"
+            "uri",
+            "references",
+            "source"
           ],
           "type": "object"
         },
@@ -9197,20 +9207,116 @@
             }
           ]
         },
+        "ReferenceSource": {
+          "description": "Source metadata shared by references from one file and enclosing symbol.",
+          "properties": {
+            "chunks": {
+              "description": "Merged source windows, in source order.",
+              "items": {
+                "$ref": "#/$defs/ReferenceSourceChunk"
+              },
+              "type": "array"
+            },
+            "content_hash": {
+              "description": "SHA-256 of the source snapshot used for available chunks.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "deferred": {
+              "description": "Snapshot-bound resources for context omitted by the response budget.",
+              "items": {
+                "$ref": "#/$defs/DeferredResourceReference"
+              },
+              "type": "array"
+            },
+            "document_version": {
+              "description": "Open-document version used for available chunks.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "unavailable": {
+              "description": "Reasons context could not be resolved, deduplicated for this group.",
+              "items": {
+                "$ref": "#/$defs/SourceUnavailableReason"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "ReferenceSourceChunk": {
+          "description": "One merged, line-numbered source window shared by nearby references.",
+          "properties": {
+            "content_hash": {
+              "description": "Per-chunk snapshot hash when a group contains mixed snapshots.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "document_version": {
+              "description": "Per-chunk document version when a group contains mixed snapshots.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lines": {
+              "description": "Inclusive `[start_line, end_line]` covered by `text`.",
+              "items": {
+                "format": "uint32",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "text": {
+              "description": "Line-numbered source text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "lines",
+            "text"
+          ],
+          "type": "object"
+        },
         "ReferenceUse": {
           "description": "One source use of the referenced symbol.",
           "properties": {
-            "location": {
-              "$ref": "#/$defs/Location",
-              "description": "Bounded location and highlighted source frame for the use."
+            "range": {
+              "description": "`[start_line, start_character, end_line, end_character]`, all 1-based.",
+              "items": {
+                "format": "uint32",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
             },
             "role": {
               "$ref": "#/$defs/ReferenceRole",
               "description": "Semantic role, reported conservatively when unavailable from the server."
+            },
+            "symbol_handle": {
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "location",
+            "range",
             "role"
           ],
           "type": "object"
@@ -9314,7 +9420,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -9329,7 +9435,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -9430,7 +9536,7 @@
         "declaration": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ReferenceUse"
+              "$ref": "#/$defs/Location"
             },
             {
               "type": "null"
@@ -9797,7 +9903,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -9812,7 +9918,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -10565,7 +10671,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -10580,7 +10686,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -10985,7 +11091,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -11000,7 +11106,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -11925,10 +12031,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -11993,10 +12096,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12061,10 +12161,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12129,10 +12226,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12197,10 +12291,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12265,10 +12356,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12333,10 +12421,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12401,10 +12486,7 @@
             }
           },
           "required": [
-            "completeness",
-            "total",
-            "returned",
-            "truncated"
+            "completeness"
           ],
           "type": "object"
         },
@@ -12581,17 +12663,6 @@
               "description": "Related tests discovered without executing them."
             }
           },
-          "required": [
-            "declaration",
-            "hover",
-            "definitions",
-            "implementations",
-            "references",
-            "calls",
-            "tests",
-            "runnables",
-            "diagnostics"
-          ],
           "type": "object"
         },
         "Location": {
@@ -12869,11 +12940,21 @@
                 "$ref": "#/$defs/ReferenceUse"
               },
               "type": "array"
+            },
+            "source": {
+              "$ref": "#/$defs/ReferenceSource",
+              "description": "Source snapshot and merged context shared by the references."
+            },
+            "uri": {
+              "description": "URI shared by every reference in this group.",
+              "type": "string"
             }
           },
           "required": [
             "project_relative_path",
-            "references"
+            "uri",
+            "references",
+            "source"
           ],
           "type": "object"
         },
@@ -12892,20 +12973,116 @@
             }
           ]
         },
+        "ReferenceSource": {
+          "description": "Source metadata shared by references from one file and enclosing symbol.",
+          "properties": {
+            "chunks": {
+              "description": "Merged source windows, in source order.",
+              "items": {
+                "$ref": "#/$defs/ReferenceSourceChunk"
+              },
+              "type": "array"
+            },
+            "content_hash": {
+              "description": "SHA-256 of the source snapshot used for available chunks.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "deferred": {
+              "description": "Snapshot-bound resources for context omitted by the response budget.",
+              "items": {
+                "$ref": "#/$defs/DeferredResourceReference"
+              },
+              "type": "array"
+            },
+            "document_version": {
+              "description": "Open-document version used for available chunks.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "unavailable": {
+              "description": "Reasons context could not be resolved, deduplicated for this group.",
+              "items": {
+                "$ref": "#/$defs/SourceUnavailableReason"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "ReferenceSourceChunk": {
+          "description": "One merged, line-numbered source window shared by nearby references.",
+          "properties": {
+            "content_hash": {
+              "description": "Per-chunk snapshot hash when a group contains mixed snapshots.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "document_version": {
+              "description": "Per-chunk document version when a group contains mixed snapshots.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lines": {
+              "description": "Inclusive `[start_line, end_line]` covered by `text`.",
+              "items": {
+                "format": "uint32",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "text": {
+              "description": "Line-numbered source text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "lines",
+            "text"
+          ],
+          "type": "object"
+        },
         "ReferenceUse": {
           "description": "One source use of the referenced symbol.",
           "properties": {
-            "location": {
-              "$ref": "#/$defs/Location",
-              "description": "Bounded location and highlighted source frame for the use."
+            "range": {
+              "description": "`[start_line, start_character, end_line, end_character]`, all 1-based.",
+              "items": {
+                "format": "uint32",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
             },
             "role": {
               "$ref": "#/$defs/ReferenceRole",
               "description": "Semantic role, reported conservatively when unavailable from the server."
+            },
+            "symbol_handle": {
+              "description": "Snapshot-bound target for coordinate-free semantic follow-ups.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "location",
+            "range",
             "role"
           ],
           "type": "object"
@@ -12916,7 +13093,7 @@
             "declaration": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/ReferenceUse"
+                  "$ref": "#/$defs/Location"
                 },
                 {
                   "type": "null"
@@ -13194,7 +13371,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -13209,7 +13386,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -13942,7 +14119,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -13957,7 +14134,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [
@@ -15710,7 +15887,7 @@
             },
             "highlighted_range": {
               "$ref": "#/$defs/Range",
-              "description": "Range highlighted by consumers; currently identical to `range`."
+              "description": "Normalized semantic result range highlighted within the source window."
             },
             "language_id": {
               "description": "Language identifier when known.",
@@ -15725,7 +15902,7 @@
             },
             "range": {
               "$ref": "#/$defs/Range",
-              "description": "Normalized 1-based result range."
+              "description": "Inclusive 1-based line window covered by `text`."
             },
             "resource": {
               "anyOf": [

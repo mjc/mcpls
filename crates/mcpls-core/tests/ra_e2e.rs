@@ -489,14 +489,19 @@ fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), Str
             inner["returned_references"]
         ));
     }
-    if inner["declaration"]["location"]["source"]["status"] != "available"
+    if inner["declaration"]["source"]["status"] != "available"
         || groups.iter().any(|group| {
             group["project_relative_path"] != "src/lib.rs"
                 || group["references"].as_array().is_none_or(|references| {
-                    references
-                        .iter()
-                        .any(|reference| reference["location"]["source"]["status"] != "available")
+                    references.iter().any(|reference| {
+                        reference["range"]
+                            .as_array()
+                            .is_none_or(|range| range.len() != 4)
+                    })
                 })
+                || group["source"]["chunks"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty)
         })
     {
         return Err(format!(
@@ -1103,9 +1108,14 @@ fn sc_symbol_handle_follow_ups(client: &mut McpClient, workspace: &Path) -> Resu
                 groups.iter().all(|group| {
                     group["references"].as_array().is_some_and(|references| {
                         references.iter().all(|reference| {
-                            reference["location"]["source"]["status"] == "available"
+                            reference["range"]
+                                .as_array()
+                                .is_some_and(|range| range.len() == 4)
+                                && reference["symbol_handle"].is_string()
                         })
-                    })
+                    }) && group["source"]["chunks"]
+                        .as_array()
+                        .is_some_and(|chunks| !chunks.is_empty())
                 })
             })
         {

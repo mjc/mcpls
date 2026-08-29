@@ -3987,6 +3987,21 @@ impl ProjectRuntime {
             .for_each(|location| self.attach_location_handle(location));
     }
 
+    fn attach_reference_handle(&mut self, reference: &mut crate::bridge::ReferenceUse) {
+        reference.symbol_handle = reference.snapshot.as_ref().map(|snapshot| {
+            let source_snapshot = snapshot.document_version.map_or_else(
+                || SourceSnapshot::Hash(snapshot.content_hash.clone()),
+                SourceSnapshot::Version,
+            );
+            self.symbol_handles.insert(StoredSymbolTarget::new(
+                PathBuf::from(&snapshot.path),
+                reference.range[0],
+                reference.range[1],
+                source_snapshot,
+            ))
+        });
+    }
+
     async fn resolve_symbol_target(
         &mut self,
         handle: &SymbolHandle,
@@ -4916,8 +4931,11 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         for group in &mut result.groups {
             for reference in &mut group.references {
-                self.attach_location_handle(&mut reference.location);
+                self.attach_reference_handle(reference);
             }
+        }
+        if let Some(declaration) = result.declaration.as_mut() {
+            self.attach_location_handle(declaration);
         }
         Ok(result)
     }
@@ -5505,8 +5523,11 @@ impl ProjectRuntime {
                 Ok(mut result) => {
                     for group in &mut result.groups {
                         for reference in &mut group.references {
-                            self.attach_location_handle(&mut reference.location);
+                            self.attach_reference_handle(reference);
                         }
+                    }
+                    if let Some(declaration) = result.declaration.as_mut() {
+                        self.attach_location_handle(declaration);
                     }
                     InspectSection::available(
                         result.provider.clone(),

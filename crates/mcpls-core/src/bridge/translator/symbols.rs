@@ -1229,7 +1229,8 @@ mod tests {
         };
         assert!(frame.text.contains("let body = 1"));
         assert!(frame.returned_lines <= 12);
-        assert!(frame.truncated);
+        assert!(!frame.truncated);
+        assert!(frame.resource.is_none());
     }
 
     #[test]

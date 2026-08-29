@@ -89,9 +89,9 @@ pub struct SourceFrame {
     pub path: String,
     /// Canonical file URI.
     pub uri: String,
-    /// Normalized 1-based result range.
+    /// Inclusive 1-based line window covered by `text`.
     pub range: Range,
-    /// Range highlighted by consumers; currently identical to `range`.
+    /// Normalized semantic result range highlighted within the source window.
     pub highlighted_range: Range,
     /// Line-numbered source text.
     pub text: String,
@@ -215,7 +215,7 @@ pub struct ReferencesResult {
     pub groups: Vec<ReferenceGroup>,
     /// Declaration location, returned once and excluded from use groups.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<ReferenceUse>,
+    pub declaration: Option<Location>,
     /// Number of references reported by the language server.
     pub total_references: usize,
     /// Number of references returned after response budgets.
@@ -240,20 +240,83 @@ pub struct ReferencesResult {
 pub struct ReferenceGroup {
     /// Project-relative path, or the absolute path for external sources.
     pub project_relative_path: String,
+    /// URI shared by every reference in this group.
+    pub uri: String,
+    /// File-backed path used internally to mint follow-up handles.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub path: Option<String>,
     /// Enclosing symbol when the language server can determine one safely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_symbol: Option<String>,
     /// References within the group, in source order.
     pub references: Vec<ReferenceUse>,
+    /// Source snapshot and merged context shared by the references.
+    pub source: ReferenceSource,
 }
 
 /// One source use of the referenced symbol.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceUse {
-    /// Bounded location and highlighted source frame for the use.
-    pub location: Location,
+    /// `[start_line, start_character, end_line, end_character]`, all 1-based.
+    #[schemars(with = "[std::num::NonZeroU32; 4]")]
+    pub range: [u32; 4],
     /// Semantic role, reported conservatively when unavailable from the server.
     pub role: ReferenceRole,
+    /// Snapshot-bound target for coordinate-free semantic follow-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<SymbolHandle>,
+    /// Per-reference snapshot used internally to mint the compact handle.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) snapshot: Option<ReferenceSnapshot>,
+}
+
+/// Compact actor-only snapshot needed to mint a reference handle.
+#[derive(Debug, Clone)]
+pub struct ReferenceSnapshot {
+    /// Canonical file path.
+    pub path: String,
+    /// Tracked document version when the source is open.
+    pub document_version: Option<i32>,
+    /// Content hash used when no document version is available.
+    pub content_hash: String,
+}
+
+/// Source metadata shared by references from one file and enclosing symbol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReferenceSource {
+    /// SHA-256 of the source snapshot used for available chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Open-document version used for available chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
+    /// Merged source windows, in source order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<ReferenceSourceChunk>,
+    /// Snapshot-bound resources for context omitted by the response budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<DeferredResourceReference>,
+    /// Reasons context could not be resolved, deduplicated for this group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<SourceUnavailableReason>,
+}
+
+/// One merged, line-numbered source window shared by nearby references.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReferenceSourceChunk {
+    /// Inclusive `[start_line, end_line]` covered by `text`.
+    #[schemars(with = "[std::num::NonZeroU32; 2]")]
+    pub lines: [u32; 2],
+    /// Line-numbered source text.
+    pub text: String,
+    /// Per-chunk snapshot hash when a group contains mixed snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Per-chunk document version when a group contains mixed snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
 }
 
 /// Safely known role of a reference.
@@ -877,25 +940,38 @@ pub enum InspectSectionCompleteness {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct InspectSection<T> {
     /// Stable provider identity, when a provider was selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// Machine-readable availability and completeness state.
     pub completeness: InspectSectionCompleteness,
     /// Items available before bounds.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[schemars(default)]
     pub total: usize,
     /// Items represented in `data`.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[schemars(default)]
     pub returned: usize,
     /// Whether bounds omitted items or source.
+    #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
     pub truncated: bool,
     /// Actionable unsupported or unavailable reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Direct resource for data omitted from the inline bundle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<DeferredResourceReference>,
     /// Typed section payload when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
 }
 
 impl<T> InspectSection<T> {
+    fn is_not_requested(&self) -> bool {
+        self.completeness == InspectSectionCompleteness::NotRequested
+    }
+
     /// Build metadata for a section omitted by caller selection.
     #[must_use]
     pub const fn not_requested() -> Self {
@@ -1039,23 +1115,51 @@ pub enum InspectSymbolResolution {
 #[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct InspectSymbolSections {
     /// Bounded declaration or body source.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub declaration: InspectSection<SourceContext>,
     /// Signature, type, and documentation at the symbol.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub hover: InspectSection<HoverResult>,
     /// Definition targets with bounded source and handles.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub definitions: InspectSection<DefinitionResult>,
     /// Implementation targets with bounded source and handles.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub implementations: InspectSection<LocationsResult>,
     /// Grouped references with bounded call-site source.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub references: InspectSection<ReferencesResult>,
     /// Incoming and outgoing call samples.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub calls: InspectSection<InspectCalls>,
     /// Related tests discovered without executing them.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub tests: InspectSection<crate::bridge::SemanticDiscoveryResult>,
     /// Runnable metadata discovered without executing commands.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub runnables: InspectSection<crate::bridge::SemanticDiscoveryResult>,
     /// Diagnostics intersecting the selected symbol range.
+    #[serde(skip_serializing_if = "InspectSection::is_not_requested")]
+    #[schemars(default)]
     pub diagnostics: InspectSection<DiagnosticsResult>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Bounded, snapshot-coherent answer about one project symbol.
@@ -1353,8 +1457,11 @@ pub struct InlayHintsResult {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{InspectSymbolRequest, InspectSymbolSectionKind};
+    use super::{
+        InspectSection, InspectSymbolRequest, InspectSymbolSectionKind, InspectSymbolSections,
+    };
 
     fn request_with_sections(sections: Vec<InspectSymbolSectionKind>) -> InspectSymbolRequest {
         InspectSymbolRequest {
@@ -1396,5 +1503,24 @@ mod tests {
         let request = request_with_sections(vec![InspectSymbolSectionKind::Calls]);
         assert!(request.wants(InspectSymbolSectionKind::Calls));
         assert!(!request.wants(InspectSymbolSectionKind::References));
+    }
+
+    #[test]
+    fn unrequested_inspect_sections_and_empty_metadata_are_not_serialized() {
+        let sections = InspectSymbolSections {
+            declaration: InspectSection::unsupported("standard_lsp", "not supported"),
+            ..InspectSymbolSections::default()
+        };
+
+        let value = serde_json::to_value(sections).unwrap();
+
+        assert_eq!(value.as_object().unwrap().len(), 1);
+        assert_eq!(value["declaration"]["completeness"], "unsupported");
+        assert_eq!(value["declaration"]["provider"], "standard_lsp");
+        assert!(value["declaration"].get("total").is_none());
+        assert!(value["declaration"].get("returned").is_none());
+        assert!(value["declaration"].get("truncated").is_none());
+        assert_eq!(value["declaration"]["reason"], "not supported");
+        assert!(value["declaration"].get("data").is_none());
     }
 }

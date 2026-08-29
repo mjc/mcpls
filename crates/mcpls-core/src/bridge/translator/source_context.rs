@@ -9,7 +9,7 @@ use super::encoding_ctx::EncodingCtx;
 use crate::bridge::DocumentTracker;
 use crate::bridge::resources::{SourceResource, make_source_uri};
 use crate::bridge::state::{path_to_uri, uri_to_path};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 const MAX_FRAME_LINES: usize = 12;
 const MAX_FRAME_BYTES: usize = 4 * 1024;
@@ -107,13 +107,38 @@ pub(super) async fn resolve_source_context_with_max_lines(
     };
 
     let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let target = range.start.line.saturating_sub(1) as usize;
+    let start = declaration_context_start(&lines, target.min(total_lines));
+    let end = start.saturating_add(max_lines).min(total_lines);
+    let resource_range = if start < end {
+        Range {
+            start: super::dto::Position2D {
+                line: u32::try_from(start + 1).unwrap_or(u32::MAX),
+                character: 1,
+            },
+            end: super::dto::Position2D {
+                line: u32::try_from(end).unwrap_or(u32::MAX),
+                character: 1,
+            },
+        }
+    } else {
+        range.clone()
+    };
+    let selected = &lines[start.min(total_lines)..end];
+    let total_bytes = selected
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| numbered_line_bytes(start + offset + 1, line))
+        .sum();
     let deferred = || {
         make_source_uri(
             &canonical_path,
-            range.start.line,
-            range.start.character,
-            range.end.line,
-            range.end.character,
+            resource_range.start.line,
+            resource_range.start.character,
+            resource_range.end.line,
+            resource_range.end.character,
             &content_hash,
             document_version,
         )
@@ -123,7 +148,7 @@ pub(super) async fn resolve_source_context_with_max_lines(
             kind: "source_context".to_owned(),
             snapshot_hash: content_hash.clone(),
             document_version,
-            total_bytes: Some(content.len()),
+            total_bytes: Some(total_bytes),
         })
     };
     if budget.remaining_bytes == 0 {
@@ -134,17 +159,6 @@ pub(super) async fn resolve_source_context_with_max_lines(
         );
     }
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
-    let target = range.start.line.saturating_sub(1) as usize;
-    let start = declaration_context_start(&lines, target.min(total_lines));
-    let end = start.saturating_add(max_lines).min(total_lines);
-    let selected = &lines[start.min(total_lines)..end];
-    let total_bytes = lines
-        .iter()
-        .enumerate()
-        .map(|(offset, line)| numbered_line_bytes(offset + 1, line))
-        .sum();
     let byte_limit = MAX_FRAME_BYTES.min(budget.remaining_bytes);
     let mut text = String::new();
     let mut returned_lines = 0;
@@ -165,14 +179,14 @@ pub(super) async fn resolve_source_context_with_max_lines(
     let canonical_uri =
         path_to_uri(&canonical_path).map_or_else(|_| uri.to_string(), |uri| uri.to_string());
 
-    let truncated = start > 0 || returned_lines < selected.len() || end < total_lines;
+    let truncated = returned_lines < selected.len();
     budget.truncated |= truncated;
     let resource = truncated.then(deferred).flatten();
     SourceContext::Available(SourceFrame {
         path: canonical_path.to_string_lossy().into_owned(),
         uri: canonical_uri,
         highlighted_range: range.clone(),
-        range,
+        range: resource_range,
         text,
         language_id,
         document_version,
@@ -227,11 +241,10 @@ fn snapshot_authorized_path(
 }
 
 fn authorized(path: &Path, roots: &[PathBuf], approved: &[PathBuf]) -> bool {
-    roots.iter().chain(approved).any(|root| {
-        dunce::canonicalize(root)
-            .ok()
-            .is_some_and(|root| path.starts_with(root))
-    })
+    roots
+        .iter()
+        .chain(approved)
+        .any(|root| dunce::canonicalize(root).is_ok_and(|root| path.starts_with(root)))
 }
 
 fn numbered_line_bytes(line_number: usize, line: &str) -> usize {
@@ -306,7 +319,8 @@ impl super::Translator {
         &self,
         resource: &SourceResource,
     ) -> Result<SourceFrame> {
-        let (path, _, _, _) = self.source_snapshot(&resource.path).await?;
+        let (path, document_version, content_hash, content) =
+            self.source_snapshot(&resource.path).await?;
         let uri = path_to_uri(&path)?;
         let range = Range {
             start: super::dto::Position2D {
@@ -318,25 +332,47 @@ impl super::Translator {
                 character: resource.end_character,
             },
         };
-        let mut budget = SourceBudget::new(usize::MAX);
-        let source = resolve_source_context_with_max_lines(
-            &self.document_tracker,
-            &self.workspace_roots,
-            &[],
-            &uri,
-            range,
-            &mut budget,
-            usize::MAX,
-        )
-        .await;
-        let SourceContext::Available(mut frame) = source else {
-            return Err(Error::McpServer(
-                "deferred source resource is no longer readable".to_owned(),
-            ));
-        };
-        frame.resource = None;
-        frame.truncated = false;
-        Ok(frame)
+        let lines: Vec<&str> = content.lines().collect();
+        let start = usize::try_from(resource.start_line.saturating_sub(1))
+            .unwrap_or(usize::MAX)
+            .min(lines.len());
+        let end = usize::try_from(resource.end_line)
+            .unwrap_or(usize::MAX)
+            .min(lines.len())
+            .max(start);
+        let selected = &lines[start..end];
+        let total_bytes = selected
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| numbered_line_bytes(start + offset + 1, line))
+            .sum();
+        let byte_limit = MAX_RESPONSE_BYTES;
+        let mut text = String::new();
+        for (offset, line) in selected.iter().enumerate() {
+            let rendered = format!("{:>4} | {line}\n", start + offset + 1);
+            if text.len() + rendered.len() > byte_limit {
+                break;
+            }
+            text.push_str(&rendered);
+        }
+        let returned_lines = text.lines().count();
+        let returned_bytes = text.len();
+        Ok(SourceFrame {
+            path: path.to_string_lossy().into_owned(),
+            uri: uri.to_string(),
+            range: range.clone(),
+            highlighted_range: range,
+            text,
+            language_id: language_id(&path),
+            document_version,
+            content_hash,
+            returned_lines,
+            total_lines: lines.len(),
+            returned_bytes,
+            total_bytes,
+            truncated: returned_lines < selected.len(),
+            resource: None,
+        })
     }
 
     pub(crate) async fn source_snapshot(
@@ -370,7 +406,7 @@ fn language_id(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::format_collect)]
 mod tests {
     use std::collections::HashMap;
 
@@ -431,6 +467,142 @@ mod tests {
 
         assert!(frame.text.contains("new_name"), "{}", frame.text);
         assert_ne!(frame.content_hash, resource.snapshot_hash);
+    }
+
+    #[tokio::test]
+    async fn source_resource_replays_the_exact_selected_context() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        tokio::fs::write(&path, content).await.unwrap();
+        let uri = path_to_uri(&path).unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let mut budget = SourceBudget::new(0);
+        let source = resolve_source_context_with_max_lines(
+            &tracker,
+            &[root.path().to_path_buf()],
+            &[],
+            &uri,
+            range(10),
+            &mut budget,
+            3,
+        )
+        .await;
+        let SourceContext::Deferred { resource } = source else {
+            panic!("source was not deferred")
+        };
+        let resource = crate::bridge::resources::parse_source_uri(&resource.uri).unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+
+        let replayed = translator.read_source_resource(&resource).await.unwrap();
+
+        assert_eq!(replayed.range.start.line, 10);
+        assert_eq!(replayed.range.end.line, 12);
+        assert_eq!(replayed.returned_lines, 3);
+        assert_eq!(replayed.total_lines, 20);
+        assert_eq!(
+            replayed.text,
+            "  10 | line 10\n  11 | line 11\n  12 | line 12\n"
+        );
+        assert!(!replayed.truncated);
+        assert!(replayed.resource.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_inline_excerpt_does_not_offer_a_redundant_resource() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        tokio::fs::write(&path, content).await.unwrap();
+        let uri = path_to_uri(&path).unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let mut budget = SourceBudget::new(usize::MAX);
+
+        let source = resolve_source_context_with_max_lines(
+            &tracker,
+            &[root.path().to_path_buf()],
+            &[],
+            &uri,
+            range(10),
+            &mut budget,
+            3,
+        )
+        .await;
+
+        let SourceContext::Available(frame) = source else {
+            panic!("source unavailable")
+        };
+        assert_eq!(frame.range.start.line, 10);
+        assert_eq!(frame.range.end.line, 12);
+        assert_eq!(frame.highlighted_range, range(10));
+        assert_eq!(frame.total_bytes, frame.returned_bytes);
+        assert!(!frame.truncated);
+        assert!(frame.resource.is_none());
+        assert!(!budget.truncated());
+    }
+
+    #[tokio::test]
+    async fn source_resource_replay_is_not_silently_capped_at_four_kibibytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = format!("{}\ntail sentinel\n", "x".repeat(MAX_FRAME_BYTES + 1));
+        tokio::fs::write(&path, &content).await.unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, version, snapshot_hash, _) = translator.source_snapshot(&path).await.unwrap();
+        let resource = SourceResource {
+            path,
+            start_line: 1,
+            start_character: 1,
+            end_line: 2,
+            end_character: 1,
+            snapshot_hash,
+            document_version: version,
+        };
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert!(frame.returned_bytes > MAX_FRAME_BYTES);
+        assert_eq!(frame.returned_lines, 2);
+        assert!(frame.text.contains("tail sentinel"));
+        assert!(!frame.truncated);
+    }
+
+    #[tokio::test]
+    async fn source_resource_replay_is_bounded_and_reports_snapshot_totals() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let content = (1..=40)
+            .map(|line| format!("line {line}: {}\n", "x".repeat(1_000)))
+            .collect::<String>();
+        tokio::fs::write(&path, &content).await.unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, version, snapshot_hash, _) = translator.source_snapshot(&path).await.unwrap();
+        let resource = SourceResource {
+            path,
+            start_line: 1,
+            start_character: 1,
+            end_line: 40,
+            end_character: 1,
+            snapshot_hash,
+            document_version: version,
+        };
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert!(frame.truncated);
+        assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        assert_eq!(frame.total_lines, 40);
+        assert!(frame.total_bytes > frame.returned_bytes);
     }
 
     #[tokio::test]

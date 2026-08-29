@@ -4431,6 +4431,12 @@ finally:
     fn server_instructions_prefer_source_rich_handle_workflows() {
         let instructions = create_test_server().get_info().instructions.unwrap();
 
+        assert!(
+            instructions.len() <= 512,
+            "initialize instructions are {} bytes",
+            instructions.len()
+        );
+
         for required in [
             "exact-first",
             "source frames",
