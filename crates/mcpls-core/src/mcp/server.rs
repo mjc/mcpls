@@ -4432,28 +4432,37 @@ finally:
         let instructions = create_test_server().get_info().instructions.unwrap();
 
         assert!(
-            instructions.len() <= 512,
+            instructions.len() <= 420,
             "initialize instructions are {} bytes",
             instructions.len()
         );
 
         for required in [
-            "exact-first",
+            "MCPLS-first",
+            "workspace_symbol_search",
+            "inspect_symbol",
+            "ast-grep/SSR",
             "source frames",
             "symbol_handle",
-            "inspect_symbol",
-            "budget",
-            "ambiguous",
-            "stale_symbol_handle",
-            "read_semantic_resource",
-            "resources/read",
-            "file read",
+            "stale handles",
+            "snapshot resources",
+            "file read/shell",
+            "preview/apply",
+            "attach/wake",
         ] {
             assert!(
                 instructions.contains(required),
                 "initialize instructions omit {required}: {instructions}"
             );
         }
+        assert!(
+            !instructions.contains("project_add") && !instructions.contains("project_activate"),
+            "lifecycle setup must be implicit: {instructions}"
+        );
+        assert!(
+            instructions.contains("attach/wake"),
+            "lifecycle guidance must describe implicit attach/wake: {instructions}"
+        );
     }
 
     #[test]
