@@ -35,6 +35,7 @@ pub use translator::{
     SemanticDiscoveryResult, SemanticResultLimits, ServerCapability, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, SourceContext, SourceFrame, SupportedWorkspaceEdit,
     Symbol, SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolBatchEntry, WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult,
     WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
     convert_code_action_or_command,
 };

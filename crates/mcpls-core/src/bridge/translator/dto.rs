@@ -831,6 +831,57 @@ pub struct WorkspaceSymbolResult {
     pub truncated: bool,
 }
 
+/// Actor-owned inputs for a bounded batch of workspace-symbol queries.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolBatchRequest {
+    /// Queries in caller order. Exact duplicates reuse the first result.
+    pub queries: Vec<String>,
+    /// Optional symbol-kind filter shared by every query.
+    pub kind_filter: Option<String>,
+    /// Name-matching behavior shared by every query.
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Source scope shared by every query.
+    pub scope: WorkspaceSymbolScope,
+    /// Whether generated symbols may be returned.
+    pub include_generated: bool,
+    /// Maximum symbols returned across all unique queries.
+    pub max_items: usize,
+    /// Maximum serialized bytes returned for the complete batch.
+    pub max_bytes: usize,
+}
+
+/// One caller-ordered workspace-symbol batch entry.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceSymbolBatchEntry {
+    /// Original query at this position.
+    pub query: String,
+    /// Search result for the first occurrence of this query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<WorkspaceSymbolResult>,
+    /// Earlier entry whose result this exact duplicate reuses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<usize>,
+    /// Whether the global response budget prevented provider work for this query.
+    pub skipped_by_budget: bool,
+}
+
+/// Bounded results for a caller-ordered batch of workspace-symbol queries.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceSymbolBatchResult {
+    /// One entry for every input query, in input order.
+    pub entries: Vec<WorkspaceSymbolBatchEntry>,
+    /// Number of distinct query strings in the request.
+    pub unique_queries: usize,
+    /// Number of downstream workspace-symbol requests actually issued.
+    pub provider_requests: usize,
+    /// Number of symbol payloads returned across unique queries.
+    pub returned: usize,
+    /// Whether an item or byte budget omitted provider work or symbol payloads.
+    pub truncated: bool,
+    /// Serialized-byte budget applied to this response.
+    pub max_bytes: usize,
+}
+
 /// Selectable sections of a high-level symbol inspection bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(inline)]

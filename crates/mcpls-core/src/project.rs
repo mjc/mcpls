@@ -30,7 +30,8 @@ use crate::bridge::{
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
     SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
-    SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
+    SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolBatchEntry,
+    WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult, WorkspaceSymbolMatchMode,
     WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
@@ -1628,6 +1629,10 @@ enum ProjectRequest {
         include_generated: bool,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
+    WorkspaceSymbolBatch {
+        request: WorkspaceSymbolBatchRequest,
+        reply: oneshot::Sender<Result<WorkspaceSymbolBatchResult, String>>,
+    },
     InspectSymbol {
         request: InspectSymbolRequest,
         reply: oneshot::Sender<Result<InspectSymbolResult, String>>,
@@ -1858,6 +1863,7 @@ impl ProjectRequest {
                 | Self::FormatWorkspaceEdit { .. }
                 | Self::SemanticDiscovery { .. }
                 | Self::WorkspaceSymbol { .. }
+                | Self::WorkspaceSymbolBatch { .. }
                 | Self::InspectSymbol { .. }
                 | Self::CodeActions { .. }
                 | Self::CodeActionList { .. }
@@ -1993,6 +1999,7 @@ impl ProjectRequest {
             Self::DocumentSymbols { reply, .. } => reply.is_closed(),
             Self::FormatDocument { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
+            Self::WorkspaceSymbolBatch { reply, .. } => reply.is_closed(),
             Self::InspectSymbol { reply, .. } => reply.is_closed(),
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reply.is_closed()
@@ -2613,6 +2620,27 @@ impl ProjectHandle {
                 include_generated,
                 reply,
             })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Route a bounded workspace-symbol batch through one project actor request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, the caller cancels, or any
+    /// downstream workspace-symbol request fails.
+    pub async fn workspace_symbol_batch(
+        &self,
+        request: WorkspaceSymbolBatchRequest,
+    ) -> Result<WorkspaceSymbolBatchResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::WorkspaceSymbolBatch { request, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3889,6 +3917,26 @@ fn call_hierarchy_snapshot_hash(items: &[CallHierarchyItemResult]) -> String {
         .unwrap_or_default()
 }
 
+fn trim_workspace_symbol_batch(batch: &mut WorkspaceSymbolBatchResult) {
+    while serde_json::to_vec(batch).map_or(usize::MAX, |encoded| encoded.len()) > batch.max_bytes {
+        let Some(result) = batch
+            .entries
+            .iter_mut()
+            .rev()
+            .filter_map(|entry| entry.result.as_mut())
+            .find(|result| !result.symbols.is_empty())
+        else {
+            batch.truncated = true;
+            return;
+        };
+        result.symbols.pop();
+        result.returned = result.symbols.len();
+        result.truncated = true;
+        batch.returned = batch.returned.saturating_sub(1);
+        batch.truncated = true;
+    }
+}
+
 impl ProjectRuntime {
     #[cfg(test)]
     fn new(translator: Translator) -> Self {
@@ -5156,6 +5204,73 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
         Ok(result)
+    }
+
+    async fn workspace_symbol_batch(
+        &mut self,
+        request: WorkspaceSymbolBatchRequest,
+    ) -> Result<WorkspaceSymbolBatchResult, String> {
+        let mut seen = HashMap::new();
+        let mut batch = WorkspaceSymbolBatchResult {
+            entries: Vec::with_capacity(request.queries.len()),
+            unique_queries: 0,
+            provider_requests: 0,
+            returned: 0,
+            truncated: false,
+            max_bytes: request.max_bytes,
+        };
+
+        for query in request.queries {
+            if let Some(&reused_from) = seen.get(&query) {
+                batch.entries.push(WorkspaceSymbolBatchEntry {
+                    query,
+                    result: None,
+                    reused_from: Some(reused_from),
+                    skipped_by_budget: false,
+                });
+                trim_workspace_symbol_batch(&mut batch);
+                continue;
+            }
+
+            let entry_index = batch.entries.len();
+            seen.insert(query.clone(), entry_index);
+            batch.unique_queries += 1;
+            let remaining = request.max_items.saturating_sub(batch.returned);
+            if remaining == 0 {
+                batch.truncated = true;
+                batch.entries.push(WorkspaceSymbolBatchEntry {
+                    query,
+                    result: None,
+                    reused_from: None,
+                    skipped_by_budget: true,
+                });
+                trim_workspace_symbol_batch(&mut batch);
+                continue;
+            }
+
+            let result = self
+                .workspace_symbol(
+                    query.clone(),
+                    request.kind_filter.clone(),
+                    u32::try_from(remaining).unwrap_or(u32::MAX),
+                    request.match_mode,
+                    request.scope,
+                    request.include_generated,
+                )
+                .await?;
+            batch.provider_requests += 1;
+            batch.returned += result.returned;
+            batch.truncated |= result.truncated;
+            batch.entries.push(WorkspaceSymbolBatchEntry {
+                query,
+                result: Some(result),
+                reused_from: None,
+                skipped_by_budget: false,
+            });
+            trim_workspace_symbol_batch(&mut batch);
+        }
+
+        Ok(batch)
     }
 
     async fn workspace_symbol_in_path(
@@ -7062,6 +7177,16 @@ async fn handle_project_request(
             let result = tokio::select! {
                 () = reply.closed() => return false,
                 result = runtime.workspace_symbol(query, kind_filter, limit, match_mode, scope, include_generated) => result,
+            };
+            let _ = reply.send(result);
+        }
+        ProjectRequest::WorkspaceSymbolBatch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.workspace_symbol_batch(request) => result,
             };
             let _ = reply.send(result);
         }
@@ -10390,6 +10515,85 @@ mod tests {
         fs::write(&source, "fn moved_target() {}\n").unwrap();
         let error = actor.resolve_symbol_handle(handle).await.unwrap_err();
         assert!(error.to_string().contains("stale_symbol_handle"));
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let alpha = root.path().join("alpha.rs");
+        let beta = root.path().join("beta.rs");
+        fs::write(&alpha, "fn alpha() {}\n").unwrap();
+        fs::write(&beta, "fn beta() {}\n").unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut queries = Vec::new();
+            while queries.len() < 2 {
+                let message = read_framed_message(&mut reader).await;
+                let Some(id) = message.get("id") else {
+                    continue;
+                };
+                let query = message["params"]["query"].as_str().unwrap().to_owned();
+                let uri = if query == "alpha" { &alpha } else { &beta };
+                write_response(
+                    &mut read_half_stdin,
+                    id,
+                    serde_json::json!([{
+                        "name": query,
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(uri).unwrap(),
+                            "range": {
+                                "start": {"line": 0, "character": 3},
+                                "end": {"line": 0, "character": 8}
+                            }
+                        }
+                    }]),
+                )
+                .await;
+                queries.push(query);
+            }
+            queries
+        });
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        let result = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: vec!["alpha".to_owned(), "alpha".to_owned(), "beta".to_owned()],
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(responder.await.unwrap(), ["alpha", "beta"]);
+        assert_eq!((result.unique_queries, result.provider_requests), (2, 2));
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries[1].reused_from, Some(0));
+        assert!(result.entries[1].result.is_none());
+        assert_eq!(result.returned, 2);
+        assert!(!result.truncated);
+        assert!(serde_json::to_vec(&result).unwrap().len() <= result.max_bytes);
     }
 
     #[tokio::test]

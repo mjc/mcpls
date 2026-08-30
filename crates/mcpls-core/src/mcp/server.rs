@@ -49,7 +49,8 @@ use super::tools::{
     SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
     WorkspaceEditApplyParams, WorkspaceEditApplyResult, WorkspaceEditContention,
     WorkspaceEditContentionScope, WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization,
-    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolParams,
+    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolBatchParams,
+    WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -57,7 +58,10 @@ use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
-use crate::bridge::{PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SymbolHandle};
+use crate::bridge::{
+    PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SymbolHandle,
+    WorkspaceSymbolBatchRequest,
+};
 use crate::edit_paths::FileOperation;
 use crate::edit_plan::EditPlanApprovalSummary;
 use crate::edit_plan::PlanId;
@@ -2548,6 +2552,83 @@ impl McplsServer {
         encode_tool_result(result)
     }
 
+    /// Search several symbol names through one bounded actor request.
+    #[tool(
+        description = "Batch workspace-symbol search with shared filters and global item/byte bounds. Exact duplicate queries reuse the first entry instead of repeating provider work or payloads."
+    )]
+    async fn workspace_symbol_search_batch(
+        &self,
+        Parameters(WorkspaceSymbolBatchParams {
+            project_id,
+            queries,
+            kind_filter,
+            match_mode,
+            scope,
+            max_items,
+            max_bytes,
+            include_generated,
+        }): Parameters<WorkspaceSymbolBatchParams>,
+    ) -> Result<Json<crate::bridge::WorkspaceSymbolBatchResult>, McpError> {
+        if queries.is_empty() || queries.len() > 32 {
+            return Err(McpError::invalid_params(
+                "queries must contain between 1 and 32 entries",
+                None,
+            ));
+        }
+        if queries
+            .iter()
+            .any(|query| query.is_empty() || query.len() > 1_000)
+        {
+            return Err(McpError::invalid_params(
+                "each query must contain between 1 and 1000 bytes",
+                None,
+            ));
+        }
+        if max_items == 0 || max_items > 1_000 {
+            return Err(McpError::invalid_params(
+                "max_items must be between 1 and 1000",
+                None,
+            ));
+        }
+        if !(4_096..=1_048_576).contains(&max_bytes) {
+            return Err(McpError::invalid_params(
+                "max_bytes must be between 4096 and 1048576",
+                None,
+            ));
+        }
+        let identity_bytes = queries.iter().map(String::len).sum::<usize>()
+            + queries.len().saturating_mul(128)
+            + 256;
+        if identity_bytes > max_bytes {
+            return Err(McpError::invalid_params(
+                "max_bytes is too small to return every query identity",
+                None,
+            ));
+        }
+
+        let id = parse_project_id(project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries,
+                kind_filter,
+                match_mode,
+                scope,
+                include_generated,
+                max_items: max_items as usize,
+                max_bytes,
+            })
+            .await
+            .map_err(|error| error.to_string());
+
+        encode_tool_result(result)
+    }
+
     /// Resolve and inspect one symbol without requiring a file read between semantic calls.
     #[tool(
         description = "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles."
@@ -4473,6 +4554,7 @@ finally:
         for required in [
             "MCPLS-first",
             "workspace_symbol_search",
+            "workspace_symbol_search_batch",
             "inspect_symbol",
             "ast-grep/SSR",
             "source frames",

@@ -365,6 +365,33 @@ pub struct WorkspaceSymbolParams {
     pub include_generated: bool,
 }
 
+/// Parameters for one bounded batch of workspace-symbol searches.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceSymbolBatchParams {
+    /// Stable project identifier whose workspace should be searched.
+    pub project_id: String,
+    /// Caller-ordered queries. Exact duplicates reuse the first result.
+    pub queries: Vec<String>,
+    /// Optional symbol-kind filter shared by every query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    /// Name matching behavior shared by every query.
+    #[serde(default)]
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Source scope shared by every query.
+    #[serde(default)]
+    pub scope: WorkspaceSymbolScope,
+    /// Maximum symbols returned across the batch.
+    #[serde(default = "default_max_results")]
+    pub max_items: u32,
+    /// Maximum serialized response bytes.
+    #[serde(default = "default_workspace_symbol_batch_bytes")]
+    pub max_bytes: usize,
+    /// Include symbols under generated/build-output directories.
+    #[serde(default)]
+    pub include_generated: bool,
+}
+
 /// Parameters for a bounded, project-scoped symbol inspection bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InspectSymbolParams {
@@ -397,6 +424,10 @@ const fn default_inspect_candidates() -> u32 {
 
 const fn default_max_results() -> u32 {
     100
+}
+
+const fn default_workspace_symbol_batch_bytes() -> usize {
+    64 * 1024
 }
 
 /// Parameters for the `get_code_actions` tool.
