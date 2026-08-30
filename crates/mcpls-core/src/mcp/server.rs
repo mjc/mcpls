@@ -4465,7 +4465,7 @@ finally:
         let instructions = create_test_server().get_info().instructions.unwrap();
 
         assert!(
-            instructions.len() <= 420,
+            instructions.len() <= 512,
             "initialize instructions are {} bytes",
             instructions.len()
         );
@@ -4481,6 +4481,11 @@ finally:
             "snapshot resources",
             "file read/shell",
             "preview/apply",
+            "registrations persist",
+            "not project-bound",
+            "project_id",
+            "project_list once",
+            "stable ID",
             "attach/wake",
         ] {
             assert!(
