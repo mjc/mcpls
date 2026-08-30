@@ -871,21 +871,11 @@ pub struct InspectSymbolRequest {
 }
 
 impl InspectSymbolRequest {
-    /// Return whether the caller selected a section, applying defaults for an empty list.
+    /// Return whether the caller selected a section, defaulting to the declaration.
     #[must_use]
     pub fn wants(&self, section: InspectSymbolSectionKind) -> bool {
-        if self.sections.is_empty() {
-            matches!(
-                section,
-                InspectSymbolSectionKind::Declaration
-                    | InspectSymbolSectionKind::Implementations
-                    | InspectSymbolSectionKind::References
-                    | InspectSymbolSectionKind::Tests
-                    | InspectSymbolSectionKind::Diagnostics
-            )
-        } else {
-            self.sections.contains(&section)
-        }
+        (self.sections.is_empty() && section == InspectSymbolSectionKind::Declaration)
+            || self.sections.contains(&section)
     }
 }
 
@@ -1477,22 +1467,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_section_selection_uses_the_bounded_default_bundle() {
+    fn empty_section_selection_defaults_to_declaration_only() {
         let request = request_with_sections(Vec::new());
-        for section in [
-            InspectSymbolSectionKind::Declaration,
-            InspectSymbolSectionKind::Implementations,
-            InspectSymbolSectionKind::References,
-            InspectSymbolSectionKind::Tests,
-            InspectSymbolSectionKind::Diagnostics,
-        ] {
-            assert!(request.wants(section));
-        }
+        assert!(request.wants(InspectSymbolSectionKind::Declaration));
         for section in [
             InspectSymbolSectionKind::Hover,
             InspectSymbolSectionKind::Definitions,
+            InspectSymbolSectionKind::Implementations,
+            InspectSymbolSectionKind::References,
             InspectSymbolSectionKind::Calls,
+            InspectSymbolSectionKind::Tests,
             InspectSymbolSectionKind::Runnables,
+            InspectSymbolSectionKind::Diagnostics,
         ] {
             assert!(!request.wants(section));
         }

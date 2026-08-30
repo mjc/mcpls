@@ -2550,7 +2550,7 @@ impl McplsServer {
 
     /// Resolve and inspect one symbol without requiring a file read between semantic calls.
     #[tool(
-        description = "Preferred no-reread workflow: resolve an exact query or prior symbol_handle into a byte/item-bounded source, docs/signature, definitions/implementations, uses/calls, tests, and diagnostics bundle. Ambiguous names return candidates; stale handles require fresh discovery."
+        description = "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles."
     )]
     async fn inspect_symbol(
         &self,

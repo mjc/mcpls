@@ -383,7 +383,7 @@ pub struct InspectSymbolParams {
     /// Maximum ranked source-bearing candidates returned for ambiguous queries.
     #[serde(default = "default_inspect_candidates")]
     pub candidate_limit: u32,
-    /// Sections to include; empty prioritizes declaration, implementations, references, tests, and diagnostics.
+    /// Sections to include; empty returns only the declaration source frame.
     #[serde(default)]
     pub sections: Vec<InspectSymbolSectionKind>,
     /// Strict serialized-byte and per-provider item bounds for the complete bundle.

@@ -11248,7 +11248,7 @@
   },
   {
     "name": "inspect_symbol",
-    "description": "Preferred no-reread workflow: resolve an exact query or prior symbol_handle into a byte/item-bounded source, docs/signature, definitions/implementations, uses/calls, tests, and diagnostics bundle. Ambiguous names return candidates; stale handles require fresh discovery.",
+    "description": "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -11317,7 +11317,7 @@
         },
         "sections": {
           "default": [],
-          "description": "Sections to include; empty prioritizes declaration, implementations, references, tests, and diagnostics.",
+          "description": "Sections to include; empty returns only the declaration source frame.",
           "items": {
             "description": "Selectable sections of a high-level symbol inspection bundle.",
             "oneOf": [
