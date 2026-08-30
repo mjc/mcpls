@@ -10,6 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ignore::WalkBuilder;
 const CALL_HIERARCHY_PAGE_SIZE: usize = 64;
 
 use serde::Serialize;
@@ -3482,6 +3483,7 @@ struct ProjectRuntime {
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
     symbol_handles: std::sync::Mutex<SymbolHandleStore>,
+    workspace_symbol_results: std::sync::Mutex<HashMap<String, WorkspaceSymbolResult>>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
@@ -3996,6 +3998,7 @@ impl ProjectRuntime {
             edit_safety,
             code_actions: CodeActionStore::new(),
             symbol_handles: std::sync::Mutex::new(SymbolHandleStore::new()),
+            workspace_symbol_results: std::sync::Mutex::new(HashMap::new()),
             deferred_results,
             deferred_scope,
             inline_module_checks: HashMap::new(),
@@ -5259,11 +5262,14 @@ impl ProjectRuntime {
         &self,
         request: WorkspaceSymbolBatchRequest,
     ) -> Result<WorkspaceSymbolBatchResult, String> {
+        let snapshot_identity = self.workspace_snapshot_identity().await?;
         let mut seen = HashMap::new();
         let mut batch = WorkspaceSymbolBatchResult {
             entries: Vec::with_capacity(request.queries.len()),
             unique_queries: 0,
             provider_requests: 0,
+            snapshot_identity,
+            cache_hit: false,
             returned: 0,
             truncated: false,
             max_bytes: request.max_bytes,
@@ -5297,17 +5303,43 @@ impl ProjectRuntime {
                 continue;
             }
 
-            let result = self
-                .workspace_symbol(
-                    query.clone(),
-                    request.kind_filter.clone(),
-                    u32::try_from(remaining).unwrap_or(u32::MAX),
-                    request.match_mode,
-                    request.scope,
-                    request.include_generated,
-                )
-                .await?;
-            batch.provider_requests += 1;
+            let limit = u32::try_from(remaining).unwrap_or(u32::MAX);
+            let cache_key = format!(
+                "{}\0{}\0{:?}\0{}\0{:?}\0{:?}",
+                batch.snapshot_identity,
+                query,
+                request.kind_filter,
+                limit,
+                request.match_mode,
+                request.scope,
+            );
+            let result = if let Some(result) = self
+                .workspace_symbol_results
+                .lock()
+                .expect("workspace-symbol cache lock poisoned")
+                .get(&cache_key)
+                .cloned()
+            {
+                batch.cache_hit = true;
+                result
+            } else {
+                let result = self
+                    .workspace_symbol(
+                        query.clone(),
+                        request.kind_filter.clone(),
+                        limit,
+                        request.match_mode,
+                        request.scope,
+                        request.include_generated,
+                    )
+                    .await?;
+                batch.provider_requests += 1;
+                self.workspace_symbol_results
+                    .lock()
+                    .expect("workspace-symbol cache lock poisoned")
+                    .insert(cache_key, result.clone());
+                result
+            };
             batch.returned += result.returned;
             batch.truncated |= result.truncated;
             batch.entries.push(WorkspaceSymbolBatchEntry {
@@ -5320,6 +5352,34 @@ impl ProjectRuntime {
         }
 
         Ok(batch)
+    }
+
+    async fn workspace_snapshot_identity(&self) -> Result<String, String> {
+        let mut paths = Vec::new();
+        for root in self.translator.workspace_roots() {
+            for entry in WalkBuilder::new(root)
+                .standard_filters(true)
+                .build()
+                .flatten()
+            {
+                if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    paths.push(entry.into_path());
+                }
+            }
+        }
+        paths.sort_unstable();
+        let mut hasher = Sha256::new();
+        for path in paths {
+            let (_, version, content_hash, _) = self
+                .translator
+                .source_snapshot(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+            hasher.update(path.as_os_str().as_encoded_bytes());
+            hasher.update(version.unwrap_or_default().to_le_bytes());
+            hasher.update(content_hash.as_bytes());
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     async fn workspace_symbol_in_path(
@@ -10711,17 +10771,22 @@ mod tests {
             mut read_half_stdin,
             mut write_stdout,
         } = server;
+        let responder_alpha = alpha.clone();
         let responder = tokio::spawn(async move {
             let _processes = (_write_half, _read_half);
             let mut reader = BufReader::new(&mut write_stdout);
             let mut queries = Vec::new();
-            while queries.len() < 2 {
+            while queries.len() < 3 {
                 let message = read_framed_message(&mut reader).await;
                 let Some(id) = message.get("id") else {
                     continue;
                 };
                 let query = message["params"]["query"].as_str().unwrap().to_owned();
-                let uri = if query == "alpha" { &alpha } else { &beta };
+                let uri = if query == "alpha" {
+                    &responder_alpha
+                } else {
+                    &beta
+                };
                 write_response(
                     &mut read_half_stdin,
                     id,
@@ -10757,7 +10822,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(responder.await.unwrap(), ["alpha", "beta"]);
         assert_eq!((result.unique_queries, result.provider_requests), (2, 2));
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.entries[1].reused_from, Some(0));
@@ -10765,6 +10829,41 @@ mod tests {
         assert_eq!(result.returned, 2);
         assert!(!result.truncated);
         assert!(serde_json::to_vec(&result).unwrap().len() <= result.max_bytes);
+
+        let repeated = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: vec!["alpha".to_owned(), "beta".to_owned()],
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(repeated.provider_requests, 0);
+        assert_eq!(repeated.returned, 2);
+        assert!(repeated.cache_hit);
+        assert_eq!(repeated.snapshot_identity, result.snapshot_identity);
+
+        fs::write(&alpha, "fn alpha_changed() {}\n").unwrap();
+        let refreshed = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: vec!["alpha".to_owned()],
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(refreshed.provider_requests, 1);
+        assert!(!refreshed.cache_hit);
+        assert_ne!(result.snapshot_identity, refreshed.snapshot_identity);
+        assert_eq!(responder.await.unwrap(), ["alpha", "beta", "alpha"]);
     }
 
     #[tokio::test]

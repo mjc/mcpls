@@ -874,6 +874,10 @@ pub struct WorkspaceSymbolBatchResult {
     pub unique_queries: usize,
     /// Number of downstream workspace-symbol requests actually issued.
     pub provider_requests: usize,
+    /// Stable content-derived identity of the project snapshot queried.
+    pub snapshot_identity: String,
+    /// Whether this response reused prior provider work for this exact snapshot.
+    pub cache_hit: bool,
     /// Number of symbol payloads returned across unique queries.
     pub returned: usize,
     /// Whether an item or byte budget omitted provider work or symbol payloads.

@@ -19235,6 +19235,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cache_hit": {
+          "description": "Whether this response reused prior provider work for this exact snapshot.",
+          "type": "boolean"
+        },
         "entries": {
           "description": "One entry for every input query, in input order.",
           "items": {
@@ -19260,6 +19264,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "snapshot_identity": {
+          "description": "Stable content-derived identity of the project snapshot queried.",
+          "type": "string"
+        },
         "truncated": {
           "description": "Whether an item or byte budget omitted provider work or symbol payloads.",
           "type": "boolean"
@@ -19275,6 +19283,8 @@
         "entries",
         "unique_queries",
         "provider_requests",
+        "snapshot_identity",
+        "cache_hit",
         "returned",
         "truncated",
         "max_bytes"
