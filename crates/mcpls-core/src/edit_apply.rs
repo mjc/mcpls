@@ -515,9 +515,13 @@ fn validate_snapshot<'a>(
             actual: canonical,
         });
     }
-    match snapshot.source() {
-        SnapshotSource::Disk => validate_disk_snapshot(snapshot)?,
-        SnapshotSource::OpenDocument => validate_open_document_snapshot(snapshot, documents)?,
+    let is_open_document = snapshot.source() == SnapshotSource::OpenDocument;
+    if is_open_document && documents.is_none() {
+        return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
+    }
+    validate_disk_snapshot(snapshot)?;
+    if is_open_document {
+        validate_open_document_snapshot(snapshot, documents)?;
     }
     Ok(snapshot)
 }
@@ -527,7 +531,7 @@ fn validate_disk_snapshot(snapshot: &FileSnapshot) -> Result<(), ApplyError> {
         path: snapshot.path().clone(),
         source,
     })?;
-    snapshot.validate(&current, None)?;
+    snapshot.validate_content(&current)?;
     Ok(())
 }
 

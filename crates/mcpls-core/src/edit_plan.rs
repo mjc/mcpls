@@ -229,11 +229,7 @@ impl FileSnapshot {
         current_content: &str,
         current_version: Option<i32>,
     ) -> Result<(), SnapshotValidationError> {
-        if hash_content(current_content) != self.content_hash {
-            return Err(SnapshotValidationError::ContentChanged {
-                path: self.path.clone(),
-            });
-        }
+        self.validate_content(current_content)?;
         if let Some(expected) = self.version
             && current_version != Some(expected)
         {
@@ -241,6 +237,19 @@ impl FileSnapshot {
                 path: self.path.clone(),
                 expected,
                 actual: current_version,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate only the exact content preimage, independent of document version.
+    pub(crate) fn validate_content(
+        &self,
+        current_content: &str,
+    ) -> Result<(), SnapshotValidationError> {
+        if hash_content(current_content) != self.content_hash {
+            return Err(SnapshotValidationError::ContentChanged {
+                path: self.path.clone(),
             });
         }
         Ok(())

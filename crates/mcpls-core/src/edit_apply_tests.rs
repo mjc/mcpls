@@ -123,19 +123,21 @@ fn rejects_open_document_snapshots_without_disk_writes() {
 }
 
 #[test]
-fn applies_open_document_snapshot_against_tracked_content() {
+fn applies_open_document_snapshot_when_disk_and_tracker_match() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("open.rs");
-    fs::write(&file, "disk\n").unwrap();
+    fs::write(&file, "before\n").unwrap();
     let documents = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-    documents.open(file.clone(), "dirty\n".to_string()).unwrap();
+    documents
+        .open(file.clone(), "before\n".to_string())
+        .unwrap();
     let plan = EditPlan::new(
         "project".to_string(),
         vec![FileSnapshot::from_contents(
             file.clone(),
             SnapshotSource::OpenDocument,
             Some(1),
-            "dirty\n",
+            "before\n",
             "updated\n",
         )],
         Vec::new(),
@@ -147,6 +149,37 @@ fn applies_open_document_snapshot_against_tracked_content() {
     apply_plan_with_documents(&boundary, &plan, &documents).unwrap();
 
     assert_eq!(fs::read_to_string(file).unwrap(), "updated\n");
+}
+
+#[test]
+fn rejects_open_document_snapshot_when_disk_changed() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("open.rs");
+    fs::write(&file, "newer disk content\n").unwrap();
+    let documents = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+    documents
+        .open(file.clone(), "stale actor content\n".to_string())
+        .unwrap();
+    let plan = EditPlan::new(
+        "project".to_string(),
+        vec![FileSnapshot::from_contents(
+            file.clone(),
+            SnapshotSource::OpenDocument,
+            Some(1),
+            "stale actor content\n",
+            "planned content\n",
+        )],
+        Vec::new(),
+        true,
+        Duration::from_secs(60),
+    );
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+
+    assert!(matches!(
+        apply_plan_with_documents(&boundary, &plan, &documents),
+        Err(ApplyError::Stale(_))
+    ));
+    assert_eq!(fs::read_to_string(file).unwrap(), "newer disk content\n");
 }
 
 #[test]

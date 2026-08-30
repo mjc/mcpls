@@ -12796,7 +12796,7 @@ while True:
     }
 
     #[tokio::test]
-    async fn project_runtime_moves_from_authoritative_open_document_content() {
+    async fn project_runtime_refuses_to_replace_disk_with_dirty_open_document_content() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("lib.rs");
         fs::write(&source, "pub mod feature { fn disk() {} }\n").unwrap();
@@ -12825,6 +12825,13 @@ while True:
             Some(VerificationStatus::StructuralUnverified)
         );
         assert_eq!(artifact.producer, Some(EditProducer::StructuralAstGrep));
+        assert!(!artifact.plan.safe_to_apply());
+        assert!(
+            artifact
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("open document differs from disk"))
+        );
         let destination = root.path().join("feature.rs");
         assert!(
             artifact
@@ -12842,14 +12849,11 @@ while True:
         );
 
         let plan_id = artifact.plan.id().clone();
-        let applied = runtime
+        let error = runtime
             .apply_edit_plan_with_context(&plan_id, "project", root.path(), None, None)
             .await
-            .unwrap();
-        assert_eq!(
-            applied.verification,
-            Some(VerificationStatus::StructuralUnverified)
-        );
+            .unwrap_err();
+        assert_eq!(error, "edit plan is not safe to apply");
         assert_eq!(
             runtime
                 .translator
@@ -12857,9 +12861,13 @@ while True:
                 .get(&source)
                 .unwrap()
                 .content(),
-            "// dirty\n#[path = \"feature.rs\"] pub mod feature;\n"
+            dirty
         );
-        assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
+        assert_eq!(
+            fs::read_to_string(source).unwrap(),
+            "pub mod feature { fn disk() {} }\n"
+        );
+        assert!(!destination.exists());
     }
 
     #[tokio::test]

@@ -43,6 +43,51 @@ fn previews_disk_text_edit_without_writing() {
 }
 
 #[test]
+fn open_document_that_differs_from_disk_makes_preview_unsafe() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("src.rs");
+    fs::write(&file, "newer disk content\n").unwrap();
+    let boundary = WorkspaceBoundary::new(root.path()).unwrap();
+    let documents = DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new());
+    documents
+        .open(file.clone(), "stale actor content\n".to_string())
+        .unwrap();
+    let edit = WorkspaceEdit {
+        changes: Some(HashMap::from([(
+            path_to_uri(&file).unwrap(),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, 5),
+                ),
+                new_text: "planned".to_string(),
+            }],
+        )])),
+        document_changes: None,
+        change_annotations: None,
+    };
+
+    let artifact = preview_workspace_edit(
+        &boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &documents,
+        PreviewLimits::default(),
+    )
+    .unwrap();
+
+    assert!(!artifact.plan.safe_to_apply());
+    assert!(
+        artifact
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("open document differs from disk"))
+    );
+    assert_eq!(fs::read_to_string(file).unwrap(), "newer disk content\n");
+}
+
+#[test]
 fn preview_and_apply_preserve_rust_literal_bytes_across_workspace_edit_transport() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("src.rs");

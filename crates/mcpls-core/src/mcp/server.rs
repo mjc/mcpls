@@ -6144,7 +6144,7 @@ while True:
         )
         .unwrap();
         fs::write(&renamed, "disk diverged from the open document\n").unwrap();
-        server
+        let fresh_range_conflict = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: fresh_range["plan_id"].as_str().unwrap().to_string(),
@@ -6152,7 +6152,13 @@ while True:
             }))
             .await
             .unwrap();
-        assert_eq!(fs::read_to_string(&renamed).unwrap(), "ranged");
+        let fresh_range_conflict: serde_json::Value =
+            serde_json::from_str(&fresh_range_conflict).unwrap();
+        assert_eq!(fresh_range_conflict["status"], "conflict");
+        assert_eq!(
+            fs::read_to_string(&renamed).unwrap(),
+            "disk diverged from the open document\n"
+        );
         let stale_range = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
@@ -6163,6 +6169,34 @@ while True:
             .unwrap();
         let stale_range: serde_json::Value = serde_json::from_str(&stale_range).unwrap();
         assert_eq!(stale_range["status"], "conflict");
+
+        fs::write(&renamed, "structural\n").unwrap();
+        let retry_range: serde_json::Value = serde_json::from_str(
+            &server
+                .range_format_preview(Parameters(RangeFormatPreviewParams {
+                    project_id: project_id.as_str().to_string(),
+                    file_path: renamed.display().to_string(),
+                    start_line: 1,
+                    start_character: 1,
+                    end_line: 2,
+                    end_character: 1,
+                    tab_size: 4,
+                    insert_spaces: true,
+                    position_encoding: Some("utf-8".to_string()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: project_id.as_str().to_string(),
+                plan_id: retry_range["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "ranged");
 
         let no_range: serde_json::Value = serde_json::from_str(
             &server
