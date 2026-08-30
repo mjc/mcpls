@@ -25,8 +25,9 @@ use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
     DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
-    InlayHintsResult, InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry,
-    LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
+    InlayHintsResult, InspectSymbolBatchEntry, InspectSymbolBatchRequest, InspectSymbolBatchResult,
+    InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry, LogLevel,
+    OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
     SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
@@ -1637,6 +1638,10 @@ enum ProjectRequest {
         request: InspectSymbolRequest,
         reply: oneshot::Sender<Result<InspectSymbolResult, String>>,
     },
+    InspectSymbolBatch {
+        request: Box<InspectSymbolBatchRequest>,
+        reply: oneshot::Sender<Result<InspectSymbolBatchResult, String>>,
+    },
     CodeActions {
         file_path: String,
         start_line: u32,
@@ -1865,6 +1870,7 @@ impl ProjectRequest {
                 | Self::WorkspaceSymbol { .. }
                 | Self::WorkspaceSymbolBatch { .. }
                 | Self::InspectSymbol { .. }
+                | Self::InspectSymbolBatch { .. }
                 | Self::CodeActions { .. }
                 | Self::CodeActionList { .. }
                 | Self::PrepareCallHierarchy { .. }
@@ -2001,6 +2007,7 @@ impl ProjectRequest {
             Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbolBatch { reply, .. } => reply.is_closed(),
             Self::InspectSymbol { reply, .. } => reply.is_closed(),
+            Self::InspectSymbolBatch { reply, .. } => reply.is_closed(),
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reply.is_closed()
             }
@@ -2662,6 +2669,30 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::InspectSymbol { request, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Inspect several symbols concurrently through one actor request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, the caller cancels, or symbol
+    /// resolution fails.
+    pub async fn inspect_symbol_batch(
+        &self,
+        request: InspectSymbolBatchRequest,
+    ) -> Result<InspectSymbolBatchResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::InspectSymbolBatch {
+                request: Box::new(request),
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3450,7 +3481,7 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
-    symbol_handles: SymbolHandleStore,
+    symbol_handles: std::sync::Mutex<SymbolHandleStore>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
@@ -3964,7 +3995,7 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             edit_safety,
             code_actions: CodeActionStore::new(),
-            symbol_handles: SymbolHandleStore::new(),
+            symbol_handles: std::sync::Mutex::new(SymbolHandleStore::new()),
             deferred_results,
             deferred_scope,
             inline_module_checks: HashMap::new(),
@@ -3998,7 +4029,7 @@ impl ProjectRuntime {
     }
 
     fn source_handle(
-        &mut self,
+        &self,
         source: &SourceContext,
         line: u32,
         character: u32,
@@ -4010,15 +4041,20 @@ impl ProjectRuntime {
             || SourceSnapshot::Hash(frame.content_hash.clone()),
             SourceSnapshot::Version,
         );
-        Some(self.symbol_handles.insert(StoredSymbolTarget::new(
-            PathBuf::from(&frame.path),
-            line,
-            character,
-            snapshot,
-        )))
+        Some(
+            self.symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(
+                    PathBuf::from(&frame.path),
+                    line,
+                    character,
+                    snapshot,
+                )),
+        )
     }
 
-    fn attach_location_handle(&mut self, location: &mut crate::bridge::Location) {
+    fn attach_location_handle(&self, location: &mut crate::bridge::Location) {
         location.symbol_handle = self.source_handle(
             &location.source,
             location.range.start.line,
@@ -4027,7 +4063,7 @@ impl ProjectRuntime {
     }
 
     fn attach_location_handles<'a>(
-        &mut self,
+        &self,
         locations: impl IntoIterator<Item = &'a mut crate::bridge::Location>,
     ) {
         locations
@@ -4035,26 +4071,33 @@ impl ProjectRuntime {
             .for_each(|location| self.attach_location_handle(location));
     }
 
-    fn attach_reference_handle(&mut self, reference: &mut crate::bridge::ReferenceUse) {
+    fn attach_reference_handle(&self, reference: &mut crate::bridge::ReferenceUse) {
         reference.symbol_handle = reference.snapshot.as_ref().map(|snapshot| {
             let source_snapshot = snapshot.document_version.map_or_else(
                 || SourceSnapshot::Hash(snapshot.content_hash.clone()),
                 SourceSnapshot::Version,
             );
-            self.symbol_handles.insert(StoredSymbolTarget::new(
-                PathBuf::from(&snapshot.path),
-                reference.range[0],
-                reference.range[1],
-                source_snapshot,
-            ))
+            self.symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(
+                    PathBuf::from(&snapshot.path),
+                    reference.range[0],
+                    reference.range[1],
+                    source_snapshot,
+                ))
         });
     }
 
     async fn resolve_symbol_target(
-        &mut self,
+        &self,
         handle: &SymbolHandle,
     ) -> Result<StoredSymbolTarget, String> {
-        let target = self.symbol_handles.resolve(handle)?;
+        let target = self
+            .symbol_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(handle)?;
         let (_, version, hash, _) = self
             .translator
             .source_snapshot(&target.file_path)
@@ -4924,7 +4967,7 @@ impl ProjectRuntime {
     }
 
     async fn hover(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -4942,7 +4985,7 @@ impl ProjectRuntime {
     }
 
     async fn definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -4957,7 +5000,7 @@ impl ProjectRuntime {
     }
 
     async fn references(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -5029,7 +5072,7 @@ impl ProjectRuntime {
     }
 
     async fn resolve_symbol_handle(
-        &mut self,
+        &self,
         symbol_handle: SymbolHandle,
     ) -> Result<ResolvedSymbolTarget, String> {
         let target = self.resolve_symbol_target(&symbol_handle).await?;
@@ -5128,7 +5171,7 @@ impl ProjectRuntime {
     }
 
     async fn document_symbols(
-        &mut self,
+        &self,
         file_path: String,
         options: DocumentSymbolOptions,
     ) -> Result<DocumentSymbolsResult, String> {
@@ -5137,7 +5180,13 @@ impl ProjectRuntime {
             .handle_document_symbols(file_path, options)
             .await
             .map_err(|error| error.to_string())?;
-        attach_document_symbol_handles(&mut self.symbol_handles, &mut result.symbols);
+        attach_document_symbol_handles(
+            &mut self
+                .symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &mut result.symbols,
+        );
         Ok(result)
     }
 
@@ -5166,7 +5215,7 @@ impl ProjectRuntime {
     }
 
     async fn semantic_discovery(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -5182,7 +5231,7 @@ impl ProjectRuntime {
     }
 
     async fn workspace_symbol(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -5207,7 +5256,7 @@ impl ProjectRuntime {
     }
 
     async fn workspace_symbol_batch(
-        &mut self,
+        &self,
         request: WorkspaceSymbolBatchRequest,
     ) -> Result<WorkspaceSymbolBatchResult, String> {
         let mut seen = HashMap::new();
@@ -5274,7 +5323,7 @@ impl ProjectRuntime {
     }
 
     async fn workspace_symbol_in_path(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -5291,10 +5340,10 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    // One linear actor operation intentionally makes the snapshot boundary visible.
+    // One actor-owned operation intentionally makes the snapshot boundary visible.
     #[allow(clippy::too_many_lines)]
     async fn inspect_symbol(
-        &mut self,
+        &self,
         request: InspectSymbolRequest,
     ) -> Result<InspectSymbolResult, String> {
         use crate::bridge::{
@@ -5783,7 +5832,86 @@ impl ProjectRuntime {
             result.truncated = true;
         }
         result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        Ok(result)
+    }
+
+    async fn inspect_symbol_batch(
+        &self,
+        request: InspectSymbolBatchRequest,
+    ) -> Result<InspectSymbolBatchResult, String> {
+        let target_count = request.targets.len();
+        if target_count == 0
+            || target_count > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
+        {
+            return Err("between 1 and 16 symbol targets are required".to_owned());
+        }
+        let identity_bytes = serde_json::to_vec(&request.targets)
+            .map_err(|error| error.to_string())?
+            .len();
+        let available_bytes = request.budget.max_bytes.saturating_sub(
+            identity_bytes
+                + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES,
+        );
+        let target_budget = crate::bridge::InspectSymbolBudget {
+            max_bytes: available_bytes / target_count,
+            max_items: request.budget.max_items / target_count,
+        };
+        if target_budget.max_bytes
+            < crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET
+            || target_budget.max_items == 0
+        {
+            return Err("batch budget is too small for every symbol target".to_owned());
+        }
+
+        let inspections = request.targets.into_iter().map(|target| {
+            let inspect_request = InspectSymbolRequest {
+                symbol_handle: target.symbol_handle.clone(),
+                query: target.query.clone(),
+                kind: target.kind.clone(),
+                path: target.path.clone(),
+                container: target.container.clone(),
+                candidate_limit: request.candidate_limit,
+                sections: request.sections.clone(),
+                budget: target_budget,
+            };
+            async move {
+                match Box::pin(self.inspect_symbol(inspect_request)).await {
+                    Ok(result) => InspectSymbolBatchEntry {
+                        target,
+                        result: Some(result),
+                        error: None,
+                    },
+                    Err(error) => InspectSymbolBatchEntry {
+                        target,
+                        result: None,
+                        error: Some(error),
+                    },
+                }
+            }
+        });
+        let entries = futures::future::join_all(inspections).await;
+        let returned_items = entries
+            .iter()
+            .filter_map(|entry| entry.result.as_ref())
+            .map(|result| result.sections.returned_items())
+            .sum();
+        let truncated = entries
+            .iter()
+            .filter_map(|entry| entry.result.as_ref())
+            .any(|result| result.truncated);
+        let mut result = InspectSymbolBatchResult {
+            inspections_started: entries.len(),
+            entries,
+            returned_items,
+            budget: request.budget,
+            returned_bytes: 0,
+            truncated,
+        };
         result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        if result.returned_bytes > result.budget.max_bytes {
+            return Err("batch response metadata exceeds max_bytes".to_owned());
+        }
         Ok(result)
     }
 
@@ -5895,7 +6023,7 @@ impl ProjectRuntime {
     }
 
     async fn prepare_call_hierarchy(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -6004,7 +6132,7 @@ impl ProjectRuntime {
     }
 
     async fn incoming_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
     ) -> Result<IncomingCallsResult, String> {
@@ -6027,7 +6155,7 @@ impl ProjectRuntime {
     }
 
     async fn outgoing_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
     ) -> Result<OutgoingCallsResult, String> {
@@ -6082,7 +6210,7 @@ impl ProjectRuntime {
     }
 
     async fn go_to_implementation(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -6097,7 +6225,7 @@ impl ProjectRuntime {
     }
 
     async fn go_to_type_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -7197,6 +7325,16 @@ async fn handle_project_request(
             let result = tokio::select! {
                 () = reply.closed() => return false,
                 result = runtime.inspect_symbol(request) => result,
+            };
+            let _ = reply.send(result);
+        }
+        ProjectRequest::InspectSymbolBatch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.inspect_symbol_batch(*request) => result,
             };
             let _ = reply.send(result);
         }
@@ -10208,7 +10346,7 @@ mod tests {
             .collect();
         let deferred_results =
             std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
-        let mut runtime = ProjectRuntime::with_deferred_results_scoped(
+        let runtime = ProjectRuntime::with_deferred_results_scoped(
             Translator::new(),
             None,
             deferred_results,
@@ -10427,12 +10565,16 @@ mod tests {
     #[test]
     fn project_actor_replacements_start_without_semantic_handles_or_edit_plans() {
         let mut old_runtime = ProjectRuntime::new(Translator::new());
-        let handle = old_runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            PathBuf::from("src/lib.rs"),
-            1,
-            2,
-            SourceSnapshot::Version(1),
-        ));
+        let handle = old_runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                PathBuf::from("src/lib.rs"),
+                1,
+                2,
+                SourceSnapshot::Version(1),
+            ));
         let plan = EditPlan::new(
             "project".to_owned(),
             vec![crate::edit_plan::FileSnapshot::from_contents(
@@ -10449,8 +10591,15 @@ mod tests {
         let plan_id = plan.id().clone();
         old_runtime.edit_plans.insert(plan).unwrap();
 
-        let mut replacement_runtime = ProjectRuntime::new(Translator::new());
-        assert!(replacement_runtime.symbol_handles.resolve(&handle).is_err());
+        let replacement_runtime = ProjectRuntime::new(Translator::new());
+        assert!(
+            replacement_runtime
+                .symbol_handles
+                .lock()
+                .unwrap()
+                .resolve(&handle)
+                .is_err()
+        );
         assert!(replacement_runtime.edit_plans.get(&plan_id).is_none());
     }
 
@@ -10473,6 +10622,28 @@ mod tests {
         };
 
         assert!(request.is_cancelled());
+    }
+
+    #[test]
+    fn inspect_symbol_batch_resumes_a_dormant_rust_runtime() {
+        let (reply, _response) = oneshot::channel();
+        let request = ProjectRequest::InspectSymbolBatch {
+            request: Box::new(crate::bridge::InspectSymbolBatchRequest {
+                targets: vec![crate::bridge::InspectSymbolTarget {
+                    symbol_handle: None,
+                    query: Some("target".to_owned()),
+                    kind: None,
+                    path: None,
+                    container: None,
+                }],
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            }),
+            reply,
+        };
+
+        assert!(request.resumes_rust_runtime());
     }
 
     #[tokio::test]
@@ -10594,6 +10765,124 @@ mod tests {
         assert_eq!(result.returned, 2);
         assert!(!result.truncated);
         assert!(serde_json::to_vec(&result).unwrap().len() <= result.max_bytes);
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budget() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        fs::write(root.path().join("beta.rs"), "fn beta() {}\n").unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let (release_server, hold_server) = oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut request_ids = Vec::new();
+            while request_ids.len() < 2 {
+                let message = read_framed_message(&mut reader).await;
+                if let Some(id) = message.get("id").cloned() {
+                    assert_eq!(message["method"], "textDocument/hover");
+                    request_ids.push(id);
+                }
+            }
+            for id in &request_ids {
+                write_response(
+                    &mut read_half_stdin,
+                    id,
+                    serde_json::json!({
+                        "contents": {"kind": "plaintext", "value": "inspected"}
+                    }),
+                )
+                .await;
+            }
+            let _ = hold_server.await;
+            request_ids.len()
+        });
+        let actor = spawn_project_actor_with_translator(4, translator);
+        let mut targets = Vec::new();
+        for query in ["alpha", "beta"] {
+            let symbol = actor
+                .workspace_symbol(
+                    query.to_owned(),
+                    None,
+                    1,
+                    WorkspaceSymbolMatchMode::Exact,
+                    WorkspaceSymbolScope::Project,
+                    false,
+                )
+                .await
+                .unwrap()
+                .symbols
+                .remove(0);
+            targets.push(crate::bridge::InspectSymbolTarget {
+                symbol_handle: symbol.location.symbol_handle,
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+            });
+        }
+        targets.push(crate::bridge::InspectSymbolTarget {
+            symbol_handle: Some(SymbolHandle::new()),
+            query: None,
+            kind: None,
+            path: None,
+            container: None,
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            actor.inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
+                targets,
+                candidate_limit: 10,
+                sections: vec![crate::bridge::InspectSymbolSectionKind::Declaration],
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 24 * 1024,
+                    max_items: 3,
+                },
+            }),
+        )
+        .await
+        .expect("batch serialized target inspections")
+        .unwrap();
+
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.inspections_started, 3);
+        assert_eq!(result.returned_items, 2, "{result:#?}");
+        assert!(result.entries[..2].iter().all(|entry| matches!(
+            entry.result.as_ref().unwrap().resolution,
+            crate::bridge::InspectSymbolResolution::Selected { .. }
+        )));
+        assert!(
+            result.entries[..2]
+                .iter()
+                .all(|entry| entry.result.as_ref().unwrap().budget.max_items == 1)
+        );
+        assert!(result.entries[2].result.is_none());
+        assert!(
+            result.entries[2]
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.starts_with("invalid_symbol_handle:") })
+        );
+        assert!(result.returned_bytes <= result.budget.max_bytes);
+        release_server.send(()).unwrap();
+        assert_eq!(responder.await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -10723,14 +11012,18 @@ mod tests {
             let _ = hold_server.await;
         });
 
-        let mut runtime = ProjectRuntime::new(translator);
+        let runtime = ProjectRuntime::new(translator);
         let (_, _, source_hash, _) = runtime.translator.source_snapshot(&source).await.unwrap();
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            source,
-            1,
-            4,
-            SourceSnapshot::Hash(source_hash),
-        ));
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                source,
+                1,
+                4,
+                SourceSnapshot::Hash(source_hash),
+            ));
         let started = Instant::now();
         let result = runtime
             .inspect_symbol(InspectSymbolRequest {
@@ -10843,7 +11136,7 @@ mod tests {
             drop(processes);
         });
 
-        let mut runtime = ProjectRuntime::new(translator);
+        let runtime = ProjectRuntime::new(translator);
         let result = Box::pin(runtime.inspect_symbol(InspectSymbolRequest {
             symbol_handle: None,
             query: Some("inspected".to_owned()),
@@ -10948,13 +11241,17 @@ mod tests {
             .document_tracker()
             .open(source.clone(), "fn before() {}\n".to_owned())
             .unwrap();
-        let mut runtime = ProjectRuntime::new(translator);
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            source.clone(),
-            1,
-            4,
-            SourceSnapshot::Version(1),
-        ));
+        let runtime = ProjectRuntime::new(translator);
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                source.clone(),
+                1,
+                4,
+                SourceSnapshot::Version(1),
+            ));
         runtime
             .translator
             .document_tracker()
@@ -10971,14 +11268,18 @@ mod tests {
         fs::write(&source, "fn before() {}\n").unwrap();
         let mut translator = Translator::new();
         translator.set_workspace_roots(vec![root.path().to_path_buf()]);
-        let mut runtime = ProjectRuntime::new(translator);
+        let runtime = ProjectRuntime::new(translator);
         let (_, _, source_hash, _) = runtime.translator.source_snapshot(&source).await.unwrap();
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            source.clone(),
-            1,
-            4,
-            SourceSnapshot::Hash(source_hash),
-        ));
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                source.clone(),
+                1,
+                4,
+                SourceSnapshot::Hash(source_hash),
+            ));
         fs::write(&source, "fn after() {}\n").unwrap();
 
         let result = runtime
@@ -11019,13 +11320,17 @@ mod tests {
             .document_tracker()
             .open(source, "fn dirty_name() {}\n".to_owned())
             .unwrap();
-        let mut runtime = ProjectRuntime::new(translator);
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            root.path().join("dirty.rs"),
-            1,
-            4,
-            SourceSnapshot::Version(1),
-        ));
+        let runtime = ProjectRuntime::new(translator);
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                root.path().join("dirty.rs"),
+                1,
+                4,
+                SourceSnapshot::Version(1),
+            ));
 
         let result = Box::pin(runtime.inspect_symbol(InspectSymbolRequest {
             symbol_handle: Some(handle),

@@ -418,8 +418,33 @@ pub struct InspectSymbolParams {
     pub budget: InspectSymbolBudget,
 }
 
+/// Parameters for one bounded batch of symbol inspections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InspectSymbolBatchParams {
+    /// Stable project identifier whose symbols should be inspected.
+    pub project_id: String,
+    /// Caller-ordered symbol identities; every target is retained in the response.
+    pub targets: Vec<crate::bridge::InspectSymbolTarget>,
+    /// Maximum ranked candidates returned for each ambiguous query.
+    #[serde(default = "default_inspect_candidates")]
+    pub candidate_limit: u32,
+    /// Sections requested for every target.
+    #[serde(default)]
+    pub sections: Vec<InspectSymbolSectionKind>,
+    /// Strict serialized-byte and per-provider item bounds shared by the batch.
+    #[serde(default = "default_inspect_batch_budget")]
+    pub budget: InspectSymbolBudget,
+}
+
 const fn default_inspect_candidates() -> u32 {
     10
+}
+
+const fn default_inspect_batch_budget() -> InspectSymbolBudget {
+    InspectSymbolBudget {
+        max_bytes: 128 * 1024,
+        max_items: 20,
+    }
 }
 
 const fn default_max_results() -> u32 {
@@ -964,6 +989,21 @@ mod tests {
         assert_eq!(params.sections.len(), 3);
         assert_eq!(params.budget.max_bytes, 8192);
         assert_eq!(params.budget.max_items, 7);
+    }
+
+    #[test]
+    fn inspect_symbol_batch_accepts_handles_under_one_shared_budget() {
+        let params: InspectSymbolBatchParams = serde_json::from_value(serde_json::json!({
+            "project_id": "project",
+            "targets": [{"symbol_handle": "target-1"}, {"query": "run"}],
+            "sections": ["declaration", "references"],
+            "budget": {"max_bytes": 16384, "max_items": 4}
+        }))
+        .unwrap();
+
+        assert_eq!(params.targets.len(), 2);
+        assert_eq!(params.budget.max_bytes, 16_384);
+        assert_eq!(params.budget.max_items, 4);
     }
 
     #[test]

@@ -155,6 +155,7 @@ fn test_e2e_list_tools() -> Result<()> {
         "format_document",
         "workspace_symbol_search",
         "inspect_symbol",
+        "inspect_symbol_batch",
         "get_code_actions",
         "prepare_call_hierarchy",
         "get_incoming_calls",

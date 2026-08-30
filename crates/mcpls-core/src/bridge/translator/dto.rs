@@ -921,6 +921,38 @@ pub struct InspectSymbolRequest {
     pub budget: InspectSymbolBudget,
 }
 
+/// One symbol identity in a batch inspection request.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InspectSymbolTarget {
+    /// Snapshot-bound handle returned by symbol discovery.
+    pub symbol_handle: Option<SymbolHandle>,
+    /// Exact symbol name used when no handle is supplied.
+    pub query: Option<String>,
+    /// Optional symbol-kind disambiguator.
+    pub kind: Option<String>,
+    /// Optional project-relative path disambiguator.
+    pub path: Option<String>,
+    /// Optional container-name disambiguator.
+    pub container: Option<String>,
+}
+
+/// Actor-owned inputs for inspecting several symbols concurrently.
+#[derive(Debug, Clone)]
+pub struct InspectSymbolBatchRequest {
+    /// Caller-ordered symbol identities.
+    pub targets: Vec<InspectSymbolTarget>,
+    /// Maximum candidates returned for each ambiguous query.
+    pub candidate_limit: u32,
+    /// Sections requested for every target.
+    pub sections: Vec<InspectSymbolSectionKind>,
+    /// Shared bounds applied across the batch.
+    pub budget: InspectSymbolBudget,
+}
+
+pub(crate) const INSPECT_SYMBOL_BATCH_MAX_TARGETS: usize = 16;
+pub(crate) const INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES: usize = 1024;
+pub(crate) const INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET: usize = 4096;
+
 impl InspectSymbolRequest {
     /// Return whether the caller selected a section, defaulting to the declaration.
     #[must_use]
@@ -1216,6 +1248,51 @@ pub struct InspectSymbolResult {
     pub returned_bytes: usize,
     /// Whether the total budget removed lower-priority sections or candidates.
     pub truncated: bool,
+}
+
+/// One caller-ordered result in a batch symbol inspection.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct InspectSymbolBatchEntry {
+    /// Original symbol identity at this position.
+    pub target: InspectSymbolTarget,
+    /// Bounded inspection result for this target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<InspectSymbolResult>,
+    /// Target-local failure; successful siblings remain available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Bounded results for a caller-ordered batch of symbol inspections.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct InspectSymbolBatchResult {
+    /// One result for every input target, in input order.
+    pub entries: Vec<InspectSymbolBatchEntry>,
+    /// Number of target inspections started concurrently.
+    pub inspections_started: usize,
+    /// Total section items returned across all targets.
+    pub returned_items: usize,
+    /// Shared bounds applied across the batch.
+    pub budget: InspectSymbolBudget,
+    /// Serialized bytes in this bundle before the MCP envelope.
+    pub returned_bytes: usize,
+    /// Whether any target result was truncated.
+    pub truncated: bool,
+}
+
+impl InspectSymbolSections {
+    #[must_use]
+    pub(crate) const fn returned_items(&self) -> usize {
+        self.declaration.returned
+            + self.hover.returned
+            + self.definitions.returned
+            + self.implementations.returned
+            + self.references.returned
+            + self.calls.returned
+            + self.tests.returned
+            + self.runnables.returned
+            + self.diagnostics.returned
+    }
 }
 
 /// A single code action.

@@ -27,6 +27,7 @@ Tool failures retain MCP's standard JSON-RPC error code and message. Operational
 | [get_document_symbols](#get_document_symbols) | `textDocument/documentSymbol` | Document symbol outline |
 | [workspace_symbol_search](#workspace_symbol_search) | `workspace/symbol` | Search symbols across workspace |
 | [inspect_symbol](#inspect_symbol) | Multiple read-only semantic methods | Bounded symbol definition and usage bundle |
+| [inspect_symbol_batch](#inspect_symbol_batch) | Multiple read-only semantic methods | Concurrent bounded bundles for several symbols |
 
 ### Diagnostics & Formatting Tools
 
@@ -725,6 +726,22 @@ The equivalent [machine-validated request example](../examples/source-rich-workf
 Pass returned handles directly to handle-aware tools instead of copying line/character coordinates. If the query is ambiguous, narrow with `path`, `kind`, or `container`; do not select a candidate silently. On `stale_symbol_handle`, rerun `workspace_symbol_search` or `get_document_symbols` and retry with the replacement.
 
 Use a direct file read only when intentionally requesting an uncapped full file or inspecting a non-source/generated artifact. For ordinary navigation, an available source frame is already the authoritative snapshot used by the semantic result; for truncation, first request a tighter section or larger explicit budget.
+
+## inspect_symbol_batch
+
+Inspect 1–16 handles or exact queries concurrently through one project actor request. Targets remain in caller order, including target-local failures, unresolved queries, and stale handles. `sections` is shared by every target; `budget.max_bytes` bounds the complete response and `budget.max_items` is divided across targets so one batch cannot multiply provider work without bound.
+
+```json
+{
+  "project_id": "default",
+  "targets": [
+    {"symbol_handle": "…"},
+    {"query": "other_symbol", "path": "src/other.rs"}
+  ],
+  "sections": ["declaration", "references"],
+  "budget": {"max_bytes": 32768, "max_items": 20}
+}
+```
 
 ## workspace_symbol_search
 

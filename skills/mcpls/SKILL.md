@@ -39,8 +39,9 @@ Prefer MCPLS results before `rg`, `sed`, or a file-read tool:
 1. Call `workspace_symbol_search` with the registered `project_id` and an exact name. Its ranked candidates include bounded `source` frames and snapshot-bound `symbol_handle` values.
 2. If exactly one candidate matches, pass its `symbol_handle` with `project_id` to `inspect_symbol`, `get_hover`, `get_definition`, `get_references`, or call-hierarchy tools. Do not copy coordinates when a handle is available.
 3. For a broad question, call `inspect_symbol` once. Select only needed `sections` and set `budget.max_bytes` and `budget.max_items`; it returns declaration/body source, docs/signature, implementations, grouped uses/calls, tests/runnables, and relevant diagnostics.
-4. If discovery is ambiguous, present or narrow the ranked source-bearing candidates with `path`, `kind`, or `container`; never silently choose one.
-5. If a follow-up returns `stale_symbol_handle`, rerun discovery and use its replacement handle.
+4. When inspecting several known handles, call `inspect_symbol_batch` once instead of repeating `inspect_symbol`. It preserves every target identity while sharing one response and provider budget.
+5. If discovery is ambiguous, present or narrow the ranked source-bearing candidates with `path`, `kind`, or `container`; never silently choose one.
+6. If a follow-up returns `stale_symbol_handle`, rerun discovery and use its replacement handle.
 
 Example with no intervening file read:
 
