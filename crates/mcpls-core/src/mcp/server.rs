@@ -18,10 +18,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, ElicitRequest, ElicitRequestParams,
     ElicitationSchema, Implementation, InputRequest, InputRequests, InputRequiredResult,
-    InputResponses, ListResourcesResult, MetaObject, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    SubscriptionFilter, UnsubscribeRequestParams,
+    InputResponses, ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+    SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -833,6 +833,25 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
     value["semantic_provider_available"] = serde_json::json!(!result.providers.is_empty());
     value["semantic_edit_count"] = serde_json::json!(result.semantic_edit_count);
     value
+}
+
+const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
+
+fn advertised_tools() -> Vec<Tool> {
+    McplsServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|mut tool| {
+            let oversized = tool.output_schema.as_ref().is_some_and(|schema| {
+                serde_json::to_vec(schema)
+                    .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
+            });
+            if oversized {
+                tool.output_schema = None;
+            }
+            tool
+        })
+        .collect()
 }
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -3175,6 +3194,20 @@ impl McplsServer {
 
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = supports_cache_hints(&context);
+        let mut result = ListToolsResult::with_all_items(advertised_tools());
+        if supports_cache_hints {
+            result.ttl_ms = Some(0);
+            result.cache_scope = Some(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -4584,6 +4617,36 @@ finally:
         assert!(
             diagnostics.output_schema.as_ref().unwrap()["properties"]["diagnostics"].is_object()
         );
+    }
+
+    #[test]
+    fn advertised_tools_compact_expanded_output_schemas() {
+        let full = McplsServer::tool_router().list_all();
+        let advertised = advertised_tools();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        let advertised_bytes = serde_json::to_vec(&advertised).unwrap().len();
+
+        assert_eq!(
+            full.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            advertised.iter().map(|tool| &tool.name).collect::<Vec<_>>()
+        );
+        assert!(
+            advertised_bytes * 2 < full_bytes,
+            "advertised tool surface is {advertised_bytes} bytes vs {full_bytes} internally"
+        );
+
+        for (full, advertised) in full.iter().zip(advertised.iter()) {
+            let oversized = full.output_schema.as_ref().is_some_and(|schema| {
+                serde_json::to_vec(schema)
+                    .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
+            });
+            assert_eq!(
+                advertised.output_schema.is_some(),
+                !oversized,
+                "unexpected advertised output schema policy for {}",
+                full.name
+            );
+        }
     }
 
     #[test]
