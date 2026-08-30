@@ -5309,7 +5309,7 @@ impl ProjectRuntime {
                 batch.snapshot_identity,
                 query,
                 request.kind_filter,
-                limit,
+                request.include_generated,
                 request.match_mode,
                 request.scope,
             );
@@ -5334,10 +5334,12 @@ impl ProjectRuntime {
                     )
                     .await?;
                 batch.provider_requests += 1;
-                self.workspace_symbol_results
-                    .lock()
-                    .expect("workspace-symbol cache lock poisoned")
-                    .insert(cache_key, result.clone());
+                if !result.truncated {
+                    self.workspace_symbol_results
+                        .lock()
+                        .expect("workspace-symbol cache lock poisoned")
+                        .insert(cache_key, result.clone());
+                }
                 result
             };
             batch.returned += result.returned;
@@ -10864,6 +10866,89 @@ mod tests {
         assert!(!refreshed.cache_hit);
         assert_ne!(result.snapshot_identity, refreshed.snapshot_identity);
         assert_eq!(responder.await.unwrap(), ["alpha", "beta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("symbols.rs");
+        fs::write(&source, "fn symbol() {}\n").unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut queries = Vec::new();
+            while queries.len() < 117 {
+                let message = read_framed_message(&mut reader).await;
+                let Some(id) = message.get("id") else {
+                    continue;
+                };
+                let query = message["params"]["query"].as_str().unwrap().to_owned();
+                write_response(
+                    &mut read_half_stdin,
+                    id,
+                    serde_json::json!([{
+                        "name": query,
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(&source).unwrap(),
+                            "range": {
+                                "start": {"line": 0, "character": 3},
+                                "end": {"line": 0, "character": 9}
+                            }
+                        }
+                    }]),
+                )
+                .await;
+                queries.push(query);
+            }
+            queries
+        });
+        let actor = spawn_project_actor_with_translator(8, translator);
+        let unique = (0..117)
+            .map(|index| format!("symbol_{index}"))
+            .collect::<Vec<_>>();
+        let mut queries = unique.clone();
+        queries.extend(unique.iter().take(26).cloned());
+
+        let mut client_calls = 0;
+        let mut provider_requests = 0;
+        for chunk in queries.chunks(32) {
+            let result = actor
+                .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                    queries: chunk.to_vec(),
+                    kind_filter: None,
+                    match_mode: WorkspaceSymbolMatchMode::Exact,
+                    scope: WorkspaceSymbolScope::Project,
+                    include_generated: false,
+                    max_items: 1_000,
+                    max_bytes: 64 * 1024,
+                })
+                .await
+                .unwrap();
+            client_calls += 1;
+            provider_requests += result.provider_requests;
+            assert_eq!(result.entries.len(), chunk.len());
+        }
+
+        assert_eq!(client_calls, 5);
+        assert_eq!(provider_requests, 117);
+        assert_eq!(responder.await.unwrap().len(), 117);
     }
 
     #[tokio::test]
