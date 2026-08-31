@@ -252,6 +252,74 @@ fn numbered_line_bytes(line_number: usize, line: &str) -> usize {
     format!("{line_number:>4} | {line}\n").len()
 }
 
+fn json_escaped_character_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{08}' | '\u{0C}' | '\n' | '\r' | '\t' => 2,
+        '\u{00}'..='\u{1F}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+fn json_escaped_bytes(text: &str) -> usize {
+    text.chars().map(json_escaped_character_bytes).sum()
+}
+
+fn source_frame_text_budget(
+    path: &Path,
+    uri: &str,
+    highlighted_range: &Range,
+    language_id: Option<String>,
+    document_version: Option<i32>,
+    content_hash: &str,
+) -> usize {
+    let cursor_uri = SourceResource {
+        path: path.to_path_buf(),
+        start_line: u32::MAX,
+        start_character: u32::MAX,
+        end_line: u32::MAX,
+        end_character: u32::MAX,
+        snapshot_hash: content_hash.to_owned(),
+        document_version,
+        offset_bytes: usize::MAX,
+    }
+    .to_uri()
+    .unwrap_or_default();
+    let placeholder = SourceFrame {
+        path: path.to_string_lossy().into_owned(),
+        uri: uri.to_owned(),
+        range: Range {
+            start: super::dto::Position2D {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+            end: super::dto::Position2D {
+                line: u32::MAX,
+                character: u32::MAX,
+            },
+        },
+        highlighted_range: highlighted_range.clone(),
+        text: String::new(),
+        language_id,
+        document_version,
+        content_hash: content_hash.to_owned(),
+        returned_lines: usize::MAX,
+        total_lines: usize::MAX,
+        returned_bytes: usize::MAX,
+        total_bytes: usize::MAX,
+        truncated: true,
+        resource: Some(DeferredResourceReference {
+            uri: cursor_uri,
+            kind: "source_context".to_owned(),
+            snapshot_hash: content_hash.to_owned(),
+            document_version,
+            total_bytes: Some(usize::MAX),
+        }),
+    };
+    MAX_RESPONSE_BYTES
+        .saturating_sub(serde_json::to_vec(&placeholder).map_or(usize::MAX, |bytes| bytes.len()))
+        .saturating_add(2)
+}
+
 impl EncodingCtx {
     fn approved_source_paths(&self, uri: &lsp_types::Uri) -> Vec<PathBuf> {
         if let Some(path) = uri_to_path(uri)
@@ -419,8 +487,18 @@ impl super::Translator {
                 )
             })
             .sum();
-        let byte_limit = MAX_RESPONSE_BYTES;
+        let canonical_uri =
+            path_to_uri(&path).map_or_else(|_| uri.to_string(), |uri| uri.to_string());
+        let json_text_limit = source_frame_text_budget(
+            &path,
+            &canonical_uri,
+            &range,
+            language_id(&path),
+            document_version,
+            &content_hash,
+        );
         let mut text = String::new();
+        let mut encoded_text_bytes = 0;
         let mut returned_lines = 0;
         let mut next = None;
         for (offset, line) in selected.iter().enumerate() {
@@ -435,23 +513,29 @@ impl super::Translator {
                 )
             })?;
             let prefix = format!("{:>4} | ", start + offset + 1);
-            let rendered_len = prefix.len() + line.len() + 1;
-            if text.len() + rendered_len <= byte_limit {
+            let rendered_json_bytes = json_escaped_bytes(&prefix) + json_escaped_bytes(line) + 2;
+            if encoded_text_bytes + rendered_json_bytes <= json_text_limit {
                 text.push_str(&prefix);
                 text.push_str(line);
                 text.push('\n');
+                encoded_text_bytes += rendered_json_bytes;
                 returned_lines += 1;
                 continue;
             }
 
-            let available = byte_limit.saturating_sub(text.len() + prefix.len() + 1);
+            let available = json_text_limit
+                .saturating_sub(encoded_text_bytes)
+                .saturating_sub(json_escaped_bytes(&prefix) + 2);
             let mut chunk_end = 0;
+            let mut chunk_json_bytes = 0;
             for (index, character) in line.char_indices() {
                 let end = index + character.len_utf8();
-                if end > available {
+                let encoded = json_escaped_character_bytes(character);
+                if chunk_json_bytes + encoded > available {
                     break;
                 }
                 chunk_end = end;
+                chunk_json_bytes += encoded;
             }
             if chunk_end > 0 {
                 text.push_str(&prefix);
@@ -510,7 +594,7 @@ impl super::Translator {
         });
         Ok(SourceFrame {
             path: path.to_string_lossy().into_owned(),
-            uri: uri.to_string(),
+            uri: canonical_uri,
             range: returned_range,
             highlighted_range: range,
             text,
@@ -744,7 +828,7 @@ mod tests {
         let path = root.path().join("lib.rs");
         let content = format!(
             "{}\ntail sentinel\n",
-            "λ".repeat(MAX_RESPONSE_BYTES / 2 + 1)
+            "λ\"".repeat(MAX_RESPONSE_BYTES / 3 + 1)
         );
         tokio::fs::write(&path, &content).await.unwrap();
         let mut translator = crate::bridge::Translator::new()
@@ -765,6 +849,7 @@ mod tests {
         let frame = translator.read_source_resource(&resource).await.unwrap();
 
         assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_RESPONSE_BYTES);
         assert!(frame.truncated);
         let next = crate::bridge::resources::parse_source_uri(
             &frame
