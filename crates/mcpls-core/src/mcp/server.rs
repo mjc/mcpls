@@ -33,9 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
-    DeferredResource, SessionResource, applied_edit_result_resource_uri, edit_diff_resource_uri,
-    event_resource_uris, parse_session_resource_uri, project_event_resource_uri,
-    project_events_resource_uri, project_status_resource_uri,
+    DeferredResource, SessionResource, applied_edit_result_resource_uri,
+    edit_approval_resource_uri, edit_diff_resource_uri, event_resource_uris,
+    parse_session_resource_uri, project_event_resource_uri, project_events_resource_uri,
+    project_status_resource_uri,
 };
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
@@ -873,9 +874,20 @@ fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value
     } else {
         "text_edit"
     };
+    let project_id = ProjectId::new(summary.project_id.clone()).expect("stored plan project id");
+    let details_truncated = summary.affected_files.len() > MAX_APPROVAL_ITEMS
+        || summary.operations.len() > MAX_APPROVAL_ITEMS
+        || summary.file_operations.len() > MAX_APPROVAL_ITEMS
+        || summary.diff_files.len() > MAX_APPROVAL_ITEMS;
     serde_json::json!({
+        "plan_id": summary.plan_id.as_str(),
+        "project_id": summary.project_id,
         "operation_kind": operation_kind,
         "affected_file_count": summary.affected_files.len(),
+        "operation_count": summary.operations.len(),
+        "file_operation_count": summary.file_operations.len(),
+        "diff_file_count": summary.diff_files.len(),
+        "snapshot_count": summary.snapshot_hashes.len(),
         "affected_files": summary
             .affected_files
             .iter()
@@ -895,6 +907,45 @@ fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value
         "diff_truncated": summary.diff_truncated,
         "safe_to_apply": summary.safe_to_apply,
         "risk_flags": risk_flags,
+        "details_truncated": details_truncated,
+        "detail_resource": {
+            "uri": edit_approval_resource_uri(&project_id, &summary.plan_id, 0),
+            "mime_type": "application/json",
+        },
+    })
+}
+
+fn edit_approval_resource_page(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+    detail: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    let mut page = applied_edit_result_resource_page(project_id, plan_id, offset_bytes, detail)?;
+    page.uri = edit_approval_resource_uri(project_id, plan_id, offset_bytes);
+    page.next_uri = page.next_uri.as_ref().and_then(|uri| {
+        super::session::parse_applied_edit_result_resource_uri(uri)
+            .map(|(_, _, offset)| edit_approval_resource_uri(project_id, plan_id, offset))
+    });
+    Ok(page)
+}
+
+fn approval_detail_json(summary: &EditPlanApprovalSummary) -> serde_json::Value {
+    serde_json::json!({
+        "plan_id": summary.plan_id.as_str(),
+        "project_id": summary.project_id,
+        "affected_files": summary.affected_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "operations": summary.operations,
+        "file_operations": summary.file_operations.iter().map(|operation| match operation {
+            FileOperation::Create { path, .. } => serde_json::json!({"kind": "create", "path": path}),
+            FileOperation::Rename { from, to, .. } => serde_json::json!({"kind": "rename", "from": from, "to": to}),
+            FileOperation::Delete { path, recursive } => serde_json::json!({"kind": "delete", "path": path, "recursive": recursive}),
+        }).collect::<Vec<_>>(),
+        "diff_files": summary.diff_files.iter().map(|file| serde_json::json!({"path": file.path(), "additions": file.additions(), "deletions": file.deletions()})).collect::<Vec<_>>(),
+        "diff_truncated": summary.diff_truncated,
+        "safe_to_apply": summary.safe_to_apply,
+        "snapshot_hashes": summary.snapshot_hashes,
+        "versions": summary.versions,
     })
 }
 
@@ -1598,6 +1649,43 @@ impl McplsServer {
                 )
             })?;
         let page = applied_edit_result_resource_page(&project_id, &plan_id, offset_bytes, &detail)?;
+        let text = serde_json::to_string(&page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(text, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_edit_approval_resource(
+        &self,
+        project_id: ProjectId,
+        plan_id: PlanId,
+        offset_bytes: usize,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.context.owns_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit approval is not owned by this MCP session",
+                None,
+            ));
+        }
+        let summary = self
+            .context
+            .project_registry
+            .inspect_edit_plan(&project_id, plan_id.clone())
+            .await
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "stale_resource: edit approval is no longer retained",
+                    None,
+                )
+            })?;
+        let detail = serde_json::to_string(&approval_detail_json(&summary))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let page = edit_approval_resource_page(&project_id, &plan_id, offset_bytes, &detail)?;
         let text = serde_json::to_string(&page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
@@ -3752,7 +3840,8 @@ impl McplsServer {
             | SessionResource::ProjectEvents { .. }
             | SessionResource::ProjectEvent { .. }
             | SessionResource::EditDiff { .. }
-            | SessionResource::AppliedEditResult { .. } => {
+            | SessionResource::AppliedEditResult { .. }
+            | SessionResource::EditApproval { .. } => {
                 return Err(McpError::invalid_params(
                     "read_semantic_resource accepts only mcpls-source:// or mcpls-deferred:// references",
                     None,
@@ -3933,6 +4022,12 @@ impl McplsServer {
                 SessionResource::AppliedEditResult { .. } => {
                     return Err(McpError::invalid_params(
                         "applied edit result resources are readable but not subscribable",
+                        None,
+                    ));
+                }
+                SessionResource::EditApproval { .. } => {
+                    return Err(McpError::invalid_params(
+                        "edit approval resources are readable but not subscribable",
                         None,
                     ));
                 }
@@ -4160,6 +4255,21 @@ impl ServerHandler for McplsServer {
                     )
                     .await;
             }
+            SessionResource::EditApproval {
+                project_id,
+                plan_id,
+                offset_bytes,
+            } => {
+                return self
+                    .read_edit_approval_resource(
+                        project_id,
+                        plan_id,
+                        offset_bytes,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => {
                 return self
@@ -4309,6 +4419,12 @@ impl ServerHandler for McplsServer {
                     None,
                 ));
             }
+            SessionResource::EditApproval { .. } => {
+                return Err(McpError::invalid_params(
+                    "edit approval resources are readable but not subscribable",
+                    None,
+                ));
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => source.path,
             SessionResource::Deferred(_) => {
@@ -4364,9 +4480,9 @@ impl ServerHandler for McplsServer {
             SessionResource::ProjectEvent { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
-            SessionResource::EditDiff { .. } | SessionResource::AppliedEditResult { .. } => {
-                request.uri
-            }
+            SessionResource::EditDiff { .. }
+            | SessionResource::AppliedEditResult { .. }
+            | SessionResource::EditApproval { .. } => request.uri,
             SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
             | SessionResource::Source(_)
@@ -4733,6 +4849,45 @@ mod tests {
                 &plan_id,
                 0,
             ))
+        );
+    }
+
+    #[test]
+    fn approval_summary_bounds_inline_lists_and_links_the_complete_plan() {
+        let plan_id = PlanId::parse("plan").unwrap();
+        let summary = EditPlanApprovalSummary {
+            plan_id: plan_id.clone(),
+            project_id: "project".to_owned(),
+            affected_files: (0..=MAX_APPROVAL_ITEMS)
+                .map(|index| PathBuf::from(format!("src/{index}.rs")))
+                .collect(),
+            operations: (0..=MAX_APPROVAL_ITEMS)
+                .map(|index| format!("edit src/{index}.rs"))
+                .collect(),
+            file_operations: Vec::new(),
+            diff_files: Vec::new(),
+            diff_truncated: false,
+            safe_to_apply: true,
+            snapshot_hashes: Vec::new(),
+            versions: Vec::new(),
+        };
+
+        let value = approval_summary_json(&summary);
+
+        assert_eq!(value["affected_file_count"], MAX_APPROVAL_ITEMS + 1);
+        assert_eq!(
+            value["affected_files"].as_array().unwrap().len(),
+            MAX_APPROVAL_ITEMS
+        );
+        assert_eq!(value["operation_count"], MAX_APPROVAL_ITEMS + 1);
+        assert_eq!(
+            value["operations"].as_array().unwrap().len(),
+            MAX_APPROVAL_ITEMS
+        );
+        assert_eq!(value["details_truncated"], true);
+        assert_eq!(
+            value["detail_resource"]["uri"],
+            format!("mcpls-edit-approval:///project?plan_id={plan_id}&offset_bytes=0")
         );
     }
 

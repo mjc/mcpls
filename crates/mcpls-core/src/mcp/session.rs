@@ -22,6 +22,7 @@ const PROJECT_EVENTS_PREFIX: &str = "mcpls-project-events:///";
 const PROJECT_EVENT_PREFIX: &str = "mcpls-project-event:///";
 const EDIT_DIFF_PREFIX: &str = "mcpls-edit-diff:///";
 const APPLIED_EDIT_RESULT_PREFIX: &str = "mcpls-edit-result:///";
+const EDIT_APPROVAL_PREFIX: &str = "mcpls-edit-approval:///";
 
 /// Encode a project identity as a subscribable MCP status resource URI.
 pub fn project_status_resource_uri(project_id: &ProjectId) -> String {
@@ -120,6 +121,38 @@ pub fn parse_applied_edit_result_resource_uri(uri: &str) -> Option<(ProjectId, P
     ))
 }
 
+/// Encode one session-private immutable approval-detail page.
+pub fn edit_approval_resource_uri(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+) -> String {
+    format!(
+        "{EDIT_APPROVAL_PREFIX}{project_id}?plan_id={}&offset_bytes={offset_bytes}",
+        plan_id.as_str()
+    )
+}
+
+/// Decode one session-private immutable approval-detail page URI.
+pub fn parse_edit_approval_resource_uri(uri: &str) -> Option<(ProjectId, PlanId, usize)> {
+    let value = uri.strip_prefix(EDIT_APPROVAL_PREFIX)?;
+    let (id, query) = value.split_once('?')?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    let mut fields = query.split('&');
+    let plan_id = fields.next()?.strip_prefix("plan_id=")?;
+    let offset_bytes = fields.next()?.strip_prefix("offset_bytes=")?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((
+        ProjectId::new(id.to_owned()).ok()?,
+        PlanId::parse(plan_id.to_owned()).ok()?,
+        offset_bytes,
+    ))
+}
+
 /// Decode a project event resource URI and optional polling cursor.
 pub fn parse_project_events_resource_uri(uri: &str) -> Option<(ProjectId, Option<u64>)> {
     let value = uri.strip_prefix(PROJECT_EVENTS_PREFIX)?;
@@ -177,6 +210,15 @@ pub enum SessionResource {
         /// UTF-8 byte offset into the complete JSON detail.
         offset_bytes: usize,
     },
+    /// A bounded page of a session-owned immutable approval detail.
+    EditApproval {
+        /// Stable project identity.
+        project_id: ProjectId,
+        /// Session-owned preview plan.
+        plan_id: PlanId,
+        /// UTF-8 byte offset into the complete JSON detail.
+        offset_bytes: usize,
+    },
     /// Snapshot-bound source context omitted from a bounded semantic result.
     Source(SourceResource),
     /// Actor-owned deferred semantic section and byte cursor.
@@ -215,6 +257,13 @@ pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, Resource
     }
     if let Some((project_id, plan_id, offset_bytes)) = parse_applied_edit_result_resource_uri(uri) {
         return Ok(SessionResource::AppliedEditResult {
+            project_id,
+            plan_id,
+            offset_bytes,
+        });
+    }
+    if let Some((project_id, plan_id, offset_bytes)) = parse_edit_approval_resource_uri(uri) {
+        return Ok(SessionResource::EditApproval {
             project_id,
             plan_id,
             offset_bytes,
