@@ -597,8 +597,10 @@ fn find_path(value: &Value) -> Option<String> {
             object.values().find_map(find_path)
         }
         Value::Array(array) => array.iter().find_map(find_path),
-        Value::String(text) if text.starts_with('{') || text.starts_with('[') => {
-            serde_json::from_str(text)
+        Value::String(text)
+            if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'[')) =>
+        {
+            serde_json::from_str(text.trim_start())
                 .ok()
                 .and_then(|value| find_path(&value))
         }
@@ -613,8 +615,10 @@ fn contains_true(value: &Value, key: &str) -> bool {
                 || object.values().any(|value| contains_true(value, key))
         }
         Value::Array(array) => array.iter().any(|value| contains_true(value, key)),
-        Value::String(text) if text.starts_with('{') || text.starts_with('[') => {
-            serde_json::from_str(text).is_ok_and(|value| contains_true(&value, key))
+        Value::String(text)
+            if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'[')) =>
+        {
+            serde_json::from_str(text.trim_start()).is_ok_and(|value| contains_true(&value, key))
         }
         _ => false,
     }
@@ -759,7 +763,7 @@ mod tests {
     #[test]
     fn history_parser_emits_only_scrubbed_semantic_and_source_read_events() {
         let history = concat!(
-            r#"{"type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"mcpls","tool":"get_definition","arguments":{"file_path":"/home/alice/private/src/lib.rs","line":2}},"duration":{"secs":0,"nanos":12000000},"result":{"Ok":{"content":[{"text":"{\"locations\":[{\"path\":\"/home/alice/private/src/lib.rs\",\"truncated\":false}]}"}]}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"mcpls","tool":"workspace_symbol_search","arguments":{"query":"private"}},"duration":{"secs":0,"nanos":12000000},"result":{"Ok":{"content":[{"text":" \n{\"locations\":[{\"path\":\"/home/alice/private/src/lib.rs\",\"truncated\":true}]}"}]}}}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = exec_command({cmd: \"sed -n 1,40p /home/alice/private/src/lib.rs\"});"}}"#,
             "\n",
@@ -777,6 +781,7 @@ mod tests {
                 .all(|event| !format!("{event:?}").contains("alice"))
         );
         assert_eq!(evaluate(&events).aggregate.post_semantic_same_file_reads, 1);
+        assert_eq!(evaluate(&events).aggregate.truncated, 1);
     }
 
     #[test]
