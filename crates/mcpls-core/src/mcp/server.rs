@@ -18,14 +18,16 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, ElicitRequest, ElicitRequestParams,
     ElicitationSchema, Implementation, InputRequest, InputRequests, InputRequiredResult,
-    InputResponses, ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
-    SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
+    InputResponses, JsonObject, ListResourcesResult, ListToolsResult, MetaObject,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, SubscriptionFilter, Tool,
+    UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use tokio::sync::Mutex;
@@ -1163,7 +1165,6 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
     value
 }
 
-const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
 const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
 const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
@@ -1173,18 +1174,58 @@ const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 16 * 1024;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
-    "project_list",
     "workspace_symbol_search",
-    "workspace_symbol_search_batch",
     "inspect_symbol",
-    "inspect_symbol_batch",
+    "get_diagnostics",
     "lexical_search",
     "read_semantic_resource",
-    "get_diagnostics",
+    "workspace_symbol_search_batch",
+    "inspect_symbol_batch",
     "structural_replace_preview",
     "workspace_edit_preview",
     "workspace_edit_apply",
+    "code_action_apply",
+    "project_list",
 ];
+
+/// Remove JSON Schema presentation metadata while retaining every invocation contract.
+fn compact_advertised_input_schema(schema: &mut JsonObject) {
+    for key in [
+        "$schema",
+        "deprecated",
+        "description",
+        "examples",
+        "readOnly",
+        "title",
+        "writeOnly",
+    ] {
+        schema.remove(key);
+    }
+
+    for (key, value) in schema {
+        if matches!(key.as_str(), "properties" | "$defs" | "definitions") {
+            if let Value::Object(entries) = value {
+                for schema in entries.values_mut() {
+                    compact_advertised_schema_value(schema);
+                }
+            }
+        } else {
+            compact_advertised_schema_value(value);
+        }
+    }
+}
+
+fn compact_advertised_schema_value(value: &mut Value) {
+    match value {
+        Value::Object(schema) => compact_advertised_input_schema(schema),
+        Value::Array(values) => {
+            for value in values {
+                compact_advertised_schema_value(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn advertised_tools() -> Vec<Tool> {
     let mut tools = McplsServer::tool_router()
@@ -1192,13 +1233,8 @@ fn advertised_tools() -> Vec<Tool> {
         .into_iter()
         .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
         .map(|mut tool| {
-            let oversized = tool.output_schema.as_ref().is_some_and(|schema| {
-                serde_json::to_vec(schema)
-                    .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
-            });
-            if oversized {
-                tool.output_schema = None;
-            }
+            compact_advertised_input_schema(Arc::make_mut(&mut tool.input_schema));
+            tool.output_schema = None;
             tool
         })
         .collect::<Vec<_>>();
@@ -6095,20 +6131,30 @@ finally:
             "advertised tool surface is {advertised_bytes} bytes vs {full_bytes} internally"
         );
 
+        assert!(advertised.iter().all(|tool| tool.output_schema.is_none()));
         for advertised in &advertised {
             let full = full
                 .iter()
                 .find(|tool| tool.name == advertised.name)
                 .unwrap();
-            let oversized = full.output_schema.as_ref().is_some_and(|schema| {
-                serde_json::to_vec(schema)
-                    .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
-            });
             assert_eq!(
-                advertised.output_schema.is_some(),
-                !oversized,
-                "unexpected advertised output schema policy for {}",
-                full.name
+                advertised.input_schema.get("type"),
+                full.input_schema.get("type")
+            );
+            assert_eq!(
+                advertised.input_schema.get("required"),
+                full.input_schema.get("required")
+            );
+            assert_eq!(
+                advertised
+                    .input_schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.keys().collect::<Vec<_>>()),
+                full.input_schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.keys().collect::<Vec<_>>())
             );
         }
     }
@@ -6136,24 +6182,30 @@ finally:
         let full_bytes = serde_json::to_vec(&full).unwrap().len();
         let (first_page, first_cursor) = advertised_tools_page(None).unwrap();
         assert!(first_cursor.is_some());
-        for name in [
-            "project_list",
-            "workspace_symbol_search",
-            "workspace_symbol_search_batch",
-            "inspect_symbol",
-            "inspect_symbol_batch",
-            "lexical_search",
-            "read_semantic_resource",
-            "get_diagnostics",
-            "structural_replace_preview",
-            "workspace_edit_preview",
-            "workspace_edit_apply",
-        ] {
-            assert!(
-                first_page.iter().any(|tool| tool.name == name),
-                "default tools/list page is missing {name}"
-            );
-        }
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            [
+                "workspace_symbol_search",
+                "inspect_symbol",
+                "get_diagnostics",
+                "lexical_search",
+                "read_semantic_resource",
+                "workspace_symbol_search_batch",
+                "inspect_symbol_batch",
+                "structural_replace_preview",
+                "workspace_edit_preview",
+                "workspace_edit_apply",
+                "code_action_apply",
+                "project_list",
+            ]
+        );
+        assert!(
+            full_bytes <= 32 * 1024,
+            "full advertised catalog is {full_bytes} bytes"
+        );
         assert!(
             serde_json::to_vec(&first_page).unwrap().len() * 2 < full_bytes,
             "default tools/list page must be less than half the full catalog"
