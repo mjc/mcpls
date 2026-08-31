@@ -56,6 +56,16 @@ fn completed_tool_result_bytes(result: &Result<CallToolResponse, ErrorData>) -> 
         .map(|()| bytes.0)
 }
 
+fn tool_request_argument_bytes(
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> usize {
+    let Some(arguments) = arguments else {
+        return 0;
+    };
+    let mut bytes = ByteCounter::default();
+    serde_json::to_writer(&mut bytes, arguments).map_or(0, |_| bytes.0)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ToolResultMetrics {
     cache_hit: Option<bool>,
@@ -237,6 +247,7 @@ impl RequestSpan {
             protocol_version = tracing::field::Empty,
             transport,
             duration_ms = tracing::field::Empty,
+            request_bytes = tracing::field::Empty,
             result_bytes = tracing::field::Empty,
             inline_bytes = tracing::field::Empty,
             deferred_bytes = tracing::field::Empty,
@@ -315,6 +326,10 @@ impl RequestSpan {
         self.span.record("success", result.is_ok() && !tool_error);
         self.span.record("protocol_error", result.is_err());
         self.span.record("tool_error", tool_error);
+    }
+
+    fn record_request_bytes(&self, request_bytes: usize) {
+        self.span.record("request_bytes", request_bytes);
     }
 }
 
@@ -591,6 +606,7 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
         let tool = request.name.clone();
+        let request_bytes = tool_request_argument_bytes(request.arguments.as_ref());
         let span = RequestSpan::new(
             "tools/call",
             self.transport,
@@ -598,6 +614,7 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
             Some(tool.as_ref()),
             None,
         );
+        span.record_request_bytes(request_bytes);
         async move {
             let result = self
                 .inner
@@ -796,6 +813,20 @@ mod tests {
             completed_tool_result_bytes(&result),
             Some(serde_json::to_vec(&payload).unwrap().len())
         );
+    }
+
+    #[test]
+    fn tool_request_argument_bytes_count_arguments_without_retaining_them() {
+        let arguments = serde_json::Map::from_iter([(
+            "replacement".to_owned(),
+            serde_json::Value::String("private source text".to_owned()),
+        )]);
+
+        assert_eq!(
+            tool_request_argument_bytes(Some(&arguments)),
+            serde_json::to_vec(&arguments).unwrap().len()
+        );
+        assert_eq!(tool_request_argument_bytes(None), 0);
     }
 
     #[test]
