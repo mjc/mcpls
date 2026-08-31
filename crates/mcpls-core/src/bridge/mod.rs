@@ -7,6 +7,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 
 pub(crate) mod ast_grep;
 mod encoding;
+pub(crate) mod lexical;
 mod notifications;
 pub mod resources;
 mod state;

@@ -24,6 +24,7 @@ lsp-types = { workspace = true }
 notify = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+regex = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",
     "transport-io",

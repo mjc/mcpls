@@ -1436,6 +1436,7 @@ dependencies = [
  "notify",
  "opentelemetry",
  "opentelemetry_sdk",
+ "regex",
  "rmcp",
  "rstest",
  "rustix",
