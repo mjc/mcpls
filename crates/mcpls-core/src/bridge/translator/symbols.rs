@@ -849,7 +849,7 @@ impl Translator {
             });
         }
 
-        if path.is_some() && candidates.is_empty() {
+        if candidates.is_empty() {
             return fallback().await;
         }
 

@@ -556,6 +556,12 @@ pub(crate) fn is_generated_path(path: &std::path::Path) -> bool {
 }
 
 fn symbol_name<L: LanguageExt>(node: &Node<'_, StrDoc<L>>) -> Option<String> {
+    if node.kind() == "use_declaration" {
+        return node
+            .dfs()
+            .filter_map(|child| identifier_text(&child))
+            .last();
+    }
     ["name", "declarator", "left", "pattern"]
         .into_iter()
         .find_map(|field| node.field(field))
@@ -593,6 +599,8 @@ fn symbol_kind<L: LanguageExt>(node: &Node<'_, StrDoc<L>>) -> Option<&'static st
         Some("method")
     } else if kind.contains("function") || kind.contains("procedure") {
         Some("function")
+    } else if kind.contains("macro") && node.text().trim_start().starts_with("macro_rules!") {
+        Some("function")
     } else if kind.contains("class") {
         Some("class")
     } else if kind.contains("interface") || kind == "trait_item" {
@@ -607,6 +615,8 @@ fn symbol_kind<L: LanguageExt>(node: &Node<'_, StrDoc<L>>) -> Option<&'static st
         Some("constant")
     } else if kind.contains("type_alias") || kind == "type_item" {
         Some("type")
+    } else if kind == "use_declaration" && node.text().contains(" as ") {
+        Some("function")
     } else {
         None
     }
@@ -676,6 +686,52 @@ mod tests {
         assert_eq!(symbols[0].kind, "struct");
         assert_eq!(symbols[1].name, "fallback_function");
         assert_eq!(symbols[1].kind, "function");
+    }
+
+    #[test]
+    fn extracts_rust_reexport_aliases_in_process() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("lib.rs"),
+            "pub use functions::create_repo as reexported_create_repo;\n",
+        )
+        .unwrap();
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["rust".to_owned()],
+            "reexported_create_repo",
+            None,
+            10,
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "reexported_create_repo");
+    }
+
+    #[test]
+    fn extracts_rust_macro_definitions_but_not_invocations() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("lib.rs"),
+            "macro_rules! fixture_macro { () => {}; }\nfn uses_it() { fixture_macro!(); }\n",
+        )
+        .unwrap();
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["rust".to_owned()],
+            "fixture_macro",
+            None,
+            10,
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "fixture_macro");
     }
 
     #[test]
