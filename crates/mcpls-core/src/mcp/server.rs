@@ -2576,7 +2576,7 @@ impl McplsServer {
     async fn lexical_search(
         &self,
         Parameters(params): Parameters<LexicalSearchParams>,
-    ) -> Result<Json<Vec<crate::bridge::LexicalSearchMatch>>, McpError> {
+    ) -> Result<Json<serde_json::Value>, McpError> {
         if params.max_files == 0 || params.max_matches == 0 {
             return Err(McpError::invalid_params(
                 "max_files and max_matches must be greater than zero",
@@ -2591,6 +2591,15 @@ impl McplsServer {
             params.multiline,
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
+        let offset = params.page_token.as_deref().map_or(Ok(0), |token| {
+            token.parse::<usize>().map_err(|_| {
+                McpError::invalid_params(
+                    "page_token must be the decimal next_cursor returned by lexical_search",
+                    None,
+                )
+            })
+        })?;
+        let limit = params.max_matches;
         let id = parse_project_id(params.project_id)?;
         let actor = self
             .context
@@ -2598,20 +2607,29 @@ impl McplsServer {
             .actor_for_project(&id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        encode_tool_result(
-            actor
-                .lexical_search(LexicalSearchRequest {
-                    query: params.query,
-                    mode: params.mode,
-                    case: params.case,
-                    multiline: params.multiline,
-                    max_files: params.max_files,
-                    max_matches: params.max_matches,
-                    include_generated: params.include_generated,
-                })
-                .await
-                .map_err(|error| error.to_string()),
-        )
+        let mut matches = actor
+            .lexical_search(LexicalSearchRequest {
+                query: params.query,
+                mode: params.mode,
+                case: params.case,
+                multiline: params.multiline,
+                max_files: params.max_files,
+                max_matches: offset.saturating_add(limit).saturating_add(1),
+                include_generated: params.include_generated,
+            })
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let has_next_page = matches.len() > offset.saturating_add(limit);
+        let end = offset.saturating_add(limit).min(matches.len());
+        let matches = matches
+            .drain(offset.min(matches.len())..end)
+            .collect::<Vec<_>>();
+        encode_tool_result(Ok::<_, String>(serde_json::json!({
+            "matches": matches,
+            "returned": matches.len(),
+            "truncated": has_next_page,
+            "next_cursor": has_next_page.then(|| offset.saturating_add(limit).to_string()),
+        })))
     }
 
     /// Search several symbol names through one bounded actor request.

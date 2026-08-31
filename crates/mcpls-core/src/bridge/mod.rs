@@ -15,9 +15,7 @@ pub(crate) mod translator;
 
 pub(crate) use ast_grep::{StructuralMatch, StructuralSearchResult};
 pub use encoding::{EncodingConverter, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
-pub(crate) use lexical::{
-    LexicalCaseMode, LexicalMatchMode, LexicalSearchMatch, LexicalSearchRequest,
-};
+pub(crate) use lexical::{LexicalCaseMode, LexicalMatchMode, LexicalSearchRequest};
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };

@@ -389,6 +389,9 @@ pub struct LexicalSearchParams {
     /// Maximum matches returned (default: 100).
     #[serde(default = "default_lexical_max_matches")]
     pub max_matches: usize,
+    /// Decimal offset returned by a prior lexical-search `next_cursor`.
+    #[serde(default)]
+    pub page_token: Option<String>,
     /// Include generated/build-output files.
     #[serde(default)]
     pub include_generated: bool,
