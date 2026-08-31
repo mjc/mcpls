@@ -6434,6 +6434,28 @@ finally:
             "after\n"
         );
 
+        let detail = server
+            .read_edit_diff_resource(
+                ProjectId::new("project").unwrap(),
+                PlanId::parse(plan_id.clone()).unwrap(),
+                0,
+                format!("mcpls-edit-diff:///project?plan_id={plan_id}&offset_bytes=0"),
+                false,
+            )
+            .await
+            .unwrap();
+        let ReadResourceResponse::Complete(detail) = detail else {
+            panic!("applied detail resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &detail.contents[0] else {
+            panic!("applied detail resource was not text");
+        };
+        let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&page.text).unwrap();
+        assert_eq!(detail["plan_id"], plan_id);
+        assert_eq!(detail["operations"], serde_json::json!(["replace src.rs"]));
+        assert_eq!(detail["unified_diff"], result["unified_diff"]);
+
         let events = server
             .read_project_events_resource(
                 ProjectId::new("project").unwrap(),
