@@ -857,8 +857,12 @@ pub enum WorkspaceEditApplyResult {
         committed: bool,
         /// Project-relative paths committed by the edit.
         committed_files: Vec<String>,
+        /// Total committed file count, including paths omitted from this response.
+        committed_file_count: usize,
         /// Human-readable operations captured by the preview.
         operations: Vec<String>,
+        /// Total operation count, including operations omitted from this response.
+        operation_count: usize,
         /// Unified diff captured by the preview.
         unified_diff: String,
         /// Session-private resource for complete applied detail when the inline diff is bounded.
@@ -870,6 +874,10 @@ pub enum WorkspaceEditApplyResult {
         /// Optional post-commit provider convergence details.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         provider_synchronization: Vec<WorkspaceEditProviderSynchronization>,
+        /// Total provider synchronization result count, including omitted results.
+        provider_synchronization_count: usize,
+        /// Whether complete committed detail is available from `detail_resource`.
+        details_truncated: bool,
         /// Aggregate provider state when synchronization details are present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         semantic_state: Option<String>,
@@ -1097,11 +1105,15 @@ mod tests {
             plan_id: "plan".to_owned(),
             committed: true,
             committed_files: vec!["src/lib.rs".to_owned()],
+            committed_file_count: 1,
             operations: vec!["edit src/lib.rs".to_owned()],
+            operation_count: 1,
             unified_diff: "diff".to_owned(),
             detail_resource: None,
             verification: None,
             provider_synchronization: Vec::new(),
+            provider_synchronization_count: 0,
+            details_truncated: false,
             semantic_state: None,
         };
         let not_ready = WorkspaceEditApplyResult::NotReady {
@@ -1141,7 +1153,11 @@ mod tests {
                 "plan_id": "plan",
                 "committed": true,
                 "committed_files": ["src/lib.rs"],
+                "committed_file_count": 1,
                 "operations": ["edit src/lib.rs"],
+                "operation_count": 1,
+                "provider_synchronization_count": 0,
+                "details_truncated": false,
                 "unified_diff": "diff",
             })
         );

@@ -21,6 +21,7 @@ const PROJECT_STATUS_PREFIX: &str = "mcpls-project-status:///";
 const PROJECT_EVENTS_PREFIX: &str = "mcpls-project-events:///";
 const PROJECT_EVENT_PREFIX: &str = "mcpls-project-event:///";
 const EDIT_DIFF_PREFIX: &str = "mcpls-edit-diff:///";
+const APPLIED_EDIT_RESULT_PREFIX: &str = "mcpls-edit-result:///";
 
 /// Encode a project identity as a subscribable MCP status resource URI.
 pub fn project_status_resource_uri(project_id: &ProjectId) -> String {
@@ -87,6 +88,38 @@ pub fn parse_edit_diff_resource_uri(uri: &str) -> Option<(ProjectId, PlanId, usi
     ))
 }
 
+/// Encode one session-private immutable applied edit result page.
+pub fn applied_edit_result_resource_uri(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+) -> String {
+    format!(
+        "{APPLIED_EDIT_RESULT_PREFIX}{project_id}?plan_id={}&offset_bytes={offset_bytes}",
+        plan_id.as_str()
+    )
+}
+
+/// Decode a session-private immutable applied edit result page URI.
+pub fn parse_applied_edit_result_resource_uri(uri: &str) -> Option<(ProjectId, PlanId, usize)> {
+    let value = uri.strip_prefix(APPLIED_EDIT_RESULT_PREFIX)?;
+    let (id, query) = value.split_once('?')?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    let mut fields = query.split('&');
+    let plan_id = fields.next()?.strip_prefix("plan_id=")?;
+    let offset_bytes = fields.next()?.strip_prefix("offset_bytes=")?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((
+        ProjectId::new(id.to_owned()).ok()?,
+        PlanId::parse(plan_id.to_owned()).ok()?,
+        offset_bytes,
+    ))
+}
+
 /// Decode a project event resource URI and optional polling cursor.
 pub fn parse_project_events_resource_uri(uri: &str) -> Option<(ProjectId, Option<u64>)> {
     let value = uri.strip_prefix(PROJECT_EVENTS_PREFIX)?;
@@ -135,6 +168,15 @@ pub enum SessionResource {
         /// UTF-8 byte offset into the complete unified diff.
         offset_bytes: usize,
     },
+    /// A bounded page of a session-owned immutable applied edit result.
+    AppliedEditResult {
+        /// Stable project identity.
+        project_id: ProjectId,
+        /// Session-owned committed plan.
+        plan_id: PlanId,
+        /// UTF-8 byte offset into the complete JSON detail.
+        offset_bytes: usize,
+    },
     /// Snapshot-bound source context omitted from a bounded semantic result.
     Source(SourceResource),
     /// Actor-owned deferred semantic section and byte cursor.
@@ -166,6 +208,13 @@ pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, Resource
     }
     if let Some((project_id, plan_id, offset_bytes)) = parse_edit_diff_resource_uri(uri) {
         return Ok(SessionResource::EditDiff {
+            project_id,
+            plan_id,
+            offset_bytes,
+        });
+    }
+    if let Some((project_id, plan_id, offset_bytes)) = parse_applied_edit_result_resource_uri(uri) {
+        return Ok(SessionResource::AppliedEditResult {
             project_id,
             plan_id,
             offset_bytes,
@@ -582,6 +631,21 @@ mod tests {
             }
         );
         assert!(parse_session_resource_uri("mcpls-edit-diff:///project?plan_id=plan").is_err());
+    }
+
+    #[test]
+    fn applied_edit_result_resource_uri_round_trips_a_session_owned_page() {
+        let project_id = ProjectId::new("project").unwrap();
+        let plan_id = PlanId::parse("plan").unwrap();
+        let uri = super::applied_edit_result_resource_uri(&project_id, &plan_id, 42);
+        assert_eq!(
+            parse_session_resource_uri(&uri).unwrap(),
+            SessionResource::AppliedEditResult {
+                project_id,
+                plan_id,
+                offset_bytes: 42,
+            }
+        );
     }
 
     #[test]

@@ -1863,6 +1863,11 @@ enum ProjectRequest {
         project_id: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    ReadAppliedEditDetail {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     ApplyEditPlan {
         plan_id: PlanId,
         project_id: String,
@@ -2171,6 +2176,7 @@ impl ProjectRequest {
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
             Self::ReadEditPlanDiff { reply, .. } => reply.is_closed(),
+            Self::ReadAppliedEditDetail { reply, .. } => reply.is_closed(),
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
@@ -3487,6 +3493,27 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Read the complete immutable result for one committed edit plan.
+    pub(crate) async fn read_applied_edit_detail(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<String, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReadAppliedEditDetail {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Apply a plan while holding the registry-owned path reservation.
     pub(crate) async fn apply_edit_plan_with_lease(
         &self,
@@ -3731,7 +3758,7 @@ const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
 const MAX_EDIT_ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_APPLIED_EDIT_RECEIPTS: usize = 256;
-const MAX_APPLIED_EDIT_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_APPLIED_EDIT_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUST_RESIDENCY_LIMIT: usize = 5;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
@@ -5017,17 +5044,26 @@ impl ProjectRuntime {
     }
 
     fn read_edit_plan_diff(&self, plan_id: &PlanId, project_id: &str) -> Result<String, String> {
-        match self.edit_plans.get_for_project(plan_id, project_id) {
-            Ok(plan) => Ok(plan.complete_unified_diff()),
-            Err(error) => self
-                .applied_edit_receipts
-                .iter()
-                .find(|receipt| &receipt.plan_id == plan_id)
-                .map(|receipt| serde_json::to_string(&receipt.detail_json()))
-                .transpose()
-                .map_err(|serialization| serialization.to_string())?
-                .ok_or_else(|| error.to_string()),
-        }
+        self.edit_plans
+            .get_for_project(plan_id, project_id)
+            .map(EditPlan::complete_unified_diff)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_applied_edit_detail(
+        &self,
+        plan_id: &PlanId,
+        project_id: &str,
+    ) -> Result<String, String> {
+        self.applied_edit_receipts
+            .iter()
+            .find(|receipt| &receipt.plan_id == plan_id)
+            .map(|receipt| serde_json::to_string(&receipt.detail_json()))
+            .transpose()
+            .map_err(|serialization| serialization.to_string())?
+            .ok_or_else(|| {
+                format!("applied edit result for project {project_id} is no longer retained")
+            })
     }
 
     fn configure_edit_safety(
@@ -8311,6 +8347,13 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.read_edit_plan_diff(&plan_id, &project_id));
+        }
+        ProjectRequest::ReadAppliedEditDetail {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.read_applied_edit_detail(&plan_id, &project_id));
         }
         ProjectRequest::ApplyEditPlan {
             plan_id,

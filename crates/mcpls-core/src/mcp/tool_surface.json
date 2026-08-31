@@ -153,6 +153,12 @@
               "description": "Whether the edit reached the filesystem commit point.",
               "type": "boolean"
             },
+            "committed_file_count": {
+              "description": "Total committed file count, including paths omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "committed_files": {
               "description": "Project-relative paths committed by the edit.",
               "items": {
@@ -166,6 +172,16 @@
                 "string",
                 "null"
               ]
+            },
+            "details_truncated": {
+              "description": "Whether complete committed detail is available from `detail_resource`.",
+              "type": "boolean"
+            },
+            "operation_count": {
+              "description": "Total operation count, including operations omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
@@ -188,6 +204,12 @@
                 "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
               },
               "type": "array"
+            },
+            "provider_synchronization_count": {
+              "description": "Total provider synchronization result count, including omitted results.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "semantic_state": {
               "description": "Aggregate provider state when synchronization details are present.",
@@ -218,8 +240,12 @@
             "plan_id",
             "committed",
             "committed_files",
+            "committed_file_count",
             "operations",
-            "unified_diff"
+            "operation_count",
+            "unified_diff",
+            "provider_synchronization_count",
+            "details_truncated"
           ],
           "type": "object"
         },
@@ -2565,6 +2591,12 @@
               "description": "Whether the edit reached the filesystem commit point.",
               "type": "boolean"
             },
+            "committed_file_count": {
+              "description": "Total committed file count, including paths omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "committed_files": {
               "description": "Project-relative paths committed by the edit.",
               "items": {
@@ -2578,6 +2610,16 @@
                 "string",
                 "null"
               ]
+            },
+            "details_truncated": {
+              "description": "Whether complete committed detail is available from `detail_resource`.",
+              "type": "boolean"
+            },
+            "operation_count": {
+              "description": "Total operation count, including operations omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
@@ -2600,6 +2642,12 @@
                 "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
               },
               "type": "array"
+            },
+            "provider_synchronization_count": {
+              "description": "Total provider synchronization result count, including omitted results.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "semantic_state": {
               "description": "Aggregate provider state when synchronization details are present.",
@@ -2630,8 +2678,12 @@
             "plan_id",
             "committed",
             "committed_files",
+            "committed_file_count",
             "operations",
-            "unified_diff"
+            "operation_count",
+            "unified_diff",
+            "provider_synchronization_count",
+            "details_truncated"
           ],
           "type": "object"
         },
@@ -18109,6 +18161,12 @@
               "description": "Whether the edit reached the filesystem commit point.",
               "type": "boolean"
             },
+            "committed_file_count": {
+              "description": "Total committed file count, including paths omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "committed_files": {
               "description": "Project-relative paths committed by the edit.",
               "items": {
@@ -18122,6 +18180,16 @@
                 "string",
                 "null"
               ]
+            },
+            "details_truncated": {
+              "description": "Whether complete committed detail is available from `detail_resource`.",
+              "type": "boolean"
+            },
+            "operation_count": {
+              "description": "Total operation count, including operations omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
@@ -18144,6 +18212,12 @@
                 "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
               },
               "type": "array"
+            },
+            "provider_synchronization_count": {
+              "description": "Total provider synchronization result count, including omitted results.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "semantic_state": {
               "description": "Aggregate provider state when synchronization details are present.",
@@ -18174,8 +18248,12 @@
             "plan_id",
             "committed",
             "committed_files",
+            "committed_file_count",
             "operations",
-            "unified_diff"
+            "operation_count",
+            "unified_diff",
+            "provider_synchronization_count",
+            "details_truncated"
           ],
           "type": "object"
         },
@@ -18720,6 +18798,12 @@
               "description": "Whether the edit reached the filesystem commit point.",
               "type": "boolean"
             },
+            "committed_file_count": {
+              "description": "Total committed file count, including paths omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "committed_files": {
               "description": "Project-relative paths committed by the edit.",
               "items": {
@@ -18733,6 +18817,16 @@
                 "string",
                 "null"
               ]
+            },
+            "details_truncated": {
+              "description": "Whether complete committed detail is available from `detail_resource`.",
+              "type": "boolean"
+            },
+            "operation_count": {
+              "description": "Total operation count, including operations omitted from this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
@@ -18755,6 +18849,12 @@
                 "$ref": "#/$defs/WorkspaceEditProviderSynchronization"
               },
               "type": "array"
+            },
+            "provider_synchronization_count": {
+              "description": "Total provider synchronization result count, including omitted results.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "semantic_state": {
               "description": "Aggregate provider state when synchronization details are present.",
@@ -18785,8 +18885,12 @@
             "plan_id",
             "committed",
             "committed_files",
+            "committed_file_count",
             "operations",
-            "unified_diff"
+            "operation_count",
+            "unified_diff",
+            "provider_synchronization_count",
+            "details_truncated"
           ],
           "type": "object"
         },

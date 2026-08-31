@@ -33,9 +33,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
-    DeferredResource, SessionResource, edit_diff_resource_uri, event_resource_uris,
-    parse_session_resource_uri, project_event_resource_uri, project_events_resource_uri,
-    project_status_resource_uri,
+    DeferredResource, SessionResource, applied_edit_result_resource_uri, edit_diff_resource_uri,
+    event_resource_uris, parse_session_resource_uri, project_event_resource_uri,
+    project_events_resource_uri, project_status_resource_uri,
 };
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
@@ -183,6 +183,61 @@ fn edit_diff_resource_page(
         }
         end = next_end;
         while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+}
+
+fn applied_edit_result_resource_page(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+    detail: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    if offset_bytes > detail.len() || !detail.is_char_boundary(offset_bytes) {
+        return Err(McpError::invalid_params(
+            "invalid applied edit result offset; restart from the original URI",
+            None,
+        ));
+    }
+
+    let total_bytes = detail.len();
+    let snapshot_hash = format!("{:x}", Sha256::digest(detail.as_bytes()));
+    let mut end = (offset_bytes + MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2).min(total_bytes);
+    while end > offset_bytes && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let uri = applied_edit_result_resource_uri(project_id, plan_id, offset_bytes);
+        let next_uri =
+            (end < total_bytes).then(|| applied_edit_result_resource_uri(project_id, plan_id, end));
+        let result = SemanticResourceReadResult {
+            uri,
+            mime_type: "application/json".to_owned(),
+            text: detail[offset_bytes..end].to_owned(),
+            next_uri,
+            total_bytes: Some(total_bytes),
+            offset_bytes: Some(offset_bytes),
+            returned_bytes: Some(end - offset_bytes),
+            remaining_bytes: Some(total_bytes - end),
+            snapshot_hash: Some(snapshot_hash.clone()),
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len()
+            <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+        {
+            return Ok(result);
+        }
+        let next_end = offset_bytes + (end - offset_bytes) / 2;
+        if next_end == offset_bytes {
+            return Err(McpError::internal_error(
+                "applied edit result resource metadata exceeds the response budget",
+                None,
+            ));
+        }
+        end = next_end;
+        while !detail.is_char_boundary(end) {
             end -= 1;
         }
     }
@@ -573,6 +628,8 @@ fn project_relative_paths(roots: &[PathBuf], paths: Vec<PathBuf>) -> Vec<String>
         .collect()
 }
 
+const MAX_INLINE_APPLIED_ITEMS: usize = 64;
+
 fn workspace_edit_apply_result(
     outcome: ApplyEditPlanOutcome,
     project_id: &str,
@@ -589,10 +646,18 @@ fn workspace_edit_apply_result(
             provider_synchronization,
         }) => {
             let committed_files = project_relative_paths(roots, committed_files);
-            let detail_resource = (unified_diff.len() > MAX_INLINE_APPLIED_DIFF_BYTES).then(|| {
-                format!(
-                    "mcpls-edit-diff:///{project_id}?plan_id={}&offset_bytes=0",
-                    plan_id.as_str()
+            let committed_file_count = committed_files.len();
+            let operation_count = operations.len();
+            let provider_synchronization_count = provider_synchronization.len();
+            let details_truncated = unified_diff.len() > MAX_INLINE_APPLIED_DIFF_BYTES
+                || committed_file_count > MAX_INLINE_APPLIED_ITEMS
+                || operation_count > MAX_INLINE_APPLIED_ITEMS
+                || provider_synchronization_count > MAX_INLINE_APPLIED_ITEMS;
+            let detail_resource = details_truncated.then(|| {
+                applied_edit_result_resource_uri(
+                    &ProjectId::new(project_id.to_owned()).expect("registered project id"),
+                    &plan_id,
+                    0,
                 )
             });
             let unified_diff =
@@ -609,6 +674,7 @@ fn workspace_edit_apply_result(
             });
             let provider_synchronization = provider_synchronization
                 .into_iter()
+                .take(MAX_INLINE_APPLIED_ITEMS)
                 .map(|provider| WorkspaceEditProviderSynchronization {
                     provider: provider.provider,
                     synchronized: provider.synchronized,
@@ -620,12 +686,22 @@ fn workspace_edit_apply_result(
                 project_id: project_id.to_owned(),
                 plan_id: plan_id.as_str().to_owned(),
                 committed: true,
-                committed_files,
-                operations,
+                committed_files: committed_files
+                    .into_iter()
+                    .take(MAX_INLINE_APPLIED_ITEMS)
+                    .collect(),
+                committed_file_count,
+                operations: operations
+                    .into_iter()
+                    .take(MAX_INLINE_APPLIED_ITEMS)
+                    .collect(),
+                operation_count,
                 unified_diff,
                 detail_resource,
                 verification: verification.map(|status| status.as_str().to_owned()),
                 provider_synchronization,
+                provider_synchronization_count,
+                details_truncated,
                 semantic_state,
             }
         }
@@ -1466,7 +1542,7 @@ impl McplsServer {
         uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
-        if !self.context.recognizes_plan(&plan_id).await {
+        if !self.context.owns_plan(&plan_id).await {
             return Err(McpError::invalid_params(
                 "edit plan is not owned by this MCP session",
                 None,
@@ -1483,6 +1559,45 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let page = edit_diff_resource_page(&project_id, &plan_id, offset_bytes, &diff)?;
+        let text = serde_json::to_string(&page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(text, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_applied_edit_result_resource(
+        &self,
+        project_id: ProjectId,
+        plan_id: PlanId,
+        offset_bytes: usize,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.context.recognizes_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "applied edit result is not owned by this MCP session",
+                None,
+            ));
+        }
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let detail = actor
+            .read_applied_edit_detail(plan_id.clone(), project_id.as_str().to_owned())
+            .await
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "stale_resource: applied edit result is no longer retained",
+                    None,
+                )
+            })?;
+        let page = applied_edit_result_resource_page(&project_id, &plan_id, offset_bytes, &detail)?;
         let text = serde_json::to_string(&page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
@@ -3636,7 +3751,8 @@ impl McplsServer {
             | SessionResource::ProjectStatus(_)
             | SessionResource::ProjectEvents { .. }
             | SessionResource::ProjectEvent { .. }
-            | SessionResource::EditDiff { .. } => {
+            | SessionResource::EditDiff { .. }
+            | SessionResource::AppliedEditResult { .. } => {
                 return Err(McpError::invalid_params(
                     "read_semantic_resource accepts only mcpls-source:// or mcpls-deferred:// references",
                     None,
@@ -3811,6 +3927,12 @@ impl McplsServer {
                 SessionResource::EditDiff { .. } => {
                     return Err(McpError::invalid_params(
                         "edit diff resources are readable but not subscribable",
+                        None,
+                    ));
+                }
+                SessionResource::AppliedEditResult { .. } => {
+                    return Err(McpError::invalid_params(
+                        "applied edit result resources are readable but not subscribable",
                         None,
                     ));
                 }
@@ -4023,6 +4145,21 @@ impl ServerHandler for McplsServer {
                     )
                     .await;
             }
+            SessionResource::AppliedEditResult {
+                project_id,
+                plan_id,
+                offset_bytes,
+            } => {
+                return self
+                    .read_applied_edit_result_resource(
+                        project_id,
+                        plan_id,
+                        offset_bytes,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => {
                 return self
@@ -4166,6 +4303,12 @@ impl ServerHandler for McplsServer {
                     None,
                 ));
             }
+            SessionResource::AppliedEditResult { .. } => {
+                return Err(McpError::invalid_params(
+                    "applied edit result resources are readable but not subscribable",
+                    None,
+                ));
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => source.path,
             SessionResource::Deferred(_) => {
@@ -4221,7 +4364,9 @@ impl ServerHandler for McplsServer {
             SessionResource::ProjectEvent { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
-            SessionResource::EditDiff { .. } => request.uri,
+            SessionResource::EditDiff { .. } | SessionResource::AppliedEditResult { .. } => {
+                request.uri
+            }
             SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
             | SessionResource::Source(_)
@@ -4541,6 +4686,85 @@ mod tests {
                 artifact.plan.id().as_str()
             )
         );
+    }
+
+    #[test]
+    fn applied_edit_result_bounds_inline_detail_and_links_the_complete_receipt() {
+        let plan_id = PlanId::parse("plan").unwrap();
+        let result = workspace_edit_apply_result(
+            ApplyEditPlanOutcome::Applied(AppliedEditPlan {
+                plan_id: plan_id.clone(),
+                operations: (0..=MAX_INLINE_APPLIED_ITEMS)
+                    .map(|index| format!("edit src/{index}.rs"))
+                    .collect(),
+                unified_diff: "x".repeat(MAX_INLINE_APPLIED_DIFF_BYTES + 1),
+                complete_unified_diff: "complete diff".to_owned(),
+                committed_files: (0..=MAX_INLINE_APPLIED_ITEMS)
+                    .map(|index| PathBuf::from(format!("/workspace/src/{index}.rs")))
+                    .collect(),
+                verification: None,
+                provider_synchronization: Vec::new(),
+            }),
+            "project",
+            &[PathBuf::from("/workspace")],
+        );
+
+        let WorkspaceEditApplyResult::Applied {
+            committed_files,
+            committed_file_count,
+            operations,
+            operation_count,
+            detail_resource,
+            details_truncated,
+            ..
+        } = result
+        else {
+            panic!("expected an applied edit result");
+        };
+        assert_eq!(committed_file_count, MAX_INLINE_APPLIED_ITEMS + 1);
+        assert_eq!(committed_files.len(), MAX_INLINE_APPLIED_ITEMS);
+        assert_eq!(operation_count, MAX_INLINE_APPLIED_ITEMS + 1);
+        assert_eq!(operations.len(), MAX_INLINE_APPLIED_ITEMS);
+        assert!(details_truncated);
+        assert_eq!(
+            detail_resource,
+            Some(applied_edit_result_resource_uri(
+                &ProjectId::new("project").unwrap(),
+                &plan_id,
+                0,
+            ))
+        );
+    }
+
+    #[test]
+    fn applied_edit_result_resource_pages_complete_json() {
+        let project_id = ProjectId::new("project").unwrap();
+        let plan_id = PlanId::parse("plan").unwrap();
+        let detail =
+            serde_json::json!({"operations": ["x".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)]})
+                .to_string();
+        let mut offset_bytes = 0;
+        let mut recovered = String::new();
+        for _ in 0..8 {
+            let page =
+                applied_edit_result_resource_page(&project_id, &plan_id, offset_bytes, &detail)
+                    .unwrap();
+            assert_eq!(page.mime_type, "application/json");
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            recovered.push_str(&page.text);
+            let Some(next_uri) = page.next_uri else {
+                break;
+            };
+            let SessionResource::AppliedEditResult {
+                offset_bytes: next, ..
+            } = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("continuation must remain an applied edit result resource");
+            };
+            offset_bytes = next;
+        }
+        assert_eq!(recovered, detail);
+        assert!(serde_json::from_str::<serde_json::Value>(&recovered).is_ok());
     }
 
     #[tokio::test]
@@ -6435,11 +6659,11 @@ finally:
         );
 
         let detail = server
-            .read_edit_diff_resource(
+            .read_applied_edit_result_resource(
                 ProjectId::new("project").unwrap(),
                 PlanId::parse(plan_id.clone()).unwrap(),
                 0,
-                format!("mcpls-edit-diff:///project?plan_id={plan_id}&offset_bytes=0"),
+                format!("mcpls-edit-result:///project?plan_id={plan_id}&offset_bytes=0"),
                 false,
             )
             .await
