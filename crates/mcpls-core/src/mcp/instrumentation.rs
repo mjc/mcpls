@@ -50,10 +50,30 @@ fn completed_tool_result_bytes(result: &Result<CallToolResponse, ErrorData>) -> 
     let Ok(CallToolResponse::Complete(result)) = result else {
         return None;
     };
+    serialized_result_bytes(result)
+}
+
+fn serialized_result_bytes<T: serde::Serialize>(result: &T) -> Option<usize> {
     let mut bytes = ByteCounter::default();
     serde_json::to_writer(&mut bytes, result)
         .ok()
         .map(|()| bytes.0)
+}
+
+fn completed_read_resource_bytes(
+    result: &Result<ReadResourceResponse, ErrorData>,
+) -> Option<usize> {
+    let Ok(ReadResourceResponse::Complete(result)) = result else {
+        return None;
+    };
+    serialized_result_bytes(result)
+}
+
+fn completed_prompt_bytes(result: &Result<GetPromptResponse, ErrorData>) -> Option<usize> {
+    let Ok(GetPromptResponse::Complete(result)) = result else {
+        return None;
+    };
+    serialized_result_bytes(result)
 }
 
 fn tool_request_argument_bytes(
@@ -359,6 +379,40 @@ where
     result
 }
 
+async fn dispatch_measured<T, F, Fut, M>(
+    transport: &'static str,
+    method: &'static str,
+    context: RequestContext<RoleServer>,
+    tool: Option<String>,
+    resource: Option<String>,
+    handler: F,
+    result_bytes: M,
+) -> Result<T, ErrorData>
+where
+    F: FnOnce(RequestContext<RoleServer>) -> Fut,
+    Fut: Future<Output = Result<T, ErrorData>>,
+    M: FnOnce(&Result<T, ErrorData>) -> Option<usize>,
+{
+    let span = RequestSpan::new(
+        method,
+        transport,
+        &context,
+        tool.as_deref(),
+        resource.as_deref(),
+    );
+    let result = handler(context).instrument(span.span.clone()).await;
+    let serialization_started = Instant::now();
+    let result_bytes = result_bytes(&result);
+    span.finish(
+        &result,
+        false,
+        result_bytes,
+        None,
+        result_bytes.map(|_| serialization_started),
+    );
+    result
+}
+
 /// A `ServerHandler` forwarding wrapper that instruments every MCP request.
 #[derive(Clone)]
 pub struct InstrumentedServer<H> {
@@ -393,14 +447,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "initialize",
             context,
             None,
             None,
             |context| self.inner.initialize(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -460,14 +514,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetPromptResponse, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "prompts/get",
             context,
             None,
             None,
             |context| self.inner.get_prompt(request, context),
-            |_| false,
+            completed_prompt_bytes,
         )
     }
 
@@ -476,14 +530,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "prompts/list",
             context,
             None,
             None,
             |context| self.inner.list_prompts(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -492,14 +546,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "resources/list",
             context,
             None,
             None,
             |context| self.inner.list_resources(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -508,14 +562,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "resources/templates/list",
             context,
             None,
             None,
             |context| self.inner.list_resource_templates(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -525,14 +579,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_ {
         let resource = resource_label(&request.uri);
-        dispatch(
+        dispatch_measured(
             self.transport,
             "resources/read",
             context,
             None,
             Some(resource),
             |context| self.inner.read_resource(request, context),
-            |_| false,
+            completed_read_resource_bytes,
         )
     }
 
@@ -644,14 +698,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "tools/list",
             context,
             None,
             None,
             |context| self.inner.list_tools(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -811,6 +865,17 @@ mod tests {
 
         assert_eq!(
             completed_tool_result_bytes(&result),
+            Some(serde_json::to_vec(&payload).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn completed_read_resource_bytes_unwraps_the_protocol_response() {
+        let payload = rmcp::model::ReadResourceResult::new(Vec::new());
+        let result = Ok::<_, ErrorData>(ReadResourceResponse::Complete(payload.clone()));
+
+        assert_eq!(
+            completed_read_resource_bytes(&result),
             Some(serde_json::to_vec(&payload).unwrap().len())
         );
     }
