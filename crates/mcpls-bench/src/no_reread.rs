@@ -532,27 +532,37 @@ fn query_fingerprint(tool: &str, arguments: &Value) -> String {
 }
 
 fn deferred_bytes(value: &Value) -> usize {
+    collect_deferred_bytes(value, false)
+}
+
+fn collect_deferred_bytes(value: &Value, legacy_deferred_entry: bool) -> usize {
     match value {
-        Value::Object(object) => object.iter().fold(0, |total, (key, value)| {
-            total.saturating_add(if key == "deferred" {
-                value.as_array().map_or(0, |references| {
-                    references.iter().fold(0, |total, reference| {
-                        total.saturating_add(
-                            reference
-                                .get("bytes")
-                                .and_then(Value::as_u64)
-                                .and_then(|bytes| usize::try_from(bytes).ok())
-                                .unwrap_or_default(),
-                        )
-                    })
+        Value::Object(object) => {
+            let bytes = object
+                .get("uri")
+                .and_then(Value::as_str)
+                .and_then(|_| object.get("total_bytes"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    legacy_deferred_entry
+                        .then(|| object.get("bytes"))
+                        .flatten()
+                        .and_then(Value::as_u64)
                 })
-            } else {
-                deferred_bytes(value)
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .unwrap_or_default();
+            object.iter().fold(bytes, |total, (key, value)| {
+                total.saturating_add(collect_deferred_bytes(value, key == "deferred"))
             })
-        }),
-        Value::Array(values) => values.iter().map(deferred_bytes).sum(),
-        Value::String(text) if text.starts_with('{') || text.starts_with('[') => {
-            serde_json::from_str(text).map_or(0, |value| deferred_bytes(&value))
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|value| collect_deferred_bytes(value, legacy_deferred_entry))
+            .sum(),
+        Value::String(text)
+            if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'[')) =>
+        {
+            serde_json::from_str(text.trim_start()).map_or(0, |value| deferred_bytes(&value))
         }
         _ => 0,
     }
@@ -820,6 +830,24 @@ mod tests {
         assert_eq!(
             report.result_bytes,
             serialized_len(&serde_json::json!({"Ok": {"plan_id": "opaque"}}))
+        );
+    }
+
+    #[test]
+    fn deferred_bytes_counts_snapshot_resource_references() {
+        let reference = serde_json::json!({
+            "result": {
+                "resource": {
+                    "uri": "mcpls-source://opaque",
+                    "total_bytes": 55
+                }
+            }
+        });
+
+        assert_eq!(deferred_bytes(&reference), 55);
+        assert_eq!(
+            deferred_bytes(&Value::String(format!(" \n{reference}"))),
+            55
         );
     }
 
