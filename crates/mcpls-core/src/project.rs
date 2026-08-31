@@ -1024,7 +1024,7 @@ impl ProjectEventHistory {
             events,
             resync_required,
             retention_floor: oldest.saturating_sub(1),
-            next_sequence: self.next_sequence,
+            next_sequence: self.next_sequence.saturating_sub(1),
         }
     }
 }
@@ -12789,6 +12789,12 @@ mod tests {
         assert_eq!(snapshot.events().len(), 2);
         assert_eq!(snapshot.events()[0].sequence(), 2);
         assert_eq!(snapshot.events()[1].sequence(), 3);
+        assert_eq!(snapshot.next_sequence(), 3);
+
+        history.record(ProjectEvent::ServerExited { generation: 2 });
+        let resumed = history.snapshot_since(Some(snapshot.next_sequence()));
+        assert_eq!(resumed.events().len(), 1);
+        assert_eq!(resumed.events()[0].sequence(), 4);
     }
 
     #[test]

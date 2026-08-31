@@ -6067,6 +6067,7 @@ finally:
         assert_eq!(event_payload["returned_events"], 2);
         assert_eq!(event_payload["first_sequence"], 1);
         assert_eq!(event_payload["last_sequence"], 2);
+        assert_eq!(event_payload["next_cursor"], 2);
         assert_eq!(event_payload["events"].as_array().unwrap().len(), 2);
         assert_eq!(event_payload["events"][0]["event"]["kind"], "files_changed");
         assert_eq!(event_payload["events"][1]["event"]["kind"], "edit_applied");
