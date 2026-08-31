@@ -160,6 +160,13 @@
               },
               "type": "array"
             },
+            "detail_resource": {
+              "description": "Session-private resource for complete applied detail when the inline diff is bounded.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
               "items": {
@@ -2564,6 +2571,13 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "detail_resource": {
+              "description": "Session-private resource for complete applied detail when the inline diff is bounded.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
@@ -18102,6 +18116,13 @@
               },
               "type": "array"
             },
+            "detail_resource": {
+              "description": "Session-private resource for complete applied detail when the inline diff is bounded.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "operations": {
               "description": "Human-readable operations captured by the preview.",
               "items": {
@@ -18705,6 +18726,13 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "detail_resource": {
+              "description": "Session-private resource for complete applied detail when the inline diff is bounded.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "operations": {
               "description": "Human-readable operations captured by the preview.",

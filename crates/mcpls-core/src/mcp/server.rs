@@ -589,6 +589,14 @@ fn workspace_edit_apply_result(
             provider_synchronization,
         }) => {
             let committed_files = project_relative_paths(roots, committed_files);
+            let detail_resource = (unified_diff.len() > MAX_INLINE_APPLIED_DIFF_BYTES).then(|| {
+                format!(
+                    "mcpls-edit-diff:///{project_id}?plan_id={}&offset_bytes=0",
+                    plan_id.as_str()
+                )
+            });
+            let unified_diff =
+                crate::util::truncate_str(&unified_diff, MAX_INLINE_APPLIED_DIFF_BYTES);
             let semantic_state = (!provider_synchronization.is_empty()).then(|| {
                 if provider_synchronization
                     .iter()
@@ -615,6 +623,7 @@ fn workspace_edit_apply_result(
                 committed_files,
                 operations,
                 unified_diff,
+                detail_resource,
                 verification: verification.map(|status| status.as_str().to_owned()),
                 provider_synchronization,
                 semantic_state,
@@ -1025,6 +1034,7 @@ const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
 const PROJECT_EVENT_PAGE_SIZE: usize = 64;
 const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
+const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 16 * 1024;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[

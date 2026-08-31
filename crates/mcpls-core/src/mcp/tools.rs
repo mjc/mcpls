@@ -861,6 +861,9 @@ pub enum WorkspaceEditApplyResult {
         operations: Vec<String>,
         /// Unified diff captured by the preview.
         unified_diff: String,
+        /// Session-private resource for complete applied detail when the inline diff is bounded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail_resource: Option<String>,
         /// Optional semantic verification outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         verification: Option<String>,
@@ -1096,6 +1099,7 @@ mod tests {
             committed_files: vec!["src/lib.rs".to_owned()],
             operations: vec!["edit src/lib.rs".to_owned()],
             unified_diff: "diff".to_owned(),
+            detail_resource: None,
             verification: None,
             provider_synchronization: Vec::new(),
             semantic_state: None,
