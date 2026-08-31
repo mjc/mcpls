@@ -19,11 +19,13 @@ use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::DeferredResourceReference;
+use crate::bridge::ast_grep::byte_offset_to_position;
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::lexical::{
     LexicalSearchMatch, LexicalSearchRequest, collect_project_paths, find_matches,
 };
 use crate::bridge::resources::SourceResource;
+use crate::bridge::resources::make_source_uri;
 use crate::bridge::translator::{CallHierarchyItemResult, DiagnosticOptions, page_items};
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
@@ -5417,14 +5419,32 @@ impl ProjectRuntime {
                 .ok_or_else(|| {
                     "lexical search found a path outside its project roots".to_owned()
                 })?;
-            matches.extend(ranges.into_iter().take(remaining).map(|byte_range| {
-                LexicalSearchMatch {
+            for byte_range in ranges.into_iter().take(remaining) {
+                let start =
+                    byte_offset_to_position(&source, byte_range.start, PositionEncoding::Utf8)
+                        .ok_or_else(|| {
+                            "lexical match start is not a valid text position".to_owned()
+                        })?;
+                let end = byte_offset_to_position(&source, byte_range.end, PositionEncoding::Utf8)
+                    .ok_or_else(|| "lexical match end is not a valid text position".to_owned())?;
+                let source_uri = make_source_uri(
+                    &path,
+                    start.line.saturating_add(1),
+                    start.character.saturating_add(1),
+                    end.line.saturating_add(1),
+                    end.character.saturating_add(1),
+                    &content_hash,
+                    document_version,
+                )
+                .map_err(|error| error.to_string())?;
+                matches.push(LexicalSearchMatch {
                     project_relative_path: project_relative_path.clone(),
                     document_version,
                     content_hash: content_hash.clone(),
+                    source_uri,
                     byte_range,
-                }
-            }));
+                });
+            }
         }
         Ok(matches)
     }

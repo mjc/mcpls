@@ -60,6 +60,8 @@ pub(crate) struct LexicalSearchMatch {
     pub document_version: Option<i32>,
     /// Content hash of the snapshot searched.
     pub content_hash: String,
+    /// Snapshot-bound source resource for the exact match range.
+    pub source_uri: String,
     /// UTF-8 byte range within the returned snapshot.
     pub byte_range: Range<usize>,
 }

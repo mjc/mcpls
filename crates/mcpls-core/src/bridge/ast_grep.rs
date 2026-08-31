@@ -524,7 +524,7 @@ fn byte_offset_to_fallback_position(source: &str, offset: usize) -> Option<(u32,
     Some((position.line, position.character))
 }
 
-fn byte_offset_to_position(
+pub(crate) fn byte_offset_to_position(
     source: &str,
     offset: usize,
     encoding: PositionEncoding,
