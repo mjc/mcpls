@@ -876,6 +876,8 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
 
 const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
 const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
+const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
+    &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
     "project_list",
     "workspace_symbol_search",
@@ -894,6 +896,7 @@ fn advertised_tools() -> Vec<Tool> {
     let mut tools = McplsServer::tool_router()
         .list_all()
         .into_iter()
+        .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
         .map(|mut tool| {
             let oversized = tool.output_schema.as_ref().is_some_and(|schema| {
                 serde_json::to_vec(schema)
@@ -4993,7 +4996,10 @@ finally:
         let advertised_bytes = serde_json::to_vec(&advertised).unwrap().len();
 
         assert_eq!(
-            full.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            full.iter()
+                .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
+                .map(|tool| &tool.name)
+                .collect::<Vec<_>>(),
             advertised.iter().map(|tool| &tool.name).collect::<Vec<_>>()
         );
         assert!(
@@ -5001,7 +5007,11 @@ finally:
             "advertised tool surface is {advertised_bytes} bytes vs {full_bytes} internally"
         );
 
-        for (full, advertised) in full.iter().zip(advertised.iter()) {
+        for advertised in &advertised {
+            let full = full
+                .iter()
+                .find(|tool| tool.name == advertised.name)
+                .unwrap();
             let oversized = full.output_schema.as_ref().is_some_and(|schema| {
                 serde_json::to_vec(schema)
                     .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
@@ -5011,6 +5021,23 @@ finally:
                 !oversized,
                 "unexpected advertised output schema policy for {}",
                 full.name
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_tools_hide_legacy_direct_mutations_but_keep_compatibility_routes() {
+        let router_tools = McplsServer::tool_router().list_all();
+        let advertised = advertised_tools();
+
+        for name in LEGACY_DIRECT_MUTATION_TOOLS {
+            assert!(
+                router_tools.iter().any(|tool| tool.name == *name),
+                "legacy compatibility route is missing {name}"
+            );
+            assert!(
+                !advertised.iter().any(|tool| tool.name == *name),
+                "legacy direct mutation is still advertised {name}"
             );
         }
     }

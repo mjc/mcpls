@@ -195,7 +195,7 @@ Claude: [get_references] Found 4 matches:
 |------|--------------|
 | `get_diagnostics` | Real compiler errors and warnings, not guesses |
 | `get_cached_diagnostics` | Fast access to push-based diagnostics from LSP server |
-| `get_code_actions` | Quick fixes, refactorings, and source actions at a position |
+| `code_action_list` → preview/apply | Quick fixes and refactorings with owned, reviewable plans |
 
 </details>
 
@@ -204,13 +204,17 @@ Claude: [get_references] Found 4 matches:
 
 | Tool | What it does |
 |------|--------------|
-| `rename_symbol` | Workspace-wide rename with full reference tracking |
-| `format_document` | Apply language-specific formatting rules |
+| `rename_preview` → `rename_apply` | Workspace-wide rename with an owned, reviewable plan |
+| `format_preview` → `format_apply` | Language-specific formatting with an owned, reviewable plan |
 | `prepare_call_hierarchy` | Get callable items at a position for call hierarchy |
 | `get_incoming_calls` | Find all callers of a function (who calls this?) |
 | `get_outgoing_calls` | Find all callees of a function (what does this call?) |
 
 </details>
+
+New clients discover the owned preview/apply mutation flows above. Existing clients that already
+cache `rename_symbol`, `format_document`, or `get_code_actions` can still call those compatibility
+routes, but they are no longer advertised by `tools/list`.
 
 <details>
 <summary><strong>Server Monitoring</strong></summary>

@@ -68,7 +68,7 @@ You should see 20 mcpls tools, including:
 - get_hover, get_definition, get_references, get_completions
 - get_diagnostics, get_cached_diagnostics
 - get_document_symbols, workspace_symbol_search
-- rename_symbol, format_document, get_code_actions
+- rename_preview/rename_apply, format_preview/format_apply, code_action_list/preview/apply
 - get_signature_help, go_to_implementation, go_to_type_definition, get_inlay_hints
 - prepare_call_hierarchy, get_incoming_calls, get_outgoing_calls
 - get_server_logs, get_server_messages
@@ -162,7 +162,7 @@ Claude: [Uses get_diagnostics] Found 2 errors:
 
 ```
 User: Rename the process_data function to handle_data everywhere
-Claude: [Uses rename_symbol] Successfully prepared rename across 12 files
+Claude: [Uses rename_preview] Successfully prepared rename across 12 files
         with 28 edits. Would you like me to apply these changes?
 ```
 
@@ -217,7 +217,7 @@ Yes! Configure as many language servers as needed in `mcpls.toml`. mcpls will ro
 
 ### Does mcpls modify my code?
 
-Only when you explicitly ask for changes (like rename_symbol or format_document). All other tools are read-only and provide information without modifying files.
+Only when you explicitly ask for changes (like rename_apply or format_apply). All other tools are read-only and provide information without modifying files.
 
 ### Can I use mcpls with other MCP clients?
 
