@@ -26,6 +26,7 @@ use crate::bridge::lexical::{
 };
 use crate::bridge::resources::SourceResource;
 use crate::bridge::resources::make_source_uri;
+use crate::bridge::translator::SourceBudget;
 use crate::bridge::translator::{CallHierarchyItemResult, DiagnosticOptions, page_items};
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
@@ -5386,6 +5387,7 @@ impl ProjectRuntime {
         &self,
         request: LexicalSearchRequest,
     ) -> Result<Vec<LexicalSearchMatch>, String> {
+        const LEXICAL_CONTEXT_BYTES: usize = 16 * 1024;
         let paths = collect_project_paths(
             self.translator.workspace_roots(),
             request.include_generated,
@@ -5393,6 +5395,7 @@ impl ProjectRuntime {
         )
         .await;
         let mut matches = Vec::new();
+        let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
         for path in paths {
             if matches.len() >= request.max_matches {
                 break;
@@ -5437,11 +5440,35 @@ impl ProjectRuntime {
                     document_version,
                 )
                 .map_err(|error| error.to_string())?;
+                let source = if request.context_lines == 0 {
+                    None
+                } else {
+                    Some(
+                        self.translator
+                            .lexical_source_context(
+                                &path,
+                                crate::bridge::Range {
+                                    start: crate::bridge::Position2D {
+                                        line: start.line.saturating_add(1),
+                                        character: start.character.saturating_add(1),
+                                    },
+                                    end: crate::bridge::Position2D {
+                                        line: end.line.saturating_add(1),
+                                        character: end.character.saturating_add(1),
+                                    },
+                                },
+                                &mut source_budget,
+                                request.context_lines,
+                            )
+                            .await,
+                    )
+                };
                 matches.push(LexicalSearchMatch {
                     project_relative_path: project_relative_path.clone(),
                     document_version,
                     content_hash: content_hash.clone(),
                     source_uri,
+                    source,
                     byte_range,
                 });
             }

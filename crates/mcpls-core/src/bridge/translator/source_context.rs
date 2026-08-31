@@ -16,7 +16,7 @@ const MAX_FRAME_BYTES: usize = 4 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
-pub(super) struct SourceBudget {
+pub(crate) struct SourceBudget {
     remaining_bytes: usize,
     truncated: bool,
 }
@@ -31,7 +31,7 @@ impl Default for SourceBudget {
 }
 
 impl SourceBudget {
-    pub(super) const fn new(max_bytes: usize) -> Self {
+    pub(crate) const fn new(max_bytes: usize) -> Self {
         Self {
             remaining_bytes: max_bytes,
             truncated: false,
@@ -315,6 +315,28 @@ fn source_snapshot_matches(
 }
 
 impl super::Translator {
+    pub(crate) async fn lexical_source_context(
+        &self,
+        path: &Path,
+        range: Range,
+        budget: &mut SourceBudget,
+        max_lines: usize,
+    ) -> SourceContext {
+        let Ok(uri) = path_to_uri(path) else {
+            return unavailable(SourceUnavailableReason::NotFound);
+        };
+        resolve_source_context_with_max_lines(
+            &self.document_tracker,
+            self.workspace_roots(),
+            &[],
+            &uri,
+            range,
+            budget,
+            max_lines,
+        )
+        .await
+    }
+
     pub(crate) async fn read_source_resource(
         &self,
         resource: &SourceResource,

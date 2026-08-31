@@ -392,6 +392,9 @@ pub struct LexicalSearchParams {
     /// Decimal offset returned by a prior lexical-search `next_cursor`.
     #[serde(default)]
     pub page_token: Option<String>,
+    /// Context lines around each match; zero returns references only.
+    #[serde(default)]
+    pub context_lines: usize,
     /// Include generated/build-output files.
     #[serde(default)]
     pub include_generated: bool,

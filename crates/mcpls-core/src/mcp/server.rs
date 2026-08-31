@@ -2616,6 +2616,7 @@ impl McplsServer {
                 max_files: params.max_files,
                 max_matches: offset.saturating_add(limit).saturating_add(1),
                 include_generated: params.include_generated,
+                context_lines: params.context_lines,
             })
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;

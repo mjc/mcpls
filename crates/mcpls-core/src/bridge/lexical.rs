@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::ast_grep::is_generated_path;
+use super::translator::SourceContext;
 
 /// Matching interpretation for a lexical query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -48,6 +49,8 @@ pub(crate) struct LexicalSearchRequest {
     pub max_matches: usize,
     /// Whether generated paths are in scope.
     pub include_generated: bool,
+    /// Context lines around each match.
+    pub context_lines: usize,
 }
 
 /// One snapshot-bound lexical match, retaining byte offsets until the MCP
@@ -62,6 +65,9 @@ pub(crate) struct LexicalSearchMatch {
     pub content_hash: String,
     /// Snapshot-bound source resource for the exact match range.
     pub source_uri: String,
+    /// Optional bounded inline context around the match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceContext>,
     /// UTF-8 byte range within the returned snapshot.
     pub byte_range: Range<usize>,
 }

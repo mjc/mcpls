@@ -44,6 +44,7 @@ pub use actor::*;
 pub use call_hierarchy::page_items;
 pub use dto::*;
 pub use semantic_edit::*;
+pub(crate) use source_context::SourceBudget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActiveLanguageAlias {
