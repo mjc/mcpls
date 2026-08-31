@@ -192,6 +192,14 @@ impl HandlerContext {
         self.edit_plans.lock().await.owned.contains(plan_id)
     }
 
+    /// Return whether this session still recognizes a previewed plan.
+    pub(crate) async fn recognizes_plan(&self, plan_id: &PlanId) -> bool {
+        let plans = self.edit_plans.lock().await;
+        plans.owned.contains(plan_id)
+            || plans.active.contains(plan_id)
+            || plans.terminal.contains(plan_id)
+    }
+
     /// Capture whether the connected client can answer form elicitation.
     pub(crate) fn set_client_capabilities(
         &self,

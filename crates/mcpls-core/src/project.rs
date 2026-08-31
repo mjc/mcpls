@@ -1383,6 +1383,8 @@ pub struct AppliedEditPlan {
     pub operations: Vec<String>,
     /// Unified diff captured by the preview.
     pub unified_diff: String,
+    /// Complete immutable unified diff retained for bounded receipt resources.
+    pub complete_unified_diff: String,
     /// Files replaced successfully.
     pub committed_files: Vec<PathBuf>,
     /// Optional semantic verification outcome for a specialized refactor.
@@ -4985,10 +4987,15 @@ impl ProjectRuntime {
     }
 
     fn read_edit_plan_diff(&self, plan_id: &PlanId, project_id: &str) -> Result<String, String> {
-        self.edit_plans
-            .get_for_project(plan_id, project_id)
-            .map(EditPlan::complete_unified_diff)
-            .map_err(|error| error.to_string())
+        match self.edit_plans.get_for_project(plan_id, project_id) {
+            Ok(plan) => Ok(plan.complete_unified_diff()),
+            Err(error) => self
+                .applied_edit_receipts
+                .iter()
+                .find(|receipt| &receipt.plan_id == plan_id)
+                .map(|receipt| receipt.complete_unified_diff.clone())
+                .ok_or_else(|| error.to_string()),
+        }
     }
 
     fn configure_edit_safety(
@@ -5286,6 +5293,7 @@ impl ProjectRuntime {
             plan_id: plan.id().clone(),
             operations: plan.operations().to_vec(),
             unified_diff: plan.unified_diff().to_string(),
+            complete_unified_diff: plan.complete_unified_diff(),
             committed_files,
             verification: None,
             provider_synchronization: Vec::new(),

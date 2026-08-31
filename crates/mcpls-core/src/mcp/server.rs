@@ -583,6 +583,7 @@ fn workspace_edit_apply_result(
             plan_id,
             operations,
             unified_diff,
+            complete_unified_diff: _,
             committed_files,
             verification,
             provider_synchronization,
@@ -1455,7 +1456,7 @@ impl McplsServer {
         uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
-        if !self.context.owns_plan(&plan_id).await {
+        if !self.context.recognizes_plan(&plan_id).await {
             return Err(McpError::invalid_params(
                 "edit plan is not owned by this MCP session",
                 None,
