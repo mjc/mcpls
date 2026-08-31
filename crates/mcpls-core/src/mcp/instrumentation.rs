@@ -56,6 +56,74 @@ fn completed_tool_result_bytes(result: &Result<CallToolResponse, ErrorData>) -> 
         .map(|()| bytes.0)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolResultMetrics {
+    cache_hit: Option<bool>,
+    item_count: usize,
+    deferred_bytes: usize,
+    truncated: bool,
+    paginated: bool,
+}
+
+fn completed_tool_result_metrics(
+    result: &Result<CallToolResponse, ErrorData>,
+) -> Option<ToolResultMetrics> {
+    let Ok(CallToolResponse::Complete(result)) = result else {
+        return None;
+    };
+    let value = result.structured_content.as_ref()?;
+    let object = value.as_object()?;
+    let item_count = ["returned", "returned_items", "returned_lines"]
+        .into_iter()
+        .find_map(|name| object.get(name).and_then(serde_json::Value::as_u64))
+        .and_then(|count| usize::try_from(count).ok())
+        .or_else(|| {
+            ["items", "matches", "diagnostics"]
+                .into_iter()
+                .find_map(|name| object.get(name).and_then(serde_json::Value::as_array))
+                .map(Vec::len)
+        })
+        .unwrap_or_default();
+    let mut metrics = ToolResultMetrics {
+        cache_hit: object.get("cache_hit").and_then(serde_json::Value::as_bool),
+        item_count,
+        truncated: object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        paginated: ["next_cursor", "nextCursor"]
+            .into_iter()
+            .any(|name| object.get(name).is_some_and(|value| !value.is_null())),
+        ..ToolResultMetrics::default()
+    };
+    collect_deferred_bytes(value, &mut metrics.deferred_bytes);
+    Some(metrics)
+}
+
+fn collect_deferred_bytes(value: &serde_json::Value, deferred_bytes: &mut usize) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_deferred_bytes(value, deferred_bytes);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object.contains_key("uri")
+                && let Some(bytes) = object
+                    .get("total_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+            {
+                *deferred_bytes = deferred_bytes.saturating_add(bytes);
+            }
+            for value in object.values() {
+                collect_deferred_bytes(value, deferred_bytes);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteTrace {
     trace_id: String,
@@ -153,6 +221,12 @@ impl RequestSpan {
             transport,
             duration_ms = tracing::field::Empty,
             result_bytes = tracing::field::Empty,
+            inline_bytes = tracing::field::Empty,
+            deferred_bytes = tracing::field::Empty,
+            item_count = tracing::field::Empty,
+            truncated = tracing::field::Empty,
+            paginated = tracing::field::Empty,
+            cache_hit = tracing::field::Empty,
             serialization_ms = tracing::field::Empty,
             actor_queue_ms = tracing::field::Empty,
             actor_execution_ms = tracing::field::Empty,
@@ -192,10 +266,22 @@ impl RequestSpan {
         result: &Result<T, ErrorData>,
         tool_error: bool,
         result_bytes: Option<usize>,
+        result_metrics: Option<ToolResultMetrics>,
         serialization_started: Option<Instant>,
     ) {
         if let Some(result_bytes) = result_bytes {
             self.span.record("result_bytes", result_bytes);
+            self.span.record("inline_bytes", result_bytes);
+        }
+        if let Some(result_metrics) = result_metrics {
+            self.span
+                .record("deferred_bytes", result_metrics.deferred_bytes);
+            self.span.record("item_count", result_metrics.item_count);
+            self.span.record("truncated", result_metrics.truncated);
+            self.span.record("paginated", result_metrics.paginated);
+            if let Some(cache_hit) = result_metrics.cache_hit {
+                self.span.record("cache_hit", cache_hit);
+            }
         }
         if let Some(serialization_started) = serialization_started {
             self.span.record(
@@ -237,7 +323,7 @@ where
     );
     let result = handler(context).instrument(span.span.clone()).await;
     let is_tool_error = result.as_ref().is_ok_and(tool_error);
-    span.finish(&result, is_tool_error, None, None);
+    span.finish(&result, is_tool_error, None, None, None);
     result
 }
 
@@ -443,7 +529,7 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
                 .listen(context)
                 .instrument(span.span.clone())
                 .await;
-            span.finish(&result, false, None, None);
+            span.finish(&result, false, None, None, None);
             result
         }
     }
@@ -507,10 +593,12 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
             });
             let serialization_started = Instant::now();
             let result_bytes = completed_tool_result_bytes(&result);
+            let result_metrics = completed_tool_result_metrics(&result);
             span.finish(
                 &result,
                 tool_error,
                 result_bytes,
+                result_metrics,
                 result_bytes.map(|_| serialization_started),
             );
             result
@@ -690,6 +778,35 @@ mod tests {
         assert_eq!(
             completed_tool_result_bytes(&result),
             Some(serde_json::to_vec(&payload).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_exposes_only_response_shape_metadata() {
+        let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+        payload.structured_content = Some(serde_json::json!({
+            "cache_hit": true,
+            "returned": 3,
+            "truncated": true,
+            "next_cursor": "3",
+            "source": "must never reach telemetry",
+            "resource": {
+                "uri": "mcpls-source:///workspace/src.rs",
+                "kind": "source_context",
+                "total_bytes": 55
+            }
+        }));
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+        assert_eq!(
+            completed_tool_result_metrics(&result),
+            Some(ToolResultMetrics {
+                cache_hit: Some(true),
+                item_count: 3,
+                deferred_bytes: 55,
+                truncated: true,
+                paginated: true,
+            })
         );
     }
 }
