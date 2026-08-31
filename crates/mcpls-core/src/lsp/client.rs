@@ -64,10 +64,18 @@ const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 /// value today. See [`LspClient::completion_timeout`].
 const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 
+/// Normal LSP requests should finish near this duration; exceeding it is
+/// observable but never cancels the request.
+const LSP_HOUSE_BUDGET: Duration = Duration::from_secs(5);
+
 const OUTBOUND_TRANSPORT_QUEUE_CAPACITY: usize = 100;
 
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
+
+fn exceeds_lsp_house_budget(elapsed: Duration) -> bool {
+    elapsed > LSP_HOUSE_BUDGET
+}
 
 struct LspRequestTiming {
     span: tracing::Span,
@@ -80,7 +88,8 @@ impl LspRequestTiming {
             span: debug_span!(
                 "lsp.request",
                 lsp_method = method,
-                lsp_ms = tracing::field::Empty
+                lsp_ms = tracing::field::Empty,
+                lsp_over_house_budget = tracing::field::Empty,
             ),
             started: Instant::now(),
         }
@@ -89,8 +98,14 @@ impl LspRequestTiming {
 
 impl Drop for LspRequestTiming {
     fn drop(&mut self) {
-        self.span
-            .record("lsp_ms", self.started.elapsed().as_millis() as u64);
+        let elapsed = self.started.elapsed();
+        let over_house_budget = exceeds_lsp_house_budget(elapsed);
+        self.span.record("lsp_ms", elapsed.as_millis() as u64);
+        self.span.record("lsp_over_house_budget", over_house_budget);
+        if over_house_budget {
+            let _entered = self.span.enter();
+            warn!("LSP request exceeded the five-second house budget");
+        }
     }
 }
 
@@ -1069,6 +1084,14 @@ mod tests {
         let timing = LspRequestTiming::new("test/request");
 
         assert_eq!(timing.span.metadata().unwrap().name(), "lsp.request");
+    }
+
+    #[test]
+    fn lsp_house_budget_is_soft_at_five_seconds() {
+        assert!(!exceeds_lsp_house_budget(Duration::from_secs(5)));
+        assert!(exceeds_lsp_house_budget(
+            Duration::from_secs(5) + Duration::from_millis(1)
+        ));
     }
 
     #[test]
