@@ -30,6 +30,9 @@ const JSONRPC_VERSION: &str = "2.0";
 /// LSP error code returned when the server cancels a request and wants the client to retry.
 const SERVER_CANCELLED_CODE: i32 = -32802;
 
+/// LSP error code returned when the server needs the client to retry against a fresh document.
+const CONTENT_MODIFIED_CODE: i32 = -32801;
+
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 
@@ -445,9 +448,10 @@ impl LspClient {
 
     /// Send request and wait for response with timeout.
     ///
-    /// Automatically retries up to 3 times when the server returns error code
-    /// -32802 (`ServerCancelled`) with `data.retriggerRequest == true`, using
-    /// exponential backoff starting at 500 ms.
+    /// Automatically retries up to 3 times when the server returns `-32801`
+    /// (`ContentModified`), or `-32802` (`ServerCancelled`) with
+    /// `data.retriggerRequest == true`, using exponential backoff starting at
+    /// 500 ms.
     ///
     /// # Type Parameters
     ///
@@ -532,11 +536,8 @@ impl LspClient {
                     code,
                     ref message,
                     ref data,
-                }) if code == SERVER_CANCELLED_CODE && Self::should_retrigger(data.as_ref()) => {
-                    warn!(
-                        "ServerCancelled (-32802) on '{}', will retry: {}",
-                        method, message
-                    );
+                }) if Self::should_retry(code, data.as_ref()) => {
+                    warn!("retryable LSP response ({code}) on '{method}', will retry: {message}");
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
                         return Err(Error::LspServerError {
                             code,
@@ -565,6 +566,11 @@ impl LspClient {
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
         })
+    }
+
+    fn should_retry(code: i32, data: Option<&Value>) -> bool {
+        code == CONTENT_MODIFIED_CODE
+            || code == SERVER_CANCELLED_CODE && Self::should_retrigger(data)
     }
 
     /// Fail every request still parked in `pending_requests` with
@@ -2042,6 +2048,42 @@ mod tests {
 
             let result = request_task.await.unwrap();
             assert_eq!(result.unwrap(), expected_result);
+        }
+
+        #[tokio::test]
+        async fn test_retry_succeeds_after_content_modified_response() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/codeAction",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let first = read_framed_message(&mut reader).await;
+            write_error_response(
+                &mut server.read_half_stdin,
+                &first["id"].clone(),
+                -32801,
+                "content modified",
+            )
+            .await;
+
+            let second = read_framed_message(&mut reader).await;
+            let expected_result = serde_json::json!([]);
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                expected_result.clone(),
+            )
+            .await;
+
+            assert_eq!(request_task.await.unwrap().unwrap(), expected_result);
         }
 
         /// #313: an oversized, server-controlled error message must be
