@@ -403,24 +403,69 @@ impl super::Translator {
             .min(lines.len())
             .max(start);
         let selected = &lines[start..end];
+        let first_line = selected.first().copied().unwrap_or_default();
+        let first_line = first_line.get(resource.offset_bytes..).ok_or_else(|| {
+            crate::error::Error::InvalidUri(
+                "source resource offset is not a UTF-8 boundary".to_owned(),
+            )
+        })?;
         let total_bytes = selected
             .iter()
             .enumerate()
-            .map(|(offset, line)| numbered_line_bytes(start + offset + 1, line))
+            .map(|(offset, line)| {
+                numbered_line_bytes(
+                    start + offset + 1,
+                    if offset == 0 { first_line } else { line },
+                )
+            })
             .sum();
         let byte_limit = MAX_RESPONSE_BYTES;
         let mut text = String::new();
         let mut returned_lines = 0;
+        let mut next = None;
         for (offset, line) in selected.iter().enumerate() {
-            let rendered = format!("{:>4} | {line}\n", start + offset + 1);
-            if !text.is_empty() && text.len() + rendered.len() > byte_limit {
-                break;
+            let line_offset = if offset == 0 {
+                resource.offset_bytes
+            } else {
+                0
+            };
+            let line = line.get(line_offset..).ok_or_else(|| {
+                crate::error::Error::InvalidUri(
+                    "source resource offset is not a UTF-8 boundary".to_owned(),
+                )
+            })?;
+            let prefix = format!("{:>4} | ", start + offset + 1);
+            let rendered_len = prefix.len() + line.len() + 1;
+            if text.len() + rendered_len <= byte_limit {
+                text.push_str(&prefix);
+                text.push_str(line);
+                text.push('\n');
+                returned_lines += 1;
+                continue;
             }
-            text.push_str(&rendered);
-            returned_lines += 1;
+
+            let available = byte_limit.saturating_sub(text.len() + prefix.len() + 1);
+            let mut chunk_end = 0;
+            for (index, character) in line.char_indices() {
+                let end = index + character.len_utf8();
+                if end > available {
+                    break;
+                }
+                chunk_end = end;
+            }
+            if chunk_end > 0 {
+                text.push_str(&prefix);
+                text.push_str(&line[..chunk_end]);
+                text.push('\n');
+                returned_lines += 1;
+                next = Some((start + offset, line_offset + chunk_end));
+            } else {
+                next = Some((start + offset, line_offset));
+            }
+            break;
         }
         let returned_bytes = text.len();
-        let truncated = returned_lines < selected.len();
+        let truncated = next.is_some();
         let returned_end = start + returned_lines;
         let returned_range = Range {
             start: super::dto::Position2D {
@@ -432,32 +477,37 @@ impl super::Translator {
                 character: 1,
             },
         };
-        let remaining_bytes = selected[returned_lines..]
-            .iter()
-            .enumerate()
-            .map(|(offset, line)| numbered_line_bytes(returned_end + offset + 1, line))
-            .sum();
-        let next_resource = truncated
-            .then(|| {
-                make_source_uri(
-                    &path,
-                    u32::try_from(returned_end + 1).unwrap_or(u32::MAX),
-                    1,
-                    resource.end_line,
-                    resource.end_character,
-                    &content_hash,
-                    document_version,
-                )
-                .ok()
-                .map(|uri| DeferredResourceReference {
-                    uri,
-                    kind: "source_context".to_owned(),
-                    snapshot_hash: content_hash.clone(),
-                    document_version,
-                    total_bytes: Some(remaining_bytes),
+        let next_resource = next.and_then(|(line, offset_bytes)| {
+            let remaining_bytes = lines[line..end]
+                .iter()
+                .enumerate()
+                .map(|(index, remaining_line)| {
+                    let offset = if index == 0 { offset_bytes } else { 0 };
+                    remaining_line.get(offset..).map_or(0, |remaining_line| {
+                        numbered_line_bytes(line + index + 1, remaining_line)
+                    })
                 })
+                .sum();
+            SourceResource {
+                path: path.clone(),
+                start_line: u32::try_from(line + 1).unwrap_or(u32::MAX),
+                start_character: 1,
+                end_line: resource.end_line,
+                end_character: resource.end_character,
+                snapshot_hash: content_hash.clone(),
+                document_version,
+                offset_bytes,
+            }
+            .to_uri()
+            .ok()
+            .map(|uri| DeferredResourceReference {
+                uri,
+                kind: "source_context".to_owned(),
+                snapshot_hash: content_hash.clone(),
+                document_version,
+                total_bytes: Some(remaining_bytes),
             })
-            .flatten();
+        });
         Ok(SourceFrame {
             path: path.to_string_lossy().into_owned(),
             uri: uri.to_string(),
@@ -539,6 +589,7 @@ mod tests {
             end_character: 2,
             snapshot_hash: "abc".to_owned(),
             document_version: None,
+            offset_bytes: 0,
         };
 
         assert!(source_snapshot_matches(&resource, Some(7), "abc"));
@@ -568,6 +619,7 @@ mod tests {
             end_character: 20,
             snapshot_hash,
             document_version: version,
+            offset_bytes: 0,
         };
         tokio::fs::write(&path, "fn new_name() {}\n").await.unwrap();
 
@@ -639,6 +691,7 @@ mod tests {
             end_character: 13,
             snapshot_hash,
             document_version: version,
+            offset_bytes: 0,
         };
 
         let frame = translator.read_source_resource(&resource).await.unwrap();
@@ -686,10 +739,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_resource_replay_is_not_silently_capped_at_four_kibibytes() {
+    async fn source_resource_replay_pages_a_single_oversized_line() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("lib.rs");
-        let content = format!("{}\ntail sentinel\n", "x".repeat(MAX_FRAME_BYTES + 1));
+        let content = format!(
+            "{}\ntail sentinel\n",
+            "λ".repeat(MAX_RESPONSE_BYTES / 2 + 1)
+        );
         tokio::fs::write(&path, &content).await.unwrap();
         let mut translator = crate::bridge::Translator::new()
             .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
@@ -703,14 +759,28 @@ mod tests {
             end_character: 1,
             snapshot_hash,
             document_version: version,
+            offset_bytes: 0,
         };
 
         let frame = translator.read_source_resource(&resource).await.unwrap();
 
-        assert!(frame.returned_bytes > MAX_FRAME_BYTES);
-        assert_eq!(frame.returned_lines, 2);
-        assert!(frame.text.contains("tail sentinel"));
-        assert!(!frame.truncated);
+        assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        assert!(frame.truncated);
+        let next = crate::bridge::resources::parse_source_uri(
+            &frame
+                .resource
+                .as_ref()
+                .expect("oversized line has next page")
+                .uri,
+        )
+        .unwrap();
+        assert_eq!(next.start_line, 1);
+        assert!(next.offset_bytes > 0);
+
+        let next_frame = translator.read_source_resource(&next).await.unwrap();
+        assert!(next_frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        assert!(next_frame.text.contains("tail sentinel"));
+        assert!(!next_frame.truncated);
     }
 
     #[tokio::test]
@@ -733,6 +803,7 @@ mod tests {
             end_character: 1,
             snapshot_hash,
             document_version: version,
+            offset_bytes: 0,
         };
 
         let frame = translator.read_source_resource(&resource).await.unwrap();
@@ -743,12 +814,18 @@ mod tests {
         assert!(frame.total_bytes > frame.returned_bytes);
         assert_eq!(frame.range.start.line, 1);
         assert_eq!(frame.range.end.line, frame.returned_lines as u32);
+        assert!(
+            frame
+                .text
+                .contains(&format!("line {}", frame.range.end.line))
+        );
         let next = frame
             .resource
             .as_ref()
             .expect("truncated source has next page");
         let next = crate::bridge::resources::parse_source_uri(&next.uri).unwrap();
-        assert_eq!(next.start_line, frame.range.end.line + 1);
+        assert_eq!(next.start_line, frame.range.end.line);
+        assert!(next.offset_bytes > 0);
         assert_eq!(next.end_line, 40);
 
         let next_frame = translator.read_source_resource(&next).await.unwrap();
@@ -757,7 +834,7 @@ mod tests {
         assert!(
             next_frame
                 .text
-                .contains(&format!("line {}", next.start_line))
+                .starts_with(&format!("{:>4} | ", next.start_line))
         );
         assert!(next_frame.text.contains("line 40"));
         assert!(next_frame.resource.is_none());
@@ -930,6 +1007,7 @@ mod tests {
             end_character: 22,
             snapshot_hash: "stale".to_owned(),
             document_version: None,
+            offset_bytes: 0,
         };
 
         let frame = translator.read_source_resource(&resource).await.unwrap();

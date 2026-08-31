@@ -63,6 +63,39 @@ pub struct SourceResource {
     pub snapshot_hash: String,
     /// Open-document version captured when the resource was created.
     pub document_version: Option<i32>,
+    /// Byte offset into the first selected line for a bounded continuation.
+    pub offset_bytes: usize,
+}
+
+impl SourceResource {
+    /// Encode this snapshot-bound source reference as an MCP resource URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be encoded as a resource URI.
+    pub fn to_uri(&self) -> Result<String, ResourceUriError> {
+        let diagnostics_uri = make_uri(&self.path)?;
+        let mut uri = Url::parse(&diagnostics_uri)
+            .map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
+        uri.set_scheme(SOURCE_SCHEME)
+            .map_err(|()| ResourceUriError::DecodeFailed(diagnostics_uri.clone()))?;
+        {
+            let mut query = uri.query_pairs_mut();
+            query
+                .append_pair("start_line", &self.start_line.to_string())
+                .append_pair("start_character", &self.start_character.to_string())
+                .append_pair("end_line", &self.end_line.to_string())
+                .append_pair("end_character", &self.end_character.to_string())
+                .append_pair("snapshot", &self.snapshot_hash);
+            if let Some(version) = self.document_version {
+                query.append_pair("version", &version.to_string());
+            }
+            if self.offset_bytes > 0 {
+                query.append_pair("offset_bytes", &self.offset_bytes.to_string());
+            }
+        }
+        Ok(uri.to_string())
+    }
 }
 
 /// Encode a source context resource without exposing mutable actor state.
@@ -79,24 +112,17 @@ pub fn make_source_uri(
     snapshot_hash: &str,
     document_version: Option<i32>,
 ) -> Result<String, ResourceUriError> {
-    let diagnostics_uri = make_uri(path)?;
-    let mut uri = Url::parse(&diagnostics_uri)
-        .map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?;
-    uri.set_scheme(SOURCE_SCHEME)
-        .map_err(|()| ResourceUriError::DecodeFailed(diagnostics_uri.clone()))?;
-    {
-        let mut query = uri.query_pairs_mut();
-        query
-            .append_pair("start_line", &start_line.to_string())
-            .append_pair("start_character", &start_character.to_string())
-            .append_pair("end_line", &end_line.to_string())
-            .append_pair("end_character", &end_character.to_string())
-            .append_pair("snapshot", snapshot_hash);
-        if let Some(version) = document_version {
-            query.append_pair("version", &version.to_string());
-        }
+    SourceResource {
+        path: path.to_path_buf(),
+        start_line,
+        start_character,
+        end_line,
+        end_character,
+        snapshot_hash: snapshot_hash.to_owned(),
+        document_version,
+        offset_bytes: 0,
     }
-    Ok(uri.to_string())
+    .to_uri()
 }
 
 /// Decode a snapshot-bound source context resource URI.
@@ -133,6 +159,11 @@ pub fn parse_source_uri(uri: &str) -> Result<SourceResource, ResourceUriError> {
         .map(|value| value.parse())
         .transpose()
         .map_err(|_| ResourceUriError::DecodeFailed("invalid version".to_owned()))?;
+    let offset_bytes = value("offset_bytes")
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| ResourceUriError::DecodeFailed("invalid offset_bytes".to_owned()))?
+        .unwrap_or_default();
     Ok(SourceResource {
         path,
         start_line: parse_u32("start_line")?,
@@ -141,6 +172,7 @@ pub fn parse_source_uri(uri: &str) -> Result<SourceResource, ResourceUriError> {
         end_character: parse_u32("end_character")?,
         snapshot_hash,
         document_version,
+        offset_bytes,
     })
 }
 
@@ -311,6 +343,24 @@ mod tests {
         assert_eq!((resource.end_line, resource.end_character), (4, 5));
         assert_eq!(resource.snapshot_hash, "abc123");
         assert_eq!(resource.document_version, Some(7));
+        assert_eq!(resource.offset_bytes, 0);
+    }
+
+    #[test]
+    fn source_resource_uri_round_trips_continuation_offset() {
+        let uri = SourceResource {
+            path: "/workspace/src/lib.rs".into(),
+            start_line: 2,
+            start_character: 1,
+            end_line: 4,
+            end_character: 1,
+            snapshot_hash: "abc123".to_owned(),
+            document_version: None,
+            offset_bytes: 7,
+        }
+        .to_uri()
+        .unwrap();
+        assert_eq!(parse_source_uri(&uri).unwrap().offset_bytes, 7);
     }
 
     #[test]
