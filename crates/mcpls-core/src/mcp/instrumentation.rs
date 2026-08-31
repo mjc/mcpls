@@ -78,6 +78,9 @@ fn completed_tool_result_metrics(
         "returned_items",
         "returned_lines",
         "returned_diagnostics",
+        "returned_references",
+        "returned_calls",
+        "returned_groups",
     ]
     .into_iter()
     .find_map(|name| object.get(name).and_then(serde_json::Value::as_u64))
@@ -852,5 +855,23 @@ mod tests {
             completed_tool_result_metrics(&result).unwrap().item_count,
             4
         );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_reads_other_explicit_result_counts() {
+        for (field, expected) in [
+            ("returned_references", 2),
+            ("returned_calls", 3),
+            ("returned_groups", 4),
+        ] {
+            let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+            payload.structured_content = Some(serde_json::json!({field: expected}));
+            let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+            assert_eq!(
+                completed_tool_result_metrics(&result).unwrap().item_count,
+                expected
+            );
+        }
     }
 }
