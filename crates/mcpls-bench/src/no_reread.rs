@@ -33,16 +33,22 @@ pub enum TraceEvent {
     Lifecycle {
         tool: String,
         request_bytes: usize,
+        #[serde(default)]
+        result_bytes: usize,
         latency_ms: u64,
     },
     McpTool {
         tool: String,
         request_bytes: usize,
+        #[serde(default)]
+        result_bytes: usize,
         latency_ms: u64,
     },
     ResourceRead {
         deferred: bool,
         request_bytes: usize,
+        #[serde(default)]
+        result_bytes: usize,
         latency_ms: u64,
     },
     ShellOutput {
@@ -199,30 +205,36 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
     match event {
         TraceEvent::Lifecycle {
             request_bytes,
+            result_bytes,
             latency_ms,
             ..
         } => {
             report.mcpls_calls += 1;
             report.lifecycle_calls += 1;
             report.request_bytes += request_bytes;
+            report.result_bytes += result_bytes;
             latencies.push(*latency_ms);
         }
         TraceEvent::McpTool {
             request_bytes,
+            result_bytes,
             latency_ms,
             ..
         } => {
             report.mcpls_calls += 1;
             report.request_bytes += request_bytes;
+            report.result_bytes += result_bytes;
             latencies.push(*latency_ms);
         }
         TraceEvent::ResourceRead {
             deferred,
             request_bytes,
+            result_bytes,
             latency_ms,
         } => {
             report.mcpls_calls += 1;
             report.request_bytes += request_bytes;
+            report.result_bytes += result_bytes;
             report.deferred_resource_reads += usize::from(*deferred);
             latencies.push(*latency_ms);
         }
@@ -416,11 +428,13 @@ fn other_mcpls_history_event(event: &Value) -> Option<TraceEvent> {
     }
     let arguments = invocation.get("arguments").unwrap_or(&Value::Null);
     let request_bytes = serialized_len(arguments);
+    let result_bytes = serialized_len(payload.get("result").unwrap_or(&Value::Null));
     let latency_ms = history_latency_ms(payload);
     if is_lifecycle_tool(tool) {
         return Some(TraceEvent::Lifecycle {
             tool: tool.to_owned(),
             request_bytes,
+            result_bytes,
             latency_ms,
         });
     }
@@ -431,12 +445,14 @@ fn other_mcpls_history_event(event: &Value) -> Option<TraceEvent> {
                 .and_then(Value::as_str)
                 .is_some_and(|uri| uri.starts_with("mcpls-deferred://")),
             request_bytes,
+            result_bytes,
             latency_ms,
         });
     }
     Some(TraceEvent::McpTool {
         tool: tool.to_owned(),
         request_bytes,
+        result_bytes,
         latency_ms,
     })
 }
@@ -789,6 +805,21 @@ mod tests {
             events
                 .iter()
                 .all(|event| !format!("{event:?}").contains("private_type"))
+        );
+    }
+
+    #[test]
+    fn history_parser_counts_non_semantic_response_bytes() {
+        let history = concat!(
+            r#"{"type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"mcpls","tool":"workspace_edit_preview","arguments":{}},"duration":{"secs":0,"nanos":1000000},"result":{"Ok":{"plan_id":"opaque"}}}}"#,
+            "\n",
+        );
+
+        let report = evaluate(&parse_history(history.as_bytes()).unwrap()).aggregate;
+
+        assert_eq!(
+            report.result_bytes,
+            serialized_len(&serde_json::json!({"Ok": {"plan_id": "opaque"}}))
         );
     }
 
