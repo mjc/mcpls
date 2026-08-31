@@ -425,11 +425,11 @@ impl super::Translator {
         let returned_range = Range {
             start: super::dto::Position2D {
                 line: u32::try_from(start + 1).unwrap_or(u32::MAX),
-                character: resource.start_character,
+                character: 1,
             },
             end: super::dto::Position2D {
                 line: u32::try_from(returned_end).unwrap_or(u32::MAX),
-                character: if truncated { 1 } else { resource.end_character },
+                character: 1,
             },
         };
         let remaining_bytes = selected[returned_lines..]
@@ -618,6 +618,36 @@ mod tests {
         );
         assert!(!replayed.truncated);
         assert!(replayed.resource.is_none());
+    }
+
+    #[tokio::test]
+    async fn source_resource_frame_range_covers_rendered_line_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        tokio::fs::write(&path, "    indented value\n")
+            .await
+            .unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, version, snapshot_hash, _) = translator.source_snapshot(&path).await.unwrap();
+        let resource = SourceResource {
+            path,
+            start_line: 1,
+            start_character: 5,
+            end_line: 1,
+            end_character: 13,
+            snapshot_hash,
+            document_version: version,
+        };
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert_eq!(frame.text, "   1 |     indented value\n");
+        assert_eq!(frame.range.start.character, 1);
+        assert_eq!(frame.range.end.character, 1);
+        assert_eq!(frame.highlighted_range.start.character, 5);
+        assert_eq!(frame.highlighted_range.end.character, 13);
     }
 
     #[tokio::test]
