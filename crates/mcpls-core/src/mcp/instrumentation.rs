@@ -85,7 +85,16 @@ fn completed_tool_result_metrics(
         })
         .unwrap_or_default();
     let mut metrics = ToolResultMetrics {
-        cache_hit: object.get("cache_hit").and_then(serde_json::Value::as_bool),
+        cache_hit: object
+            .get("cache_hit")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                object
+                    .get("cache")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|cache| cache.get("hit"))
+                    .and_then(serde_json::Value::as_bool)
+            }),
         item_count,
         truncated: object
             .get("truncated")
@@ -807,6 +816,21 @@ mod tests {
                 truncated: true,
                 paginated: true,
             })
+        );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_reads_nested_diagnostics_cache_hit() {
+        let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+        payload.structured_content = Some(serde_json::json!({
+            "diagnostics": [],
+            "cache": {"hit": true, "age_ms": 1, "snapshot_identity": "opaque"}
+        }));
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+        assert_eq!(
+            completed_tool_result_metrics(&result).unwrap().cache_hit,
+            Some(true)
         );
     }
 }
