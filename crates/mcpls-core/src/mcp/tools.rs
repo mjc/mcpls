@@ -1002,6 +1002,12 @@ pub struct SemanticResourceReadResult {
     /// Byte offset of this fragment in the complete JSON payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset_bytes: Option<usize>,
+    /// Number of JSON bytes returned in this fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_bytes: Option<usize>,
+    /// Number of JSON bytes still available after this fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_bytes: Option<usize>,
 }
 
 #[cfg(test)]

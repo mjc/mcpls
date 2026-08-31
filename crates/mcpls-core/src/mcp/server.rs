@@ -106,8 +106,10 @@ fn deferred_resource_page(
             mime_type: "application/json".to_owned(),
             text: json[deferred.offset_bytes..end].to_owned(),
             next_uri,
-            total_bytes: (end < total_bytes).then_some(total_bytes),
-            offset_bytes: (end < total_bytes).then_some(deferred.offset_bytes),
+            total_bytes: Some(total_bytes),
+            offset_bytes: Some(deferred.offset_bytes),
+            returned_bytes: Some(end - deferred.offset_bytes),
+            remaining_bytes: Some(total_bytes - end),
         };
         let result_bytes = serde_json::to_vec(&result)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -3518,6 +3520,8 @@ impl McplsServer {
                 next_uri: None,
                 total_bytes: None,
                 offset_bytes: None,
+                returned_bytes: None,
+                remaining_bytes: None,
             };
             let result_bytes = serde_json::to_vec(&result)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -4067,6 +4071,13 @@ mod tests {
             .unwrap();
             assert!(
                 serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+            );
+            assert_eq!(result.total_bytes, Some(expected.len()));
+            assert_eq!(result.offset_bytes, Some(offset_bytes));
+            assert_eq!(result.returned_bytes, Some(result.text.len()));
+            assert_eq!(
+                result.remaining_bytes,
+                Some(expected.len() - offset_bytes - result.text.len())
             );
             actual.push_str(&result.text);
             let Some(next_uri) = result.next_uri else {

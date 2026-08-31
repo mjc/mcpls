@@ -17890,6 +17890,24 @@
             "null"
           ]
         },
+        "remaining_bytes": {
+          "description": "Number of JSON bytes still available after this fragment.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "returned_bytes": {
+          "description": "Number of JSON bytes returned in this fragment.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "text": {
           "description": "Complete JSON resource payload, or an ordered UTF-8 JSON fragment when `next_uri` is set.",
           "type": "string"
