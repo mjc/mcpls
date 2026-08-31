@@ -39,10 +39,10 @@ use super::session::{
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
-    CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
-    HoverParams, InlayHintsParams, InspectSymbolBatchParams, InspectSymbolParams,
-    LexicalSearchParams, MoveInlineModulePreviewParams, MoveItemPreviewParams,
+    CompletionsParams, DaemonStatusParams, DefinitionParams, DiagnosticsParams,
+    DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, GoToImplementationParams,
+    GoToTypeDefinitionParams, HoverParams, InlayHintsParams, InspectSymbolBatchParams,
+    InspectSymbolParams, LexicalSearchParams, MoveInlineModulePreviewParams, MoveItemPreviewParams,
     PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams,
     ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
     RenameParams, RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
@@ -876,6 +876,7 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
 
 const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
 const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
+const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
@@ -974,6 +975,29 @@ fn resource_page(
             .collect(),
         next_cursor,
     ))
+}
+
+fn project_list_page(
+    project_count: usize,
+    cursor: Option<&str>,
+) -> Result<(std::ops::Range<usize>, Option<String>), String> {
+    let start = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| format!("invalid project_list cursor: {cursor}"))?,
+        None => 0,
+    };
+    if cursor.is_some() && start >= project_count {
+        return Err(format!(
+            "project_list cursor is outside the project list: {start}"
+        ));
+    }
+
+    let end = start
+        .saturating_add(PROJECT_LIST_PAGE_SIZE)
+        .min(project_count);
+    let next_cursor = (end < project_count).then(|| end.to_string());
+    Ok((start..end, next_cursor))
 }
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -1788,13 +1812,15 @@ impl McplsServer {
     }
 
     /// List all registered projects without waiting on project actors.
-    #[tool(description = "List registered projects and their canonical roots.")]
+    #[tool(description = "List registered projects and canonical roots in cursor pages.")]
     async fn project_list(
         &self,
-        Parameters(_params): Parameters<ProjectListParams>,
+        Parameters(ProjectListParams { cursor }): Parameters<ProjectListParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let projects = self.context.project_registry.list().await;
-        let result: Vec<_> = projects
+        let (page, next_cursor) = project_list_page(projects.len(), cursor.as_deref())
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let result: Vec<_> = projects[page]
             .iter()
             .map(|project| {
                 serde_json::json!({
@@ -1805,7 +1831,12 @@ impl McplsServer {
                 })
             })
             .collect();
-        encode_json(&result)
+        encode_json(&serde_json::json!({
+            "projects": result,
+            "returned": result.len(),
+            "truncated": next_cursor.is_some(),
+            "next_cursor": next_cursor,
+        }))
     }
 
     /// List resource subscriptions owned by this MCP session.
@@ -1824,7 +1855,7 @@ impl McplsServer {
     #[tool(description = "Return daemon liveness and non-blocking project lifecycle counts.")]
     async fn health(
         &self,
-        Parameters(_params): Parameters<ProjectListParams>,
+        Parameters(_params): Parameters<DaemonStatusParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
@@ -1844,7 +1875,7 @@ impl McplsServer {
     #[tool(description = "Return daemon version, uptime, and non-blocking project status.")]
     async fn server_status(
         &self,
-        Parameters(_params): Parameters<ProjectListParams>,
+        Parameters(_params): Parameters<DaemonStatusParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
@@ -5289,6 +5320,31 @@ finally:
     }
 
     #[test]
+    fn project_list_tool_schema_exposes_cursor_pagination() {
+        let tools = McplsServer::tool_router().list_all();
+        let project_list = tools
+            .iter()
+            .find(|tool| tool.name == "project_list")
+            .unwrap();
+
+        let expected = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "cursor": {
+                    "default": null,
+                    "description": "Decimal cursor returned by a prior `project_list` response.",
+                    "type": ["string", "null"]
+                }
+            },
+            "type": "object"
+        });
+        assert_eq!(
+            project_list.input_schema.as_ref(),
+            expected.as_object().unwrap()
+        );
+    }
+
+    #[test]
     fn tool_surface_snapshot_is_current() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/tool_surface.json");
         let rendered =
@@ -5479,6 +5535,59 @@ finally:
     }
 
     #[tokio::test]
+    async fn project_list_pages_every_registered_project() {
+        let parent = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        for index in 0..33 {
+            let root = parent.path().join(index.to_string());
+            std::fs::create_dir(&root).unwrap();
+            registry
+                .add(ProjectIdentity::new(
+                    ProjectId::new(format!("project-{index:02}")).unwrap(),
+                    CanonicalRoot::new(root).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let first: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams::default()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["returned"], 32);
+        assert!(first["truncated"].as_bool().unwrap());
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let second: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams {
+                    cursor: Some(cursor),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let ids = first["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["projects"].as_array().unwrap())
+            .map(|project| project["project_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 33);
+        assert_eq!(ids.first(), Some(&"project-00"));
+        assert_eq!(ids.last(), Some(&"project-32"));
+        assert_eq!(second["returned"], 1);
+        assert!(!second["truncated"].as_bool().unwrap());
+        assert!(second["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
     async fn project_add_applies_project_lsp_configuration() {
         let root = TempDir::new().unwrap();
         std::fs::write(
@@ -5558,7 +5667,7 @@ finally:
         let server = create_test_server();
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -5584,7 +5693,7 @@ finally:
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(
             &server
-                .server_status(Parameters(ProjectListParams {}))
+                .server_status(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -5609,7 +5718,7 @@ finally:
         server.context.project_registry.shutdown_all().await;
         let shutdown_health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -5643,7 +5752,7 @@ finally:
 
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -5677,7 +5786,7 @@ finally:
 
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )

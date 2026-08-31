@@ -17592,9 +17592,19 @@
   },
   {
     "name": "project_list",
-    "description": "List registered projects and their canonical roots.",
+    "description": "List registered projects and canonical roots in cursor pages.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Decimal cursor returned by a prior `project_list` response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "outputSchema": {

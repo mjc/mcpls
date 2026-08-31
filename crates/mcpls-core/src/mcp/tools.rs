@@ -958,10 +958,19 @@ pub enum WorkspaceEditContentionScope {
     SameWorktree,
 }
 
-/// Empty parameters for listing all registered projects.
+/// Parameters for listing all registered projects.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List all registered projects.")]
-pub struct ProjectListParams {}
+pub struct ProjectListParams {
+    /// Decimal cursor returned by a prior `project_list` response.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Empty parameters for daemon health and status snapshots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Return a daemon health or status snapshot.")]
+pub struct DaemonStatusParams {}
 
 /// Empty parameters for listing this MCP session's resource subscriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
