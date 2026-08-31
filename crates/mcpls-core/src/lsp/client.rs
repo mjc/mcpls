@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout_at};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, debug_span, error, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
@@ -68,6 +68,31 @@ const OUTBOUND_TRANSPORT_QUEUE_CAPACITY: usize = 100;
 
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
+
+struct LspRequestTiming {
+    span: tracing::Span,
+    started: Instant,
+}
+
+impl LspRequestTiming {
+    fn new(method: &str) -> Self {
+        Self {
+            span: debug_span!(
+                "lsp.request",
+                lsp_method = method,
+                lsp_ms = tracing::field::Empty
+            ),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for LspRequestTiming {
+    fn drop(&mut self) {
+        self.span
+            .record("lsp_ms", self.started.elapsed().as_millis() as u64);
+    }
+}
 
 /// LSP client with async request/response handling.
 ///
@@ -431,6 +456,7 @@ impl LspClient {
         P: Serialize,
         R: DeserializeOwned,
     {
+        let _timing = LspRequestTiming::new(method);
         let params_value = serde_json::to_value(params)?;
         let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
@@ -1035,6 +1061,14 @@ mod tests {
 
         let client = LspClient::new(config);
         assert_eq!(client.language_id(), "rust");
+    }
+
+    #[test]
+    fn lsp_request_span_uses_the_shared_provider_boundary() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let timing = LspRequestTiming::new("test/request");
+
+        assert_eq!(timing.span.metadata().unwrap().name(), "lsp.request");
     }
 
     #[test]
