@@ -77,6 +77,8 @@ use crate::project::{
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
+const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 32 * 1024;
+
 #[derive(Debug, schemars::JsonSchema)]
 #[allow(dead_code)] // Schema-only marker for dynamically assembled object responses.
 struct StructuredObject {
@@ -3404,30 +3406,9 @@ impl McplsServer {
         let mut response_uri = uri;
         let text = match resource {
             SessionResource::Source(source) => {
-                let actor = match self.context.required_actor_for_path(&source.path).await {
-                    Ok(actor) => actor,
-                    Err(_) => self
-                        .context
-                        .project_registry
-                        .actor_for_source_path(&source.path)
-                        .await
-                        .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
-                };
-                let frame = actor
-                    .read_source_resource(source)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                response_uri = make_source_uri(
-                    Path::new(&frame.path),
-                    frame.range.start.line,
-                    frame.range.start.character,
-                    frame.range.end.line,
-                    frame.range.end.character,
-                    &frame.content_hash,
-                    frame.document_version,
-                )
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                serde_json::to_string(&frame)
+                let result = self.read_source_resource_as_tool_result(source).await?;
+                response_uri = result.uri;
+                result.text
             }
             SessionResource::Deferred(token) => {
                 let value = self
@@ -3436,6 +3417,7 @@ impl McplsServer {
                     .read_deferred_resource(&token)
                     .map_err(|error| McpError::invalid_params(error, None))?;
                 serde_json::to_string(&value)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?
             }
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
@@ -3445,8 +3427,7 @@ impl McplsServer {
                     None,
                 ));
             }
-        }
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        };
 
         encode_tool_result(Ok::<_, String>(SemanticResourceReadResult {
             uri: response_uri,
@@ -3457,6 +3438,59 @@ impl McplsServer {
 }
 
 impl McplsServer {
+    async fn read_source_resource_as_tool_result(
+        &self,
+        resource: crate::bridge::resources::SourceResource,
+    ) -> Result<SemanticResourceReadResult, McpError> {
+        let actor = match self.context.required_actor_for_path(&resource.path).await {
+            Ok(actor) => actor,
+            Err(_) => self
+                .context
+                .project_registry
+                .actor_for_source_path(&resource.path)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+        };
+        let mut frame_budget = MAX_SEMANTIC_RESOURCE_RESULT_BYTES;
+
+        loop {
+            let frame = actor
+                .read_source_resource(resource.clone(), frame_budget)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            let uri = make_source_uri(
+                Path::new(&frame.path),
+                frame.range.start.line,
+                frame.range.start.character,
+                frame.range.end.line,
+                frame.range.end.character,
+                &frame.content_hash,
+                frame.document_version,
+            )
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let text = serde_json::to_string(&frame)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let result = SemanticResourceReadResult {
+                uri,
+                mime_type: "application/json".to_owned(),
+                text,
+            };
+            let result_bytes = serde_json::to_vec(&result)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            if result_bytes.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+                return Ok(result);
+            }
+
+            frame_budget /= 2;
+            if frame_budget == 0 {
+                return Err(McpError::internal_error(
+                    "source resource metadata exceeds the response budget",
+                    None,
+                ));
+            }
+        }
+    }
+
     async fn read_source_resource(
         &self,
         resource: crate::bridge::resources::SourceResource,
@@ -3473,7 +3507,7 @@ impl McplsServer {
                 .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
         };
         let frame = actor
-            .read_source_resource(resource)
+            .read_source_resource(resource, MAX_SEMANTIC_RESOURCE_RESULT_BYTES)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let fresh_uri = make_source_uri(
@@ -3964,6 +3998,61 @@ mod tests {
             writeln!(output, "{prefix} {line}").unwrap();
             output
         })
+    }
+
+    #[tokio::test]
+    async fn semantic_resource_tool_pages_an_escaped_source_frame_to_its_outer_budget() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("quoted.rs");
+        let content = format!(
+            "{}\ntail sentinel\n",
+            "λ\"".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 3 + 1)
+        );
+        std::fs::write(&source, &content).unwrap();
+        let registry = ProjectRegistry::new(1);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let resource = crate::bridge::resources::SourceResource {
+            path: source,
+            start_line: 1,
+            start_character: 1,
+            end_line: 2,
+            end_character: 1,
+            snapshot_hash: format!("{:x}", Sha256::digest(content.as_bytes())),
+            document_version: None,
+            offset_bytes: 0,
+        };
+
+        let mut result = server
+            .read_source_resource_as_tool_result(resource)
+            .await
+            .unwrap();
+        let mut recovered = String::new();
+        for _ in 0..16 {
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+            );
+            let frame: crate::bridge::SourceFrame = serde_json::from_str(&result.text).unwrap();
+            recovered.push_str(&frame.text);
+            if !frame.truncated {
+                break;
+            }
+            let next =
+                crate::bridge::resources::parse_source_uri(&frame.resource.unwrap().uri).unwrap();
+            result = server
+                .read_source_resource_as_tool_result(next)
+                .await
+                .unwrap();
+        }
+
+        assert!(recovered.contains("tail sentinel"));
     }
 
     #[test]

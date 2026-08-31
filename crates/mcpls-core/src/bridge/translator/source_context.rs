@@ -14,7 +14,7 @@ use crate::error::Result;
 
 const MAX_FRAME_LINES: usize = 12;
 const MAX_FRAME_BYTES: usize = 4 * 1024;
-const MAX_RESPONSE_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_SOURCE_RESOURCE_FRAME_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct SourceBudget {
@@ -25,7 +25,7 @@ pub(crate) struct SourceBudget {
 impl Default for SourceBudget {
     fn default() -> Self {
         Self {
-            remaining_bytes: MAX_RESPONSE_BYTES,
+            remaining_bytes: MAX_SOURCE_RESOURCE_FRAME_BYTES,
             truncated: false,
         }
     }
@@ -271,6 +271,7 @@ fn source_frame_text_budget(
     language_id: Option<String>,
     document_version: Option<i32>,
     content_hash: &str,
+    max_response_bytes: usize,
 ) -> usize {
     let cursor_uri = SourceResource {
         path: path.to_path_buf(),
@@ -315,7 +316,7 @@ fn source_frame_text_budget(
             total_bytes: Some(usize::MAX),
         }),
     };
-    MAX_RESPONSE_BYTES
+    max_response_bytes
         .saturating_sub(serde_json::to_vec(&placeholder).map_or(usize::MAX, |bytes| bytes.len()))
         .saturating_add(2)
 }
@@ -445,9 +446,10 @@ impl super::Translator {
         .await
     }
 
-    pub(crate) async fn read_source_resource(
+    pub(crate) async fn read_source_resource_with_max_bytes(
         &self,
         resource: &SourceResource,
+        max_response_bytes: usize,
     ) -> Result<SourceFrame> {
         let path = self.validate_source_resource_path(&resource.path)?;
         let (path, document_version, content_hash, content) = self.source_snapshot_at(path).await?;
@@ -496,6 +498,7 @@ impl super::Translator {
             language_id(&path),
             document_version,
             &content_hash,
+            max_response_bytes,
         );
         let mut text = String::new();
         let mut encoded_text_bytes = 0;
@@ -707,7 +710,10 @@ mod tests {
         };
         tokio::fs::write(&path, "fn new_name() {}\n").await.unwrap();
 
-        let frame = translator.read_source_resource(&resource).await.unwrap();
+        let frame = translator
+            .read_source_resource_with_max_bytes(&resource, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
 
         assert!(frame.text.contains("new_name"), "{}", frame.text);
         assert_ne!(frame.content_hash, resource.snapshot_hash);
@@ -742,7 +748,10 @@ mod tests {
             .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
         translator.set_workspace_roots(vec![root.path().to_path_buf()]);
 
-        let replayed = translator.read_source_resource(&resource).await.unwrap();
+        let replayed = translator
+            .read_source_resource_with_max_bytes(&resource, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
 
         assert_eq!(replayed.range.start.line, 10);
         assert_eq!(replayed.range.end.line, 12);
@@ -778,7 +787,10 @@ mod tests {
             offset_bytes: 0,
         };
 
-        let frame = translator.read_source_resource(&resource).await.unwrap();
+        let frame = translator
+            .read_source_resource_with_max_bytes(&resource, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
 
         assert_eq!(frame.text, "   1 |     indented value\n");
         assert_eq!(frame.range.start.character, 1);
@@ -828,7 +840,7 @@ mod tests {
         let path = root.path().join("lib.rs");
         let content = format!(
             "{}\ntail sentinel\n",
-            "λ\"".repeat(MAX_RESPONSE_BYTES / 3 + 1)
+            "λ\"".repeat(MAX_SOURCE_RESOURCE_FRAME_BYTES / 3 + 1)
         );
         tokio::fs::write(&path, &content).await.unwrap();
         let mut translator = crate::bridge::Translator::new()
@@ -846,10 +858,13 @@ mod tests {
             offset_bytes: 0,
         };
 
-        let frame = translator.read_source_resource(&resource).await.unwrap();
+        let frame = translator
+            .read_source_resource_with_max_bytes(&resource, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
 
-        assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
-        assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_RESPONSE_BYTES);
+        assert!(frame.returned_bytes <= MAX_SOURCE_RESOURCE_FRAME_BYTES);
+        assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_SOURCE_RESOURCE_FRAME_BYTES);
         assert!(frame.truncated);
         let next = crate::bridge::resources::parse_source_uri(
             &frame
@@ -862,8 +877,11 @@ mod tests {
         assert_eq!(next.start_line, 1);
         assert!(next.offset_bytes > 0);
 
-        let next_frame = translator.read_source_resource(&next).await.unwrap();
-        assert!(next_frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        let next_frame = translator
+            .read_source_resource_with_max_bytes(&next, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
+        assert!(next_frame.returned_bytes <= MAX_SOURCE_RESOURCE_FRAME_BYTES);
         assert!(next_frame.text.contains("tail sentinel"));
         assert!(!next_frame.truncated);
     }
@@ -891,10 +909,13 @@ mod tests {
             offset_bytes: 0,
         };
 
-        let frame = translator.read_source_resource(&resource).await.unwrap();
+        let frame = translator
+            .read_source_resource_with_max_bytes(&resource, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
 
         assert!(frame.truncated);
-        assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
+        assert!(frame.returned_bytes <= MAX_SOURCE_RESOURCE_FRAME_BYTES);
         assert_eq!(frame.total_lines, 40);
         assert!(frame.total_bytes > frame.returned_bytes);
         assert_eq!(frame.range.start.line, 1);
@@ -913,7 +934,10 @@ mod tests {
         assert!(next.offset_bytes > 0);
         assert_eq!(next.end_line, 40);
 
-        let next_frame = translator.read_source_resource(&next).await.unwrap();
+        let next_frame = translator
+            .read_source_resource_with_max_bytes(&next, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
         assert_eq!(next_frame.range.start.line, next.start_line);
         assert_eq!(next_frame.range.end.line, 40);
         assert!(
@@ -1095,7 +1119,10 @@ mod tests {
             offset_bytes: 0,
         };
 
-        let frame = translator.read_source_resource(&resource).await.unwrap();
+        let frame = translator
+            .read_source_resource_with_max_bytes(&resource, MAX_SOURCE_RESOURCE_FRAME_BYTES)
+            .await
+            .unwrap();
 
         assert!(frame.text.contains("dependency"));
         assert!(translator.validate_path(&path).is_err());

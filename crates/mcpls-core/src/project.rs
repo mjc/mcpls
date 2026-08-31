@@ -1592,6 +1592,7 @@ enum ProjectRequest {
     },
     ReadSourceResource {
         resource: SourceResource,
+        max_response_bytes: usize,
         reply: oneshot::Sender<Result<SourceFrame, String>>,
     },
     ResolveSymbolHandle {
@@ -2366,10 +2367,15 @@ impl ProjectHandle {
     pub(crate) async fn read_source_resource(
         &self,
         resource: SourceResource,
+        max_response_bytes: usize,
     ) -> Result<SourceFrame, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::ReadSourceResource { resource, reply })
+            .send(ProjectRequest::ReadSourceResource {
+                resource,
+                max_response_bytes,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -5352,9 +5358,13 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    async fn read_source_resource(&self, resource: SourceResource) -> Result<SourceFrame, String> {
+    async fn read_source_resource(
+        &self,
+        resource: SourceResource,
+        max_response_bytes: usize,
+    ) -> Result<SourceFrame, String> {
         self.translator
-            .read_source_resource(&resource)
+            .read_source_resource_with_max_bytes(&resource, max_response_bytes)
             .await
             .map_err(|error| error.to_string())
     }
@@ -7698,8 +7708,16 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::ReadSourceResource { resource, reply } => {
-            let _ = reply.send(runtime.read_source_resource(resource).await);
+        ProjectRequest::ReadSourceResource {
+            resource,
+            max_response_bytes,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .read_source_resource(resource, max_response_bytes)
+                    .await,
+            );
         }
         ProjectRequest::ResolveSymbolHandle {
             symbol_handle,
