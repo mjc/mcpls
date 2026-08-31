@@ -878,7 +878,15 @@ fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value
     let details_truncated = summary.affected_files.len() > MAX_APPROVAL_ITEMS
         || summary.operations.len() > MAX_APPROVAL_ITEMS
         || summary.file_operations.len() > MAX_APPROVAL_ITEMS
-        || summary.diff_files.len() > MAX_APPROVAL_ITEMS;
+        || summary.diff_files.len() > MAX_APPROVAL_ITEMS
+        || summary
+            .affected_files
+            .iter()
+            .any(|path| path.display().to_string().len() > MAX_APPROVAL_TEXT_BYTES)
+        || summary
+            .operations
+            .iter()
+            .any(|operation| operation.len() > MAX_APPROVAL_TEXT_BYTES);
     serde_json::json!({
         "plan_id": summary.plan_id.as_str(),
         "project_id": summary.project_id,
@@ -4889,6 +4897,24 @@ mod tests {
             value["detail_resource"]["uri"],
             format!("mcpls-edit-approval:///project?plan_id={plan_id}&offset_bytes=0")
         );
+    }
+
+    #[test]
+    fn approval_summary_marks_a_truncated_inline_operation() {
+        let summary = EditPlanApprovalSummary {
+            plan_id: PlanId::parse("plan").unwrap(),
+            project_id: "project".to_owned(),
+            affected_files: Vec::new(),
+            operations: vec!["x".repeat(MAX_APPROVAL_TEXT_BYTES + 1)],
+            file_operations: Vec::new(),
+            diff_files: Vec::new(),
+            diff_truncated: false,
+            safe_to_apply: true,
+            snapshot_hashes: Vec::new(),
+            versions: Vec::new(),
+        };
+
+        assert_eq!(approval_summary_json(&summary)["details_truncated"], true);
     }
 
     #[test]
