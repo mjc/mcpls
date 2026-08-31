@@ -470,6 +470,10 @@ fn project_events_json(
         "project_id": project_id.as_str(),
         "next_cursor": snapshot.next_sequence(),
         "resync_required": snapshot.resync_required(),
+        "retention_floor": snapshot.retention_floor(),
+        "returned_events": snapshot.events().len(),
+        "first_sequence": snapshot.first_sequence(),
+        "last_sequence": snapshot.last_sequence(),
         "events": snapshot
             .events()
             .iter()
@@ -6059,6 +6063,10 @@ finally:
         let event_payload: serde_json::Value = serde_json::from_str(event_text).unwrap();
         assert_eq!(event_payload["project_id"], "project");
         assert_eq!(event_payload["resync_required"], false);
+        assert_eq!(event_payload["retention_floor"], 0);
+        assert_eq!(event_payload["returned_events"], 2);
+        assert_eq!(event_payload["first_sequence"], 1);
+        assert_eq!(event_payload["last_sequence"], 2);
         assert_eq!(event_payload["events"].as_array().unwrap().len(), 2);
         assert_eq!(event_payload["events"][0]["event"]["kind"], "files_changed");
         assert_eq!(event_payload["events"][1]["event"]["kind"], "edit_applied");

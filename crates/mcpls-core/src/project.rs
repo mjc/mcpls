@@ -933,6 +933,7 @@ impl ProjectEventRecord {
 pub struct ProjectEventSnapshot {
     events: Vec<ProjectEventRecord>,
     resync_required: bool,
+    retention_floor: u64,
     next_sequence: u64,
 }
 
@@ -943,10 +944,28 @@ impl ProjectEventSnapshot {
         &self.events
     }
 
+    /// Return the first retained sequence in this response, when any.
+    #[must_use]
+    pub fn first_sequence(&self) -> Option<u64> {
+        self.events.first().map(ProjectEventRecord::sequence)
+    }
+
+    /// Return the last retained sequence in this response, when any.
+    #[must_use]
+    pub fn last_sequence(&self) -> Option<u64> {
+        self.events.last().map(ProjectEventRecord::sequence)
+    }
+
     /// Whether the requested cursor predates the retained bounded history.
     #[must_use]
     pub const fn resync_required(&self) -> bool {
         self.resync_required
+    }
+
+    /// Return the latest cursor whose successor is entirely retained.
+    #[must_use]
+    pub const fn retention_floor(&self) -> u64 {
+        self.retention_floor
     }
 
     /// Return the next cursor clients should use for a subsequent poll.
@@ -1004,6 +1023,7 @@ impl ProjectEventHistory {
         ProjectEventSnapshot {
             events,
             resync_required,
+            retention_floor: oldest.saturating_sub(1),
             next_sequence: self.next_sequence,
         }
     }
