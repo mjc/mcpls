@@ -984,15 +984,24 @@ pub struct SemanticResourceReadParams {
     pub uri: String,
 }
 
-/// Tool-call representation of one deferred semantic resource.
+/// Tool-call representation of one semantic resource page.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticResourceReadResult {
     /// Resource URI that was read.
     pub uri: String,
     /// MIME type of `text`.
     pub mime_type: String,
-    /// Complete JSON resource payload.
+    /// Complete JSON resource payload, or an ordered UTF-8 JSON fragment when `next_uri` is set.
     pub text: String,
+    /// URI for the next fragment, when this response is not the complete payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_uri: Option<String>,
+    /// Total byte length of the complete JSON payload when this is a fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<usize>,
+    /// Byte offset of this fragment in the complete JSON payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_bytes: Option<usize>,
 }
 
 #[cfg(test)]

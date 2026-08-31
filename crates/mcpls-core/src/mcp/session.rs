@@ -70,8 +70,17 @@ pub enum SessionResource {
     },
     /// Snapshot-bound source context omitted from a bounded semantic result.
     Source(SourceResource),
-    /// Actor-owned deferred semantic section identified by an opaque token.
-    Deferred(String),
+    /// Actor-owned deferred semantic section and byte cursor.
+    Deferred(DeferredResource),
+}
+
+/// Cursor into an actor-owned deferred semantic section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredResource {
+    /// Opaque resource token.
+    pub token: String,
+    /// UTF-8 byte offset of this continuation page.
+    pub offset_bytes: usize,
 }
 
 /// Parse either a diagnostics or project-status resource URI.
@@ -85,11 +94,23 @@ pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, Resource
     if uri.starts_with("mcpls-source://") {
         return parse_source_uri(uri).map(SessionResource::Source);
     }
-    if let Some(token) = uri.strip_prefix("mcpls-deferred:///")
-        && !token.is_empty()
-        && !token.contains('/')
-    {
-        return Ok(SessionResource::Deferred(token.to_owned()));
+    if let Some(value) = uri.strip_prefix("mcpls-deferred:///") {
+        let (token, query) = value
+            .split_once('?')
+            .map_or((value, None), |(token, query)| (token, Some(query)));
+        let offset_bytes = query
+            .map_or(Some(0), |query| {
+                query
+                    .strip_prefix("offset_bytes=")
+                    .and_then(|value| value.parse().ok())
+            })
+            .ok_or_else(|| ResourceUriError::DecodeFailed(uri.to_owned()))?;
+        if !token.is_empty() && !token.contains('/') {
+            return Ok(SessionResource::Deferred(DeferredResource {
+                token: token.to_owned(),
+                offset_bytes,
+            }));
+        }
     }
     parse_uri(uri).map(SessionResource::Diagnostics)
 }
@@ -437,6 +458,18 @@ mod tests {
             diagnostics_resource_uri("file:///workspace/src/main.rs"),
             Some("lsp-diagnostics:///workspace/src/main.rs".to_string())
         );
+    }
+
+    #[test]
+    fn deferred_resource_uri_round_trips_a_continuation_offset() {
+        assert_eq!(
+            parse_session_resource_uri("mcpls-deferred:///token?offset_bytes=42").unwrap(),
+            SessionResource::Deferred(super::DeferredResource {
+                token: "token".to_owned(),
+                offset_bytes: 42,
+            })
+        );
+        assert!(parse_session_resource_uri("mcpls-deferred:///token?offset_bytes=nope").is_err());
     }
 
     #[test]

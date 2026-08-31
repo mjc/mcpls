@@ -33,8 +33,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
-    SessionResource, event_resource_uris, parse_session_resource_uri, project_events_resource_uri,
-    project_status_resource_uri,
+    DeferredResource, SessionResource, event_resource_uris, parse_session_resource_uri,
+    project_events_resource_uri, project_status_resource_uri,
 };
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
@@ -78,6 +78,55 @@ use crate::project::{
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
 const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 32 * 1024;
+
+fn deferred_resource_page(
+    deferred: &DeferredResource,
+    uri: String,
+    value: serde_json::Value,
+) -> Result<SemanticResourceReadResult, McpError> {
+    let json = serde_json::to_string(&value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let total_bytes = json.len();
+    if deferred.offset_bytes > total_bytes || !json.is_char_boundary(deferred.offset_bytes) {
+        return Err(McpError::invalid_params(
+            "invalid deferred resource offset; restart from the original URI",
+            None,
+        ));
+    }
+
+    let mut end = (deferred.offset_bytes + MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2).min(total_bytes);
+    while end > deferred.offset_bytes && !json.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let next_uri = (end < total_bytes)
+            .then(|| format!("mcpls-deferred:///{}?offset_bytes={end}", deferred.token));
+        let result = SemanticResourceReadResult {
+            uri: uri.clone(),
+            mime_type: "application/json".to_owned(),
+            text: json[deferred.offset_bytes..end].to_owned(),
+            next_uri,
+            total_bytes: (end < total_bytes).then_some(total_bytes),
+            offset_bytes: (end < total_bytes).then_some(deferred.offset_bytes),
+        };
+        let result_bytes = serde_json::to_vec(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if result_bytes.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+            return Ok(result);
+        }
+        let next_end = deferred.offset_bytes + (end - deferred.offset_bytes) / 2;
+        if next_end == deferred.offset_bytes {
+            return Err(McpError::internal_error(
+                "deferred resource metadata exceeds the response budget",
+                None,
+            ));
+        }
+        end = next_end;
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+}
 
 #[derive(Debug, schemars::JsonSchema)]
 #[allow(dead_code)] // Schema-only marker for dynamically assembled object responses.
@@ -3395,7 +3444,7 @@ impl McplsServer {
 
     /// Read source context omitted from a bounded result when the client does not expose MCP resources.
     #[tool(
-        description = "Read a complete snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. This is the callable fallback for clients that do not expose resources/read."
+        description = "Read a snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. Deferred payloads return lossless UTF-8 JSON pages with a continuation URI when needed. This is the callable fallback for clients that do not expose resources/read."
     )]
     async fn read_semantic_resource(
         &self,
@@ -3403,21 +3452,17 @@ impl McplsServer {
     ) -> Result<Json<SemanticResourceReadResult>, McpError> {
         let resource = parse_session_resource_uri(&uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let mut response_uri = uri;
-        let text = match resource {
+        let result = match resource {
             SessionResource::Source(source) => {
-                let result = self.read_source_resource_as_tool_result(source).await?;
-                response_uri = result.uri;
-                result.text
+                self.read_source_resource_as_tool_result(source).await?
             }
-            SessionResource::Deferred(token) => {
+            SessionResource::Deferred(deferred) => {
                 let value = self
                     .context
                     .project_registry
-                    .read_deferred_resource(&token)
+                    .read_deferred_resource(&deferred.token)
                     .map_err(|error| McpError::invalid_params(error, None))?;
-                serde_json::to_string(&value)
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?
+                deferred_resource_page(&deferred, uri, value)?
             }
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
@@ -3429,11 +3474,7 @@ impl McplsServer {
             }
         };
 
-        encode_tool_result(Ok::<_, String>(SemanticResourceReadResult {
-            uri: response_uri,
-            mime_type: "application/json".to_owned(),
-            text,
-        }))
+        encode_tool_result(Ok::<_, String>(result))
     }
 }
 
@@ -3474,6 +3515,9 @@ impl McplsServer {
                 uri,
                 mime_type: "application/json".to_owned(),
                 text,
+                next_uri: None,
+                total_bytes: None,
+                offset_bytes: None,
             };
             let result_bytes = serde_json::to_vec(&result)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -3531,16 +3575,17 @@ impl McplsServer {
 
     fn read_deferred_resource(
         &self,
-        token: &str,
+        deferred: DeferredResource,
         uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
         let value = self
             .context
             .project_registry
-            .read_deferred_resource(token)
+            .read_deferred_resource(&deferred.token)
             .map_err(|error| McpError::invalid_params(error, None))?;
-        let json = serde_json::to_string(&value)
+        let page = deferred_resource_page(&deferred, uri.clone(), value)?;
+        let json = serde_json::to_string(&page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json, uri)],
@@ -3771,8 +3816,8 @@ impl ServerHandler for McplsServer {
                     .read_source_resource(source, request.uri, supports_cache_hints)
                     .await;
             }
-            SessionResource::Deferred(token) => {
-                return self.read_deferred_resource(&token, request.uri, supports_cache_hints);
+            SessionResource::Deferred(deferred) => {
+                return self.read_deferred_resource(deferred, request.uri, supports_cache_hints);
             }
         };
 
@@ -3998,6 +4043,43 @@ mod tests {
             writeln!(output, "{prefix} {line}").unwrap();
             output
         })
+    }
+
+    #[test]
+    fn deferred_resource_pages_are_bounded_and_lossless() {
+        let value = serde_json::json!({
+            "references": ["λ\"".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)],
+        });
+        let expected = serde_json::to_string(&value).unwrap();
+        let mut offset_bytes = 0;
+        let mut actual = String::new();
+
+        loop {
+            let deferred = DeferredResource {
+                token: "token".to_owned(),
+                offset_bytes,
+            };
+            let result = deferred_resource_page(
+                &deferred,
+                format!("mcpls-deferred:///token?offset_bytes={offset_bytes}"),
+                value.clone(),
+            )
+            .unwrap();
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+            );
+            actual.push_str(&result.text);
+            let Some(next_uri) = result.next_uri else {
+                break;
+            };
+            let SessionResource::Deferred(next) = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("continuation must remain a deferred resource");
+            };
+            offset_bytes = next.offset_bytes;
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

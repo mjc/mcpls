@@ -17853,7 +17853,7 @@
   },
   {
     "name": "read_semantic_resource",
-    "description": "Read a complete snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. This is the callable fallback for clients that do not expose resources/read.",
+    "description": "Read a snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. Deferred payloads return lossless UTF-8 JSON pages with a continuation URI when needed. This is the callable fallback for clients that do not expose resources/read.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -17874,9 +17874,34 @@
           "description": "MIME type of `text`.",
           "type": "string"
         },
+        "next_uri": {
+          "description": "URI for the next fragment, when this response is not the complete payload.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset_bytes": {
+          "description": "Byte offset of this fragment in the complete JSON payload.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "text": {
-          "description": "Complete JSON resource payload.",
+          "description": "Complete JSON resource payload, or an ordered UTF-8 JSON fragment when `next_uri` is set.",
           "type": "string"
+        },
+        "total_bytes": {
+          "description": "Total byte length of the complete JSON payload when this is a fragment.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "uri": {
           "description": "Resource URI that was read.",
