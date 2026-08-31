@@ -42,10 +42,10 @@ use super::tools::{
     CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
     FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
     HoverParams, InlayHintsParams, InspectSymbolBatchParams, InspectSymbolParams,
-    MoveInlineModulePreviewParams, MoveItemPreviewParams, PathRenamePreviewParams,
-    ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams, ProjectListParams,
-    ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams, RenameParams,
-    RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
+    LexicalSearchParams, MoveInlineModulePreviewParams, MoveItemPreviewParams,
+    PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams,
+    ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
+    RenameParams, RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
     SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
     StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
     WorkspaceEditApplyResult, WorkspaceEditContention, WorkspaceEditContentionScope,
@@ -54,13 +54,14 @@ use super::tools::{
 };
 #[cfg(test)]
 use crate::bridge::Translator;
+use crate::bridge::lexical::find_matches;
 use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
 use crate::bridge::{
-    PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SymbolHandle,
-    WorkspaceSymbolBatchRequest,
+    LexicalSearchRequest, PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind,
+    SymbolHandle, WorkspaceSymbolBatchRequest,
 };
 use crate::edit_paths::FileOperation;
 use crate::edit_plan::EditPlanApprovalSummary;
@@ -2568,6 +2569,51 @@ impl McplsServer {
         encode_tool_result(result)
     }
 
+    /// Search project snapshots by literal text or Rust regex.
+    #[tool(
+        description = "Bounded project lexical search over current document snapshots. Literal and Rust-regex modes preserve exact byte ranges; ignored and generated paths are excluded unless explicitly requested."
+    )]
+    async fn lexical_search(
+        &self,
+        Parameters(params): Parameters<LexicalSearchParams>,
+    ) -> Result<Json<Vec<crate::bridge::LexicalSearchMatch>>, McpError> {
+        if params.max_files == 0 || params.max_matches == 0 {
+            return Err(McpError::invalid_params(
+                "max_files and max_matches must be greater than zero",
+                None,
+            ));
+        }
+        find_matches(
+            "",
+            &params.query,
+            params.mode,
+            params.case,
+            params.multiline,
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let id = parse_project_id(params.project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        encode_tool_result(
+            actor
+                .lexical_search(LexicalSearchRequest {
+                    query: params.query,
+                    mode: params.mode,
+                    case: params.case,
+                    multiline: params.multiline,
+                    max_files: params.max_files,
+                    max_matches: params.max_matches,
+                    include_generated: params.include_generated,
+                })
+                .await
+                .map_err(|error| error.to_string()),
+        )
+    }
+
     /// Search several symbol names through one bounded actor request.
     #[tool(
         description = "Batch workspace-symbol search with shared filters and global item/byte bounds. Exact duplicate queries reuse the first entry instead of repeating provider work or payloads."
@@ -4866,6 +4912,21 @@ finally:
             schema["properties"]["entries"].is_object()
                 && schema["properties"]["budget"].is_object()
         }));
+    }
+
+    #[test]
+    fn lexical_search_is_advertised_with_explicit_matching_controls() {
+        let tool = McplsServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "lexical_search")
+            .expect("lexical_search is missing from tools/list");
+
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(schema.contains("literal"));
+        assert!(schema.contains("regex"));
+        assert!(schema.contains("smart"));
+        assert!(tool.input_schema["properties"]["max_matches"].is_object());
     }
 
     #[tokio::test]

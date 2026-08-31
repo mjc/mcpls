@@ -546,7 +546,7 @@ fn byte_offset_to_position(
     ))
 }
 
-fn is_generated_path(path: &std::path::Path) -> bool {
+pub(crate) fn is_generated_path(path: &std::path::Path) -> bool {
     path.components().any(|component| {
         component
             .as_os_str()

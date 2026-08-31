@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bridge::DeferredResourceReference;
 use crate::bridge::convert_code_action_or_command;
+use crate::bridge::lexical::{
+    LexicalSearchMatch, LexicalSearchRequest, collect_project_paths, find_matches,
+};
 use crate::bridge::resources::SourceResource;
 use crate::bridge::translator::{CallHierarchyItemResult, DiagnosticOptions, page_items};
 use crate::bridge::{
@@ -1635,6 +1638,10 @@ enum ProjectRequest {
         request: WorkspaceSymbolBatchRequest,
         reply: oneshot::Sender<Result<WorkspaceSymbolBatchResult, String>>,
     },
+    LexicalSearch {
+        request: LexicalSearchRequest,
+        reply: oneshot::Sender<Result<Vec<LexicalSearchMatch>, String>>,
+    },
     InspectSymbol {
         request: InspectSymbolRequest,
         reply: oneshot::Sender<Result<InspectSymbolResult, String>>,
@@ -2007,6 +2014,7 @@ impl ProjectRequest {
             Self::FormatDocument { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbolBatch { reply, .. } => reply.is_closed(),
+            Self::LexicalSearch { reply, .. } => reply.is_closed(),
             Self::InspectSymbol { reply, .. } => reply.is_closed(),
             Self::InspectSymbolBatch { reply, .. } => reply.is_closed(),
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
@@ -2649,6 +2657,22 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::WorkspaceSymbolBatch { request, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Search project snapshots with bounded lexical matching.
+    pub(crate) async fn lexical_search(
+        &self,
+        request: LexicalSearchRequest,
+    ) -> Result<Vec<LexicalSearchMatch>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::LexicalSearch { request, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -5356,6 +5380,55 @@ impl ProjectRuntime {
         Ok(batch)
     }
 
+    async fn lexical_search(
+        &self,
+        request: LexicalSearchRequest,
+    ) -> Result<Vec<LexicalSearchMatch>, String> {
+        let paths = collect_project_paths(
+            self.translator.workspace_roots(),
+            request.include_generated,
+            request.max_files,
+        )
+        .await;
+        let mut matches = Vec::new();
+        for path in paths {
+            if matches.len() >= request.max_matches {
+                break;
+            }
+            let (path, document_version, content_hash, source) = self
+                .translator
+                .source_snapshot(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+            let ranges = find_matches(
+                &source,
+                &request.query,
+                request.mode,
+                request.case,
+                request.multiline,
+            )?;
+            let remaining = request.max_matches.saturating_sub(matches.len());
+            let project_relative_path = self
+                .translator
+                .workspace_roots()
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok())
+                .map(|relative| relative.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    "lexical search found a path outside its project roots".to_owned()
+                })?;
+            matches.extend(ranges.into_iter().take(remaining).map(|byte_range| {
+                LexicalSearchMatch {
+                    project_relative_path: project_relative_path.clone(),
+                    document_version,
+                    content_hash: content_hash.clone(),
+                    byte_range,
+                }
+            }));
+        }
+        Ok(matches)
+    }
+
     async fn workspace_snapshot_identity(&self) -> Result<String, String> {
         let mut paths = Vec::new();
         for root in self.translator.workspace_roots() {
@@ -7377,6 +7450,16 @@ async fn handle_project_request(
             let result = tokio::select! {
                 () = reply.closed() => return false,
                 result = runtime.workspace_symbol_batch(request) => result,
+            };
+            let _ = reply.send(result);
+        }
+        ProjectRequest::LexicalSearch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.lexical_search(request) => result,
             };
             let _ = reply.send(result);
         }

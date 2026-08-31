@@ -7,6 +7,7 @@ use crate::bridge::{
     DocumentSymbolOptions, InspectSymbolBudget, InspectSymbolSectionKind, SemanticResultLimits,
     SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope,
 };
+use crate::bridge::{LexicalCaseMode, LexicalMatchMode};
 
 /// Parameters for the `get_hover` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -366,6 +367,38 @@ pub struct WorkspaceSymbolParams {
     /// Include symbols under generated/build-output directories (default: false).
     #[serde(default)]
     pub include_generated: bool,
+}
+
+/// Parameters for bounded project-scoped lexical search.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LexicalSearchParams {
+    /// Registered project identifier whose snapshots should be searched.
+    pub project_id: String,
+    /// Literal text or Rust regex to find.
+    pub query: String,
+    /// Interpret `query` literally or as a Rust regex.
+    pub mode: LexicalMatchMode,
+    /// Case sensitivity behavior.
+    pub case: LexicalCaseMode,
+    /// Enable multiline regex anchors.
+    #[serde(default)]
+    pub multiline: bool,
+    /// Maximum project files inspected (default: 1024).
+    #[serde(default = "default_lexical_max_files")]
+    pub max_files: usize,
+    /// Maximum matches returned (default: 100).
+    #[serde(default = "default_lexical_max_matches")]
+    pub max_matches: usize,
+    /// Include generated/build-output files.
+    #[serde(default)]
+    pub include_generated: bool,
+}
+
+const fn default_lexical_max_files() -> usize {
+    1024
+}
+const fn default_lexical_max_matches() -> usize {
+    100
 }
 
 /// Parameters for one bounded batch of workspace-symbol searches.
