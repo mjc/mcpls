@@ -708,6 +708,8 @@ Resolve one project symbol by snapshot-bound `symbol_handle` or exact `query`. O
 
 ### No-file-read workflow
 
+For literal or Rust-regex source text, call `lexical_search` first. It returns bounded snapshot references and optional context, so `rg` is unnecessary for ordinary project search.
+
 ```text
 workspace_symbol_search {project_id: "default", query: "charge", match_mode: "exact"}
 → ranked candidate with source.status="available" and symbol_handle="…"

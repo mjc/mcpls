@@ -4868,6 +4868,7 @@ finally:
             for required in [
                 "workspace_symbol_search",
                 "inspect_symbol",
+                "lexical_search",
                 "symbol_handle",
                 "stale_symbol_handle",
                 "uncapped full file",
