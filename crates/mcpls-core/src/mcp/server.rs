@@ -876,6 +876,7 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
 
 const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
 const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
+const RESOURCE_PAGE_SIZE: usize = 64;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
@@ -942,6 +943,36 @@ fn advertised_tools_page(cursor: Option<&str>) -> Result<(Vec<Tool>, Option<Stri
     Ok((
         tools[start..end].to_vec(),
         (end < tools.len()).then(|| end.to_string()),
+    ))
+}
+
+fn resource_page(
+    resources: Vec<Resource>,
+    cursor: Option<&str>,
+) -> Result<(Vec<Resource>, Option<String>), String> {
+    let start = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| format!("invalid resources/list cursor: {cursor}"))?,
+        None => 0,
+    };
+    if cursor.is_some() && start >= resources.len() {
+        return Err(format!(
+            "resources/list cursor is outside the catalog: {start}"
+        ));
+    }
+
+    let end = start
+        .saturating_add(RESOURCE_PAGE_SIZE)
+        .min(resources.len());
+    let next_cursor = (end < resources.len()).then(|| end.to_string());
+    Ok((
+        resources
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .collect(),
+        next_cursor,
     ))
 }
 
@@ -3581,11 +3612,9 @@ impl ServerHandler for McplsServer {
 
     async fn list_resources(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
+        request: Option<rmcp::model::PaginatedRequestParams>,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
-        // very large single-page responses that may exceed transport buffers).
         let open_documents = self
             .context
             .project_registry
@@ -3631,7 +3660,15 @@ impl ServerHandler for McplsServer {
                 .with_description(format!("Ordered project events for {project_id}"))
         }));
 
-        let result = ListResourcesResult::with_all_items(resources);
+        let (resources, next_cursor) = resource_page(
+            resources,
+            request
+                .as_ref()
+                .and_then(|request| request.cursor.as_deref()),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut result = ListResourcesResult::with_all_items(resources);
+        result.next_cursor = next_cursor;
         if supports_cache_hints(&context) {
             Ok(result.with_ttl_ms(0).with_cache_scope(CacheScope::Private))
         } else {
@@ -5091,6 +5128,35 @@ finally:
         );
         assert!(advertised_tools_page(Some("not-an-offset")).is_err());
         assert!(advertised_tools_page(Some(&names.len().to_string())).is_err());
+    }
+
+    #[test]
+    fn resource_pages_are_lossless_and_bounded() {
+        let resources = || {
+            (0..=RESOURCE_PAGE_SIZE)
+                .map(|index| Resource::new(format!("mcpls://resource/{index}"), index.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let expected = resources()
+            .into_iter()
+            .map(|resource| resource.uri)
+            .collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut uris = Vec::new();
+
+        loop {
+            let (page, next_cursor) = resource_page(resources(), cursor.as_deref()).unwrap();
+            assert!(page.len() <= RESOURCE_PAGE_SIZE);
+            uris.extend(page.into_iter().map(|resource| resource.uri));
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+
+        assert_eq!(uris, expected);
+        assert!(resource_page(resources(), Some("not-an-offset")).is_err());
+        assert!(resource_page(resources(), Some(&expected.len().to_string())).is_err());
     }
 
     #[test]
