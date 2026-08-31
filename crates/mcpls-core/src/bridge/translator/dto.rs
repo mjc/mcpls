@@ -113,7 +113,7 @@ pub struct SourceFrame {
     pub total_bytes: usize,
     /// Whether a line or byte budget shortened the frame.
     pub truncated: bool,
-    /// Direct resource for the complete selected context when this frame is bounded.
+    /// Direct snapshot-bound page for selected context omitted from this frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<DeferredResourceReference>,
 }
@@ -483,6 +483,23 @@ pub struct DiagnosticsResult {
     pub truncated: bool,
     /// Filters and bounds applied to this result.
     pub filters: DiagnosticOptions,
+    /// Provenance when this result came from cached diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<DiagnosticsCacheMetadata>,
+}
+
+/// Provenance for a cached diagnostics result.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DiagnosticsCacheMetadata {
+    /// Cached diagnostics were used instead of a fresh analysis request.
+    pub hit: bool,
+    /// Age of the cached notification when this result was read.
+    pub age_ms: u64,
+    /// Opaque identity of the cached diagnostics publication.
+    pub snapshot_identity: String,
+    /// Cached document version, when supplied by the language server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
 }
 
 /// Filters and explicit response bounds for diagnostics.
@@ -554,6 +571,7 @@ impl DiagnosticsResult {
             omitted_groups: 0,
             truncated: false,
             filters: DiagnosticOptions::default(),
+            cache: None,
         }
     }
 }
@@ -831,6 +849,61 @@ pub struct WorkspaceSymbolResult {
     pub truncated: bool,
 }
 
+/// Actor-owned inputs for a bounded batch of workspace-symbol queries.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolBatchRequest {
+    /// Queries in caller order. Exact duplicates reuse the first result.
+    pub queries: Vec<String>,
+    /// Optional symbol-kind filter shared by every query.
+    pub kind_filter: Option<String>,
+    /// Name-matching behavior shared by every query.
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Source scope shared by every query.
+    pub scope: WorkspaceSymbolScope,
+    /// Whether generated symbols may be returned.
+    pub include_generated: bool,
+    /// Maximum symbols returned across all unique queries.
+    pub max_items: usize,
+    /// Maximum serialized bytes returned for the complete batch.
+    pub max_bytes: usize,
+}
+
+/// One caller-ordered workspace-symbol batch entry.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceSymbolBatchEntry {
+    /// Original query at this position.
+    pub query: String,
+    /// Search result for the first occurrence of this query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<WorkspaceSymbolResult>,
+    /// Earlier entry whose result this exact duplicate reuses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<usize>,
+    /// Whether the global response budget prevented provider work for this query.
+    pub skipped_by_budget: bool,
+}
+
+/// Bounded results for a caller-ordered batch of workspace-symbol queries.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceSymbolBatchResult {
+    /// One entry for every input query, in input order.
+    pub entries: Vec<WorkspaceSymbolBatchEntry>,
+    /// Number of distinct query strings in the request.
+    pub unique_queries: usize,
+    /// Number of downstream workspace-symbol requests actually issued.
+    pub provider_requests: usize,
+    /// Stable content-derived identity of the project snapshot queried.
+    pub snapshot_identity: String,
+    /// Whether this response reused prior provider work for this exact snapshot.
+    pub cache_hit: bool,
+    /// Number of symbol payloads returned across unique queries.
+    pub returned: usize,
+    /// Whether an item or byte budget omitted provider work or symbol payloads.
+    pub truncated: bool,
+    /// Serialized-byte budget applied to this response.
+    pub max_bytes: usize,
+}
+
 /// Selectable sections of a high-level symbol inspection bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(inline)]
@@ -870,22 +943,44 @@ pub struct InspectSymbolRequest {
     pub budget: InspectSymbolBudget,
 }
 
+/// One symbol identity in a batch inspection request.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InspectSymbolTarget {
+    /// Snapshot-bound handle returned by symbol discovery.
+    pub symbol_handle: Option<SymbolHandle>,
+    /// Exact symbol name used when no handle is supplied.
+    pub query: Option<String>,
+    /// Optional symbol-kind disambiguator.
+    pub kind: Option<String>,
+    /// Optional project-relative path disambiguator.
+    pub path: Option<String>,
+    /// Optional container-name disambiguator.
+    pub container: Option<String>,
+}
+
+/// Actor-owned inputs for inspecting several symbols concurrently.
+#[derive(Debug, Clone)]
+pub struct InspectSymbolBatchRequest {
+    /// Caller-ordered symbol identities.
+    pub targets: Vec<InspectSymbolTarget>,
+    /// Maximum candidates returned for each ambiguous query.
+    pub candidate_limit: u32,
+    /// Sections requested for every target.
+    pub sections: Vec<InspectSymbolSectionKind>,
+    /// Shared bounds applied across the batch.
+    pub budget: InspectSymbolBudget,
+}
+
+pub(crate) const INSPECT_SYMBOL_BATCH_MAX_TARGETS: usize = 16;
+pub(crate) const INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES: usize = 1024;
+pub(crate) const INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET: usize = 4096;
+
 impl InspectSymbolRequest {
-    /// Return whether the caller selected a section, applying defaults for an empty list.
+    /// Return whether the caller selected a section, defaulting to the declaration.
     #[must_use]
     pub fn wants(&self, section: InspectSymbolSectionKind) -> bool {
-        if self.sections.is_empty() {
-            matches!(
-                section,
-                InspectSymbolSectionKind::Declaration
-                    | InspectSymbolSectionKind::Implementations
-                    | InspectSymbolSectionKind::References
-                    | InspectSymbolSectionKind::Tests
-                    | InspectSymbolSectionKind::Diagnostics
-            )
-        } else {
-            self.sections.contains(&section)
-        }
+        (self.sections.is_empty() && section == InspectSymbolSectionKind::Declaration)
+            || self.sections.contains(&section)
     }
 }
 
@@ -1175,6 +1270,51 @@ pub struct InspectSymbolResult {
     pub returned_bytes: usize,
     /// Whether the total budget removed lower-priority sections or candidates.
     pub truncated: bool,
+}
+
+/// One caller-ordered result in a batch symbol inspection.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct InspectSymbolBatchEntry {
+    /// Original symbol identity at this position.
+    pub target: InspectSymbolTarget,
+    /// Bounded inspection result for this target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<InspectSymbolResult>,
+    /// Target-local failure; successful siblings remain available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Bounded results for a caller-ordered batch of symbol inspections.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct InspectSymbolBatchResult {
+    /// One result for every input target, in input order.
+    pub entries: Vec<InspectSymbolBatchEntry>,
+    /// Number of target inspections started concurrently.
+    pub inspections_started: usize,
+    /// Total section items returned across all targets.
+    pub returned_items: usize,
+    /// Shared bounds applied across the batch.
+    pub budget: InspectSymbolBudget,
+    /// Serialized bytes in this bundle before the MCP envelope.
+    pub returned_bytes: usize,
+    /// Whether any target result was truncated.
+    pub truncated: bool,
+}
+
+impl InspectSymbolSections {
+    #[must_use]
+    pub(crate) const fn returned_items(&self) -> usize {
+        self.declaration.returned
+            + self.hover.returned
+            + self.definitions.returned
+            + self.implementations.returned
+            + self.references.returned
+            + self.calls.returned
+            + self.tests.returned
+            + self.runnables.returned
+            + self.diagnostics.returned
+    }
 }
 
 /// A single code action.
@@ -1477,22 +1617,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_section_selection_uses_the_bounded_default_bundle() {
+    fn empty_section_selection_defaults_to_declaration_only() {
         let request = request_with_sections(Vec::new());
-        for section in [
-            InspectSymbolSectionKind::Declaration,
-            InspectSymbolSectionKind::Implementations,
-            InspectSymbolSectionKind::References,
-            InspectSymbolSectionKind::Tests,
-            InspectSymbolSectionKind::Diagnostics,
-        ] {
-            assert!(request.wants(section));
-        }
+        assert!(request.wants(InspectSymbolSectionKind::Declaration));
         for section in [
             InspectSymbolSectionKind::Hover,
             InspectSymbolSectionKind::Definitions,
+            InspectSymbolSectionKind::Implementations,
+            InspectSymbolSectionKind::References,
             InspectSymbolSectionKind::Calls,
+            InspectSymbolSectionKind::Tests,
             InspectSymbolSectionKind::Runnables,
+            InspectSymbolSectionKind::Diagnostics,
         ] {
             assert!(!request.wants(section));
         }

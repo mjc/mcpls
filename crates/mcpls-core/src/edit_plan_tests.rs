@@ -156,6 +156,31 @@ fn bounds_rendered_diff_without_discarding_complete_line_counts() {
 }
 
 #[test]
+fn retains_a_complete_diff_for_a_bounded_preview() {
+    let original = numbered_lines("old line", 20_000);
+    let planned = numbered_lines("new line", 20_000);
+    let plan = EditPlan::new(
+        "project-a".to_string(),
+        vec![FileSnapshot::from_contents(
+            PathBuf::from("src/huge.rs"),
+            SnapshotSource::Disk,
+            None,
+            original,
+            planned,
+        )],
+        vec!["text edit".to_string()],
+        true,
+        Duration::from_secs(60),
+    );
+
+    assert!(plan.diff_truncated());
+    let complete = plan.complete_unified_diff();
+    assert!(complete.len() > MAX_RENDERED_DIFF_BYTES);
+    assert!(complete.contains("-old line 19999"));
+    assert!(complete.contains("+new line 19999"));
+}
+
+#[test]
 fn truncation_preserves_utf8_and_an_explicit_marker_at_the_byte_boundary() {
     let mut rendered = "a".repeat(MAX_RENDERED_DIFF_BYTES - 1);
 

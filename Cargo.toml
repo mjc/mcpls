@@ -37,6 +37,7 @@ opentelemetry = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 predicates = "3.1"
+regex = "1.12"
 rmcp = "3.1.2"
 rstest = "0.26"
 rustix = { version = "1.1", features = ["process"] }

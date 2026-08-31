@@ -2,7 +2,13 @@
 #![expect(deprecated)]
 #![allow(clippy::ignored_unit_patterns)]
 
-use std::{borrow::Cow, collections::HashMap, future::Future, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    future::Future,
+    io::{self, Write},
+    time::Instant,
+};
 
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
@@ -25,6 +31,145 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 const MAX_TRACEPARENT_BYTES: usize = 55;
 const MAX_TRACESTATE_BYTES: usize = 512;
 const MAX_BAGGAGE_BYTES: usize = 8 * 1024;
+
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn completed_tool_result_bytes(result: &Result<CallToolResponse, ErrorData>) -> Option<usize> {
+    let Ok(CallToolResponse::Complete(result)) = result else {
+        return None;
+    };
+    serialized_result_bytes(result)
+}
+
+fn serialized_result_bytes<T: serde::Serialize>(result: &T) -> Option<usize> {
+    let mut bytes = ByteCounter::default();
+    serde_json::to_writer(&mut bytes, result)
+        .ok()
+        .map(|()| bytes.0)
+}
+
+fn completed_read_resource_bytes(
+    result: &Result<ReadResourceResponse, ErrorData>,
+) -> Option<usize> {
+    let Ok(ReadResourceResponse::Complete(result)) = result else {
+        return None;
+    };
+    serialized_result_bytes(result)
+}
+
+fn completed_prompt_bytes(result: &Result<GetPromptResponse, ErrorData>) -> Option<usize> {
+    let Ok(GetPromptResponse::Complete(result)) = result else {
+        return None;
+    };
+    serialized_result_bytes(result)
+}
+
+fn tool_request_argument_bytes(
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> usize {
+    let Some(arguments) = arguments else {
+        return 0;
+    };
+    let mut bytes = ByteCounter::default();
+    serde_json::to_writer(&mut bytes, arguments).map_or(0, |_| bytes.0)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolResultMetrics {
+    cache_hit: Option<bool>,
+    item_count: usize,
+    deferred_bytes: usize,
+    truncated: bool,
+    paginated: bool,
+}
+
+fn completed_tool_result_metrics(
+    result: &Result<CallToolResponse, ErrorData>,
+) -> Option<ToolResultMetrics> {
+    let Ok(CallToolResponse::Complete(result)) = result else {
+        return None;
+    };
+    let value = result.structured_content.as_ref()?;
+    let object = value.as_object()?;
+    let item_count = [
+        "returned",
+        "returned_items",
+        "returned_lines",
+        "returned_diagnostics",
+        "returned_references",
+        "returned_calls",
+        "returned_groups",
+    ]
+    .into_iter()
+    .find_map(|name| object.get(name).and_then(serde_json::Value::as_u64))
+    .and_then(|count| usize::try_from(count).ok())
+    .or_else(|| {
+        ["items", "matches", "diagnostics"]
+            .into_iter()
+            .find_map(|name| object.get(name).and_then(serde_json::Value::as_array))
+            .map(Vec::len)
+    })
+    .unwrap_or_default();
+    let mut metrics = ToolResultMetrics {
+        cache_hit: object
+            .get("cache_hit")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                object
+                    .get("cache")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|cache| cache.get("hit"))
+                    .and_then(serde_json::Value::as_bool)
+            }),
+        item_count,
+        truncated: object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        paginated: ["next_cursor", "nextCursor"]
+            .into_iter()
+            .any(|name| object.get(name).is_some_and(|value| !value.is_null())),
+        ..ToolResultMetrics::default()
+    };
+    collect_deferred_bytes(value, &mut metrics.deferred_bytes);
+    Some(metrics)
+}
+
+fn collect_deferred_bytes(value: &serde_json::Value, deferred_bytes: &mut usize) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_deferred_bytes(value, deferred_bytes);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object.contains_key("uri")
+                && let Some(bytes) = object
+                    .get("total_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+            {
+                *deferred_bytes = deferred_bytes.saturating_add(bytes);
+            }
+            for value in object.values() {
+                collect_deferred_bytes(value, deferred_bytes);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteTrace {
@@ -122,6 +267,17 @@ impl RequestSpan {
             protocol_version = tracing::field::Empty,
             transport,
             duration_ms = tracing::field::Empty,
+            request_bytes = tracing::field::Empty,
+            result_bytes = tracing::field::Empty,
+            inline_bytes = tracing::field::Empty,
+            deferred_bytes = tracing::field::Empty,
+            item_count = tracing::field::Empty,
+            truncated = tracing::field::Empty,
+            paginated = tracing::field::Empty,
+            cache_hit = tracing::field::Empty,
+            serialization_ms = tracing::field::Empty,
+            actor_queue_ms = tracing::field::Empty,
+            actor_execution_ms = tracing::field::Empty,
             cancelled = tracing::field::Empty,
             success = tracing::field::Empty,
             protocol_error = tracing::field::Empty,
@@ -153,7 +309,34 @@ impl RequestSpan {
         }
     }
 
-    fn finish<T>(&self, result: &Result<T, ErrorData>, tool_error: bool) {
+    fn finish<T>(
+        &self,
+        result: &Result<T, ErrorData>,
+        tool_error: bool,
+        result_bytes: Option<usize>,
+        result_metrics: Option<ToolResultMetrics>,
+        serialization_started: Option<Instant>,
+    ) {
+        if let Some(result_bytes) = result_bytes {
+            self.span.record("result_bytes", result_bytes);
+            self.span.record("inline_bytes", result_bytes);
+        }
+        if let Some(result_metrics) = result_metrics {
+            self.span
+                .record("deferred_bytes", result_metrics.deferred_bytes);
+            self.span.record("item_count", result_metrics.item_count);
+            self.span.record("truncated", result_metrics.truncated);
+            self.span.record("paginated", result_metrics.paginated);
+            if let Some(cache_hit) = result_metrics.cache_hit {
+                self.span.record("cache_hit", cache_hit);
+            }
+        }
+        if let Some(serialization_started) = serialization_started {
+            self.span.record(
+                "serialization_ms",
+                serialization_started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         self.span.record(
             "duration_ms",
             self.started.elapsed().as_secs_f64() * 1_000.0,
@@ -163,6 +346,10 @@ impl RequestSpan {
         self.span.record("success", result.is_ok() && !tool_error);
         self.span.record("protocol_error", result.is_err());
         self.span.record("tool_error", tool_error);
+    }
+
+    fn record_request_bytes(&self, request_bytes: usize) {
+        self.span.record("request_bytes", request_bytes);
     }
 }
 
@@ -188,7 +375,41 @@ where
     );
     let result = handler(context).instrument(span.span.clone()).await;
     let is_tool_error = result.as_ref().is_ok_and(tool_error);
-    span.finish(&result, is_tool_error);
+    span.finish(&result, is_tool_error, None, None, None);
+    result
+}
+
+async fn dispatch_measured<T, F, Fut, M>(
+    transport: &'static str,
+    method: &'static str,
+    context: RequestContext<RoleServer>,
+    tool: Option<String>,
+    resource: Option<String>,
+    handler: F,
+    result_bytes: M,
+) -> Result<T, ErrorData>
+where
+    F: FnOnce(RequestContext<RoleServer>) -> Fut,
+    Fut: Future<Output = Result<T, ErrorData>>,
+    M: FnOnce(&Result<T, ErrorData>) -> Option<usize>,
+{
+    let span = RequestSpan::new(
+        method,
+        transport,
+        &context,
+        tool.as_deref(),
+        resource.as_deref(),
+    );
+    let result = handler(context).instrument(span.span.clone()).await;
+    let serialization_started = Instant::now();
+    let result_bytes = result_bytes(&result);
+    span.finish(
+        &result,
+        false,
+        result_bytes,
+        None,
+        result_bytes.map(|_| serialization_started),
+    );
     result
 }
 
@@ -226,14 +447,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "initialize",
             context,
             None,
             None,
             |context| self.inner.initialize(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -293,14 +514,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetPromptResponse, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "prompts/get",
             context,
             None,
             None,
             |context| self.inner.get_prompt(request, context),
-            |_| false,
+            completed_prompt_bytes,
         )
     }
 
@@ -309,14 +530,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "prompts/list",
             context,
             None,
             None,
             |context| self.inner.list_prompts(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -325,14 +546,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "resources/list",
             context,
             None,
             None,
             |context| self.inner.list_resources(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -341,14 +562,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "resources/templates/list",
             context,
             None,
             None,
             |context| self.inner.list_resource_templates(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -358,14 +579,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_ {
         let resource = resource_label(&request.uri);
-        dispatch(
+        dispatch_measured(
             self.transport,
             "resources/read",
             context,
             None,
             Some(resource),
             |context| self.inner.read_resource(request, context),
-            |_| false,
+            completed_read_resource_bytes,
         )
     }
 
@@ -394,7 +615,7 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
                 .listen(context)
                 .instrument(span.span.clone())
                 .await;
-            span.finish(&result, false);
+            span.finish(&result, false, None, None, None);
             result
         }
     }
@@ -439,18 +660,37 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
         let tool = request.name.clone();
-        dispatch(
-            self.transport,
+        let request_bytes = tool_request_argument_bytes(request.arguments.as_ref());
+        let span = RequestSpan::new(
             "tools/call",
-            context,
-            Some(tool.into_owned()),
+            self.transport,
+            &context,
+            Some(tool.as_ref()),
             None,
-            |context| self.inner.call_tool(request, context),
-            |response| match response {
+        );
+        span.record_request_bytes(request_bytes);
+        async move {
+            let result = self
+                .inner
+                .call_tool(request, context)
+                .instrument(span.span.clone())
+                .await;
+            let tool_error = result.as_ref().is_ok_and(|response| match response {
                 CallToolResponse::Complete(result) => result.is_error.unwrap_or(false),
                 _ => false,
-            },
-        )
+            });
+            let serialization_started = Instant::now();
+            let result_bytes = completed_tool_result_bytes(&result);
+            let result_metrics = completed_tool_result_metrics(&result);
+            span.finish(
+                &result,
+                tool_error,
+                result_bytes,
+                result_metrics,
+                result_bytes.map(|_| serialization_started),
+            );
+            result
+        }
     }
 
     fn list_tools(
@@ -458,14 +698,14 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        dispatch(
+        dispatch_measured(
             self.transport,
             "tools/list",
             context,
             None,
             None,
             |context| self.inner.list_tools(request, context),
-            |_| false,
+            |result| result.as_ref().ok().and_then(serialized_result_bytes),
         )
     }
 
@@ -616,5 +856,118 @@ mod tests {
     fn resource_labels_drop_uri_paths() {
         assert_eq!(resource_label("file:///secret/workspace/main.rs"), "file");
         assert_eq!(resource_label("resource"), "resource");
+    }
+
+    #[test]
+    fn completed_tool_result_bytes_count_payload_without_retaining_it() {
+        let payload = rmcp::model::CallToolResult::success(Vec::new());
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload.clone()));
+
+        assert_eq!(
+            completed_tool_result_bytes(&result),
+            Some(serde_json::to_vec(&payload).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn completed_read_resource_bytes_unwraps_the_protocol_response() {
+        let payload = rmcp::model::ReadResourceResult::new(Vec::new());
+        let result = Ok::<_, ErrorData>(ReadResourceResponse::Complete(payload.clone()));
+
+        assert_eq!(
+            completed_read_resource_bytes(&result),
+            Some(serde_json::to_vec(&payload).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn tool_request_argument_bytes_count_arguments_without_retaining_them() {
+        let arguments = serde_json::Map::from_iter([(
+            "replacement".to_owned(),
+            serde_json::Value::String("private source text".to_owned()),
+        )]);
+
+        assert_eq!(
+            tool_request_argument_bytes(Some(&arguments)),
+            serde_json::to_vec(&arguments).unwrap().len()
+        );
+        assert_eq!(tool_request_argument_bytes(None), 0);
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_exposes_only_response_shape_metadata() {
+        let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+        payload.structured_content = Some(serde_json::json!({
+            "cache_hit": true,
+            "returned": 3,
+            "truncated": true,
+            "next_cursor": "3",
+            "source": "must never reach telemetry",
+            "resource": {
+                "uri": "mcpls-source:///workspace/src.rs",
+                "kind": "source_context",
+                "total_bytes": 55
+            }
+        }));
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+        assert_eq!(
+            completed_tool_result_metrics(&result),
+            Some(ToolResultMetrics {
+                cache_hit: Some(true),
+                item_count: 3,
+                deferred_bytes: 55,
+                truncated: true,
+                paginated: true,
+            })
+        );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_reads_nested_diagnostics_cache_hit() {
+        let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+        payload.structured_content = Some(serde_json::json!({
+            "diagnostics": [],
+            "cache": {"hit": true, "age_ms": 1, "snapshot_identity": "opaque"}
+        }));
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+        assert_eq!(
+            completed_tool_result_metrics(&result).unwrap().cache_hit,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_prefers_reported_diagnostic_count() {
+        let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+        payload.structured_content = Some(serde_json::json!({
+            "diagnostics": [{"occurrence_count": 4}],
+            "returned_diagnostics": 4
+        }));
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+        assert_eq!(
+            completed_tool_result_metrics(&result).unwrap().item_count,
+            4
+        );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_reads_other_explicit_result_counts() {
+        for (field, expected) in [
+            ("returned_references", 2),
+            ("returned_calls", 3),
+            ("returned_groups", 4),
+        ] {
+            let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+            payload.structured_content = Some(serde_json::json!({field: expected}));
+            let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+            assert_eq!(
+                completed_tool_result_metrics(&result).unwrap().item_count,
+                expected
+            );
+        }
     }
 }

@@ -161,15 +161,10 @@ impl Translator {
     #[must_use]
     pub(crate) fn semantic_server_ready_for_file(&self, path: &Path) -> bool {
         let language = detect_language(path, &self.extension_map);
-        let configs = lock_std(&self.project_lsp_configs);
         let clients = lock_std(&self.lsp_clients);
-        let expected = lock_std(&self.expected_servers);
-        configs.iter().any(|config| {
-            let id = config.id();
-            config.language_id.eq_ignore_ascii_case(&language)
-                && clients.contains_key(&id)
-                && !expected.contains(&id)
-        })
+        clients
+            .values()
+            .any(|client| client.language_id().eq_ignore_ascii_case(&language))
     }
 
     pub(crate) async fn request_will_rename_files(

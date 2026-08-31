@@ -33,6 +33,7 @@ pub(super) enum RustResidencyMode {
 #[derive(Debug)]
 struct RustResidencyBudget {
     limit: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     idle_timeout: Duration,
     residents: HashMap<RustGroupId, ResidentGroup>,
 }
@@ -205,13 +206,12 @@ impl RustResidencyController {
         let mut excluded = HashSet::new();
         loop {
             let transition = self.inner.transition.lock().await;
-            let idle_timeout = self.state().budget.idle_timeout;
             let minimum_idle = match mode {
                 RustResidencyMode::Touch => {
                     unreachable!("touch mode must use try_acquire_existing")
                 }
-                RustResidencyMode::Resume => idle_timeout,
-                RustResidencyMode::Activate => Duration::ZERO,
+                // A user-requested semantic operation must reach its actor now.
+                RustResidencyMode::Resume | RustResidencyMode::Activate => Duration::ZERO,
             };
             let decision = self.pin_group(group, &excluded, minimum_idle);
             match decision {
@@ -495,30 +495,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_waits_for_idle_timeout_before_eviction() {
-        let controller = RustResidencyController::with_idle_timeout(1, Duration::from_millis(20));
-        let (first_sender, mut first_receiver) = mpsc::channel(1);
-        let (second_sender, _second_receiver) = mpsc::channel(1);
-        controller.register(RustGroupId(1), first_sender.downgrade());
-        controller.register(RustGroupId(2), second_sender.downgrade());
-        drop(controller.acquire(RustGroupId(1)).await);
-
-        let suspension = tokio::spawn(async move {
-            let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
-                panic!("expected suspension request");
-            };
-            reply.send(Ok(())).unwrap();
-        });
-        let guard =
-            tokio::time::timeout(Duration::from_secs(1), controller.acquire(RustGroupId(2)))
-                .await
-                .expect("activation should be admitted after the idle timeout");
-
-        suspension.await.unwrap();
-        drop(guard);
-    }
-
-    #[tokio::test]
     async fn explicit_activation_evicts_a_recent_unpinned_group() {
         let controller =
             RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
@@ -546,29 +522,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_request_waits_for_idle_timeout_before_eviction() {
-        let controller = RustResidencyController::with_idle_timeout(1, Duration::from_millis(20));
+    async fn semantic_resume_evicts_a_recent_unpinned_group() {
+        let controller =
+            RustResidencyController::with_idle_timeout(1, Duration::from_secs(60 * 60));
         let (first_sender, mut first_receiver) = mpsc::channel(1);
         let (second_sender, _second_receiver) = mpsc::channel(1);
         controller.register(RustGroupId(1), first_sender.downgrade());
         controller.register(RustGroupId(2), second_sender.downgrade());
         drop(controller.acquire(RustGroupId(1)).await);
 
-        let controller_for_request = controller.clone();
-        let second =
-            tokio::spawn(async move { controller_for_request.acquire(RustGroupId(2)).await });
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(!second.is_finished());
-
-        let Some(ProjectRequest::Suspend { reply, .. }) = first_receiver.recv().await else {
-            panic!("expected suspension request after the idle timeout");
+        let demand = tokio::spawn({
+            let controller = controller.clone();
+            async move {
+                controller
+                    .acquire_for(RustGroupId(2), RustResidencyMode::Resume)
+                    .await
+            }
+        });
+        let ProjectRequest::Suspend { reply, .. } =
+            tokio::time::timeout(Duration::from_secs(1), first_receiver.recv())
+                .await
+                .expect("semantic demand must not wait for the dormancy timeout")
+                .expect("first actor must receive an eviction request")
+        else {
+            panic!("expected residency eviction");
         };
         reply.send(Ok(())).unwrap();
-        let guard = tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .expect("cold request should be admitted after the idle timeout")
-            .unwrap();
-        drop(guard);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), demand)
+                .await
+                .expect("semantic demand should be admitted after eviction")
+                .unwrap(),
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 
 pub(crate) mod ast_grep;
 mod encoding;
+pub(crate) mod lexical;
 mod notifications;
 pub mod resources;
 mod state;
@@ -14,6 +15,7 @@ pub(crate) mod translator;
 
 pub(crate) use ast_grep::{StructuralMatch, StructuralSearchResult};
 pub use encoding::{EncodingConverter, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position};
+pub(crate) use lexical::{LexicalCaseMode, LexicalMatchMode, LexicalSearchRequest};
 pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
@@ -25,16 +27,19 @@ pub use state::{
 };
 pub use translator::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
-    DeferredResourceReference, DefinitionResult, Diagnostic, DiagnosticSeverity, DiagnosticsResult,
-    DocumentChanges, DocumentSymbolOptions, DocumentSymbolsResult, FormatDocumentResult,
-    HoverResult, IncomingCallsResult, InlayHintsResult, InspectCalls, InspectSection,
-    InspectSectionCompleteness, InspectSymbolBudget, InspectSymbolRequest, InspectSymbolResolution,
-    InspectSymbolResult, InspectSymbolSectionKind, InspectSymbolSections, Location,
+    DeferredResourceReference, DefinitionResult, Diagnostic, DiagnosticSeverity,
+    DiagnosticsCacheMetadata, DiagnosticsResult, DocumentChanges, DocumentSymbolOptions,
+    DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
+    InlayHintsResult, InspectCalls, InspectSection, InspectSectionCompleteness,
+    InspectSymbolBatchEntry, InspectSymbolBatchRequest, InspectSymbolBatchResult,
+    InspectSymbolBudget, InspectSymbolRequest, InspectSymbolResolution, InspectSymbolResult,
+    InspectSymbolSectionKind, InspectSymbolSections, InspectSymbolTarget, Location,
     LocationsResult, OutgoingCallsResult, Position2D, ProjectActivation, ProviderSynchronization,
     Range, ReferenceUse, ReferencesResult, RenameResult, SemanticDiscoveryKind,
     SemanticDiscoveryResult, SemanticResultLimits, ServerCapability, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, SourceContext, SourceFrame, SupportedWorkspaceEdit,
     Symbol, SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolBatchEntry, WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult,
     WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
     convert_code_action_or_command,
 };

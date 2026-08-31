@@ -142,6 +142,7 @@ struct PlannedFile {
     source: SnapshotSource,
     version: Option<i32>,
     created: bool,
+    disk_matches: bool,
     original: String,
     planned: String,
 }
@@ -493,6 +494,7 @@ impl<'a> PreviewBuilder<'a> {
                         source: SnapshotSource::Disk,
                         version: None,
                         created: true,
+                        disk_matches: true,
                         original: String::new(),
                         planned: String::new(),
                     }
@@ -500,6 +502,12 @@ impl<'a> PreviewBuilder<'a> {
             } else {
                 initial_file(&path, self.documents)?
             };
+            if !file.disk_matches {
+                self.conflicts.push(format!(
+                    "open document differs from disk: {}",
+                    path.display()
+                ));
+            }
             self.files.insert(path.clone(), file);
         }
         let entry = self
@@ -545,10 +553,15 @@ fn path_for_uri(uri: &str) -> Result<PathBuf, PreviewError> {
 
 fn initial_file(path: &PathBuf, documents: &DocumentTracker) -> Result<PlannedFile, PreviewError> {
     if let Some(document) = documents.get(path) {
+        let disk = fs::read_to_string(path).map_err(|source| PreviewError::Read {
+            path: path.clone(),
+            source,
+        })?;
         return Ok(PlannedFile {
             source: SnapshotSource::OpenDocument,
             version: Some(document.version()),
             created: false,
+            disk_matches: disk == document.content(),
             original: document.content().to_string(),
             planned: document.content().to_string(),
         });
@@ -561,6 +574,7 @@ fn initial_file(path: &PathBuf, documents: &DocumentTracker) -> Result<PlannedFi
         source: SnapshotSource::Disk,
         version: None,
         created: false,
+        disk_matches: true,
         planned: original.clone(),
         original,
     })

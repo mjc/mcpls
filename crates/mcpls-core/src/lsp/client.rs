@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout_at};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, debug_span, error, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
@@ -29,6 +29,9 @@ const JSONRPC_VERSION: &str = "2.0";
 
 /// LSP error code returned when the server cancels a request and wants the client to retry.
 const SERVER_CANCELLED_CODE: i32 = -32802;
+
+/// LSP error code returned when the server needs the client to retry against a fresh document.
+const CONTENT_MODIFIED_CODE: i32 = -32801;
 
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
@@ -64,10 +67,50 @@ const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 /// value today. See [`LspClient::completion_timeout`].
 const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 
+/// Normal LSP requests should finish near this duration; exceeding it is
+/// observable but never cancels the request.
+const LSP_HOUSE_BUDGET: Duration = Duration::from_secs(5);
+
 const OUTBOUND_TRANSPORT_QUEUE_CAPACITY: usize = 100;
 
 /// Type alias for pending request tracking map.
 type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
+
+fn exceeds_lsp_house_budget(elapsed: Duration) -> bool {
+    elapsed > LSP_HOUSE_BUDGET
+}
+
+struct LspRequestTiming {
+    span: tracing::Span,
+    started: Instant,
+}
+
+impl LspRequestTiming {
+    fn new(method: &str) -> Self {
+        Self {
+            span: debug_span!(
+                "lsp.request",
+                lsp_method = method,
+                lsp_ms = tracing::field::Empty,
+                lsp_over_house_budget = tracing::field::Empty,
+            ),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for LspRequestTiming {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        let over_house_budget = exceeds_lsp_house_budget(elapsed);
+        self.span.record("lsp_ms", elapsed.as_millis() as u64);
+        self.span.record("lsp_over_house_budget", over_house_budget);
+        if over_house_budget {
+            let _entered = self.span.enter();
+            warn!("LSP request exceeded the five-second house budget");
+        }
+    }
+}
 
 /// LSP client with async request/response handling.
 ///
@@ -207,13 +250,11 @@ async fn lsp_writer_loop(
     Ok(())
 }
 
-fn enqueue_outbound(
+async fn enqueue_outbound(
     outbound_tx: &mpsc::Sender<OutboundBatch>,
     batch: OutboundBatch,
 ) -> std::result::Result<(), OutboundBatch> {
-    outbound_tx
-        .try_send(batch)
-        .map_err(tokio::sync::mpsc::error::TrySendError::into_inner)
+    outbound_tx.send(batch).await.map_err(|error| error.0)
 }
 
 fn cancel_request_notification(id: &RequestId) -> Value {
@@ -405,9 +446,10 @@ impl LspClient {
 
     /// Send request and wait for response with timeout.
     ///
-    /// Automatically retries up to 3 times when the server returns error code
-    /// -32802 (`ServerCancelled`) with `data.retriggerRequest == true`, using
-    /// exponential backoff starting at 500 ms.
+    /// Automatically retries up to 3 times when the server returns `-32801`
+    /// (`ContentModified`), or `-32802` (`ServerCancelled`) with
+    /// `data.retriggerRequest == true`, using exponential backoff starting at
+    /// 500 ms.
     ///
     /// # Type Parameters
     ///
@@ -431,6 +473,7 @@ impl LspClient {
         P: Serialize,
         R: DeserializeOwned,
     {
+        let _timing = LspRequestTiming::new(method);
         let params_value = serde_json::to_value(params)?;
         let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
@@ -491,11 +534,8 @@ impl LspClient {
                     code,
                     ref message,
                     ref data,
-                }) if code == SERVER_CANCELLED_CODE && Self::should_retrigger(data.as_ref()) => {
-                    warn!(
-                        "ServerCancelled (-32802) on '{}', will retry: {}",
-                        method, message
-                    );
+                }) if Self::should_retry(code, data.as_ref()) => {
+                    warn!("retryable LSP response ({code}) on '{method}', will retry: {message}");
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
                         return Err(Error::LspServerError {
                             code,
@@ -524,6 +564,11 @@ impl LspClient {
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
         })
+    }
+
+    fn should_retry(code: i32, data: Option<&Value>) -> bool {
+        code == CONTENT_MODIFIED_CODE
+            || code == SERVER_CANCELLED_CODE && Self::should_retrigger(data)
     }
 
     /// Fail every request still parked in `pending_requests` with
@@ -717,7 +762,7 @@ impl LspClient {
                             );
 
                             let value = serde_json::to_value(&request)?;
-                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).is_err() {
+                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).await.is_err() {
                                 let response_tx = pending_requests.lock().await.remove(&id);
                                 if let Some(response_tx) = response_tx {
                                     let _ = response_tx.send(Err(Error::Transport(
@@ -736,6 +781,7 @@ impl LspClient {
                                 outbound_tx,
                                 OutboundBatch::one(notification),
                             )
+                            .await
                             .map_err(|_| {
                                 Error::Transport(
                                     "outbound LSP transport queue is full or closed".to_string(),
@@ -776,6 +822,7 @@ impl LspClient {
                                     written_tx: Some(written_tx),
                                 },
                             )
+                            .await
                             .is_err()
                             {
                                 let _ = response_tx.send(Err(Error::Transport(
@@ -798,6 +845,7 @@ impl LspClient {
                                 outbound_tx,
                                 OutboundBatch::one(cancel_request_notification(&id)),
                             )
+                            .await
                             .is_err()
                             {
                                 warn!("Dropping LSP cancellation because the transport queue is full");
@@ -835,9 +883,10 @@ impl LspClient {
                                 written_tx: None,
                             },
                         )
+                        .await
                         .is_err()
                     {
-                        warn!("Dropping watched-file notification because the transport queue is full");
+                        warn!("Watched-file notification could not be delivered because the transport is closed");
                     }
                 }
 
@@ -895,7 +944,7 @@ impl LspClient {
                                 watch_registry,
                             );
                             let value = serde_json::to_value(&response)?;
-                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).is_err() {
+                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).await.is_err() {
                                 warn!("Dropping LSP server response because the transport queue is full");
                             }
                         }
@@ -1035,6 +1084,22 @@ mod tests {
 
         let client = LspClient::new(config);
         assert_eq!(client.language_id(), "rust");
+    }
+
+    #[test]
+    fn lsp_request_span_uses_the_shared_provider_boundary() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let timing = LspRequestTiming::new("test/request");
+
+        assert_eq!(timing.span.metadata().unwrap().name(), "lsp.request");
+    }
+
+    #[test]
+    fn lsp_house_budget_is_soft_at_five_seconds() {
+        assert!(!exceeds_lsp_house_budget(Duration::from_secs(5)));
+        assert!(exceeds_lsp_house_budget(
+            Duration::from_secs(5) + Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -1432,6 +1497,28 @@ mod tests {
         };
 
         assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn outbound_queue_backpressures_without_dropping_a_batch() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(OutboundBatch::one(serde_json::json!({"first": true})))
+            .await
+            .unwrap();
+        let queued = OutboundBatch::one(serde_json::json!({"second": true}));
+        let mut enqueue = Box::pin(enqueue_outbound(&sender, queued));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut enqueue)
+                .await
+                .is_err()
+        );
+        let first = receiver.recv().await.unwrap();
+        assert_eq!(first.messages, vec![serde_json::json!({"first": true})]);
+        assert!(enqueue.await.is_ok());
+        let second = receiver.recv().await.unwrap();
+        assert_eq!(second.messages, vec![serde_json::json!({"second": true})]);
     }
 
     /// #249 continuation: a client about to be discarded (e.g. superseded by
@@ -1985,6 +2072,42 @@ mod tests {
 
             let result = request_task.await.unwrap();
             assert_eq!(result.unwrap(), expected_result);
+        }
+
+        #[tokio::test]
+        async fn test_retry_succeeds_after_content_modified_response() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/codeAction",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let first = read_framed_message(&mut reader).await;
+            write_error_response(
+                &mut server.read_half_stdin,
+                &first["id"].clone(),
+                -32801,
+                "content modified",
+            )
+            .await;
+
+            let second = read_framed_message(&mut reader).await;
+            let expected_result = serde_json::json!([]);
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                expected_result.clone(),
+            )
+            .await;
+
+            assert_eq!(request_task.await.unwrap().unwrap(), expected_result);
         }
 
         /// #313: an oversized, server-controlled error message must be

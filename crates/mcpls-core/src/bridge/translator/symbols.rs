@@ -849,7 +849,7 @@ impl Translator {
             });
         }
 
-        if path.is_some() && candidates.is_empty() {
+        if candidates.is_empty() {
             return fallback().await;
         }
 
@@ -883,6 +883,9 @@ impl Translator {
         let ctx = EncodingCtx {
             encoding: crate::bridge::encoding::PositionEncoding::Utf8,
             tracker: self.document_tracker.clone(),
+            approved_source_paths: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         };
         let mut candidates = Vec::new();
         for symbol in matches {

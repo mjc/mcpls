@@ -1412,6 +1412,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "url",
 ]
@@ -1436,6 +1437,7 @@ dependencies = [
  "notify",
  "opentelemetry",
  "opentelemetry_sdk",
+ "regex",
  "rmcp",
  "rstest",
  "rustix",

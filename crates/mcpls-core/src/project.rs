@@ -10,27 +10,40 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ignore::WalkBuilder;
 const CALL_HIERARCHY_PAGE_SIZE: usize = 64;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::bridge::DeferredResourceReference;
+use crate::bridge::ast_grep::byte_offset_to_position;
 use crate::bridge::convert_code_action_or_command;
+use crate::bridge::lexical::{
+    LexicalSearchMatch, LexicalSearchRequest, collect_project_paths_filtered, find_matches,
+};
 use crate::bridge::resources::SourceResource;
-use crate::bridge::translator::{CallHierarchyItemResult, DiagnosticOptions, page_items};
+use crate::bridge::resources::make_source_uri;
+use crate::bridge::translator::SourceBudget;
+use crate::bridge::translator::{
+    CallHierarchyItemResult, DiagnosticOptions, SourceUnavailableReason, WorkspaceSymbol,
+    page_items,
+};
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
     DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
-    InlayHintsResult, InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry,
-    LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
+    InlayHintsResult, InspectSymbolBatchEntry, InspectSymbolBatchRequest, InspectSymbolBatchResult,
+    InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry, LogLevel,
+    OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
     SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
-    SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolMatchMode,
+    SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolBatchEntry,
+    WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult, WorkspaceSymbolMatchMode,
     WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
@@ -920,6 +933,8 @@ impl ProjectEventRecord {
 pub struct ProjectEventSnapshot {
     events: Vec<ProjectEventRecord>,
     resync_required: bool,
+    truncated: bool,
+    retention_floor: u64,
     next_sequence: u64,
 }
 
@@ -930,10 +945,34 @@ impl ProjectEventSnapshot {
         &self.events
     }
 
+    /// Return the first retained sequence in this response, when any.
+    #[must_use]
+    pub fn first_sequence(&self) -> Option<u64> {
+        self.events.first().map(ProjectEventRecord::sequence)
+    }
+
+    /// Return the last retained sequence in this response, when any.
+    #[must_use]
+    pub fn last_sequence(&self) -> Option<u64> {
+        self.events.last().map(ProjectEventRecord::sequence)
+    }
+
     /// Whether the requested cursor predates the retained bounded history.
     #[must_use]
     pub const fn resync_required(&self) -> bool {
         self.resync_required
+    }
+
+    /// Whether retained events remain after this page.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Return the latest cursor whose successor is entirely retained.
+    #[must_use]
+    pub const fn retention_floor(&self) -> u64 {
+        self.retention_floor
     }
 
     /// Return the next cursor clients should use for a subsequent poll.
@@ -974,24 +1013,40 @@ impl ProjectEventHistory {
         sequence
     }
 
+    /// Return one retained immutable event record by sequence.
+    #[must_use]
+    pub fn record_at(&self, sequence: u64) -> Option<ProjectEventRecord> {
+        self.records
+            .iter()
+            .find(|record| record.sequence == sequence)
+            .cloned()
+    }
+
     /// Return retained events newer than `cursor`, marking overflow when needed.
     #[must_use]
-    pub fn snapshot_since(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+    pub fn snapshot_since(&self, cursor: Option<u64>, max_events: usize) -> ProjectEventSnapshot {
         let oldest = self
             .records
             .front()
             .map_or(self.next_sequence, |record| record.sequence);
         let resync_required = cursor.is_some_and(|cursor| cursor < oldest.saturating_sub(1));
-        let events = self
+        let mut records = self
             .records
             .iter()
             .filter(|record| cursor.is_none_or(|cursor| record.sequence > cursor))
-            .cloned()
-            .collect();
+            .cloned();
+        let events = records.by_ref().take(max_events.max(1)).collect::<Vec<_>>();
+        let truncated = records.next().is_some();
+        let next_sequence = events.last().map_or_else(
+            || cursor.unwrap_or(self.next_sequence.saturating_sub(1)),
+            ProjectEventRecord::sequence,
+        );
         ProjectEventSnapshot {
             events,
             resync_required,
-            next_sequence: self.next_sequence,
+            truncated,
+            retention_floor: oldest.saturating_sub(1),
+            next_sequence,
         }
     }
 }
@@ -1210,6 +1265,20 @@ struct ProjectRequestSender {
     residency: Option<ProjectResidency>,
 }
 
+struct ProjectRequestTiming {
+    queued_at: Instant,
+    span: tracing::Span,
+}
+
+impl ProjectRequestTiming {
+    fn capture() -> Self {
+        Self {
+            queued_at: Instant::now(),
+            span: tracing::Span::current(),
+        }
+    }
+}
+
 impl ProjectRequestSender {
     #[cfg(test)]
     fn new(sender: mpsc::Sender<ProjectRequest>) -> Self {
@@ -1264,6 +1333,11 @@ impl ProjectRequestSender {
             return Err(mpsc::error::SendError(request));
         }
 
+        request = ProjectRequest::Timed {
+            request: Box::new(request),
+            timing: ProjectRequestTiming::capture(),
+        };
+
         if let Some(mode) = request.rust_residency_mode()
             && let Some(residency) = &self.residency
         {
@@ -1309,6 +1383,8 @@ pub struct AppliedEditPlan {
     pub operations: Vec<String>,
     /// Unified diff captured by the preview.
     pub unified_diff: String,
+    /// Complete immutable unified diff retained for bounded receipt resources.
+    pub complete_unified_diff: String,
     /// Files replaced successfully.
     pub committed_files: Vec<PathBuf>,
     /// Optional semantic verification outcome for a specialized refactor.
@@ -1351,6 +1427,33 @@ pub enum ApplyEditPlanOutcome {
 }
 
 impl AppliedEditPlan {
+    fn detail_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "plan_id": self.plan_id.as_str(),
+            "operations": self.operations,
+            "unified_diff": self.complete_unified_diff,
+            "committed_files": self.committed_files,
+            "verification": self.verification.map(VerificationStatus::as_str),
+            "provider_synchronization": self.provider_synchronization.iter().map(|result| serde_json::json!({
+                "provider": result.provider,
+                "synchronized": result.synchronized,
+                "watched_file_notifications": result.watched_file_notifications,
+                "message": result.message,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.complete_unified_diff.len()
+            + self.unified_diff.len()
+            + self.operations.iter().map(String::len).sum::<usize>()
+            + self
+                .provider_synchronization
+                .iter()
+                .map(|result| result.provider.len() + result.message.as_deref().map_or(0, str::len))
+                .sum::<usize>()
+    }
+
     fn project_events(&self) -> [ProjectEvent; 2] {
         [
             ProjectEvent::FilesChanged {
@@ -1511,6 +1614,10 @@ pub(crate) struct ResolvedSymbolTarget {
 }
 
 enum ProjectRequest {
+    Timed {
+        request: Box<Self>,
+        timing: ProjectRequestTiming,
+    },
     Resident {
         request: Box<Self>,
         guard: residency::RustResidencyGuard,
@@ -1556,6 +1663,7 @@ enum ProjectRequest {
     },
     ReadSourceResource {
         resource: SourceResource,
+        max_response_bytes: usize,
         reply: oneshot::Sender<Result<SourceFrame, String>>,
     },
     ResolveSymbolHandle {
@@ -1628,9 +1736,21 @@ enum ProjectRequest {
         include_generated: bool,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
+    WorkspaceSymbolBatch {
+        request: WorkspaceSymbolBatchRequest,
+        reply: oneshot::Sender<Result<WorkspaceSymbolBatchResult, String>>,
+    },
+    LexicalSearch {
+        request: LexicalSearchRequest,
+        reply: oneshot::Sender<Result<Vec<LexicalSearchMatch>, String>>,
+    },
     InspectSymbol {
         request: InspectSymbolRequest,
         reply: oneshot::Sender<Result<InspectSymbolResult, String>>,
+    },
+    InspectSymbolBatch {
+        request: Box<InspectSymbolBatchRequest>,
+        reply: oneshot::Sender<Result<InspectSymbolBatchResult, String>>,
     },
     CodeActions {
         file_path: String,
@@ -1716,6 +1836,10 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    SourcePathAuthorized {
+        path: PathBuf,
+        reply: oneshot::Sender<bool>,
+    },
     AddWorkspaceRoot {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
@@ -1733,6 +1857,16 @@ enum ProjectRequest {
         plan_id: PlanId,
         project_id: String,
         reply: oneshot::Sender<Result<crate::edit_plan::EditPlanApprovalSummary, String>>,
+    },
+    ReadEditPlanDiff {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    ReadAppliedEditDetail {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
     },
     ApplyEditPlan {
         plan_id: PlanId,
@@ -1833,7 +1967,23 @@ impl ProjectRequest {
         }
     }
 
+    fn into_timed(self) -> (Self, ProjectRequestTiming) {
+        match self {
+            Self::Timed { request, timing } => (*request, timing),
+            request => (
+                request,
+                ProjectRequestTiming {
+                    queued_at: Instant::now(),
+                    span: tracing::Span::none(),
+                },
+            ),
+        }
+    }
+
     const fn rust_residency_requirement(&self) -> RustResidencyRequirement {
+        if let Self::Timed { request, .. } = self {
+            return request.rust_residency_requirement();
+        }
         if matches!(
             self,
             Self::Activate { .. }
@@ -1858,7 +2008,9 @@ impl ProjectRequest {
                 | Self::FormatWorkspaceEdit { .. }
                 | Self::SemanticDiscovery { .. }
                 | Self::WorkspaceSymbol { .. }
+                | Self::WorkspaceSymbolBatch { .. }
                 | Self::InspectSymbol { .. }
+                | Self::InspectSymbolBatch { .. }
                 | Self::CodeActions { .. }
                 | Self::CodeActionList { .. }
                 | Self::PrepareCallHierarchy { .. }
@@ -1967,6 +2119,7 @@ impl ProjectRequest {
 impl ProjectRequest {
     fn is_cancelled(&self) -> bool {
         match self {
+            Self::Timed { request, .. } => request.is_cancelled(),
             Self::Resident { request, .. } => request.is_cancelled(),
             Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
                 reply.is_closed()
@@ -1993,7 +2146,10 @@ impl ProjectRequest {
             Self::DocumentSymbols { reply, .. } => reply.is_closed(),
             Self::FormatDocument { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
+            Self::WorkspaceSymbolBatch { reply, .. } => reply.is_closed(),
+            Self::LexicalSearch { reply, .. } => reply.is_closed(),
             Self::InspectSymbol { reply, .. } => reply.is_closed(),
+            Self::InspectSymbolBatch { reply, .. } => reply.is_closed(),
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reply.is_closed()
             }
@@ -2015,9 +2171,12 @@ impl ProjectRequest {
             Self::ValidatePath { reply, .. } | Self::StoreEditPlan { reply, .. } => {
                 reply.is_closed()
             }
+            Self::SourcePathAuthorized { reply, .. } => reply.is_closed(),
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
+            Self::ReadEditPlanDiff { reply, .. } => reply.is_closed(),
+            Self::ReadAppliedEditDetail { reply, .. } => reply.is_closed(),
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
@@ -2067,11 +2226,20 @@ impl ProjectHandle {
 
     /// Return retained project events newer than an optional polling cursor.
     #[must_use]
-    pub fn event_snapshot(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+    pub fn event_snapshot(&self, cursor: Option<u64>, max_events: usize) -> ProjectEventSnapshot {
         self.event_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot_since(cursor)
+            .snapshot_since(cursor, max_events)
+    }
+
+    /// Return one retained immutable event record by sequence.
+    #[must_use]
+    pub fn event_record(&self, sequence: u64) -> Option<ProjectEventRecord> {
+        self.event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_at(sequence)
     }
 
     fn reject_new_work(&self) {
@@ -2291,10 +2459,15 @@ impl ProjectHandle {
     pub(crate) async fn read_source_resource(
         &self,
         resource: SourceResource,
+        max_response_bytes: usize,
     ) -> Result<SourceFrame, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::ReadSourceResource { resource, reply })
+            .send(ProjectRequest::ReadSourceResource {
+                resource,
+                max_response_bytes,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -2621,6 +2794,43 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Route a bounded workspace-symbol batch through one project actor request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, the caller cancels, or any
+    /// downstream workspace-symbol request fails.
+    pub async fn workspace_symbol_batch(
+        &self,
+        request: WorkspaceSymbolBatchRequest,
+    ) -> Result<WorkspaceSymbolBatchResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::WorkspaceSymbolBatch { request, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Search project snapshots with bounded lexical matching.
+    pub(crate) async fn lexical_search(
+        &self,
+        request: LexicalSearchRequest,
+    ) -> Result<Vec<LexicalSearchMatch>, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::LexicalSearch { request, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Resolve and inspect one symbol in a single actor-owned snapshot.
     ///
     /// # Errors
@@ -2634,6 +2844,30 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::InspectSymbol { request, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Inspect several symbols concurrently through one actor request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, the caller cancels, or symbol
+    /// resolution fails.
+    pub async fn inspect_symbol_batch(
+        &self,
+        request: InspectSymbolBatchRequest,
+    ) -> Result<InspectSymbolBatchResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::InspectSymbolBatch {
+                request: Box::new(request),
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3030,6 +3264,19 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Whether this actor has an active-LSP source-read capability for `path`.
+    pub async fn source_path_is_authorized(
+        &self,
+        path: PathBuf,
+    ) -> Result<bool, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::SourcePathAuthorized { path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
+    }
+
     /// Add a compatible linked-project root to this actor's workspace.
     ///
     /// # Errors
@@ -3213,6 +3460,48 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::InspectEditPlan {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Read the complete immutable unified diff for one retained edit plan.
+    pub(crate) async fn read_edit_plan_diff(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<String, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReadEditPlanDiff {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Read the complete immutable result for one committed edit plan.
+    pub(crate) async fn read_applied_edit_detail(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<String, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReadAppliedEditDetail {
                 plan_id,
                 project_id,
                 reply,
@@ -3422,11 +3711,13 @@ struct ProjectRuntime {
     edit_plans: EditPlanStore,
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
-    symbol_handles: SymbolHandleStore,
+    symbol_handles: std::sync::Mutex<SymbolHandleStore>,
+    workspace_symbol_results: std::sync::Mutex<HashMap<String, WorkspaceSymbolResult>>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     applied_edit_receipts: VecDeque<AppliedEditPlan>,
+    applied_edit_receipt_bytes: usize,
     edit_conflicts: VecDeque<EditConflict>,
     active_edit_workers: usize,
     activation_health: ActivationHealth,
@@ -3467,6 +3758,7 @@ const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
 const MAX_EDIT_ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_APPLIED_EDIT_RECEIPTS: usize = 256;
+const MAX_APPLIED_EDIT_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUST_RESIDENCY_LIMIT: usize = 5;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
@@ -3662,8 +3954,16 @@ struct SymbolHandleStore {
     max_entries: usize,
 }
 
+/// Deferred payload and the immutable snapshot that produced it.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredResourcePayload {
+    pub value: serde_json::Value,
+    pub snapshot_hash: String,
+}
+
 struct StoredDeferredResult {
     value: serde_json::Value,
+    snapshot_hash: String,
     created_at: Instant,
     scope: String,
 }
@@ -3713,6 +4013,7 @@ impl DeferredResultStore {
             token.clone(),
             StoredDeferredResult {
                 value,
+                snapshot_hash: snapshot_hash.clone(),
                 created_at: Instant::now(),
                 scope: scope.to_owned(),
             },
@@ -3730,24 +4031,28 @@ impl DeferredResultStore {
         self.entries.retain(|_, result| result.scope != scope);
     }
 
-    fn read(&mut self, token: &str) -> Result<serde_json::Value, String> {
-        self.read_with_scope(token, None)
+    fn read(&mut self, token: &str) -> Result<DeferredResourcePayload, String> {
+        self.read_entry(token, None)
+            .map(|result| DeferredResourcePayload {
+                value: result.value.clone(),
+                snapshot_hash: result.snapshot_hash.clone(),
+            })
     }
 
     fn read_scoped(&mut self, token: &str, scope: &str) -> Result<serde_json::Value, String> {
-        self.read_with_scope(token, Some(scope))
+        self.read_entry(token, Some(scope))
+            .map(|result| result.value.clone())
     }
 
-    fn read_with_scope(
+    fn read_entry(
         &mut self,
         token: &str,
         scope: Option<&str>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<&StoredDeferredResult, String> {
         self.prune();
         self.entries
             .get(token)
             .filter(|result| scope.is_none_or(|scope| result.scope == scope))
-            .map(|result| result.value.clone())
             .ok_or_else(|| "stale_resource: deferred result is missing or expired".to_owned())
     }
 }
@@ -3773,6 +4078,144 @@ fn attach_document_symbol_handles(
             attach_document_symbol_handles(store, children);
         }
     }
+}
+
+fn rendered_workspace_symbol_position(
+    rendered: &str,
+    name: &str,
+    range: &crate::bridge::Range,
+) -> Option<(u32, u32)> {
+    (!name.is_empty()).then_some(())?;
+
+    rendered.lines().find_map(|rendered_line| {
+        let (number, text) = rendered_line.split_once(" | ")?;
+        let line = number.trim().parse::<u32>().ok()?;
+        if !(range.start.line..=range.end.line).contains(&line) {
+            return None;
+        }
+        symbol_position_in_line(line, text, name)
+    })
+}
+
+fn source_symbol_position(
+    source: &str,
+    name: &str,
+    range: &crate::bridge::Range,
+) -> Option<(u32, u32)> {
+    source.lines().enumerate().find_map(|(index, text)| {
+        let line = u32::try_from(index).ok()?.saturating_add(1);
+        (range.start.line..=range.end.line)
+            .contains(&line)
+            .then(|| symbol_position_in_line(line, text, name))
+            .flatten()
+    })
+}
+
+fn symbol_position_in_line(line: u32, text: &str, name: &str) -> Option<(u32, u32)> {
+    (!name.is_empty()).then_some(())?;
+    let text = text.trim_start();
+    if text.starts_with("//") || text.starts_with("#") {
+        return None;
+    }
+    text.match_indices(name).find_map(|(offset, _)| {
+        let before = text[..offset].chars().next_back();
+        let after = text[offset + name.len()..].chars().next();
+        if before.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+            && after.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+        {
+            Some((
+                line,
+                u32::try_from(text[..offset].encode_utf16().count()).ok()? + 1,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+fn rendered_struct_declaration(rendered: &str, name: &str, range: &crate::bridge::Range) -> bool {
+    rendered.lines().any(|rendered_line| {
+        let Some((number, text)) = rendered_line.split_once(" | ") else {
+            return false;
+        };
+        let Ok(line) = number.trim().parse::<u32>() else {
+            return false;
+        };
+        if line != range.start.line {
+            return false;
+        }
+        let text = text.trim_start();
+        let Some((prefix, _)) = text.split_once(name) else {
+            return false;
+        };
+        prefix.split_whitespace().next_back() == Some("struct")
+    })
+}
+
+fn discard_workspace_symbol_struct_uses(symbols: &mut Vec<WorkspaceSymbol>) {
+    let declarations = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.kind == "Struct"
+                && matches!(
+                    &symbol.location.source,
+                    SourceContext::Available(frame)
+                        if rendered_struct_declaration(&frame.text, &symbol.name, &symbol.location.range)
+                )
+        })
+        .map(|symbol| (symbol.name.clone(), symbol.location.uri.clone()))
+        .collect::<HashSet<_>>();
+    symbols.retain(|symbol| {
+        symbol.kind != "Struct"
+            || !declarations.contains(&(symbol.name.clone(), symbol.location.uri.clone()))
+            || matches!(
+                &symbol.location.source,
+                SourceContext::Available(frame)
+                    if rendered_struct_declaration(&frame.text, &symbol.name, &symbol.location.range)
+            )
+    });
+}
+
+#[test]
+fn rendered_workspace_symbol_position_skips_docs_and_declaration_prefixes() {
+    let range = crate::bridge::Range {
+        start: crate::bridge::Position2D {
+            line: 65,
+            character: 1,
+        },
+        end: crate::bridge::Position2D {
+            line: 65,
+            character: 24,
+        },
+    };
+
+    assert_eq!(
+        rendered_workspace_symbol_position(
+            "  64 | /// Adds two values.\n  65 | pub fn add(a: i32, b: i32) -> i32 {\n",
+            "add",
+            &range,
+        ),
+        Some((65, 8)),
+    );
+}
+
+#[test]
+fn rendered_struct_declaration_rejects_struct_uses() {
+    let range = crate::bridge::Range {
+        start: crate::bridge::Position2D {
+            line: 2,
+            character: 13,
+        },
+        end: crate::bridge::Position2D {
+            line: 2,
+            character: 18,
+        },
+    };
+    assert!(!rendered_struct_declaration(
+        "   1 | pub struct Point { x: f64 }\n   2 | let p = Point { x: 1.0 };\n",
+        "Point",
+        &range,
+    ));
 }
 
 fn missing_call_hierarchy_item() -> crate::bridge::InspectSection<crate::bridge::InspectCalls> {
@@ -3889,6 +4332,26 @@ fn call_hierarchy_snapshot_hash(items: &[CallHierarchyItemResult]) -> String {
         .unwrap_or_default()
 }
 
+fn trim_workspace_symbol_batch(batch: &mut WorkspaceSymbolBatchResult) {
+    while serde_json::to_vec(batch).map_or(usize::MAX, |encoded| encoded.len()) > batch.max_bytes {
+        let Some(result) = batch
+            .entries
+            .iter_mut()
+            .rev()
+            .filter_map(|entry| entry.result.as_mut())
+            .find(|result| !result.symbols.is_empty())
+        else {
+            batch.truncated = true;
+            return;
+        };
+        result.symbols.pop();
+        result.returned = result.symbols.len();
+        result.truncated = true;
+        batch.returned = batch.returned.saturating_sub(1);
+        batch.truncated = true;
+    }
+}
+
 impl ProjectRuntime {
     #[cfg(test)]
     fn new(translator: Translator) -> Self {
@@ -3916,11 +4379,13 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             edit_safety,
             code_actions: CodeActionStore::new(),
-            symbol_handles: SymbolHandleStore::new(),
+            symbol_handles: std::sync::Mutex::new(SymbolHandleStore::new()),
+            workspace_symbol_results: std::sync::Mutex::new(HashMap::new()),
             deferred_results,
             deferred_scope,
             inline_module_checks: HashMap::new(),
             applied_edit_receipts: VecDeque::new(),
+            applied_edit_receipt_bytes: 0,
             edit_conflicts: VecDeque::new(),
             active_edit_workers: 0,
             activation_health: ActivationHealth::Ready,
@@ -3950,7 +4415,7 @@ impl ProjectRuntime {
     }
 
     fn source_handle(
-        &mut self,
+        &self,
         source: &SourceContext,
         line: u32,
         character: u32,
@@ -3962,15 +4427,20 @@ impl ProjectRuntime {
             || SourceSnapshot::Hash(frame.content_hash.clone()),
             SourceSnapshot::Version,
         );
-        Some(self.symbol_handles.insert(StoredSymbolTarget::new(
-            PathBuf::from(&frame.path),
-            line,
-            character,
-            snapshot,
-        )))
+        Some(
+            self.symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(
+                    PathBuf::from(&frame.path),
+                    line,
+                    character,
+                    snapshot,
+                )),
+        )
     }
 
-    fn attach_location_handle(&mut self, location: &mut crate::bridge::Location) {
+    fn attach_location_handle(&self, location: &mut crate::bridge::Location) {
         location.symbol_handle = self.source_handle(
             &location.source,
             location.range.start.line,
@@ -3979,7 +4449,7 @@ impl ProjectRuntime {
     }
 
     fn attach_location_handles<'a>(
-        &mut self,
+        &self,
         locations: impl IntoIterator<Item = &'a mut crate::bridge::Location>,
     ) {
         locations
@@ -3987,26 +4457,124 @@ impl ProjectRuntime {
             .for_each(|location| self.attach_location_handle(location));
     }
 
-    fn attach_reference_handle(&mut self, reference: &mut crate::bridge::ReferenceUse) {
+    async fn attach_workspace_symbol_handle(
+        &self,
+        symbol: &mut WorkspaceSymbol,
+        snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
+    ) {
+        let location = &mut symbol.location;
+        let Some(path) = location.path.as_deref().map(PathBuf::from) else {
+            return;
+        };
+        let (line, character, snapshot) = match &location.source {
+            SourceContext::Available(frame) => {
+                let position =
+                    rendered_workspace_symbol_position(&frame.text, &symbol.name, &location.range)
+                        .unwrap_or((location.range.start.line, location.range.start.character));
+                let snapshot = frame.document_version.map_or_else(
+                    || SourceSnapshot::Hash(frame.content_hash.clone()),
+                    SourceSnapshot::Version,
+                );
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Deferred { resource } => {
+                let snapshot = resource.document_version.map_or_else(
+                    || SourceSnapshot::Hash(resource.snapshot_hash.clone()),
+                    SourceSnapshot::Version,
+                );
+                let position = self
+                    .workspace_symbol_position(&path, &symbol.name, &location.range, snapshots)
+                    .await
+                    .unwrap_or((location.range.start.line, location.range.start.character));
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Unavailable {
+                reason: SourceUnavailableReason::ResponseBudgetExhausted,
+            } => {
+                let Some((document_version, content_hash, source)) =
+                    self.workspace_symbol_snapshot(&path, snapshots).await
+                else {
+                    return;
+                };
+                let position = source_symbol_position(&source, &symbol.name, &location.range)
+                    .unwrap_or((location.range.start.line, location.range.start.character));
+                let snapshot = document_version.map_or_else(
+                    || SourceSnapshot::Hash(content_hash.to_owned()),
+                    SourceSnapshot::Version,
+                );
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Unavailable { .. } => return,
+        };
+        location.symbol_handle = Some(
+            self.symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(path, line, character, snapshot)),
+        );
+    }
+
+    async fn attach_workspace_symbol_handles<'a>(
+        &self,
+        symbols: impl IntoIterator<Item = &'a mut WorkspaceSymbol>,
+    ) {
+        let mut snapshots = HashMap::new();
+        for symbol in symbols {
+            self.attach_workspace_symbol_handle(symbol, &mut snapshots)
+                .await;
+        }
+    }
+
+    async fn workspace_symbol_position(
+        &self,
+        path: &Path,
+        name: &str,
+        range: &crate::bridge::Range,
+        snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
+    ) -> Option<(u32, u32)> {
+        let (_, _, source) = self.workspace_symbol_snapshot(path, snapshots).await?;
+        source_symbol_position(source, name, range)
+    }
+
+    async fn workspace_symbol_snapshot<'a>(
+        &self,
+        path: &Path,
+        snapshots: &'a mut HashMap<PathBuf, (Option<i32>, String, String)>,
+    ) -> Option<&'a (Option<i32>, String, String)> {
+        if !snapshots.contains_key(path) {
+            let (_, version, hash, source) = self.translator.source_snapshot(path).await.ok()?;
+            snapshots.insert(path.to_path_buf(), (version, hash, source));
+        }
+        snapshots.get(path)
+    }
+
+    fn attach_reference_handle(&self, reference: &mut crate::bridge::ReferenceUse) {
         reference.symbol_handle = reference.snapshot.as_ref().map(|snapshot| {
             let source_snapshot = snapshot.document_version.map_or_else(
                 || SourceSnapshot::Hash(snapshot.content_hash.clone()),
                 SourceSnapshot::Version,
             );
-            self.symbol_handles.insert(StoredSymbolTarget::new(
-                PathBuf::from(&snapshot.path),
-                reference.range[0],
-                reference.range[1],
-                source_snapshot,
-            ))
+            self.symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(
+                    PathBuf::from(&snapshot.path),
+                    reference.range[0],
+                    reference.range[1],
+                    source_snapshot,
+                ))
         });
     }
 
     async fn resolve_symbol_target(
-        &mut self,
+        &self,
         handle: &SymbolHandle,
     ) -> Result<StoredSymbolTarget, String> {
-        let target = self.symbol_handles.resolve(handle)?;
+        let target = self
+            .symbol_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(handle)?;
         let (_, version, hash, _) = self
             .translator
             .source_snapshot(&target.file_path)
@@ -4475,6 +5043,29 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn read_edit_plan_diff(&self, plan_id: &PlanId, project_id: &str) -> Result<String, String> {
+        self.edit_plans
+            .get_for_project(plan_id, project_id)
+            .map(EditPlan::complete_unified_diff)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_applied_edit_detail(
+        &self,
+        plan_id: &PlanId,
+        project_id: &str,
+    ) -> Result<String, String> {
+        self.applied_edit_receipts
+            .iter()
+            .find(|receipt| &receipt.plan_id == plan_id)
+            .map(|receipt| serde_json::to_string(&receipt.detail_json()))
+            .transpose()
+            .map_err(|serialization| serialization.to_string())?
+            .ok_or_else(|| {
+                format!("applied edit result for project {project_id} is no longer retained")
+            })
+    }
+
     fn configure_edit_safety(
         &mut self,
         boundary: &WorkspaceBoundary,
@@ -4770,14 +5361,31 @@ impl ProjectRuntime {
             plan_id: plan.id().clone(),
             operations: plan.operations().to_vec(),
             unified_diff: plan.unified_diff().to_string(),
+            complete_unified_diff: plan.complete_unified_diff(),
             committed_files,
             verification: None,
             provider_synchronization: Vec::new(),
         };
-        if self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS {
-            self.applied_edit_receipts.pop_front();
+        let applied_bytes = applied.estimated_bytes();
+        while self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS
+            || self
+                .applied_edit_receipt_bytes
+                .saturating_add(applied_bytes)
+                > MAX_APPLIED_EDIT_RECEIPT_BYTES
+        {
+            let Some(evicted) = self.applied_edit_receipts.pop_front() else {
+                break;
+            };
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_sub(evicted.estimated_bytes());
         }
-        self.applied_edit_receipts.push_back(applied.clone());
+        if applied_bytes <= MAX_APPLIED_EDIT_RECEIPT_BYTES {
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_add(applied_bytes);
+            self.applied_edit_receipts.push_back(applied.clone());
+        }
         drop(lease);
 
         let (provider_synchronization, verification) = self
@@ -4796,7 +5404,13 @@ impl ProjectRuntime {
             .iter_mut()
             .find(|receipt| receipt.plan_id == applied.plan_id)
         {
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_sub(receipt.estimated_bytes());
             *receipt = applied.clone();
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_add(receipt.estimated_bytes());
         }
         Ok(ApplyEditPlanOutcome::Applied(applied))
     }
@@ -4876,7 +5490,7 @@ impl ProjectRuntime {
     }
 
     async fn hover(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -4894,7 +5508,7 @@ impl ProjectRuntime {
     }
 
     async fn definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -4909,7 +5523,7 @@ impl ProjectRuntime {
     }
 
     async fn references(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -4940,9 +5554,13 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    async fn read_source_resource(&self, resource: SourceResource) -> Result<SourceFrame, String> {
+    async fn read_source_resource(
+        &self,
+        resource: SourceResource,
+        max_response_bytes: usize,
+    ) -> Result<SourceFrame, String> {
         self.translator
-            .read_source_resource(&resource)
+            .read_source_resource_with_max_bytes(&resource, max_response_bytes)
             .await
             .map_err(|error| error.to_string())
     }
@@ -4981,7 +5599,7 @@ impl ProjectRuntime {
     }
 
     async fn resolve_symbol_handle(
-        &mut self,
+        &self,
         symbol_handle: SymbolHandle,
     ) -> Result<ResolvedSymbolTarget, String> {
         let target = self.resolve_symbol_target(&symbol_handle).await?;
@@ -5080,7 +5698,7 @@ impl ProjectRuntime {
     }
 
     async fn document_symbols(
-        &mut self,
+        &self,
         file_path: String,
         options: DocumentSymbolOptions,
     ) -> Result<DocumentSymbolsResult, String> {
@@ -5089,7 +5707,13 @@ impl ProjectRuntime {
             .handle_document_symbols(file_path, options)
             .await
             .map_err(|error| error.to_string())?;
-        attach_document_symbol_handles(&mut self.symbol_handles, &mut result.symbols);
+        attach_document_symbol_handles(
+            &mut self
+                .symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &mut result.symbols,
+        );
         Ok(result)
     }
 
@@ -5118,7 +5742,7 @@ impl ProjectRuntime {
     }
 
     async fn semantic_discovery(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -5134,7 +5758,7 @@ impl ProjectRuntime {
     }
 
     async fn workspace_symbol(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -5154,12 +5778,236 @@ impl ProjectRuntime {
             )
             .await
             .map_err(|error| error.to_string())?;
-        self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
+        discard_workspace_symbol_struct_uses(&mut result.symbols);
+        result.returned = result.symbols.len();
+        self.attach_workspace_symbol_handles(&mut result.symbols)
+            .await;
         Ok(result)
     }
 
+    async fn workspace_symbol_batch(
+        &self,
+        request: WorkspaceSymbolBatchRequest,
+    ) -> Result<WorkspaceSymbolBatchResult, String> {
+        let snapshot_identity = self.workspace_snapshot_identity().await?;
+        let mut seen = HashMap::new();
+        let mut batch = WorkspaceSymbolBatchResult {
+            entries: Vec::with_capacity(request.queries.len()),
+            unique_queries: 0,
+            provider_requests: 0,
+            snapshot_identity,
+            cache_hit: false,
+            returned: 0,
+            truncated: false,
+            max_bytes: request.max_bytes,
+        };
+
+        for query in request.queries {
+            if let Some(&reused_from) = seen.get(&query) {
+                batch.entries.push(WorkspaceSymbolBatchEntry {
+                    query,
+                    result: None,
+                    reused_from: Some(reused_from),
+                    skipped_by_budget: false,
+                });
+                trim_workspace_symbol_batch(&mut batch);
+                continue;
+            }
+
+            let entry_index = batch.entries.len();
+            seen.insert(query.clone(), entry_index);
+            batch.unique_queries += 1;
+            let remaining = request.max_items.saturating_sub(batch.returned);
+            if remaining == 0 {
+                batch.truncated = true;
+                batch.entries.push(WorkspaceSymbolBatchEntry {
+                    query,
+                    result: None,
+                    reused_from: None,
+                    skipped_by_budget: true,
+                });
+                trim_workspace_symbol_batch(&mut batch);
+                continue;
+            }
+
+            let limit = u32::try_from(remaining).unwrap_or(u32::MAX);
+            let cache_key = format!(
+                "{}\0{}\0{:?}\0{}\0{:?}\0{:?}",
+                batch.snapshot_identity,
+                query,
+                request.kind_filter,
+                request.include_generated,
+                request.match_mode,
+                request.scope,
+            );
+            let result = if let Some(result) = self
+                .workspace_symbol_results
+                .lock()
+                .expect("workspace-symbol cache lock poisoned")
+                .get(&cache_key)
+                .cloned()
+            {
+                batch.cache_hit = true;
+                result
+            } else {
+                let result = self
+                    .workspace_symbol(
+                        query.clone(),
+                        request.kind_filter.clone(),
+                        limit,
+                        request.match_mode,
+                        request.scope,
+                        request.include_generated,
+                    )
+                    .await?;
+                batch.provider_requests += 1;
+                if !result.truncated {
+                    self.workspace_symbol_results
+                        .lock()
+                        .expect("workspace-symbol cache lock poisoned")
+                        .insert(cache_key, result.clone());
+                }
+                result
+            };
+            batch.returned += result.returned;
+            batch.truncated |= result.truncated;
+            batch.entries.push(WorkspaceSymbolBatchEntry {
+                query,
+                result: Some(result),
+                reused_from: None,
+                skipped_by_budget: false,
+            });
+            trim_workspace_symbol_batch(&mut batch);
+        }
+
+        Ok(batch)
+    }
+
+    async fn lexical_search(
+        &self,
+        request: LexicalSearchRequest,
+    ) -> Result<Vec<LexicalSearchMatch>, String> {
+        const LEXICAL_CONTEXT_BYTES: usize = 16 * 1024;
+        let paths = collect_project_paths_filtered(
+            self.translator.workspace_roots(),
+            request.include_generated,
+            request.max_files,
+            &request.include_paths,
+            &request.exclude_paths,
+        )
+        .await?;
+        let mut matches = Vec::new();
+        let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
+        for path in paths {
+            if matches.len() >= request.max_matches {
+                break;
+            }
+            let (path, document_version, content_hash, source) = self
+                .translator
+                .source_snapshot(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+            let ranges = find_matches(
+                &source,
+                &request.query,
+                request.mode,
+                request.case,
+                request.multiline,
+            )?;
+            let remaining = request.max_matches.saturating_sub(matches.len());
+            let project_relative_path = self
+                .translator
+                .workspace_roots()
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok())
+                .map(|relative| relative.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    "lexical search found a path outside its project roots".to_owned()
+                })?;
+            for byte_range in ranges.into_iter().take(remaining) {
+                let start =
+                    byte_offset_to_position(&source, byte_range.start, PositionEncoding::Utf8)
+                        .ok_or_else(|| {
+                            "lexical match start is not a valid text position".to_owned()
+                        })?;
+                let end = byte_offset_to_position(&source, byte_range.end, PositionEncoding::Utf8)
+                    .ok_or_else(|| "lexical match end is not a valid text position".to_owned())?;
+                let source_uri = make_source_uri(
+                    &path,
+                    start.line.saturating_add(1),
+                    start.character.saturating_add(1),
+                    end.line.saturating_add(1),
+                    end.character.saturating_add(1),
+                    &content_hash,
+                    document_version,
+                )
+                .map_err(|error| error.to_string())?;
+                let source = if request.context_lines == 0 {
+                    None
+                } else {
+                    Some(
+                        self.translator
+                            .lexical_source_context(
+                                &path,
+                                crate::bridge::Range {
+                                    start: crate::bridge::Position2D {
+                                        line: start.line.saturating_add(1),
+                                        character: start.character.saturating_add(1),
+                                    },
+                                    end: crate::bridge::Position2D {
+                                        line: end.line.saturating_add(1),
+                                        character: end.character.saturating_add(1),
+                                    },
+                                },
+                                &mut source_budget,
+                                request.context_lines,
+                            )
+                            .await,
+                    )
+                };
+                matches.push(LexicalSearchMatch {
+                    project_relative_path: project_relative_path.clone(),
+                    document_version,
+                    content_hash: content_hash.clone(),
+                    source_uri,
+                    source,
+                    byte_range,
+                });
+            }
+        }
+        Ok(matches)
+    }
+
+    async fn workspace_snapshot_identity(&self) -> Result<String, String> {
+        let mut paths = Vec::new();
+        for root in self.translator.workspace_roots() {
+            for entry in WalkBuilder::new(root)
+                .standard_filters(true)
+                .build()
+                .flatten()
+            {
+                if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    paths.push(entry.into_path());
+                }
+            }
+        }
+        paths.sort_unstable();
+        let mut hasher = Sha256::new();
+        for path in paths {
+            let (_, version, content_hash, _) = self
+                .translator
+                .source_snapshot(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+            hasher.update(path.as_os_str().as_encoded_bytes());
+            hasher.update(version.unwrap_or_default().to_le_bytes());
+            hasher.update(content_hash.as_bytes());
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     async fn workspace_symbol_in_path(
-        &mut self,
+        &self,
         query: String,
         kind_filter: Option<String>,
         limit: u32,
@@ -5172,14 +6020,17 @@ impl ProjectRuntime {
             .handle_workspace_symbol_in_path(query, kind_filter, limit, match_mode, scope, path)
             .await
             .map_err(|error| error.to_string())?;
-        self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
+        discard_workspace_symbol_struct_uses(&mut result.symbols);
+        result.returned = result.symbols.len();
+        self.attach_workspace_symbol_handles(&mut result.symbols)
+            .await;
         Ok(result)
     }
 
-    // One linear actor operation intentionally makes the snapshot boundary visible.
+    // One actor-owned operation intentionally makes the snapshot boundary visible.
     #[allow(clippy::too_many_lines)]
     async fn inspect_symbol(
-        &mut self,
+        &self,
         request: InspectSymbolRequest,
     ) -> Result<InspectSymbolResult, String> {
         use crate::bridge::{
@@ -5668,7 +6519,86 @@ impl ProjectRuntime {
             result.truncated = true;
         }
         result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        Ok(result)
+    }
+
+    async fn inspect_symbol_batch(
+        &self,
+        request: InspectSymbolBatchRequest,
+    ) -> Result<InspectSymbolBatchResult, String> {
+        let target_count = request.targets.len();
+        if target_count == 0
+            || target_count > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
+        {
+            return Err("between 1 and 16 symbol targets are required".to_owned());
+        }
+        let identity_bytes = serde_json::to_vec(&request.targets)
+            .map_err(|error| error.to_string())?
+            .len();
+        let available_bytes = request.budget.max_bytes.saturating_sub(
+            identity_bytes
+                + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES,
+        );
+        let target_budget = crate::bridge::InspectSymbolBudget {
+            max_bytes: available_bytes / target_count,
+            max_items: request.budget.max_items / target_count,
+        };
+        if target_budget.max_bytes
+            < crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET
+            || target_budget.max_items == 0
+        {
+            return Err("batch budget is too small for every symbol target".to_owned());
+        }
+
+        let inspections = request.targets.into_iter().map(|target| {
+            let inspect_request = InspectSymbolRequest {
+                symbol_handle: target.symbol_handle.clone(),
+                query: target.query.clone(),
+                kind: target.kind.clone(),
+                path: target.path.clone(),
+                container: target.container.clone(),
+                candidate_limit: request.candidate_limit,
+                sections: request.sections.clone(),
+                budget: target_budget,
+            };
+            async move {
+                match Box::pin(self.inspect_symbol(inspect_request)).await {
+                    Ok(result) => InspectSymbolBatchEntry {
+                        target,
+                        result: Some(result),
+                        error: None,
+                    },
+                    Err(error) => InspectSymbolBatchEntry {
+                        target,
+                        result: None,
+                        error: Some(error),
+                    },
+                }
+            }
+        });
+        let entries = futures::future::join_all(inspections).await;
+        let returned_items = entries
+            .iter()
+            .filter_map(|entry| entry.result.as_ref())
+            .map(|result| result.sections.returned_items())
+            .sum();
+        let truncated = entries
+            .iter()
+            .filter_map(|entry| entry.result.as_ref())
+            .any(|result| result.truncated);
+        let mut result = InspectSymbolBatchResult {
+            inspections_started: entries.len(),
+            entries,
+            returned_items,
+            budget: request.budget,
+            returned_bytes: 0,
+            truncated,
+        };
         result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        if result.returned_bytes > result.budget.max_bytes {
+            return Err("batch response metadata exceeds max_bytes".to_owned());
+        }
         Ok(result)
     }
 
@@ -5780,7 +6710,7 @@ impl ProjectRuntime {
     }
 
     async fn prepare_call_hierarchy(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -5889,7 +6819,7 @@ impl ProjectRuntime {
     }
 
     async fn incoming_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
     ) -> Result<IncomingCallsResult, String> {
@@ -5912,7 +6842,7 @@ impl ProjectRuntime {
     }
 
     async fn outgoing_calls(
-        &mut self,
+        &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
     ) -> Result<OutgoingCallsResult, String> {
@@ -5967,7 +6897,7 @@ impl ProjectRuntime {
     }
 
     async fn go_to_implementation(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -5982,7 +6912,7 @@ impl ProjectRuntime {
     }
 
     async fn go_to_type_definition(
-        &mut self,
+        &self,
         file_path: String,
         line: u32,
         character: u32,
@@ -6018,6 +6948,10 @@ impl ProjectRuntime {
             .validate_path(Path::new(file_path))
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn source_path_is_authorized(&self, path: &Path) -> bool {
+        self.translator.source_path_is_authorized(path)
     }
 
     fn server_logs(
@@ -6547,14 +7481,17 @@ async fn run_project_actor(
 ) {
     while let Some(request) = next_project_request(&mut receiver).await {
         let (request, _residency_guard) = request.into_resident();
+        let (request, timing) = request.into_timed();
         if matches!(&request, ProjectRequest::Shutdown { .. }) {
             while runtime.active_edit_workers > 0 {
                 let Some(next) = next_project_request(&mut receiver).await else {
                     break;
                 };
                 let (next, _residency_guard) = next.into_resident();
-                let stop = handle_project_request(
+                let (next, timing) = next.into_timed();
+                let stop = handle_timed_project_request(
                     next,
+                    timing,
                     &actor_sender,
                     &channels,
                     &mut state,
@@ -6576,8 +7513,9 @@ async fn run_project_actor(
         {
             resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
         }
-        let stop = handle_project_request(
+        let stop = handle_timed_project_request(
             request,
+            timing,
             &actor_sender,
             &channels,
             &mut state,
@@ -6597,6 +7535,30 @@ async fn run_project_actor(
     if let Some(residency) = residency {
         residency.controller.remove(residency.group);
     }
+}
+
+#[allow(clippy::large_futures)]
+async fn handle_timed_project_request(
+    request: ProjectRequest,
+    timing: ProjectRequestTiming,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+    residency: Option<&ProjectResidency>,
+) -> bool {
+    timing.span.record(
+        "actor_queue_ms",
+        timing.queued_at.elapsed().as_millis() as u64,
+    );
+    let started = Instant::now();
+    let stop = handle_project_request(request, actor_sender, channels, state, runtime, residency)
+        .instrument(timing.span.clone())
+        .await;
+    timing
+        .span
+        .record("actor_execution_ms", started.elapsed().as_millis() as u64);
+    stop
 }
 
 async fn resume_project_runtime(
@@ -6817,6 +7779,9 @@ async fn handle_project_request(
     };
 
     match request {
+        ProjectRequest::Timed { .. } => {
+            unreachable!("timed request must be unwrapped by the actor loop")
+        }
         ProjectRequest::Resident { .. } => {
             unreachable!("resident request must be unwrapped by the actor loop")
         }
@@ -6939,8 +7904,16 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::ReadSourceResource { resource, reply } => {
-            let _ = reply.send(runtime.read_source_resource(resource).await);
+        ProjectRequest::ReadSourceResource {
+            resource,
+            max_response_bytes,
+            reply,
+        } => {
+            let _ = reply.send(
+                runtime
+                    .read_source_resource(resource, max_response_bytes)
+                    .await,
+            );
         }
         ProjectRequest::ResolveSymbolHandle {
             symbol_handle,
@@ -7065,6 +8038,26 @@ async fn handle_project_request(
             };
             let _ = reply.send(result);
         }
+        ProjectRequest::WorkspaceSymbolBatch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.workspace_symbol_batch(request) => result,
+            };
+            let _ = reply.send(result);
+        }
+        ProjectRequest::LexicalSearch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.lexical_search(request) => result,
+            };
+            let _ = reply.send(result);
+        }
         ProjectRequest::InspectSymbol { request, mut reply } => {
             if reply.is_closed() {
                 return false;
@@ -7072,6 +8065,16 @@ async fn handle_project_request(
             let result = tokio::select! {
                 () = reply.closed() => return false,
                 result = runtime.inspect_symbol(request) => result,
+            };
+            let _ = reply.send(result);
+        }
+        ProjectRequest::InspectSymbolBatch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.inspect_symbol_batch(*request) => result,
             };
             let _ = reply.send(result);
         }
@@ -7227,6 +8230,9 @@ async fn handle_project_request(
         ProjectRequest::ValidatePath { file_path, reply } => {
             let _ = reply.send(runtime.validate_path(&file_path));
         }
+        ProjectRequest::SourcePathAuthorized { path, reply } => {
+            let _ = reply.send(runtime.source_path_is_authorized(&path));
+        }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             let previous_status = state.status;
             runtime.begin_transition();
@@ -7334,6 +8340,20 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.inspect_edit_plan(&plan_id, &project_id));
+        }
+        ProjectRequest::ReadEditPlanDiff {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.read_edit_plan_diff(&plan_id, &project_id));
+        }
+        ProjectRequest::ReadAppliedEditDetail {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.read_applied_edit_detail(&plan_id, &project_id));
         }
         ProjectRequest::ApplyEditPlan {
             plan_id,
@@ -9311,6 +10331,19 @@ impl ProjectRegistry {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn acquire_test_edit_lease(
+        &self,
+        path: std::path::PathBuf,
+    ) -> crate::edit_coordinator::EditLease {
+        self.edit_coordinator
+            .try_acquire(
+                "test-session",
+                [crate::edit_coordinator::EditResource::exact(path)],
+            )
+            .unwrap_or_else(|error| panic!("test edit lease must be available: {error}"))
+    }
+
     /// Inspect a project-owned edit plan without consuming it.
     pub(crate) async fn inspect_edit_plan(
         &self,
@@ -9620,6 +10653,43 @@ impl ProjectRegistry {
         self.project_for_path(path).await.map(|(_, actor)| actor)
     }
 
+    /// Resolve a path and wake its registered project when it is dormant.
+    pub async fn active_actor_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let (project_id, actor) = self.project_for_path(path).await?;
+        if actor.query().await?.status() == ProjectStatus::Dormant {
+            self.activate(&project_id).await?;
+        }
+        Ok(actor)
+    }
+
+    /// Resolve a dependency source previously surfaced by an active LSP.
+    pub async fn actor_for_source_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let path = canonicalize(path.as_ref())?;
+        let actors = self
+            .projects
+            .read()
+            .await
+            .values()
+            .flat_map(|project| project.actors.iter().map(|entry| entry.actor.clone()))
+            .collect::<Vec<_>>();
+        for actor in actors {
+            if actor
+                .source_path_is_authorized(path.clone())
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(actor);
+            }
+        }
+        Err(ProjectIdentityError::UnregisteredPath(path).into())
+    }
+
     /// Resolve a file path to its owning project ID and actor.
     ///
     /// This is the identity-preserving form of [`Self::actor_for_path`], used
@@ -9722,7 +10792,10 @@ impl ProjectRegistry {
         Err("invalid_symbol_handle: unknown or forged handle; rerun symbol discovery".to_owned())
     }
 
-    pub(crate) fn read_deferred_resource(&self, token: &str) -> Result<serde_json::Value, String> {
+    pub(crate) fn read_deferred_resource(
+        &self,
+        token: &str,
+    ) -> Result<DeferredResourcePayload, String> {
         self.deferred_results
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10006,10 +11079,9 @@ mod tests {
             .strip_prefix("mcpls-deferred:///")
             .unwrap()
             .to_owned();
-        assert_eq!(
-            registry.read_deferred_resource(&token).unwrap(),
-            serde_json::json!({"references": [1, 2]})
-        );
+        let payload = registry.read_deferred_resource(&token).unwrap();
+        assert_eq!(payload.value, serde_json::json!({"references": [1, 2]}));
+        assert_eq!(payload.snapshot_hash, "snapshot");
     }
 
     #[test]
@@ -10032,7 +11104,7 @@ mod tests {
 
         assert!(store.read(first_token).is_err());
         assert_eq!(
-            store.read(second_token).unwrap(),
+            store.read(second_token).unwrap().value,
             serde_json::json!({"project": "second"})
         );
     }
@@ -10083,7 +11155,7 @@ mod tests {
             .collect();
         let deferred_results =
             std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
-        let mut runtime = ProjectRuntime::with_deferred_results_scoped(
+        let runtime = ProjectRuntime::with_deferred_results_scoped(
             Translator::new(),
             None,
             deferred_results,
@@ -10302,12 +11374,16 @@ mod tests {
     #[test]
     fn project_actor_replacements_start_without_semantic_handles_or_edit_plans() {
         let mut old_runtime = ProjectRuntime::new(Translator::new());
-        let handle = old_runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            PathBuf::from("src/lib.rs"),
-            1,
-            2,
-            SourceSnapshot::Version(1),
-        ));
+        let handle = old_runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                PathBuf::from("src/lib.rs"),
+                1,
+                2,
+                SourceSnapshot::Version(1),
+            ));
         let plan = EditPlan::new(
             "project".to_owned(),
             vec![crate::edit_plan::FileSnapshot::from_contents(
@@ -10324,8 +11400,15 @@ mod tests {
         let plan_id = plan.id().clone();
         old_runtime.edit_plans.insert(plan).unwrap();
 
-        let mut replacement_runtime = ProjectRuntime::new(Translator::new());
-        assert!(replacement_runtime.symbol_handles.resolve(&handle).is_err());
+        let replacement_runtime = ProjectRuntime::new(Translator::new());
+        assert!(
+            replacement_runtime
+                .symbol_handles
+                .lock()
+                .unwrap()
+                .resolve(&handle)
+                .is_err()
+        );
         assert!(replacement_runtime.edit_plans.get(&plan_id).is_none());
     }
 
@@ -10348,6 +11431,28 @@ mod tests {
         };
 
         assert!(request.is_cancelled());
+    }
+
+    #[test]
+    fn inspect_symbol_batch_resumes_a_dormant_rust_runtime() {
+        let (reply, _response) = oneshot::channel();
+        let request = ProjectRequest::InspectSymbolBatch {
+            request: Box::new(crate::bridge::InspectSymbolBatchRequest {
+                targets: vec![crate::bridge::InspectSymbolTarget {
+                    symbol_handle: None,
+                    query: Some("target".to_owned()),
+                    kind: None,
+                    path: None,
+                    container: None,
+                }],
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            }),
+            reply,
+        };
+
+        assert!(request.resumes_rust_runtime());
     }
 
     #[tokio::test]
@@ -10380,6 +11485,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(target.file_path, source.display().to_string());
+        assert_eq!(target.character, 4);
         let other_actor = spawn_project_actor_with_translator(4, Translator::new());
         let isolation_error = other_actor
             .resolve_symbol_handle(handle.clone())
@@ -10390,6 +11496,380 @@ mod tests {
         fs::write(&source, "fn moved_target() {}\n").unwrap();
         let error = actor.resolve_symbol_handle(handle).await.unwrap_err();
         assert!(error.to_string().contains("stale_symbol_handle"));
+    }
+
+    #[tokio::test]
+    async fn deferred_workspace_symbol_handle_targets_the_identifier() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, _, content_hash, _) = translator.source_snapshot(&source).await.unwrap();
+        let runtime = ProjectRuntime::new(translator);
+        let mut symbol = WorkspaceSymbol {
+            name: "add".to_owned(),
+            kind: "Function".to_owned(),
+            location: crate::bridge::Location {
+                path: Some(source.display().to_string()),
+                uri: crate::bridge::path_to_uri(&source).unwrap().to_string(),
+                range: crate::bridge::Range {
+                    start: crate::bridge::Position2D {
+                        line: 1,
+                        character: 1,
+                    },
+                    end: crate::bridge::Position2D {
+                        line: 1,
+                        character: 4,
+                    },
+                },
+                source: SourceContext::Deferred {
+                    resource: crate::bridge::translator::DeferredResourceReference {
+                        uri: "mcpls-source://test".to_owned(),
+                        kind: "source_context".to_owned(),
+                        snapshot_hash: content_hash,
+                        document_version: None,
+                        total_bytes: None,
+                    },
+                },
+                symbol_handle: None,
+            },
+            container_name: None,
+            match_class: crate::bridge::translator::WorkspaceSymbolMatch::Exact,
+            score: 100,
+            project_relative_path: Some("lib.rs".to_owned()),
+            origin: crate::bridge::translator::WorkspaceSymbolOrigin::ProjectLocal,
+            is_generated: false,
+        };
+
+        runtime
+            .attach_workspace_symbol_handle(&mut symbol, &mut HashMap::new())
+            .await;
+        let target = runtime
+            .resolve_symbol_target(symbol.location.symbol_handle.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!((target.line, target.character), (1, 8));
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let alpha = root.path().join("alpha.rs");
+        let beta = root.path().join("beta.rs");
+        fs::write(&alpha, "fn alpha() {}\n").unwrap();
+        fs::write(&beta, "fn beta() {}\n").unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let responder_alpha = alpha.clone();
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut queries = Vec::new();
+            while queries.len() < 3 {
+                let message = read_framed_message(&mut reader).await;
+                let Some(id) = message.get("id") else {
+                    continue;
+                };
+                let query = message["params"]["query"].as_str().unwrap().to_owned();
+                let uri = if query == "alpha" {
+                    &responder_alpha
+                } else {
+                    &beta
+                };
+                write_response(
+                    &mut read_half_stdin,
+                    id,
+                    serde_json::json!([{
+                        "name": query,
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(uri).unwrap(),
+                            "range": {
+                                "start": {"line": 0, "character": 3},
+                                "end": {"line": 0, "character": 8}
+                            }
+                        }
+                    }]),
+                )
+                .await;
+                queries.push(query);
+            }
+            queries
+        });
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        let result = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: vec!["alpha".to_owned(), "alpha".to_owned(), "beta".to_owned()],
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!((result.unique_queries, result.provider_requests), (2, 2));
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries[1].reused_from, Some(0));
+        assert!(result.entries[1].result.is_none());
+        assert_eq!(result.returned, 2);
+        assert!(!result.truncated);
+        assert!(serde_json::to_vec(&result).unwrap().len() <= result.max_bytes);
+
+        let repeated = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: vec!["alpha".to_owned(), "beta".to_owned()],
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(repeated.provider_requests, 0);
+        assert_eq!(repeated.returned, 2);
+        assert!(repeated.cache_hit);
+        assert_eq!(repeated.snapshot_identity, result.snapshot_identity);
+
+        fs::write(&alpha, "fn alpha_changed() {}\n").unwrap();
+        let refreshed = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: vec!["alpha".to_owned()],
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(refreshed.provider_requests, 1);
+        assert!(!refreshed.cache_hit);
+        assert_ne!(result.snapshot_identity, refreshed.snapshot_identity);
+        assert_eq!(responder.await.unwrap(), ["alpha", "beta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("symbols.rs");
+        fs::write(&source, "fn symbol() {}\n").unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut queries = Vec::new();
+            while queries.len() < 117 {
+                let message = read_framed_message(&mut reader).await;
+                let Some(id) = message.get("id") else {
+                    continue;
+                };
+                let query = message["params"]["query"].as_str().unwrap().to_owned();
+                write_response(
+                    &mut read_half_stdin,
+                    id,
+                    serde_json::json!([{
+                        "name": query,
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(&source).unwrap(),
+                            "range": {
+                                "start": {"line": 0, "character": 3},
+                                "end": {"line": 0, "character": 9}
+                            }
+                        }
+                    }]),
+                )
+                .await;
+                queries.push(query);
+            }
+            queries
+        });
+        let actor = spawn_project_actor_with_translator(8, translator);
+        let unique = (0..117)
+            .map(|index| format!("symbol_{index}"))
+            .collect::<Vec<_>>();
+        let mut queries = unique.clone();
+        queries.extend(unique.iter().take(26).cloned());
+
+        let mut client_calls = 0;
+        let mut provider_requests = 0;
+        for chunk in queries.chunks(32) {
+            let result = actor
+                .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                    queries: chunk.to_vec(),
+                    kind_filter: None,
+                    match_mode: WorkspaceSymbolMatchMode::Exact,
+                    scope: WorkspaceSymbolScope::Project,
+                    include_generated: false,
+                    max_items: 1_000,
+                    max_bytes: 64 * 1024,
+                })
+                .await
+                .unwrap();
+            client_calls += 1;
+            provider_requests += result.provider_requests;
+            assert_eq!(result.entries.len(), chunk.len());
+        }
+
+        assert_eq!(client_calls, 5);
+        assert_eq!(provider_requests, 117);
+        assert_eq!(responder.await.unwrap().len(), 117);
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budget() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        fs::write(root.path().join("beta.rs"), "fn beta() {}\n").unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half,
+            _read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let (release_server, hold_server) = oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let _processes = (_write_half, _read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let mut request_ids = Vec::new();
+            while request_ids.len() < 2 {
+                let message = read_framed_message(&mut reader).await;
+                if let Some(id) = message.get("id").cloned() {
+                    assert_eq!(message["method"], "textDocument/hover");
+                    request_ids.push(id);
+                }
+            }
+            for id in &request_ids {
+                write_response(
+                    &mut read_half_stdin,
+                    id,
+                    serde_json::json!({
+                        "contents": {"kind": "plaintext", "value": "inspected"}
+                    }),
+                )
+                .await;
+            }
+            let _ = hold_server.await;
+            request_ids.len()
+        });
+        let actor = spawn_project_actor_with_translator(4, translator);
+        let mut targets = Vec::new();
+        for query in ["alpha", "beta"] {
+            let symbol = actor
+                .workspace_symbol(
+                    query.to_owned(),
+                    None,
+                    1,
+                    WorkspaceSymbolMatchMode::Exact,
+                    WorkspaceSymbolScope::Project,
+                    false,
+                )
+                .await
+                .unwrap()
+                .symbols
+                .remove(0);
+            targets.push(crate::bridge::InspectSymbolTarget {
+                symbol_handle: symbol.location.symbol_handle,
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+            });
+        }
+        targets.push(crate::bridge::InspectSymbolTarget {
+            symbol_handle: Some(SymbolHandle::new()),
+            query: None,
+            kind: None,
+            path: None,
+            container: None,
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            actor.inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
+                targets,
+                candidate_limit: 10,
+                sections: vec![crate::bridge::InspectSymbolSectionKind::Declaration],
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 24 * 1024,
+                    max_items: 3,
+                },
+            }),
+        )
+        .await
+        .expect("batch serialized target inspections")
+        .unwrap();
+
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.inspections_started, 3);
+        assert_eq!(result.returned_items, 2, "{result:#?}");
+        assert!(result.entries[..2].iter().all(|entry| matches!(
+            entry.result.as_ref().unwrap().resolution,
+            crate::bridge::InspectSymbolResolution::Selected { .. }
+        )));
+        assert!(
+            result.entries[..2]
+                .iter()
+                .all(|entry| entry.result.as_ref().unwrap().budget.max_items == 1)
+        );
+        assert!(result.entries[2].result.is_none());
+        assert!(
+            result.entries[2]
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.starts_with("invalid_symbol_handle:") })
+        );
+        assert!(result.returned_bytes <= result.budget.max_bytes);
+        release_server.send(()).unwrap();
+        assert_eq!(responder.await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -10519,14 +11999,18 @@ mod tests {
             let _ = hold_server.await;
         });
 
-        let mut runtime = ProjectRuntime::new(translator);
+        let runtime = ProjectRuntime::new(translator);
         let (_, _, source_hash, _) = runtime.translator.source_snapshot(&source).await.unwrap();
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            source,
-            1,
-            4,
-            SourceSnapshot::Hash(source_hash),
-        ));
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                source,
+                1,
+                4,
+                SourceSnapshot::Hash(source_hash),
+            ));
         let started = Instant::now();
         let result = runtime
             .inspect_symbol(InspectSymbolRequest {
@@ -10639,7 +12123,7 @@ mod tests {
             drop(processes);
         });
 
-        let mut runtime = ProjectRuntime::new(translator);
+        let runtime = ProjectRuntime::new(translator);
         let result = Box::pin(runtime.inspect_symbol(InspectSymbolRequest {
             symbol_handle: None,
             query: Some("inspected".to_owned()),
@@ -10744,13 +12228,17 @@ mod tests {
             .document_tracker()
             .open(source.clone(), "fn before() {}\n".to_owned())
             .unwrap();
-        let mut runtime = ProjectRuntime::new(translator);
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            source.clone(),
-            1,
-            4,
-            SourceSnapshot::Version(1),
-        ));
+        let runtime = ProjectRuntime::new(translator);
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                source.clone(),
+                1,
+                4,
+                SourceSnapshot::Version(1),
+            ));
         runtime
             .translator
             .document_tracker()
@@ -10767,14 +12255,18 @@ mod tests {
         fs::write(&source, "fn before() {}\n").unwrap();
         let mut translator = Translator::new();
         translator.set_workspace_roots(vec![root.path().to_path_buf()]);
-        let mut runtime = ProjectRuntime::new(translator);
+        let runtime = ProjectRuntime::new(translator);
         let (_, _, source_hash, _) = runtime.translator.source_snapshot(&source).await.unwrap();
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            source.clone(),
-            1,
-            4,
-            SourceSnapshot::Hash(source_hash),
-        ));
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                source.clone(),
+                1,
+                4,
+                SourceSnapshot::Hash(source_hash),
+            ));
         fs::write(&source, "fn after() {}\n").unwrap();
 
         let result = runtime
@@ -10815,13 +12307,17 @@ mod tests {
             .document_tracker()
             .open(source, "fn dirty_name() {}\n".to_owned())
             .unwrap();
-        let mut runtime = ProjectRuntime::new(translator);
-        let handle = runtime.symbol_handles.insert(StoredSymbolTarget::new(
-            root.path().join("dirty.rs"),
-            1,
-            4,
-            SourceSnapshot::Version(1),
-        ));
+        let runtime = ProjectRuntime::new(translator);
+        let handle = runtime
+            .symbol_handles
+            .lock()
+            .unwrap()
+            .insert(StoredSymbolTarget::new(
+                root.path().join("dirty.rs"),
+                1,
+                4,
+                SourceSnapshot::Version(1),
+            ));
 
         let result = Box::pin(runtime.inspect_symbol(InspectSymbolRequest {
             symbol_handle: Some(handle),
@@ -11333,6 +12829,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_request_sender_attaches_queue_timing_before_enqueue() {
+        let (channel, mut receiver) = mpsc::channel(1);
+        let sender = ProjectRequestSender::new(channel);
+
+        sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let request = receiver.recv().await.unwrap();
+        let (request, timing) = request.into_timed();
+        assert!(matches!(
+            request,
+            ProjectRequest::ServerExited { generation: 0 }
+        ));
+        assert!(timing.queued_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
     async fn queued_resident_request_pins_group_before_actor_dequeues_it() {
         let controller = RustResidencyController::new(1);
         let (first_channel, mut first_receiver) = mpsc::channel(4);
@@ -11458,11 +12973,49 @@ mod tests {
         });
         history.record(ProjectEvent::ServerExited { generation: 1 });
 
-        let snapshot = history.snapshot_since(Some(0));
+        let snapshot = history.snapshot_since(Some(0), 2);
         assert!(snapshot.resync_required());
         assert_eq!(snapshot.events().len(), 2);
         assert_eq!(snapshot.events()[0].sequence(), 2);
         assert_eq!(snapshot.events()[1].sequence(), 3);
+        assert_eq!(snapshot.next_sequence(), 3);
+
+        history.record(ProjectEvent::ServerExited { generation: 2 });
+        let resumed = history.snapshot_since(Some(snapshot.next_sequence()), 2);
+        assert_eq!(resumed.events().len(), 1);
+        assert_eq!(resumed.events()[0].sequence(), 4);
+    }
+
+    #[test]
+    fn project_event_history_pages_an_exclusive_cursor_without_gaps() {
+        let mut history = ProjectEventHistory::new(4);
+        for generation in 1..=4 {
+            history.record(ProjectEvent::ServerExited { generation });
+        }
+
+        let first = history.snapshot_since(None, 2);
+        assert!(first.truncated());
+        assert_eq!(first.next_sequence(), 2);
+        assert_eq!(
+            first
+                .events()
+                .iter()
+                .map(ProjectEventRecord::sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second = history.snapshot_since(Some(first.next_sequence()), 2);
+        assert!(!second.truncated());
+        assert_eq!(second.next_sequence(), 4);
+        assert_eq!(
+            second
+                .events()
+                .iter()
+                .map(ProjectEventRecord::sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 
     #[test]
@@ -11478,7 +13031,7 @@ mod tests {
             operation_count: 1,
         });
 
-        let snapshot = history.snapshot_since(None);
+        let snapshot = history.snapshot_since(None, 4);
         assert!(matches!(
             snapshot.events()[0].event(),
             ProjectEvent::FilesChanged { paths } if paths.len() == 1
@@ -12070,6 +13623,25 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let diagnostics = actor
+            .cached_diagnostics(file.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            diagnostics
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.document_version),
+            None
+        );
+        assert!(diagnostics.cache.as_ref().is_some_and(|cache| cache.hit));
+        assert_eq!(
+            diagnostics
+                .cache
+                .as_ref()
+                .map(|cache| cache.snapshot_identity.len()),
+            Some(64)
+        );
     }
 
     #[tokio::test]
@@ -12375,7 +13947,10 @@ while True:
         let actor = spawn_project_actor_with_translator(2, translator);
 
         let first = actor.activate(root.path().to_path_buf()).await.unwrap();
-        assert_eq!(first.status(), ProjectStatus::Ready);
+        assert!(matches!(
+            first.status(),
+            ProjectStatus::Starting | ProjectStatus::Ready
+        ));
         assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
 
         let second = actor.activate(root.path().to_path_buf()).await.unwrap();
@@ -12796,7 +14371,7 @@ while True:
     }
 
     #[tokio::test]
-    async fn project_runtime_moves_from_authoritative_open_document_content() {
+    async fn project_runtime_refuses_to_replace_disk_with_dirty_open_document_content() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("lib.rs");
         fs::write(&source, "pub mod feature { fn disk() {} }\n").unwrap();
@@ -12825,6 +14400,13 @@ while True:
             Some(VerificationStatus::StructuralUnverified)
         );
         assert_eq!(artifact.producer, Some(EditProducer::StructuralAstGrep));
+        assert!(!artifact.plan.safe_to_apply());
+        assert!(
+            artifact
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("open document differs from disk"))
+        );
         let destination = root.path().join("feature.rs");
         assert!(
             artifact
@@ -12842,14 +14424,11 @@ while True:
         );
 
         let plan_id = artifact.plan.id().clone();
-        let applied = runtime
+        let error = runtime
             .apply_edit_plan_with_context(&plan_id, "project", root.path(), None, None)
             .await
-            .unwrap();
-        assert_eq!(
-            applied.verification,
-            Some(VerificationStatus::StructuralUnverified)
-        );
+            .unwrap_err();
+        assert_eq!(error, "edit plan is not safe to apply");
         assert_eq!(
             runtime
                 .translator
@@ -12857,9 +14436,13 @@ while True:
                 .get(&source)
                 .unwrap()
                 .content(),
-            "// dirty\n#[path = \"feature.rs\"] pub mod feature;\n"
+            dirty
         );
-        assert_eq!(fs::read_to_string(destination).unwrap(), " fn open() {} ");
+        assert_eq!(
+            fs::read_to_string(source).unwrap(),
+            "pub mod feature { fn disk() {} }\n"
+        );
+        assert!(!destination.exists());
     }
 
     #[tokio::test]
@@ -13229,6 +14812,78 @@ while True:
     }
 
     #[tokio::test]
+    async fn registry_overlaps_linked_worktree_commits() {
+        let (_repository, _worktrees, roots) = compatible_worktree_fixture();
+        let registry = ProjectRegistry::new(4);
+        let project_id = ProjectId::new("project").unwrap();
+        add_compatible_roots(&registry, &project_id, &roots).await;
+        let actor = registry.actor_for_project(&project_id).await.unwrap();
+        let first_path = roots[0].join("src.rs");
+        let second_path = roots[1].join("src.rs");
+        fs::write(&first_path, "before first\n").unwrap();
+        fs::write(&second_path, "before second\n").unwrap();
+        let first = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                first_path.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before first\n",
+                "after first\n",
+            )],
+            vec!["replace first".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(roots[0].clone());
+        let second = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                second_path.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before second\n",
+                "after second\n",
+            )],
+            vec!["replace second".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(roots[1].clone());
+        let first_id = first.id().clone();
+        let second_id = second.id().clone();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let _barrier =
+            crate::edit_apply::install_test_apply_barrier([first_id.clone(), second_id.clone()], 2);
+        let (first_result, second_result) = tokio::join!(
+            registry.apply_edit_plan_with_context(
+                &project_id,
+                first_id,
+                Some("first-session".to_owned()),
+                None,
+            ),
+            registry.apply_edit_plan_with_context(
+                &project_id,
+                second_id,
+                Some("second-session".to_owned()),
+                None,
+            ),
+        );
+        assert!(matches!(
+            first_result.unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            second_result.unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert_eq!(fs::read_to_string(first_path).unwrap(), "after first\n");
+        assert_eq!(fs::read_to_string(second_path).unwrap(), "after second\n");
+    }
+
+    #[tokio::test]
     async fn registry_reports_busy_without_consuming_a_plan() {
         let root = TempDir::new().unwrap();
         let file = root.path().join("busy.rs");
@@ -13286,6 +14941,96 @@ while True:
                 .unwrap(),
             ApplyEditPlanOutcome::Applied(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn registry_competing_same_file_is_retryable_then_conflicts() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        fs::write(&file, "before\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = |after| {
+            EditPlan::new(
+                project_id.to_string(),
+                vec![crate::edit_plan::FileSnapshot::from_contents(
+                    file.clone(),
+                    crate::edit_plan::SnapshotSource::Disk,
+                    None,
+                    "before\n",
+                    after,
+                )],
+                vec!["replace src.rs".to_owned()],
+                true,
+                Duration::from_secs(60),
+            )
+            .with_workspace_root(root.path().to_path_buf())
+        };
+        let first = plan("first\n");
+        let second = plan("second\n");
+        let first_id = first.id().clone();
+        let second_id = second.id().clone();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let lease = registry
+            .edit_coordinator
+            .try_acquire(
+                "first-session",
+                [crate::edit_coordinator::EditResource::exact(file.clone())],
+            )
+            .unwrap();
+        let busy = registry
+            .apply_edit_plan_with_wait(
+                &project_id,
+                second_id.clone(),
+                Some("second-session".to_owned()),
+                None,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(busy, ApplyEditPlanOutcome::NotReady(_)));
+        assert!(
+            actor
+                .inspect_edit_plan(second_id.clone(), project_id.to_string())
+                .await
+                .is_ok()
+        );
+
+        drop(lease);
+        assert!(matches!(
+            registry
+                .apply_edit_plan_with_context(
+                    &project_id,
+                    first_id,
+                    Some("first-session".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            registry
+                .apply_edit_plan_with_context(
+                    &project_id,
+                    second_id,
+                    Some("second-session".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap(),
+            ApplyEditPlanOutcome::Conflict(_)
+        ));
+        assert_eq!(fs::read_to_string(file).unwrap(), "first\n");
     }
 
     #[tokio::test]
@@ -13506,7 +15251,7 @@ while True:
             .unwrap();
         assert!(
             duplicate
-                .event_snapshot(None)
+                .event_snapshot(None, 256)
                 .events()
                 .iter()
                 .any(|record| {
@@ -13851,7 +15596,7 @@ while True:
 
         assert!(registry.read_deferred_resource(first_token).is_err());
         assert_eq!(
-            registry.read_deferred_resource(second_token).unwrap(),
+            registry.read_deferred_resource(second_token).unwrap().value,
             serde_json::json!("second")
         );
     }
@@ -13921,9 +15666,10 @@ while True:
         let project_id = ProjectId::new("retry-removal").unwrap();
         let identity =
             ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
-        let (sender, mut receiver) = mpsc::channel(2);
+        let (sender, mut receiver) = mpsc::channel::<ProjectRequest>(2);
         tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
+                let (request, _) = request.into_timed();
                 match request {
                     ProjectRequest::PublishEvent { reply, .. }
                     | ProjectRequest::SetStatus { reply, .. } => {
@@ -14017,6 +15763,35 @@ while True:
             ProjectStatus::Dormant
         );
         assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_actor_for_path_wakes_a_dormant_restored_project() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let store = ProjectRegistrationStore::new(root.path().join("state/projects.json"));
+        store
+            .save(&[PersistedProject {
+                project_id: "dormant".to_owned(),
+                root: root.path().to_path_buf(),
+                additional_roots: Vec::new(),
+                config: None,
+            }])
+            .unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(store);
+        registry.restore_from_persistence().await.unwrap();
+
+        registry.active_actor_for_path(&file).await.unwrap();
+
+        assert_ne!(
+            registry
+                .status(&ProjectId::new("dormant").unwrap())
+                .await
+                .unwrap()
+                .status(),
+            ProjectStatus::Dormant
+        );
     }
 
     #[tokio::test]

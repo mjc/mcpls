@@ -458,6 +458,40 @@ fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     Ok(())
 }
 
+/// Dependency definitions returned by rust-analyzer expose read-only source context.
+fn sc_dependency_source_context(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let (line, character) = find_position(&lib, "fmt;");
+    let result = call_json(
+        client,
+        "get_definition",
+        &json!({
+            "file_path": lib,
+            "line": line,
+            "character": character,
+        }),
+    )?;
+    let location = result["locations"]
+        .as_array()
+        .and_then(|locations| locations.first())
+        .ok_or_else(|| format!("dependency definition returned no locations: {result}"))?;
+    let path = location["path"]
+        .as_str()
+        .ok_or_else(|| format!("dependency definition omitted its path: {result}"))?;
+
+    if path.starts_with(workspace.to_string_lossy().as_ref())
+        || location["source"]["status"] != "available"
+        || location["source"]["text"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "dependency definition omitted read-only source context: {result}"
+        ));
+    }
+    Ok(())
+}
+
 /// Tool 3: `get_references` — find references to `add`.
 fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
@@ -2684,6 +2718,7 @@ fn ra_e2e_suite() {
     let sub_cases: &[SubCase] = &[
         sub_case!(sc_get_hover),
         sub_case!(sc_get_definition),
+        sub_case!(sc_dependency_source_context),
         sub_case!(sc_get_references),
         sub_case!(sc_get_diagnostics),
         sub_case!(sc_rename_symbol),
@@ -2914,7 +2949,9 @@ fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixtur
     add_and_activate_project(client, "second", &fixture.second, &fixture.second_lib);
 
     let projects = call_json(client, "project_list", &json!({})).unwrap();
-    assert_eq!(projects.as_array().unwrap().len(), 2);
+    assert_eq!(projects["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(projects["returned"], 2);
+    assert!(projects["next_cursor"].is_null());
 
     let first_symbols = call_json(
         client,
@@ -2930,6 +2967,7 @@ fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixtur
     )
     .unwrap();
     assert!(!second_symbols["symbols"].as_array().unwrap().is_empty());
+    wait_until_ready(client, &fixture.second_lib);
 }
 
 fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {

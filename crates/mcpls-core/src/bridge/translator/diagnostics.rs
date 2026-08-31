@@ -379,6 +379,9 @@ impl Translator {
                 let ctx = EncodingCtx {
                     encoding,
                     tracker: tracker.clone(),
+                    approved_source_paths: Arc::new(std::sync::Mutex::new(
+                        std::collections::HashSet::new(),
+                    )),
                 };
                 let mut result = Vec::with_capacity(diag_info.diagnostics.len());
                 for d in &diag_info.diagnostics {
@@ -567,6 +570,7 @@ impl Translator {
             omitted_groups: total_groups.saturating_sub(returned_groups),
             truncated: byte_truncated || returned_groups < total_groups,
             filters: options,
+            cache: None,
         }
     }
 
@@ -798,6 +802,9 @@ mod tests {
         let ctx = EncodingCtx {
             encoding: PositionEncoding::Utf16,
             tracker: test_tracker(),
+            approved_source_paths: Arc::new(
+                std::sync::Mutex::new(std::collections::HashSet::new()),
+            ),
         };
         let mut budget = SourceBudget::default();
         let converted = diagnostic_to_mcp(

@@ -7,6 +7,7 @@ use crate::bridge::{
     DocumentSymbolOptions, InspectSymbolBudget, InspectSymbolSectionKind, SemanticResultLimits,
     SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope,
 };
+use crate::bridge::{LexicalCaseMode, LexicalMatchMode};
 
 /// Parameters for the `get_hover` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -110,6 +111,9 @@ pub struct DiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
+    /// Request fresh analysis instead of using available cached diagnostics.
+    #[serde(default)]
+    pub fresh: bool,
     /// Filters, grouping behavior, and response bounds.
     #[serde(flatten)]
     pub options: crate::bridge::translator::DiagnosticOptions,
@@ -365,6 +369,83 @@ pub struct WorkspaceSymbolParams {
     pub include_generated: bool,
 }
 
+/// Parameters for bounded project-scoped lexical search.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LexicalSearchParams {
+    /// Registered project identifier whose snapshots should be searched.
+    pub project_id: String,
+    /// Literal text or Rust regex to find.
+    pub query: String,
+    /// Interpret `query` literally or as a Rust regex.
+    pub mode: LexicalMatchMode,
+    /// Case sensitivity behavior.
+    pub case: LexicalCaseMode,
+    /// Enable multiline regex anchors.
+    #[serde(default)]
+    pub multiline: bool,
+    /// Maximum project files inspected (default: 1024).
+    #[serde(default = "default_lexical_max_files")]
+    pub max_files: usize,
+    /// Maximum matches returned (default: 100).
+    #[serde(default = "default_lexical_max_matches")]
+    pub max_matches: usize,
+    /// Maximum serialized structured response bytes (default: 65536).
+    #[serde(default = "default_lexical_max_bytes")]
+    pub max_bytes: usize,
+    /// Decimal offset returned by a prior lexical-search `next_cursor`.
+    #[serde(default)]
+    pub page_token: Option<String>,
+    /// Context lines around each match; zero returns references only.
+    #[serde(default)]
+    pub context_lines: usize,
+    /// Include generated/build-output files.
+    #[serde(default)]
+    pub include_generated: bool,
+    /// Optional project-relative globs to include.
+    #[serde(default)]
+    pub include_paths: Vec<String>,
+    /// Project-relative globs to exclude after inclusion.
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+}
+
+const fn default_lexical_max_files() -> usize {
+    1024
+}
+const fn default_lexical_max_matches() -> usize {
+    100
+}
+const fn default_lexical_max_bytes() -> usize {
+    64 * 1024
+}
+
+/// Parameters for one bounded batch of workspace-symbol searches.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceSymbolBatchParams {
+    /// Stable project identifier whose workspace should be searched.
+    pub project_id: String,
+    /// Caller-ordered queries. Exact duplicates reuse the first result.
+    pub queries: Vec<String>,
+    /// Optional symbol-kind filter shared by every query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    /// Name matching behavior shared by every query.
+    #[serde(default)]
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Source scope shared by every query.
+    #[serde(default)]
+    pub scope: WorkspaceSymbolScope,
+    /// Maximum symbols returned across the batch.
+    #[serde(default = "default_max_results")]
+    pub max_items: u32,
+    /// Maximum serialized response bytes.
+    #[serde(default = "default_workspace_symbol_batch_bytes")]
+    pub max_bytes: usize,
+    /// Include symbols under generated/build-output directories.
+    #[serde(default)]
+    pub include_generated: bool,
+}
+
 /// Parameters for a bounded, project-scoped symbol inspection bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InspectSymbolParams {
@@ -383,7 +464,7 @@ pub struct InspectSymbolParams {
     /// Maximum ranked source-bearing candidates returned for ambiguous queries.
     #[serde(default = "default_inspect_candidates")]
     pub candidate_limit: u32,
-    /// Sections to include; empty prioritizes declaration, implementations, references, tests, and diagnostics.
+    /// Sections to include; empty returns only the declaration source frame.
     #[serde(default)]
     pub sections: Vec<InspectSymbolSectionKind>,
     /// Strict serialized-byte and per-provider item bounds for the complete bundle.
@@ -391,12 +472,41 @@ pub struct InspectSymbolParams {
     pub budget: InspectSymbolBudget,
 }
 
+/// Parameters for one bounded batch of symbol inspections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InspectSymbolBatchParams {
+    /// Stable project identifier whose symbols should be inspected.
+    pub project_id: String,
+    /// Caller-ordered symbol identities; every target is retained in the response.
+    pub targets: Vec<crate::bridge::InspectSymbolTarget>,
+    /// Maximum ranked candidates returned for each ambiguous query.
+    #[serde(default = "default_inspect_candidates")]
+    pub candidate_limit: u32,
+    /// Sections requested for every target.
+    #[serde(default)]
+    pub sections: Vec<InspectSymbolSectionKind>,
+    /// Strict serialized-byte and per-provider item bounds shared by the batch.
+    #[serde(default = "default_inspect_batch_budget")]
+    pub budget: InspectSymbolBudget,
+}
+
 const fn default_inspect_candidates() -> u32 {
     10
 }
 
+const fn default_inspect_batch_budget() -> InspectSymbolBudget {
+    InspectSymbolBudget {
+        max_bytes: 128 * 1024,
+        max_items: 20,
+    }
+}
+
 const fn default_max_results() -> u32 {
     100
+}
+
+const fn default_workspace_symbol_batch_bytes() -> usize {
+    64 * 1024
 }
 
 /// Parameters for the `get_code_actions` tool.
@@ -747,16 +857,27 @@ pub enum WorkspaceEditApplyResult {
         committed: bool,
         /// Project-relative paths committed by the edit.
         committed_files: Vec<String>,
+        /// Total committed file count, including paths omitted from this response.
+        committed_file_count: usize,
         /// Human-readable operations captured by the preview.
         operations: Vec<String>,
+        /// Total operation count, including operations omitted from this response.
+        operation_count: usize,
         /// Unified diff captured by the preview.
         unified_diff: String,
+        /// Session-private resource for complete applied detail when the inline diff is bounded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail_resource: Option<String>,
         /// Optional semantic verification outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         verification: Option<String>,
         /// Optional post-commit provider convergence details.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         provider_synchronization: Vec<WorkspaceEditProviderSynchronization>,
+        /// Total provider synchronization result count, including omitted results.
+        provider_synchronization_count: usize,
+        /// Whether complete committed detail is available from `detail_resource`.
+        details_truncated: bool,
         /// Aggregate provider state when synchronization details are present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         semantic_state: Option<String>,
@@ -848,10 +969,19 @@ pub enum WorkspaceEditContentionScope {
     SameWorktree,
 }
 
-/// Empty parameters for listing all registered projects.
+/// Parameters for listing all registered projects.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List all registered projects.")]
-pub struct ProjectListParams {}
+pub struct ProjectListParams {
+    /// Decimal cursor returned by a prior `project_list` response.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Empty parameters for daemon health and status snapshots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Return a daemon health or status snapshot.")]
+pub struct DaemonStatusParams {}
 
 /// Empty parameters for listing this MCP session's resource subscriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -865,15 +995,33 @@ pub struct SemanticResourceReadParams {
     pub uri: String,
 }
 
-/// Tool-call representation of one deferred semantic resource.
+/// Tool-call representation of one semantic resource page.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticResourceReadResult {
     /// Resource URI that was read.
     pub uri: String,
     /// MIME type of `text`.
     pub mime_type: String,
-    /// Complete JSON resource payload.
+    /// Complete JSON resource payload, or an ordered UTF-8 JSON fragment when `next_uri` is set.
     pub text: String,
+    /// URI for the next fragment, when this response is not the complete payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_uri: Option<String>,
+    /// Total byte length of the complete JSON payload when this is a fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<usize>,
+    /// Byte offset of this fragment in the complete JSON payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_bytes: Option<usize>,
+    /// Number of JSON bytes returned in this fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_bytes: Option<usize>,
+    /// Number of JSON bytes still available after this fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_bytes: Option<usize>,
+    /// Snapshot identity of the immutable deferred payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -936,16 +1084,36 @@ mod tests {
     }
 
     #[test]
+    fn inspect_symbol_batch_accepts_handles_under_one_shared_budget() {
+        let params: InspectSymbolBatchParams = serde_json::from_value(serde_json::json!({
+            "project_id": "project",
+            "targets": [{"symbol_handle": "target-1"}, {"query": "run"}],
+            "sections": ["declaration", "references"],
+            "budget": {"max_bytes": 16384, "max_items": 4}
+        }))
+        .unwrap();
+
+        assert_eq!(params.targets.len(), 2);
+        assert_eq!(params.budget.max_bytes, 16_384);
+        assert_eq!(params.budget.max_items, 4);
+    }
+
+    #[test]
     fn workspace_edit_apply_result_uses_explicit_statuses() {
         let applied = WorkspaceEditApplyResult::Applied {
             project_id: "project".to_owned(),
             plan_id: "plan".to_owned(),
             committed: true,
             committed_files: vec!["src/lib.rs".to_owned()],
+            committed_file_count: 1,
             operations: vec!["edit src/lib.rs".to_owned()],
+            operation_count: 1,
             unified_diff: "diff".to_owned(),
+            detail_resource: None,
             verification: None,
             provider_synchronization: Vec::new(),
+            provider_synchronization_count: 0,
+            details_truncated: false,
             semantic_state: None,
         };
         let not_ready = WorkspaceEditApplyResult::NotReady {
@@ -985,7 +1153,11 @@ mod tests {
                 "plan_id": "plan",
                 "committed": true,
                 "committed_files": ["src/lib.rs"],
+                "committed_file_count": 1,
                 "operations": ["edit src/lib.rs"],
+                "operation_count": 1,
+                "provider_synchronization_count": 0,
+                "details_truncated": false,
                 "unified_diff": "diff",
             })
         );

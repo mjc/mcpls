@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::config::ServerId;
@@ -560,6 +561,10 @@ pub struct DiagnosticInfo {
     pub uri: Uri,
     /// Document version when diagnostics were received.
     pub version: Option<i32>,
+    /// UTC time when the diagnostics notification was received.
+    pub received_at: DateTime<Utc>,
+    /// Opaque identity for this cached diagnostics publication.
+    pub snapshot_identity: String,
     /// List of diagnostics.
     pub diagnostics: Vec<LspDiagnostic>,
 }
@@ -842,12 +847,6 @@ impl NotificationCache {
         cap_diagnostics_entry_size(uri, &mut diagnostics);
 
         let key = uri_cache_key(uri.as_str()).into_owned();
-        let info = DiagnosticInfo {
-            uri: uri.clone(),
-            version,
-            diagnostics,
-        };
-
         // Remove the URI's existing order entry, if any -- from its
         // previous owner's order map, whether that's this same server (a
         // republish, repositioned to the back below) or a different one
@@ -882,6 +881,17 @@ impl NotificationCache {
             .insert(key.clone(), server_id.clone());
         let seq = self.next_diagnostic_seq;
         self.next_diagnostic_seq += 1;
+        let mut hasher = Sha256::new();
+        hasher.update(uri.as_str().as_bytes());
+        hasher.update(version.unwrap_or_default().to_le_bytes());
+        hasher.update(seq.to_le_bytes());
+        let info = DiagnosticInfo {
+            uri: uri.clone(),
+            version,
+            received_at: Utc::now(),
+            snapshot_identity: format!("{:x}", hasher.finalize()),
+            diagnostics,
+        };
         self.diagnostic_order
             .entry(server_id.clone())
             .or_default()
@@ -1116,6 +1126,7 @@ mod tests {
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.uri, uri);
         assert_eq!(stored.version, Some(1));
+        assert!(stored.received_at <= Utc::now());
         assert_eq!(stored.diagnostics.len(), 1);
         assert_eq!(stored.diagnostics[0].message, "test error");
     }
@@ -1555,12 +1566,18 @@ mod tests {
 
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
+        let first_identity = cache
+            .get_diagnostics(uri.as_str())
+            .unwrap()
+            .snapshot_identity
+            .clone();
 
         cache.store_diagnostics(&test_server(), &uri, Some(2), vec![]);
         assert_eq!(cache.diagnostics_count(), 1);
 
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.version, Some(2));
+        assert_ne!(stored.snapshot_identity, first_identity);
     }
 
     #[test]

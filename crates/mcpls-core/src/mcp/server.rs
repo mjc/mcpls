@@ -18,10 +18,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, ElicitRequest, ElicitRequestParams,
     ElicitationSchema, Implementation, InputRequest, InputRequests, InputRequiredResult,
-    InputResponses, ListResourcesResult, MetaObject, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    SubscriptionFilter, UnsubscribeRequestParams,
+    InputResponses, ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+    SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -33,31 +33,38 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
-    SessionResource, event_resource_uris, parse_session_resource_uri, project_events_resource_uri,
+    DeferredResource, SessionResource, applied_edit_result_resource_uri,
+    edit_approval_resource_uri, edit_diff_resource_uri, event_resource_uris,
+    parse_session_resource_uri, project_event_resource_uri, project_events_resource_uri,
     project_status_resource_uri,
 };
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
-    CompletionsParams, DefinitionParams, DiagnosticsParams, DocumentSymbolsParams,
-    FormatDocumentParams, FormatPreviewParams, GoToImplementationParams, GoToTypeDefinitionParams,
-    HoverParams, InlayHintsParams, InspectSymbolParams, MoveInlineModulePreviewParams,
-    MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams,
-    ProjectIdParams, ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams,
-    ReferencesParams, RenameParams, RenamePreviewParams, SemanticPositionParams,
-    SemanticResourceReadParams, SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
-    WorkspaceEditApplyParams, WorkspaceEditApplyResult, WorkspaceEditContention,
-    WorkspaceEditContentionScope, WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization,
-    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolParams,
+    CompletionsParams, DaemonStatusParams, DefinitionParams, DiagnosticsParams,
+    DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, GoToImplementationParams,
+    GoToTypeDefinitionParams, HoverParams, InlayHintsParams, InspectSymbolBatchParams,
+    InspectSymbolParams, LexicalSearchParams, MoveInlineModulePreviewParams, MoveItemPreviewParams,
+    PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams,
+    ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
+    RenameParams, RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
+    SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
+    StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
+    WorkspaceEditApplyResult, WorkspaceEditContention, WorkspaceEditContentionScope,
+    WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization, WorkspaceEditRetry,
+    WorkspaceEditRetryAction, WorkspaceSymbolBatchParams, WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
+use crate::bridge::lexical::{find_matches, validate_path_globs};
 use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
-use crate::bridge::{PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind, SymbolHandle};
+use crate::bridge::{
+    LexicalSearchRequest, PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind,
+    SymbolHandle, WorkspaceSymbolBatchRequest,
+};
 use crate::edit_paths::FileOperation;
 use crate::edit_plan::EditPlanApprovalSummary;
 use crate::edit_plan::PlanId;
@@ -71,6 +78,171 @@ use crate::project::{
     StructuralReplaceRequest,
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
+
+const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 32 * 1024;
+
+fn deferred_resource_page(
+    deferred: &DeferredResource,
+    uri: String,
+    value: serde_json::Value,
+    snapshot_hash: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    let json = serde_json::to_string(&value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let total_bytes = json.len();
+    if deferred.offset_bytes > total_bytes || !json.is_char_boundary(deferred.offset_bytes) {
+        return Err(McpError::invalid_params(
+            "invalid deferred resource offset; restart from the original URI",
+            None,
+        ));
+    }
+
+    let mut end = (deferred.offset_bytes + MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2).min(total_bytes);
+    while end > deferred.offset_bytes && !json.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let next_uri = (end < total_bytes)
+            .then(|| format!("mcpls-deferred:///{}?offset_bytes={end}", deferred.token));
+        let result = SemanticResourceReadResult {
+            uri: uri.clone(),
+            mime_type: "application/json".to_owned(),
+            text: json[deferred.offset_bytes..end].to_owned(),
+            next_uri,
+            total_bytes: Some(total_bytes),
+            offset_bytes: Some(deferred.offset_bytes),
+            returned_bytes: Some(end - deferred.offset_bytes),
+            remaining_bytes: Some(total_bytes - end),
+            snapshot_hash: Some(snapshot_hash.to_owned()),
+        };
+        let result_bytes = serde_json::to_vec(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if result_bytes.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+            return Ok(result);
+        }
+        let next_end = deferred.offset_bytes + (end - deferred.offset_bytes) / 2;
+        if next_end == deferred.offset_bytes {
+            return Err(McpError::internal_error(
+                "deferred resource metadata exceeds the response budget",
+                None,
+            ));
+        }
+        end = next_end;
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+}
+
+fn edit_diff_resource_page(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+    diff: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    if offset_bytes > diff.len() || !diff.is_char_boundary(offset_bytes) {
+        return Err(McpError::invalid_params(
+            "invalid edit diff offset; restart from the original URI",
+            None,
+        ));
+    }
+
+    let total_bytes = diff.len();
+    let snapshot_hash = format!("{:x}", Sha256::digest(diff.as_bytes()));
+    let mut end = (offset_bytes + MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2).min(total_bytes);
+    while end > offset_bytes && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let uri = edit_diff_resource_uri(project_id, plan_id, offset_bytes);
+        let next_uri =
+            (end < total_bytes).then(|| edit_diff_resource_uri(project_id, plan_id, end));
+        let result = SemanticResourceReadResult {
+            uri,
+            mime_type: "text/x-diff".to_owned(),
+            text: diff[offset_bytes..end].to_owned(),
+            next_uri,
+            total_bytes: Some(total_bytes),
+            offset_bytes: Some(offset_bytes),
+            returned_bytes: Some(end - offset_bytes),
+            remaining_bytes: Some(total_bytes - end),
+            snapshot_hash: Some(snapshot_hash.clone()),
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len()
+            <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+        {
+            return Ok(result);
+        }
+        let next_end = offset_bytes + (end - offset_bytes) / 2;
+        if next_end == offset_bytes {
+            return Err(McpError::internal_error(
+                "edit diff resource metadata exceeds the response budget",
+                None,
+            ));
+        }
+        end = next_end;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+}
+
+fn applied_edit_result_resource_page(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+    detail: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    if offset_bytes > detail.len() || !detail.is_char_boundary(offset_bytes) {
+        return Err(McpError::invalid_params(
+            "invalid applied edit result offset; restart from the original URI",
+            None,
+        ));
+    }
+
+    let total_bytes = detail.len();
+    let snapshot_hash = format!("{:x}", Sha256::digest(detail.as_bytes()));
+    let mut end = (offset_bytes + MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2).min(total_bytes);
+    while end > offset_bytes && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let uri = applied_edit_result_resource_uri(project_id, plan_id, offset_bytes);
+        let next_uri =
+            (end < total_bytes).then(|| applied_edit_result_resource_uri(project_id, plan_id, end));
+        let result = SemanticResourceReadResult {
+            uri,
+            mime_type: "application/json".to_owned(),
+            text: detail[offset_bytes..end].to_owned(),
+            next_uri,
+            total_bytes: Some(total_bytes),
+            offset_bytes: Some(offset_bytes),
+            returned_bytes: Some(end - offset_bytes),
+            remaining_bytes: Some(total_bytes - end),
+            snapshot_hash: Some(snapshot_hash.clone()),
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len()
+            <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+        {
+            return Ok(result);
+        }
+        let next_end = offset_bytes + (end - offset_bytes) / 2;
+        if next_end == offset_bytes {
+            return Err(McpError::internal_error(
+                "applied edit result resource metadata exceeds the response budget",
+                None,
+            ));
+        }
+        end = next_end;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+}
 
 #[derive(Debug, schemars::JsonSchema)]
 #[allow(dead_code)] // Schema-only marker for dynamically assembled object responses.
@@ -199,6 +371,40 @@ where
             Ok(Json::new(structured.clone(), structured.to_string()))
         },
     )
+}
+
+fn bounded_lexical_page(
+    mut matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
+    offset: usize,
+    has_next_page: bool,
+    max_bytes: usize,
+) -> Result<crate::bridge::lexical::LexicalSearchResult, usize> {
+    let total_matches = matches.len();
+    loop {
+        let truncated = has_next_page || matches.len() < total_matches;
+        let page = crate::bridge::lexical::LexicalSearchResult {
+            returned: matches.len(),
+            next_cursor: truncated.then(|| offset.saturating_add(matches.len()).to_string()),
+            truncated,
+            matches,
+        };
+        let encoded_bytes = serde_json::to_vec(&page).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_bytes <= max_bytes || page.matches.is_empty() {
+            return Ok(page);
+        }
+        matches = page.matches;
+        if let Some(match_with_context) = matches
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.source.is_some())
+        {
+            match_with_context.source = None;
+        } else if matches.len() == 1 {
+            return Err(encoded_bytes);
+        } else {
+            matches.pop();
+        }
+    }
 }
 
 fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpError> {
@@ -375,12 +581,36 @@ fn project_events_json(
     serde_json::json!({
         "project_id": project_id.as_str(),
         "next_cursor": snapshot.next_sequence(),
+        "next_uri": snapshot.truncated().then(|| {
+            format!("mcpls-project-events:///{project_id}?since={}", snapshot.next_sequence())
+        }),
         "resync_required": snapshot.resync_required(),
+        "truncated": snapshot.truncated(),
+        "retention_floor": snapshot.retention_floor(),
+        "returned_events": snapshot.events().len(),
+        "first_sequence": snapshot.first_sequence(),
+        "last_sequence": snapshot.last_sequence(),
         "events": snapshot
             .events()
             .iter()
-            .map(ProjectEventRecord::json_value)
+            .map(|record| project_event_json(project_id, record))
             .collect::<Vec<_>>(),
+    })
+}
+
+fn project_event_json(project_id: &ProjectId, record: &ProjectEventRecord) -> serde_json::Value {
+    let event = record.event().json_value();
+    let total_bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
+    if total_bytes <= MAX_INLINE_PROJECT_EVENT_BYTES {
+        return record.json_value();
+    }
+    serde_json::json!({
+        "sequence": record.sequence(),
+        "event": {"kind": event.get("kind").cloned().unwrap_or(serde_json::Value::Null)},
+        "resource": {
+            "uri": project_event_resource_uri(project_id, record.sequence()),
+            "total_bytes": total_bytes,
+        },
     })
 }
 
@@ -399,6 +629,8 @@ fn project_relative_paths(roots: &[PathBuf], paths: Vec<PathBuf>) -> Vec<String>
         .collect()
 }
 
+const MAX_INLINE_APPLIED_ITEMS: usize = 64;
+
 fn workspace_edit_apply_result(
     outcome: ApplyEditPlanOutcome,
     project_id: &str,
@@ -409,11 +641,28 @@ fn workspace_edit_apply_result(
             plan_id,
             operations,
             unified_diff,
+            complete_unified_diff: _,
             committed_files,
             verification,
             provider_synchronization,
         }) => {
             let committed_files = project_relative_paths(roots, committed_files);
+            let committed_file_count = committed_files.len();
+            let operation_count = operations.len();
+            let provider_synchronization_count = provider_synchronization.len();
+            let details_truncated = unified_diff.len() > MAX_INLINE_APPLIED_DIFF_BYTES
+                || committed_file_count > MAX_INLINE_APPLIED_ITEMS
+                || operation_count > MAX_INLINE_APPLIED_ITEMS
+                || provider_synchronization_count > MAX_INLINE_APPLIED_ITEMS;
+            let detail_resource = details_truncated.then(|| {
+                applied_edit_result_resource_uri(
+                    &ProjectId::new(project_id.to_owned()).expect("registered project id"),
+                    &plan_id,
+                    0,
+                )
+            });
+            let unified_diff =
+                crate::util::truncate_str(&unified_diff, MAX_INLINE_APPLIED_DIFF_BYTES);
             let semantic_state = (!provider_synchronization.is_empty()).then(|| {
                 if provider_synchronization
                     .iter()
@@ -426,6 +675,7 @@ fn workspace_edit_apply_result(
             });
             let provider_synchronization = provider_synchronization
                 .into_iter()
+                .take(MAX_INLINE_APPLIED_ITEMS)
                 .map(|provider| WorkspaceEditProviderSynchronization {
                     provider: provider.provider,
                     synchronized: provider.synchronized,
@@ -437,11 +687,22 @@ fn workspace_edit_apply_result(
                 project_id: project_id.to_owned(),
                 plan_id: plan_id.as_str().to_owned(),
                 committed: true,
-                committed_files,
-                operations,
+                committed_files: committed_files
+                    .into_iter()
+                    .take(MAX_INLINE_APPLIED_ITEMS)
+                    .collect(),
+                committed_file_count,
+                operations: operations
+                    .into_iter()
+                    .take(MAX_INLINE_APPLIED_ITEMS)
+                    .collect(),
+                operation_count,
                 unified_diff,
+                detail_resource,
                 verification: verification.map(|status| status.as_str().to_owned()),
                 provider_synchronization,
+                provider_synchronization_count,
+                details_truncated,
                 semantic_state,
             }
         }
@@ -613,9 +874,28 @@ fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value
     } else {
         "text_edit"
     };
+    let project_id = ProjectId::new(summary.project_id.clone()).expect("stored plan project id");
+    let details_truncated = summary.affected_files.len() > MAX_APPROVAL_ITEMS
+        || summary.operations.len() > MAX_APPROVAL_ITEMS
+        || summary.file_operations.len() > MAX_APPROVAL_ITEMS
+        || summary.diff_files.len() > MAX_APPROVAL_ITEMS
+        || summary
+            .affected_files
+            .iter()
+            .any(|path| path.display().to_string().len() > MAX_APPROVAL_TEXT_BYTES)
+        || summary
+            .operations
+            .iter()
+            .any(|operation| operation.len() > MAX_APPROVAL_TEXT_BYTES);
     serde_json::json!({
+        "plan_id": summary.plan_id.as_str(),
+        "project_id": summary.project_id,
         "operation_kind": operation_kind,
         "affected_file_count": summary.affected_files.len(),
+        "operation_count": summary.operations.len(),
+        "file_operation_count": summary.file_operations.len(),
+        "diff_file_count": summary.diff_files.len(),
+        "snapshot_count": summary.snapshot_hashes.len(),
         "affected_files": summary
             .affected_files
             .iter()
@@ -635,6 +915,45 @@ fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value
         "diff_truncated": summary.diff_truncated,
         "safe_to_apply": summary.safe_to_apply,
         "risk_flags": risk_flags,
+        "details_truncated": details_truncated,
+        "detail_resource": {
+            "uri": edit_approval_resource_uri(&project_id, &summary.plan_id, 0),
+            "mime_type": "application/json",
+        },
+    })
+}
+
+fn edit_approval_resource_page(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+    detail: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    let mut page = applied_edit_result_resource_page(project_id, plan_id, offset_bytes, detail)?;
+    page.uri = edit_approval_resource_uri(project_id, plan_id, offset_bytes);
+    page.next_uri = page.next_uri.as_ref().and_then(|uri| {
+        super::session::parse_applied_edit_result_resource_uri(uri)
+            .map(|(_, _, offset)| edit_approval_resource_uri(project_id, plan_id, offset))
+    });
+    Ok(page)
+}
+
+fn approval_detail_json(summary: &EditPlanApprovalSummary) -> serde_json::Value {
+    serde_json::json!({
+        "plan_id": summary.plan_id.as_str(),
+        "project_id": summary.project_id,
+        "affected_files": summary.affected_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "operations": summary.operations,
+        "file_operations": summary.file_operations.iter().map(|operation| match operation {
+            FileOperation::Create { path, .. } => serde_json::json!({"kind": "create", "path": path}),
+            FileOperation::Rename { from, to, .. } => serde_json::json!({"kind": "rename", "from": from, "to": to}),
+            FileOperation::Delete { path, recursive } => serde_json::json!({"kind": "delete", "path": path, "recursive": recursive}),
+        }).collect::<Vec<_>>(),
+        "diff_files": summary.diff_files.iter().map(|file| serde_json::json!({"path": file.path(), "additions": file.additions(), "deletions": file.deletions()})).collect::<Vec<_>>(),
+        "diff_truncated": summary.diff_truncated,
+        "safe_to_apply": summary.safe_to_apply,
+        "snapshot_hashes": summary.snapshot_hashes,
+        "versions": summary.versions,
     })
 }
 
@@ -781,6 +1100,15 @@ fn preview_artifact_json(result: &PreviewArtifact, project_id: &str) -> serde_js
     if let Some(producer) = result.producer {
         value["producer"] = serde_json::json!(producer.as_str());
     }
+    if result.plan.diff_truncated() {
+        value["diff_resource"] = serde_json::json!({
+            "uri": format!(
+                "mcpls-edit-diff:///{project_id}?plan_id={}&offset_bytes=0",
+                result.plan.id().as_str(),
+            ),
+            "mime_type": "text/x-diff",
+        });
+    }
     value
 }
 
@@ -833,6 +1161,135 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
     value["semantic_provider_available"] = serde_json::json!(!result.providers.is_empty());
     value["semantic_edit_count"] = serde_json::json!(result.semantic_edit_count);
     value
+}
+
+const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
+const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
+const PROJECT_LIST_PAGE_SIZE: usize = 32;
+const RESOURCE_PAGE_SIZE: usize = 64;
+const PROJECT_EVENT_PAGE_SIZE: usize = 64;
+const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
+const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 16 * 1024;
+const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
+    &["rename_symbol", "format_document", "get_code_actions"];
+const DEFAULT_TOOL_PAGE: &[&str] = &[
+    "project_list",
+    "workspace_symbol_search",
+    "workspace_symbol_search_batch",
+    "inspect_symbol",
+    "inspect_symbol_batch",
+    "lexical_search",
+    "read_semantic_resource",
+    "get_diagnostics",
+    "structural_replace_preview",
+    "workspace_edit_preview",
+    "workspace_edit_apply",
+];
+
+fn advertised_tools() -> Vec<Tool> {
+    let mut tools = McplsServer::tool_router()
+        .list_all()
+        .into_iter()
+        .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
+        .map(|mut tool| {
+            let oversized = tool.output_schema.as_ref().is_some_and(|schema| {
+                serde_json::to_vec(schema)
+                    .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
+            });
+            if oversized {
+                tool.output_schema = None;
+            }
+            tool
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| {
+        tool_catalog_rank(left.name.as_ref()).cmp(&tool_catalog_rank(right.name.as_ref()))
+    });
+    tools
+}
+
+fn tool_catalog_rank(name: &str) -> (usize, &str) {
+    (
+        DEFAULT_TOOL_PAGE
+            .iter()
+            .position(|candidate| *candidate == name)
+            .unwrap_or(DEFAULT_TOOL_PAGE.len()),
+        name,
+    )
+}
+
+fn advertised_tools_page(cursor: Option<&str>) -> Result<(Vec<Tool>, Option<String>), String> {
+    let tools = advertised_tools();
+    let start = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| format!("invalid tools/list cursor: {cursor}"))?,
+        None => 0,
+    };
+    if start >= tools.len() {
+        return Err(format!("tools/list cursor is outside the catalog: {start}"));
+    }
+
+    let end = start
+        .saturating_add(ADVERTISED_TOOL_PAGE_SIZE)
+        .min(tools.len());
+    Ok((
+        tools[start..end].to_vec(),
+        (end < tools.len()).then(|| end.to_string()),
+    ))
+}
+
+fn resource_page(
+    resources: Vec<Resource>,
+    cursor: Option<&str>,
+) -> Result<(Vec<Resource>, Option<String>), String> {
+    let start = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| format!("invalid resources/list cursor: {cursor}"))?,
+        None => 0,
+    };
+    if cursor.is_some() && start >= resources.len() {
+        return Err(format!(
+            "resources/list cursor is outside the catalog: {start}"
+        ));
+    }
+
+    let end = start
+        .saturating_add(RESOURCE_PAGE_SIZE)
+        .min(resources.len());
+    let next_cursor = (end < resources.len()).then(|| end.to_string());
+    Ok((
+        resources
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .collect(),
+        next_cursor,
+    ))
+}
+
+fn project_list_page(
+    project_count: usize,
+    cursor: Option<&str>,
+) -> Result<(std::ops::Range<usize>, Option<String>), String> {
+    let start = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| format!("invalid project_list cursor: {cursor}"))?,
+        None => 0,
+    };
+    if cursor.is_some() && start >= project_count {
+        return Err(format!(
+            "project_list cursor is outside the project list: {start}"
+        ));
+    }
+
+    let end = start
+        .saturating_add(PROJECT_LIST_PAGE_SIZE)
+        .min(project_count);
+    let next_cursor = (end < project_count).then(|| end.to_string());
+    Ok((start..end, next_cursor))
 }
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -1099,10 +1556,148 @@ impl McplsServer {
             .actor_for_project(&project_id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let snapshot = actor.event_snapshot(cursor);
+        let snapshot = actor.event_snapshot(cursor, PROJECT_EVENT_PAGE_SIZE);
         let json = encode_json(&project_events_json(&project_id, &snapshot))?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json.legacy, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_project_event_resource(
+        &self,
+        project_id: ProjectId,
+        sequence: u64,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let record = actor.event_record(sequence).ok_or_else(|| {
+            McpError::invalid_params(
+                "stale_resource: project event is no longer retained; reread project events",
+                None,
+            )
+        })?;
+        let json = serde_json::to_string(&record.json_value())
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_edit_diff_resource(
+        &self,
+        project_id: ProjectId,
+        plan_id: PlanId,
+        offset_bytes: usize,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.context.owns_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit plan is not owned by this MCP session",
+                None,
+            ));
+        }
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let diff = actor
+            .read_edit_plan_diff(plan_id.clone(), project_id.as_str().to_owned())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let page = edit_diff_resource_page(&project_id, &plan_id, offset_bytes, &diff)?;
+        let text = serde_json::to_string(&page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(text, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_applied_edit_result_resource(
+        &self,
+        project_id: ProjectId,
+        plan_id: PlanId,
+        offset_bytes: usize,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.context.recognizes_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "applied edit result is not owned by this MCP session",
+                None,
+            ));
+        }
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let detail = actor
+            .read_applied_edit_detail(plan_id.clone(), project_id.as_str().to_owned())
+            .await
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "stale_resource: applied edit result is no longer retained",
+                    None,
+                )
+            })?;
+        let page = applied_edit_result_resource_page(&project_id, &plan_id, offset_bytes, &detail)?;
+        let text = serde_json::to_string(&page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(text, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_edit_approval_resource(
+        &self,
+        project_id: ProjectId,
+        plan_id: PlanId,
+        offset_bytes: usize,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.context.owns_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit approval is not owned by this MCP session",
+                None,
+            ));
+        }
+        let summary = self
+            .context
+            .project_registry
+            .inspect_edit_plan(&project_id, plan_id.clone())
+            .await
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "stale_resource: edit approval is no longer retained",
+                    None,
+                )
+            })?;
+        let detail = serde_json::to_string(&approval_detail_json(&summary))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let page = edit_approval_resource_page(&project_id, &plan_id, offset_bytes, &detail)?;
+        let text = serde_json::to_string(&page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(text, uri)],
             supports_cache_hints,
         )
         .into())
@@ -1647,13 +2242,15 @@ impl McplsServer {
     }
 
     /// List all registered projects without waiting on project actors.
-    #[tool(description = "List registered projects and their canonical roots.")]
+    #[tool(description = "List registered projects and canonical roots in cursor pages.")]
     async fn project_list(
         &self,
-        Parameters(_params): Parameters<ProjectListParams>,
+        Parameters(ProjectListParams { cursor }): Parameters<ProjectListParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let projects = self.context.project_registry.list().await;
-        let result: Vec<_> = projects
+        let (page, next_cursor) = project_list_page(projects.len(), cursor.as_deref())
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let result: Vec<_> = projects[page]
             .iter()
             .map(|project| {
                 serde_json::json!({
@@ -1664,7 +2261,12 @@ impl McplsServer {
                 })
             })
             .collect();
-        encode_json(&result)
+        encode_json(&serde_json::json!({
+            "projects": result,
+            "returned": result.len(),
+            "truncated": next_cursor.is_some(),
+            "next_cursor": next_cursor,
+        }))
     }
 
     /// List resource subscriptions owned by this MCP session.
@@ -1683,7 +2285,7 @@ impl McplsServer {
     #[tool(description = "Return daemon liveness and non-blocking project lifecycle counts.")]
     async fn health(
         &self,
-        Parameters(_params): Parameters<ProjectListParams>,
+        Parameters(_params): Parameters<DaemonStatusParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
@@ -1703,7 +2305,7 @@ impl McplsServer {
     #[tool(description = "Return daemon version, uptime, and non-blocking project status.")]
     async fn server_status(
         &self,
-        Parameters(_params): Parameters<ProjectListParams>,
+        Parameters(_params): Parameters<DaemonStatusParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
         encode_json(&serde_json::json!({
@@ -2374,21 +2976,37 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location."
+        description = "Cached-preferred diagnostics for a file. Set fresh=true only when a new analysis is required."
     )]
     async fn get_diagnostics(
         &self,
-        Parameters(DiagnosticsParams { file_path, options }): Parameters<DiagnosticsParams>,
+        Parameters(DiagnosticsParams {
+            file_path,
+            fresh,
+            options,
+        }): Parameters<DiagnosticsParams>,
     ) -> Result<Json<crate::bridge::DiagnosticsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = actor
-            .diagnostics_with_options(file_path, options)
-            .await
-            .map_err(|error| error.to_string());
+        let cached_available = !fresh
+            && actor
+                .has_cached_diagnostics(file_path.clone())
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = if cached_available {
+            actor
+                .cached_diagnostics_with_options(file_path, options)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            actor
+                .diagnostics_with_options(file_path, options)
+                .await
+                .map_err(|error| error.to_string())
+        };
 
         encode_tool_result(result)
     }
@@ -2529,9 +3147,168 @@ impl McplsServer {
         encode_tool_result(result)
     }
 
+    /// Search project snapshots by literal text or Rust regex.
+    #[tool(
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::bridge::lexical::LexicalSearchResult>(),
+        description = "Bounded project lexical search over current document snapshots. Literal and Rust-regex modes preserve exact byte ranges; ignored and generated paths are excluded unless explicitly requested."
+    )]
+    async fn lexical_search(
+        &self,
+        Parameters(params): Parameters<LexicalSearchParams>,
+    ) -> Result<Json<serde_json::Value>, McpError> {
+        if params.max_files == 0 || params.max_matches == 0 {
+            return Err(McpError::invalid_params(
+                "max_files and max_matches must be greater than zero",
+                None,
+            ));
+        }
+        if !(4 * 1024..=1024 * 1024).contains(&params.max_bytes) {
+            return Err(McpError::invalid_params(
+                "max_bytes must be between 4096 and 1048576",
+                None,
+            ));
+        }
+        find_matches(
+            "",
+            &params.query,
+            params.mode,
+            params.case,
+            params.multiline,
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        validate_path_globs(&params.include_paths, &params.exclude_paths)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let offset = params.page_token.as_deref().map_or(Ok(0), |token| {
+            token.parse::<usize>().map_err(|_| {
+                McpError::invalid_params(
+                    "page_token must be the decimal next_cursor returned by lexical_search",
+                    None,
+                )
+            })
+        })?;
+        let limit = params.max_matches;
+        let id = parse_project_id(params.project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let mut matches = actor
+            .lexical_search(LexicalSearchRequest {
+                query: params.query,
+                mode: params.mode,
+                case: params.case,
+                multiline: params.multiline,
+                max_files: params.max_files,
+                max_matches: offset.saturating_add(limit).saturating_add(1),
+                include_generated: params.include_generated,
+                include_paths: params.include_paths,
+                exclude_paths: params.exclude_paths,
+                context_lines: params.context_lines,
+            })
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let has_next_page = matches.len() > offset.saturating_add(limit);
+        let end = offset.saturating_add(limit).min(matches.len());
+        let matches = matches
+            .drain(offset.min(matches.len())..end)
+            .collect::<Vec<_>>();
+        let page = bounded_lexical_page(matches, offset, has_next_page, params.max_bytes)
+            .map_err(|required_bytes| {
+                McpError::invalid_params(
+                    format!(
+                        "max_bytes must be at least {required_bytes} to return one lexical match identity"
+                    ),
+                    None,
+                )
+            })?;
+        let value = serde_json::to_value(page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let legacy = value.to_string();
+        Ok(Json::new(value, legacy))
+    }
+
+    /// Search several symbol names through one bounded actor request.
+    #[tool(
+        description = "Batch workspace-symbol search with shared filters and global item/byte bounds. Exact duplicate queries reuse the first entry instead of repeating provider work or payloads."
+    )]
+    async fn workspace_symbol_search_batch(
+        &self,
+        Parameters(WorkspaceSymbolBatchParams {
+            project_id,
+            queries,
+            kind_filter,
+            match_mode,
+            scope,
+            max_items,
+            max_bytes,
+            include_generated,
+        }): Parameters<WorkspaceSymbolBatchParams>,
+    ) -> Result<Json<crate::bridge::WorkspaceSymbolBatchResult>, McpError> {
+        if queries.is_empty() || queries.len() > 32 {
+            return Err(McpError::invalid_params(
+                "queries must contain between 1 and 32 entries",
+                None,
+            ));
+        }
+        if queries
+            .iter()
+            .any(|query| query.is_empty() || query.len() > 1_000)
+        {
+            return Err(McpError::invalid_params(
+                "each query must contain between 1 and 1000 bytes",
+                None,
+            ));
+        }
+        if max_items == 0 || max_items > 1_000 {
+            return Err(McpError::invalid_params(
+                "max_items must be between 1 and 1000",
+                None,
+            ));
+        }
+        if !(4_096..=1_048_576).contains(&max_bytes) {
+            return Err(McpError::invalid_params(
+                "max_bytes must be between 4096 and 1048576",
+                None,
+            ));
+        }
+        let identity_bytes = queries.iter().map(String::len).sum::<usize>()
+            + queries.len().saturating_mul(128)
+            + 256;
+        if identity_bytes > max_bytes {
+            return Err(McpError::invalid_params(
+                "max_bytes is too small to return every query identity",
+                None,
+            ));
+        }
+
+        let id = parse_project_id(project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries,
+                kind_filter,
+                match_mode,
+                scope,
+                include_generated,
+                max_items: max_items as usize,
+                max_bytes,
+            })
+            .await
+            .map_err(|error| error.to_string());
+
+        encode_tool_result(result)
+    }
+
     /// Resolve and inspect one symbol without requiring a file read between semantic calls.
     #[tool(
-        description = "Preferred no-reread workflow: resolve an exact query or prior symbol_handle into a byte/item-bounded source, docs/signature, definitions/implementations, uses/calls, tests, and diagnostics bundle. Ambiguous names return candidates; stale handles require fresh discovery."
+        description = "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles."
     )]
     async fn inspect_symbol(
         &self,
@@ -2563,6 +3340,81 @@ impl McplsServer {
                 kind: params.kind,
                 path: params.path,
                 container: params.container,
+                candidate_limit: params.candidate_limit,
+                sections: params.sections,
+                budget: params.budget,
+            })
+            .await
+            .map_err(operation_error);
+        encode_tool_result(result)
+    }
+
+    /// Inspect several symbols concurrently without repeating actor round trips.
+    #[tool(
+        description = "Inspect 1-16 symbol handles or exact queries concurrently in one actor request. Returns every target identity and source-bearing sections in caller order under one shared budget."
+    )]
+    async fn inspect_symbol_batch(
+        &self,
+        Parameters(params): Parameters<InspectSymbolBatchParams>,
+    ) -> Result<Json<crate::bridge::InspectSymbolBatchResult>, McpError> {
+        if params.targets.is_empty()
+            || params.targets.len() > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
+        {
+            return Err(McpError::invalid_params(
+                "targets must contain between 1 and 16 symbols",
+                None,
+            ));
+        }
+        if params.targets.iter().any(|target| {
+            target.symbol_handle.is_none()
+                && target
+                    .query
+                    .as_ref()
+                    .is_none_or(|query| query.trim().is_empty())
+        }) {
+            return Err(McpError::invalid_params(
+                "every target requires query or symbol_handle",
+                None,
+            ));
+        }
+        if params.candidate_limit == 0 || params.candidate_limit > 100 {
+            return Err(McpError::invalid_params(
+                "candidate_limit must be between 1 and 100",
+                None,
+            ));
+        }
+        if params.budget.max_items < params.targets.len() {
+            return Err(McpError::invalid_params(
+                "budget.max_items must allow at least one item per target",
+                None,
+            ));
+        }
+        let identity_bytes = serde_json::to_vec(&params.targets)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+            .len();
+        let minimum_bytes = identity_bytes
+            + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES
+            + params.targets.len()
+                * crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET;
+        if params.budget.max_bytes < minimum_bytes || params.budget.max_bytes > 1024 * 1024 {
+            return Err(McpError::invalid_params(
+                format!(
+                    "budget.max_bytes must be between {minimum_bytes} and 1048576 for these targets"
+                ),
+                None,
+            ));
+        }
+
+        let id = parse_project_id(params.project_id)?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(operation_error)?;
+        let result = actor
+            .inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
+                targets: params.targets,
                 candidate_limit: params.candidate_limit,
                 sections: params.sections,
                 budget: params.budget,
@@ -2971,7 +3823,7 @@ impl McplsServer {
 
     /// Read source context omitted from a bounded result when the client does not expose MCP resources.
     #[tool(
-        description = "Read a complete snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. This is the callable fallback for clients that do not expose resources/read."
+        description = "Read a snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. Deferred payloads return lossless UTF-8 JSON pages with a continuation URI when needed. This is the callable fallback for clients that do not expose resources/read."
     )]
     async fn read_semantic_resource(
         &self,
@@ -2979,71 +3831,113 @@ impl McplsServer {
     ) -> Result<Json<SemanticResourceReadResult>, McpError> {
         let resource = parse_session_resource_uri(&uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let mut response_uri = uri;
-        let text = match resource {
+        let result = match resource {
             SessionResource::Source(source) => {
-                let actor = self
-                    .context
-                    .required_actor_for_path(&source.path)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                let frame = actor
-                    .read_source_resource(source)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-                response_uri = make_source_uri(
-                    Path::new(&frame.path),
-                    frame.range.start.line,
-                    frame.range.start.character,
-                    frame.range.end.line,
-                    frame.range.end.character,
-                    &frame.content_hash,
-                    frame.document_version,
-                )
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                serde_json::to_string(&frame)
+                self.read_source_resource_as_tool_result(source).await?
             }
-            SessionResource::Deferred(token) => {
-                let value = self
+            SessionResource::Deferred(deferred) => {
+                let payload = self
                     .context
                     .project_registry
-                    .read_deferred_resource(&token)
+                    .read_deferred_resource(&deferred.token)
                     .map_err(|error| McpError::invalid_params(error, None))?;
-                serde_json::to_string(&value)
+                deferred_resource_page(&deferred, uri, payload.value, &payload.snapshot_hash)?
             }
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
-            | SessionResource::ProjectEvents { .. } => {
+            | SessionResource::ProjectEvents { .. }
+            | SessionResource::ProjectEvent { .. }
+            | SessionResource::EditDiff { .. }
+            | SessionResource::AppliedEditResult { .. }
+            | SessionResource::EditApproval { .. } => {
                 return Err(McpError::invalid_params(
                     "read_semantic_resource accepts only mcpls-source:// or mcpls-deferred:// references",
                     None,
                 ));
             }
-        }
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        };
 
-        encode_tool_result(Ok::<_, String>(SemanticResourceReadResult {
-            uri: response_uri,
-            mime_type: "application/json".to_owned(),
-            text,
-        }))
+        encode_tool_result(Ok::<_, String>(result))
     }
 }
 
 impl McplsServer {
+    async fn read_source_resource_as_tool_result(
+        &self,
+        resource: crate::bridge::resources::SourceResource,
+    ) -> Result<SemanticResourceReadResult, McpError> {
+        let actor = match self.context.required_actor_for_path(&resource.path).await {
+            Ok(actor) => actor,
+            Err(_) => self
+                .context
+                .project_registry
+                .actor_for_source_path(&resource.path)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+        };
+        let mut frame_budget = MAX_SEMANTIC_RESOURCE_RESULT_BYTES;
+
+        loop {
+            let frame = actor
+                .read_source_resource(resource.clone(), frame_budget)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            let uri = make_source_uri(
+                Path::new(&frame.path),
+                frame.range.start.line,
+                frame.range.start.character,
+                frame.range.end.line,
+                frame.range.end.character,
+                &frame.content_hash,
+                frame.document_version,
+            )
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let text = serde_json::to_string(&frame)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let result = SemanticResourceReadResult {
+                uri,
+                mime_type: "application/json".to_owned(),
+                text,
+                next_uri: None,
+                total_bytes: None,
+                offset_bytes: None,
+                returned_bytes: None,
+                remaining_bytes: None,
+                snapshot_hash: None,
+            };
+            let result_bytes = serde_json::to_vec(&result)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            if result_bytes.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+                return Ok(result);
+            }
+
+            frame_budget /= 2;
+            if frame_budget == 0 {
+                return Err(McpError::internal_error(
+                    "source resource metadata exceeds the response budget",
+                    None,
+                ));
+            }
+        }
+    }
+
     async fn read_source_resource(
         &self,
         resource: crate::bridge::resources::SourceResource,
         _uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&resource.path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let actor = match self.context.required_actor_for_path(&resource.path).await {
+            Ok(actor) => actor,
+            Err(_) => self
+                .context
+                .project_registry
+                .actor_for_source_path(&resource.path)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+        };
         let frame = actor
-            .read_source_resource(resource)
+            .read_source_resource(resource, MAX_SEMANTIC_RESOURCE_RESULT_BYTES)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let fresh_uri = make_source_uri(
@@ -3067,16 +3961,22 @@ impl McplsServer {
 
     fn read_deferred_resource(
         &self,
-        token: &str,
+        deferred: DeferredResource,
         uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
-        let value = self
+        let payload = self
             .context
             .project_registry
-            .read_deferred_resource(token)
+            .read_deferred_resource(&deferred.token)
             .map_err(|error| McpError::invalid_params(error, None))?;
-        let json = serde_json::to_string(&value)
+        let page = deferred_resource_page(
+            &deferred,
+            uri.clone(),
+            payload.value,
+            &payload.snapshot_hash,
+        )?;
+        let json = serde_json::to_string(&page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json, uri)],
@@ -3095,7 +3995,8 @@ impl McplsServer {
                 .map_err(|error| McpError::invalid_params(error.to_string(), None))?
             {
                 SessionResource::ProjectStatus(project_id)
-                | SessionResource::ProjectEvents { project_id, .. } => {
+                | SessionResource::ProjectEvents { project_id, .. }
+                | SessionResource::ProjectEvent { project_id, .. } => {
                     project_ids.insert(project_id);
                 }
                 SessionResource::Diagnostics(path) => {
@@ -3117,6 +4018,24 @@ impl McplsServer {
                 SessionResource::Deferred(_) => {
                     return Err(McpError::invalid_params(
                         "deferred semantic resources are readable but not subscribable",
+                        None,
+                    ));
+                }
+                SessionResource::EditDiff { .. } => {
+                    return Err(McpError::invalid_params(
+                        "edit diff resources are readable but not subscribable",
+                        None,
+                    ));
+                }
+                SessionResource::AppliedEditResult { .. } => {
+                    return Err(McpError::invalid_params(
+                        "applied edit result resources are readable but not subscribable",
+                        None,
+                    ));
+                }
+                SessionResource::EditApproval { .. } => {
+                    return Err(McpError::invalid_params(
+                        "edit approval resources are readable but not subscribable",
                         None,
                     ));
                 }
@@ -3175,6 +4094,27 @@ impl McplsServer {
 
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = supports_cache_hints(&context);
+        let (tools, next_cursor) = advertised_tools_page(
+            request
+                .as_ref()
+                .and_then(|request| request.cursor.as_deref()),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut result = ListToolsResult::with_all_items(tools);
+        result.next_cursor = next_cursor;
+        if supports_cache_hints {
+            result.ttl_ms = Some(0);
+            result.cache_scope = Some(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -3192,11 +4132,9 @@ impl ServerHandler for McplsServer {
 
     async fn list_resources(
         &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
+        request: Option<rmcp::model::PaginatedRequestParams>,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // TODO(critic-S5): paginate when max_documents == 0 (unlimited mode can produce
-        // very large single-page responses that may exceed transport buffers).
         let open_documents = self
             .context
             .project_registry
@@ -3242,7 +4180,15 @@ impl ServerHandler for McplsServer {
                 .with_description(format!("Ordered project events for {project_id}"))
         }));
 
-        let result = ListResourcesResult::with_all_items(resources);
+        let (resources, next_cursor) = resource_page(
+            resources,
+            request
+                .as_ref()
+                .and_then(|request| request.cursor.as_deref()),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut result = ListResourcesResult::with_all_items(resources);
+        result.next_cursor = next_cursor;
         if supports_cache_hints(&context) {
             Ok(result.with_ttl_ms(0).with_cache_scope(CacheScope::Private))
         } else {
@@ -3274,14 +4220,72 @@ impl ServerHandler for McplsServer {
                     )
                     .await;
             }
+            SessionResource::ProjectEvent {
+                project_id,
+                sequence,
+            } => {
+                return self
+                    .read_project_event_resource(
+                        project_id,
+                        sequence,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
+            SessionResource::EditDiff {
+                project_id,
+                plan_id,
+                offset_bytes,
+            } => {
+                return self
+                    .read_edit_diff_resource(
+                        project_id,
+                        plan_id,
+                        offset_bytes,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
+            SessionResource::AppliedEditResult {
+                project_id,
+                plan_id,
+                offset_bytes,
+            } => {
+                return self
+                    .read_applied_edit_result_resource(
+                        project_id,
+                        plan_id,
+                        offset_bytes,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
+            SessionResource::EditApproval {
+                project_id,
+                plan_id,
+                offset_bytes,
+            } => {
+                return self
+                    .read_edit_approval_resource(
+                        project_id,
+                        plan_id,
+                        offset_bytes,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => {
                 return self
                     .read_source_resource(source, request.uri, supports_cache_hints)
                     .await;
             }
-            SessionResource::Deferred(token) => {
-                return self.read_deferred_resource(&token, request.uri, supports_cache_hints);
+            SessionResource::Deferred(deferred) => {
+                return self.read_deferred_resource(deferred, request.uri, supports_cache_hints);
             }
         };
 
@@ -3402,6 +4406,33 @@ impl ServerHandler for McplsServer {
                 .await?;
                 return Ok(());
             }
+            SessionResource::ProjectEvent { project_id, .. } => {
+                self.attach_project_subscription(
+                    project_id.clone(),
+                    project_events_resource_uri(&project_id),
+                    context.peer,
+                )
+                .await?;
+                return Ok(());
+            }
+            SessionResource::EditDiff { .. } => {
+                return Err(McpError::invalid_params(
+                    "edit diff resources are readable but not subscribable",
+                    None,
+                ));
+            }
+            SessionResource::AppliedEditResult { .. } => {
+                return Err(McpError::invalid_params(
+                    "applied edit result resources are readable but not subscribable",
+                    None,
+                ));
+            }
+            SessionResource::EditApproval { .. } => {
+                return Err(McpError::invalid_params(
+                    "edit approval resources are readable but not subscribable",
+                    None,
+                ));
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => source.path,
             SessionResource::Deferred(_) => {
@@ -3454,6 +4485,12 @@ impl ServerHandler for McplsServer {
             SessionResource::ProjectEvents { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
+            SessionResource::ProjectEvent { project_id, .. } => {
+                project_events_resource_uri(&project_id)
+            }
+            SessionResource::EditDiff { .. }
+            | SessionResource::AppliedEditResult { .. }
+            | SessionResource::EditApproval { .. } => request.uri,
             SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
             | SessionResource::Source(_)
@@ -3495,6 +4532,7 @@ mod tests {
     use super::*;
     use crate::bridge::resources::parse_uri;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
+    use crate::project::ProjectStatus;
     use tempfile::TempDir;
 
     fn create_test_server() -> McplsServer {
@@ -3507,6 +4545,190 @@ mod tests {
             writeln!(output, "{prefix} {line}").unwrap();
             output
         })
+    }
+
+    #[test]
+    fn truncated_project_event_pages_expose_a_direct_continuation_uri() {
+        let mut history = crate::project::ProjectEventHistory::new(2);
+        for generation in 1..=2 {
+            history.record(ProjectEvent::ServerExited { generation });
+        }
+        let project_id = ProjectId::new("project").unwrap();
+        let payload = project_events_json(&project_id, &history.snapshot_since(None, 1));
+
+        assert_eq!(
+            payload["next_uri"],
+            "mcpls-project-events:///project?since=1"
+        );
+    }
+
+    #[test]
+    fn oversized_project_event_body_is_referenced_without_losing_identity() {
+        let mut history = crate::project::ProjectEventHistory::new(1);
+        history.record(ProjectEvent::StatusChanged {
+            status: ProjectStatus::Failed,
+            last_error: Some("x".repeat(1024)),
+        });
+        let project_id = ProjectId::new("project").unwrap();
+        let payload = project_events_json(&project_id, &history.snapshot_since(None, 1));
+
+        assert_eq!(payload["events"][0]["sequence"], 1);
+        assert_eq!(payload["events"][0]["event"]["kind"], "status_changed");
+        assert_eq!(
+            payload["events"][0]["resource"]["uri"],
+            "mcpls-project-event:///project?sequence=1"
+        );
+        assert!(
+            payload["events"][0]["resource"]["total_bytes"]
+                .as_u64()
+                .unwrap()
+                > 1024
+        );
+        assert!(payload["events"][0]["event"].get("last_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_project_event_resources_are_readable_until_evicted() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(1);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let uri = project_event_resource_uri(&project_id, 1);
+        let response = server
+            .read_project_event_resource(project_id.clone(), 1, uri, false)
+            .await
+            .unwrap();
+        let ReadResourceResponse::Complete(response) = response else {
+            panic!("project event resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+            panic!("project event resource was not text");
+        };
+        let event: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(event["sequence"], 1);
+        assert_eq!(event["event"]["kind"], "status_changed");
+
+        let error = server
+            .read_project_event_resource(
+                project_id,
+                99,
+                "mcpls-project-event:///project?sequence=99".to_owned(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stale_resource:"));
+    }
+
+    #[test]
+    fn deferred_resource_pages_are_bounded_and_lossless() {
+        let value = serde_json::json!({
+            "references": ["λ\"".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)],
+        });
+        let expected = serde_json::to_string(&value).unwrap();
+        let mut offset_bytes = 0;
+        let mut actual = String::new();
+
+        loop {
+            let deferred = DeferredResource {
+                token: "token".to_owned(),
+                offset_bytes,
+            };
+            let result = deferred_resource_page(
+                &deferred,
+                format!("mcpls-deferred:///token?offset_bytes={offset_bytes}"),
+                value.clone(),
+                "snapshot",
+            )
+            .unwrap();
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+            );
+            assert_eq!(result.total_bytes, Some(expected.len()));
+            assert_eq!(result.offset_bytes, Some(offset_bytes));
+            assert_eq!(result.returned_bytes, Some(result.text.len()));
+            assert_eq!(result.snapshot_hash.as_deref(), Some("snapshot"));
+            assert_eq!(
+                result.remaining_bytes,
+                Some(expected.len() - offset_bytes - result.text.len())
+            );
+            actual.push_str(&result.text);
+            let Some(next_uri) = result.next_uri else {
+                break;
+            };
+            let SessionResource::Deferred(next) = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("continuation must remain a deferred resource");
+            };
+            offset_bytes = next.offset_bytes;
+        }
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn semantic_resource_tool_pages_an_escaped_source_frame_to_its_outer_budget() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("quoted.rs");
+        let content = format!(
+            "{}\ntail sentinel\n",
+            "λ\"".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 3 + 1)
+        );
+        std::fs::write(&source, &content).unwrap();
+        let registry = ProjectRegistry::new(1);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let resource = crate::bridge::resources::SourceResource {
+            path: source,
+            start_line: 1,
+            start_character: 1,
+            end_line: 2,
+            end_character: 1,
+            snapshot_hash: format!("{:x}", Sha256::digest(content.as_bytes())),
+            document_version: None,
+            offset_bytes: 0,
+        };
+
+        let mut result = server
+            .read_source_resource_as_tool_result(resource)
+            .await
+            .unwrap();
+        let mut recovered = String::new();
+        for _ in 0..16 {
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+            );
+            let frame: crate::bridge::SourceFrame = serde_json::from_str(&result.text).unwrap();
+            recovered.push_str(&frame.text);
+            if !frame.truncated {
+                break;
+            }
+            let next =
+                crate::bridge::resources::parse_source_uri(&frame.resource.unwrap().uri).unwrap();
+            result = server
+                .read_source_resource_as_tool_result(next)
+                .await
+                .unwrap();
+        }
+
+        assert!(recovered.contains("tail sentinel"));
     }
 
     #[test]
@@ -3581,6 +4803,261 @@ mod tests {
         assert_eq!(value["unsupported"][0], "unsupported");
         assert_eq!(value["preconditions"].as_array().unwrap().len(), 1);
         assert_eq!(value["safe_to_apply"], false);
+        assert_eq!(
+            value["diff_resource"]["uri"],
+            format!(
+                "mcpls-edit-diff:///project?plan_id={}&offset_bytes=0",
+                artifact.plan.id().as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn applied_edit_result_bounds_inline_detail_and_links_the_complete_receipt() {
+        let plan_id = PlanId::parse("plan").unwrap();
+        let result = workspace_edit_apply_result(
+            ApplyEditPlanOutcome::Applied(AppliedEditPlan {
+                plan_id: plan_id.clone(),
+                operations: (0..=MAX_INLINE_APPLIED_ITEMS)
+                    .map(|index| format!("edit src/{index}.rs"))
+                    .collect(),
+                unified_diff: "x".repeat(MAX_INLINE_APPLIED_DIFF_BYTES + 1),
+                complete_unified_diff: "complete diff".to_owned(),
+                committed_files: (0..=MAX_INLINE_APPLIED_ITEMS)
+                    .map(|index| PathBuf::from(format!("/workspace/src/{index}.rs")))
+                    .collect(),
+                verification: None,
+                provider_synchronization: Vec::new(),
+            }),
+            "project",
+            &[PathBuf::from("/workspace")],
+        );
+
+        let WorkspaceEditApplyResult::Applied {
+            committed_files,
+            committed_file_count,
+            operations,
+            operation_count,
+            detail_resource,
+            details_truncated,
+            ..
+        } = result
+        else {
+            panic!("expected an applied edit result");
+        };
+        assert_eq!(committed_file_count, MAX_INLINE_APPLIED_ITEMS + 1);
+        assert_eq!(committed_files.len(), MAX_INLINE_APPLIED_ITEMS);
+        assert_eq!(operation_count, MAX_INLINE_APPLIED_ITEMS + 1);
+        assert_eq!(operations.len(), MAX_INLINE_APPLIED_ITEMS);
+        assert!(details_truncated);
+        assert_eq!(
+            detail_resource,
+            Some(applied_edit_result_resource_uri(
+                &ProjectId::new("project").unwrap(),
+                &plan_id,
+                0,
+            ))
+        );
+    }
+
+    #[test]
+    fn approval_summary_bounds_inline_lists_and_links_the_complete_plan() {
+        let plan_id = PlanId::parse("plan").unwrap();
+        let summary = EditPlanApprovalSummary {
+            plan_id: plan_id.clone(),
+            project_id: "project".to_owned(),
+            affected_files: (0..=MAX_APPROVAL_ITEMS)
+                .map(|index| PathBuf::from(format!("src/{index}.rs")))
+                .collect(),
+            operations: (0..=MAX_APPROVAL_ITEMS)
+                .map(|index| format!("edit src/{index}.rs"))
+                .collect(),
+            file_operations: Vec::new(),
+            diff_files: Vec::new(),
+            diff_truncated: false,
+            safe_to_apply: true,
+            snapshot_hashes: Vec::new(),
+            versions: Vec::new(),
+        };
+
+        let value = approval_summary_json(&summary);
+
+        assert_eq!(value["affected_file_count"], MAX_APPROVAL_ITEMS + 1);
+        assert_eq!(
+            value["affected_files"].as_array().unwrap().len(),
+            MAX_APPROVAL_ITEMS
+        );
+        assert_eq!(value["operation_count"], MAX_APPROVAL_ITEMS + 1);
+        assert_eq!(
+            value["operations"].as_array().unwrap().len(),
+            MAX_APPROVAL_ITEMS
+        );
+        assert_eq!(value["details_truncated"], true);
+        assert_eq!(
+            value["detail_resource"]["uri"],
+            format!("mcpls-edit-approval:///project?plan_id={plan_id}&offset_bytes=0")
+        );
+    }
+
+    #[test]
+    fn approval_summary_marks_a_truncated_inline_operation() {
+        let summary = EditPlanApprovalSummary {
+            plan_id: PlanId::parse("plan").unwrap(),
+            project_id: "project".to_owned(),
+            affected_files: Vec::new(),
+            operations: vec!["x".repeat(MAX_APPROVAL_TEXT_BYTES + 1)],
+            file_operations: Vec::new(),
+            diff_files: Vec::new(),
+            diff_truncated: false,
+            safe_to_apply: true,
+            snapshot_hashes: Vec::new(),
+            versions: Vec::new(),
+        };
+
+        assert_eq!(approval_summary_json(&summary)["details_truncated"], true);
+    }
+
+    #[test]
+    fn approval_detail_resource_pages_complete_json() {
+        let project_id = ProjectId::new("project").unwrap();
+        let plan_id = PlanId::parse("plan").unwrap();
+        let detail =
+            serde_json::json!({"operations": ["x".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)]})
+                .to_string();
+        let mut offset_bytes = 0;
+        let mut recovered = String::new();
+        for _ in 0..8 {
+            let page =
+                edit_approval_resource_page(&project_id, &plan_id, offset_bytes, &detail).unwrap();
+            assert_eq!(page.mime_type, "application/json");
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            recovered.push_str(&page.text);
+            let Some(next_uri) = page.next_uri else { break };
+            let SessionResource::EditApproval {
+                offset_bytes: next, ..
+            } = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("continuation must remain an approval resource");
+            };
+            offset_bytes = next;
+        }
+        assert_eq!(recovered, detail);
+    }
+
+    #[test]
+    fn applied_edit_result_resource_pages_complete_json() {
+        let project_id = ProjectId::new("project").unwrap();
+        let plan_id = PlanId::parse("plan").unwrap();
+        let detail =
+            serde_json::json!({"operations": ["x".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)]})
+                .to_string();
+        let mut offset_bytes = 0;
+        let mut recovered = String::new();
+        for _ in 0..8 {
+            let page =
+                applied_edit_result_resource_page(&project_id, &plan_id, offset_bytes, &detail)
+                    .unwrap();
+            assert_eq!(page.mime_type, "application/json");
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            recovered.push_str(&page.text);
+            let Some(next_uri) = page.next_uri else {
+                break;
+            };
+            let SessionResource::AppliedEditResult {
+                offset_bytes: next, ..
+            } = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("continuation must remain an applied edit result resource");
+            };
+            offset_bytes = next;
+        }
+        assert_eq!(recovered, detail);
+        assert!(serde_json::from_str::<serde_json::Value>(&recovered).is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_diff_resource_pages_the_complete_plan_diff_for_its_owner() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(1);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = EditPlan::new(
+            "project".to_owned(),
+            vec![FileSnapshot::from_contents(
+                root.path().join("huge.rs"),
+                SnapshotSource::Disk,
+                None,
+                numbered_lines("old line", 5_000),
+                numbered_lines("new line", 5_000),
+            )],
+            vec!["text huge.rs".to_owned()],
+            true,
+            std::time::Duration::from_secs(60),
+        );
+        let expected = plan.complete_unified_diff();
+        assert!(plan.diff_truncated());
+        let plan_id = plan.id().clone();
+        actor.store_edit_plan(plan).await.unwrap();
+
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        server.context.remember_plan(plan_id.clone()).await;
+        let mut offset_bytes = 0;
+        let mut recovered = String::new();
+        for _ in 0..32 {
+            let uri = edit_diff_resource_uri(&project_id, &plan_id, offset_bytes);
+            let response = server
+                .read_edit_diff_resource(
+                    project_id.clone(),
+                    plan_id.clone(),
+                    offset_bytes,
+                    uri,
+                    false,
+                )
+                .await
+                .unwrap();
+            let ReadResourceResponse::Complete(response) = response else {
+                panic!("edit diff resource unexpectedly requested input");
+            };
+            let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+                panic!("edit diff resource was not text");
+            };
+            let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            assert_eq!(page.offset_bytes, Some(offset_bytes));
+            recovered.push_str(&page.text);
+            let Some(next_uri) = page.next_uri else {
+                break;
+            };
+            let SessionResource::EditDiff {
+                offset_bytes: next, ..
+            } = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("edit diff continuation was not an edit diff resource");
+            };
+            offset_bytes = next;
+        }
+        assert_eq!(recovered, expected);
+
+        let other_session = server.for_session();
+        let error = other_session
+            .read_edit_diff_resource(
+                project_id,
+                plan_id,
+                0,
+                "mcpls-edit-diff:///project?plan_id=unowned&offset_bytes=0".to_owned(),
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not owned by this MCP session"));
     }
 
     #[tokio::test]
@@ -4088,7 +5565,7 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn in_flight_request_pins_group_before_second_cold_request() {
+    async fn in_flight_request_blocks_second_semantic_request_until_it_can_resume() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
         let first_file = write_rust_fixture(first_root.path());
@@ -4157,14 +5634,14 @@ finally:
         std::fs::write(&release, "release").unwrap();
         blocked.await.unwrap().unwrap();
         let second_result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second_request).await;
-        assert!(
-            second_result.is_err(),
-            "recently used residency was evicted before the idle timeout"
-        );
-        second_request.abort();
-        second_request.await.unwrap_err();
-        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+            tokio::time::timeout(std::time::Duration::from_secs(3), &mut second_request)
+                .await
+                .expect("second semantic request should resume after the first request completes")
+                .unwrap()
+                .unwrap();
+        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
+        assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
             "1"
@@ -4438,22 +5915,39 @@ finally:
         );
 
         for required in [
-            "exact-first",
+            "MCPLS-first",
+            "workspace_symbol_search",
+            "workspace_symbol_search_batch",
+            "lexical_search",
+            "inspect_symbol",
+            "inspect_symbol_batch",
+            "ast-grep/SSR",
             "source frames",
             "symbol_handle",
-            "inspect_symbol",
-            "budget",
-            "ambiguous",
-            "stale_symbol_handle",
-            "read_semantic_resource",
-            "resources/read",
-            "file read",
+            "stale handles",
+            "snapshot resources",
+            "file read/shell",
+            "preview/apply",
+            "registrations persist",
+            "not project-bound",
+            "project_id",
+            "project_list once",
+            "stable ID",
+            "attach/wake",
         ] {
             assert!(
                 instructions.contains(required),
                 "initialize instructions omit {required}: {instructions}"
             );
         }
+        assert!(
+            !instructions.contains("project_add") && !instructions.contains("project_activate"),
+            "lifecycle setup must be implicit: {instructions}"
+        );
+        assert!(
+            instructions.contains("attach/wake"),
+            "lifecycle guidance must describe implicit attach/wake: {instructions}"
+        );
     }
 
     #[test]
@@ -4471,6 +5965,7 @@ finally:
         for name in [
             "workspace_symbol_search",
             "inspect_symbol",
+            "inspect_symbol_batch",
             "get_hover",
             "get_definition",
             "get_references",
@@ -4529,6 +6024,7 @@ finally:
             for required in [
                 "workspace_symbol_search",
                 "inspect_symbol",
+                "lexical_search",
                 "symbol_handle",
                 "stale_symbol_handle",
                 "uncapped full file",
@@ -4578,13 +6074,154 @@ finally:
     }
 
     #[test]
-    fn inspect_symbol_is_advertised_with_typed_contract() {
+    fn advertised_tools_compact_expanded_output_schemas() {
+        let mut full = McplsServer::tool_router().list_all();
+        full.sort_by(|left, right| {
+            tool_catalog_rank(left.name.as_ref()).cmp(&tool_catalog_rank(right.name.as_ref()))
+        });
+        let advertised = advertised_tools();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        let advertised_bytes = serde_json::to_vec(&advertised).unwrap().len();
+
+        assert_eq!(
+            full.iter()
+                .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
+                .map(|tool| &tool.name)
+                .collect::<Vec<_>>(),
+            advertised.iter().map(|tool| &tool.name).collect::<Vec<_>>()
+        );
+        assert!(
+            advertised_bytes * 2 < full_bytes,
+            "advertised tool surface is {advertised_bytes} bytes vs {full_bytes} internally"
+        );
+
+        for advertised in &advertised {
+            let full = full
+                .iter()
+                .find(|tool| tool.name == advertised.name)
+                .unwrap();
+            let oversized = full.output_schema.as_ref().is_some_and(|schema| {
+                serde_json::to_vec(schema)
+                    .is_ok_and(|encoded| encoded.len() > ADVERTISED_OUTPUT_SCHEMA_LIMIT)
+            });
+            assert_eq!(
+                advertised.output_schema.is_some(),
+                !oversized,
+                "unexpected advertised output schema policy for {}",
+                full.name
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_tools_hide_legacy_direct_mutations_but_keep_compatibility_routes() {
+        let router_tools = McplsServer::tool_router().list_all();
+        let advertised = advertised_tools();
+
+        for name in LEGACY_DIRECT_MUTATION_TOOLS {
+            assert!(
+                router_tools.iter().any(|tool| tool.name == *name),
+                "legacy compatibility route is missing {name}"
+            );
+            assert!(
+                !advertised.iter().any(|tool| tool.name == *name),
+                "legacy direct mutation is still advertised {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_tool_pages_are_lossless_and_bounded() {
+        let full = advertised_tools();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        let (first_page, first_cursor) = advertised_tools_page(None).unwrap();
+        assert!(first_cursor.is_some());
+        for name in [
+            "project_list",
+            "workspace_symbol_search",
+            "workspace_symbol_search_batch",
+            "inspect_symbol",
+            "inspect_symbol_batch",
+            "lexical_search",
+            "read_semantic_resource",
+            "get_diagnostics",
+            "structural_replace_preview",
+            "workspace_edit_preview",
+            "workspace_edit_apply",
+        ] {
+            assert!(
+                first_page.iter().any(|tool| tool.name == name),
+                "default tools/list page is missing {name}"
+            );
+        }
+        assert!(
+            serde_json::to_vec(&first_page).unwrap().len() * 2 < full_bytes,
+            "default tools/list page must be less than half the full catalog"
+        );
+        let mut cursor = None;
+        let mut names = Vec::new();
+
+        loop {
+            let (page, next_cursor) = advertised_tools_page(cursor.as_deref()).unwrap();
+            assert!(page.len() <= ADVERTISED_TOOL_PAGE_SIZE);
+            names.extend(page.into_iter().map(|tool| tool.name.into_owned()));
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+
+        assert_eq!(
+            names,
+            full.into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(advertised_tools_page(Some("not-an-offset")).is_err());
+        assert!(advertised_tools_page(Some(&names.len().to_string())).is_err());
+    }
+
+    #[test]
+    fn resource_pages_are_lossless_and_bounded() {
+        let resources = || {
+            (0..=RESOURCE_PAGE_SIZE)
+                .map(|index| Resource::new(format!("mcpls://resource/{index}"), index.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let expected = resources()
+            .into_iter()
+            .map(|resource| resource.uri)
+            .collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut uris = Vec::new();
+
+        loop {
+            let (page, next_cursor) = resource_page(resources(), cursor.as_deref()).unwrap();
+            assert!(page.len() <= RESOURCE_PAGE_SIZE);
+            uris.extend(page.into_iter().map(|resource| resource.uri));
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+
+        assert_eq!(uris, expected);
+        assert!(resource_page(resources(), Some("not-an-offset")).is_err());
+        assert!(resource_page(resources(), Some(&expected.len().to_string())).is_err());
+    }
+
+    #[test]
+    fn inspect_symbol_tools_are_advertised_with_typed_contracts() {
         let tools = McplsServer::tool_router().list_all();
         let workspace = tools
             .iter()
             .find(|tool| tool.name == "workspace_symbol_search")
             .unwrap();
         let inspect = tools.iter().find(|tool| tool.name == "inspect_symbol");
+        let batch = tools
+            .iter()
+            .find(|tool| tool.name == "inspect_symbol_batch")
+            .expect("inspect_symbol_batch is missing from tools/list");
 
         assert!(
             inspect.is_some(),
@@ -4605,6 +6242,89 @@ finally:
             schema["properties"]["resolution"].is_object()
                 && schema["properties"]["sections"].is_object()
         }));
+        assert!(batch.input_schema["properties"]["targets"]["items"].is_object());
+        assert!(batch.output_schema.as_ref().is_some_and(|schema| {
+            schema["properties"]["entries"].is_object()
+                && schema["properties"]["budget"].is_object()
+        }));
+    }
+
+    #[test]
+    fn lexical_search_is_advertised_with_explicit_matching_controls() {
+        let tool = McplsServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "lexical_search")
+            .expect("lexical_search is missing from tools/list");
+
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(schema.contains("literal"));
+        assert!(schema.contains("regex"));
+        assert!(schema.contains("smart"));
+        assert!(tool.input_schema["properties"]["max_matches"].is_object());
+        assert!(tool.input_schema["properties"]["max_bytes"].is_object());
+    }
+
+    #[test]
+    fn lexical_page_respects_its_serialized_byte_budget() {
+        let matches = (0..2)
+            .map(|index| crate::bridge::lexical::LexicalSearchMatch {
+                project_relative_path: format!("src/{index:0200}.rs"),
+                document_version: None,
+                content_hash: "a".repeat(64),
+                source_uri: format!("mcpls-source:///src/{index:0200}.rs"),
+                source: None,
+                byte_range: 0..1,
+            })
+            .collect();
+
+        let page = bounded_lexical_page(matches, 0, false, 800).unwrap();
+
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 800);
+        assert_eq!(page.returned, 1);
+        assert!(page.truncated);
+        assert_eq!(page.next_cursor.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn lexical_page_rejects_a_budget_that_cannot_return_one_identity() {
+        let matches = vec![crate::bridge::lexical::LexicalSearchMatch {
+            project_relative_path: format!("src/{}.rs", "a".repeat(8_000)),
+            document_version: None,
+            content_hash: "a".repeat(64),
+            source_uri: "mcpls-source:///src/too-long.rs".to_owned(),
+            source: None,
+            byte_range: 0..1,
+        }];
+
+        assert!(bounded_lexical_page(matches, 0, false, 4 * 1024).is_err());
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_batch_rejects_a_budget_that_cannot_cover_every_target() {
+        let server = create_test_server();
+        let target = || crate::bridge::InspectSymbolTarget {
+            symbol_handle: None,
+            query: Some("run".to_owned()),
+            kind: None,
+            path: None,
+            container: None,
+        };
+        let error = server
+            .inspect_symbol_batch(Parameters(InspectSymbolBatchParams {
+                project_id: "project".to_owned(),
+                targets: vec![target(), target()],
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 16 * 1024,
+                    max_items: 1,
+                },
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("at least one item per target"));
     }
 
     #[test]
@@ -4617,6 +6337,31 @@ finally:
 
         assert!(read.input_schema["properties"]["uri"].is_object());
         assert!(read.output_schema.as_ref().is_some());
+    }
+
+    #[test]
+    fn project_list_tool_schema_exposes_cursor_pagination() {
+        let tools = McplsServer::tool_router().list_all();
+        let project_list = tools
+            .iter()
+            .find(|tool| tool.name == "project_list")
+            .unwrap();
+
+        let expected = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "cursor": {
+                    "default": null,
+                    "description": "Decimal cursor returned by a prior `project_list` response.",
+                    "type": ["string", "null"]
+                }
+            },
+            "type": "object"
+        });
+        assert_eq!(
+            project_list.input_schema.as_ref(),
+            expected.as_object().unwrap()
+        );
     }
 
     #[test]
@@ -4810,6 +6555,59 @@ finally:
     }
 
     #[tokio::test]
+    async fn project_list_pages_every_registered_project() {
+        let parent = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        for index in 0..33 {
+            let root = parent.path().join(index.to_string());
+            std::fs::create_dir(&root).unwrap();
+            registry
+                .add(ProjectIdentity::new(
+                    ProjectId::new(format!("project-{index:02}")).unwrap(),
+                    CanonicalRoot::new(root).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let first: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams::default()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["returned"], 32);
+        assert!(first["truncated"].as_bool().unwrap());
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let second: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams {
+                    cursor: Some(cursor),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let ids = first["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["projects"].as_array().unwrap())
+            .map(|project| project["project_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 33);
+        assert_eq!(ids.first(), Some(&"project-00"));
+        assert_eq!(ids.last(), Some(&"project-32"));
+        assert_eq!(second["returned"], 1);
+        assert!(!second["truncated"].as_bool().unwrap());
+        assert!(second["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
     async fn project_add_applies_project_lsp_configuration() {
         let root = TempDir::new().unwrap();
         std::fs::write(
@@ -4889,7 +6687,7 @@ finally:
         let server = create_test_server();
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -4915,7 +6713,7 @@ finally:
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(
             &server
-                .server_status(Parameters(ProjectListParams {}))
+                .server_status(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -4940,7 +6738,7 @@ finally:
         server.context.project_registry.shutdown_all().await;
         let shutdown_health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -4974,7 +6772,7 @@ finally:
 
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -5008,7 +6806,7 @@ finally:
 
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(ProjectListParams {}))
+                .health(Parameters(DaemonStatusParams {}))
                 .await
                 .unwrap(),
         )
@@ -5068,6 +6866,28 @@ finally:
             "after\n"
         );
 
+        let detail = server
+            .read_applied_edit_result_resource(
+                ProjectId::new("project").unwrap(),
+                PlanId::parse(plan_id.clone()).unwrap(),
+                0,
+                format!("mcpls-edit-result:///project?plan_id={plan_id}&offset_bytes=0"),
+                false,
+            )
+            .await
+            .unwrap();
+        let ReadResourceResponse::Complete(detail) = detail else {
+            panic!("applied detail resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &detail.contents[0] else {
+            panic!("applied detail resource was not text");
+        };
+        let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&page.text).unwrap();
+        assert_eq!(detail["plan_id"], plan_id);
+        assert_eq!(detail["operations"], serde_json::json!(["replace src.rs"]));
+        assert_eq!(detail["unified_diff"], result["unified_diff"]);
+
         let events = server
             .read_project_events_resource(
                 ProjectId::new("project").unwrap(),
@@ -5089,6 +6909,11 @@ finally:
         let event_payload: serde_json::Value = serde_json::from_str(event_text).unwrap();
         assert_eq!(event_payload["project_id"], "project");
         assert_eq!(event_payload["resync_required"], false);
+        assert_eq!(event_payload["retention_floor"], 0);
+        assert_eq!(event_payload["returned_events"], 2);
+        assert_eq!(event_payload["first_sequence"], 1);
+        assert_eq!(event_payload["last_sequence"], 2);
+        assert_eq!(event_payload["next_cursor"], 2);
         assert_eq!(event_payload["events"].as_array().unwrap().len(), 2);
         assert_eq!(event_payload["events"][0]["event"]["kind"], "files_changed");
         assert_eq!(event_payload["events"][1]["event"]["kind"], "edit_applied");
@@ -5107,6 +6932,108 @@ finally:
             std::fs::read_to_string(root.path().join("src.rs")).unwrap(),
             "after\n"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_edit_apply_reports_competing_session_as_retryable() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        std::fs::write(&file, "before\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = |after| {
+            EditPlan::new(
+                project_id.to_string(),
+                vec![FileSnapshot::from_contents(
+                    file.clone(),
+                    SnapshotSource::Disk,
+                    None,
+                    "before\n",
+                    after,
+                )],
+                vec!["replace src.rs".to_owned()],
+                true,
+                std::time::Duration::from_secs(60),
+            )
+            .with_workspace_root(root.path().to_path_buf())
+        };
+        let first = plan("first\n");
+        let second = plan("second\n");
+        let first_id = first.id().as_str().to_owned();
+        let second_id = second.id().as_str().to_owned();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let server = McplsServer::new_with_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            registry.clone(),
+        );
+        let other_session = server.for_session();
+        server
+            .context
+            .remember_plan(PlanId::parse(first_id.clone()).unwrap())
+            .await;
+        other_session
+            .context
+            .remember_plan(PlanId::parse(second_id.clone()).unwrap())
+            .await;
+        let lease = registry.acquire_test_edit_lease(file.clone());
+
+        let busy: serde_json::Value = serde_json::from_str(
+            &other_session
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.to_string(),
+                    plan_id: second_id.clone(),
+                    wait_timeout_ms: Some(0),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(busy["status"], "not_ready");
+        assert_eq!(busy["reason"], "edit_in_progress");
+        assert_eq!(busy["retry"]["action"], "retry_apply");
+        assert_eq!(busy["retry"]["same_plan"], true);
+        assert_eq!(busy["contention"]["scope"], "same_worktree");
+        assert_eq!(
+            busy["contention"]["blocked_paths"],
+            serde_json::json!(["src.rs"])
+        );
+
+        drop(lease);
+        let first: serde_json::Value = serde_json::from_str(
+            &server
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.to_string(),
+                    plan_id: first_id,
+                    wait_timeout_ms: None,
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["status"], "applied");
+
+        let stale: serde_json::Value = serde_json::from_str(
+            &other_session
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.to_string(),
+                    plan_id: second_id,
+                    wait_timeout_ms: None,
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stale["status"], "conflict");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "first\n");
     }
 
     #[tokio::test]
@@ -6067,7 +7994,7 @@ while True:
         )
         .unwrap();
         fs::write(&renamed, "disk diverged from the open document\n").unwrap();
-        server
+        let fresh_range_conflict = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
                 plan_id: fresh_range["plan_id"].as_str().unwrap().to_string(),
@@ -6075,7 +8002,13 @@ while True:
             }))
             .await
             .unwrap();
-        assert_eq!(fs::read_to_string(&renamed).unwrap(), "ranged");
+        let fresh_range_conflict: serde_json::Value =
+            serde_json::from_str(&fresh_range_conflict).unwrap();
+        assert_eq!(fresh_range_conflict["status"], "conflict");
+        assert_eq!(
+            fs::read_to_string(&renamed).unwrap(),
+            "disk diverged from the open document\n"
+        );
         let stale_range = server
             .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
                 project_id: project_id.as_str().to_string(),
@@ -6086,6 +8019,34 @@ while True:
             .unwrap();
         let stale_range: serde_json::Value = serde_json::from_str(&stale_range).unwrap();
         assert_eq!(stale_range["status"], "conflict");
+
+        fs::write(&renamed, "structural\n").unwrap();
+        let retry_range: serde_json::Value = serde_json::from_str(
+            &server
+                .range_format_preview(Parameters(RangeFormatPreviewParams {
+                    project_id: project_id.as_str().to_string(),
+                    file_path: renamed.display().to_string(),
+                    start_line: 1,
+                    start_character: 1,
+                    end_line: 2,
+                    end_character: 1,
+                    tab_size: 4,
+                    insert_spaces: true,
+                    position_encoding: Some("utf-8".to_string()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: project_id.as_str().to_string(),
+                plan_id: retry_range["plan_id"].as_str().unwrap().to_string(),
+                wait_timeout_ms: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "ranged");
 
         let no_range: serde_json::Value = serde_json::from_str(
             &server
@@ -6974,6 +8935,7 @@ while True:
         let result = server
             .get_diagnostics(Parameters(DiagnosticsParams {
                 file_path: file_path.display().to_string(),
+                fresh: false,
                 options: DiagnosticOptions::default(),
             }))
             .await;
@@ -7350,6 +9312,7 @@ while True:
         let server = create_test_server();
         let params = Parameters(DiagnosticsParams {
             file_path: "/test/file.rs".to_string(),
+            fresh: false,
             options: DiagnosticOptions::default(),
         });
 

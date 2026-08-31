@@ -416,14 +416,27 @@ fn parse_response(bytes: &[u8]) -> Value {
     } else {
         body.to_vec()
     };
-    let mut response = decoded
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"data: "))
-        .filter(|line| !line.is_empty())
-        .find_map(|line| {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            serde_json::from_slice::<Value>(line).ok()
-        })
+    let mut event_data = Vec::new();
+    let mut response = None;
+    for raw_line in decoded.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            if !event_data.is_empty() {
+                if let Ok(value) = serde_json::from_slice(&event_data) {
+                    response = Some(value);
+                    break;
+                }
+                event_data.clear();
+            }
+        } else if let Some(data) = line.strip_prefix(b"data:") {
+            if !event_data.is_empty() {
+                event_data.push(b'\n');
+            }
+            event_data.extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
+        }
+    }
+    let mut response = response
+        .or_else(|| serde_json::from_slice(&event_data).ok())
         .or_else(|| serde_json::from_slice::<Value>(&decoded).ok())
         .unwrap_or_else(|| json!({}));
     response["_status"] = json!(status);
@@ -431,6 +444,24 @@ fn parse_response(bytes: &[u8]) -> Value {
         response["_session_id"] = json!(session_id);
     }
     response
+}
+
+#[test]
+fn parse_response_accepts_sse_data_without_a_space() {
+    let response = parse_response(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata:{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ready\":true}}\n\n",
+    );
+
+    assert_eq!(response["result"]["ready"], true);
+}
+
+#[test]
+fn parse_response_reassembles_multiline_sse_data() {
+    let response = parse_response(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":1,\"result\":{\"ready\":true}}\n\n",
+    );
+
+    assert_eq!(response["result"]["ready"], true);
 }
 
 fn decode_chunked(body: &[u8]) -> Vec<u8> {
