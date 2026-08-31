@@ -246,12 +246,20 @@ where
 }
 
 pub fn decode_sse(body: &str) -> Option<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
-        .filter(|line| !line.is_empty())
-        .rev()
-        .find_map(|line| serde_json::from_str(line).ok())
-        .or_else(|| serde_json::from_str(body.trim()).ok())
+    let mut last = None;
+    let mut event = String::new();
+    for line in body.lines().chain(std::iter::once("")) {
+        if let Some(data) = line.strip_prefix("data:") {
+            if !event.is_empty() {
+                event.push('\n');
+            }
+            event.push_str(data.trim_start());
+        } else if line.is_empty() && !event.is_empty() {
+            last = serde_json::from_str(&event).ok().or(last);
+            event.clear();
+        }
+    }
+    last.or_else(|| serde_json::from_str(body.trim()).ok())
 }
 
 pub struct McpClient {
@@ -421,6 +429,12 @@ mod tests {
     }
 
     #[test]
+    fn decodes_multiline_sse_json_event() {
+        let body = "data: stale\n\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":7}\n";
+        assert_eq!(decode_sse(body).and_then(|v| v["id"].as_u64()), Some(7));
+    }
+
+    #[test]
     fn rejects_fallback_only_samples() {
         let error = match validate_process_snapshot(0, 1, 1) {
             Ok(()) => panic!("fallback-only sample was accepted"),
@@ -471,6 +485,8 @@ mod tests {
                 };
                 let body = if request == 1 {
                     String::new()
+                } else if request == 2 {
+                    format!("data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\ndata: {result}}}\n")
                 } else {
                     format!("data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{result}}}\n")
                 };
