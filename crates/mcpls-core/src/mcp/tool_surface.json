@@ -3218,6 +3218,34 @@
             }
           ]
         },
+        "DiagnosticsCacheMetadata": {
+          "description": "Provenance for a cached diagnostics result.",
+          "properties": {
+            "age_ms": {
+              "description": "Age of the cached notification when this result was read.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "document_version": {
+              "description": "Cached document version, when supplied by the language server.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hit": {
+              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "hit",
+            "age_ms"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -3480,6 +3508,17 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiagnosticsCacheMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provenance when this result came from cached diagnostics."
+        },
         "diagnostics": {
           "description": "List of diagnostics for the document.",
           "items": {
@@ -5642,7 +5681,7 @@
   },
   {
     "name": "get_diagnostics",
-    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location.",
+    "description": "Cached-preferred diagnostics for a file. Set fresh=true only when a new analysis is required.",
     "inputSchema": {
       "$defs": {
         "DiagnosticSeverity": {
@@ -5691,6 +5730,11 @@
         "file_path": {
           "description": "Absolute path to the file.",
           "type": "string"
+        },
+        "fresh": {
+          "default": false,
+          "description": "Request fresh analysis instead of using available cached diagnostics.",
+          "type": "boolean"
         },
         "include_generated": {
           "default": true,
@@ -5987,6 +6031,34 @@
             }
           ]
         },
+        "DiagnosticsCacheMetadata": {
+          "description": "Provenance for a cached diagnostics result.",
+          "properties": {
+            "age_ms": {
+              "description": "Age of the cached notification when this result was read.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "document_version": {
+              "description": "Cached document version, when supplied by the language server.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hit": {
+              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "hit",
+            "age_ms"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -6249,6 +6321,17 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiagnosticsCacheMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provenance when this result came from cached diagnostics."
+        },
         "diagnostics": {
           "description": "List of diagnostics for the document.",
           "items": {
@@ -11753,9 +11836,48 @@
             }
           ]
         },
+        "DiagnosticsCacheMetadata": {
+          "description": "Provenance for a cached diagnostics result.",
+          "properties": {
+            "age_ms": {
+              "description": "Age of the cached notification when this result was read.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "document_version": {
+              "description": "Cached document version, when supplied by the language server.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hit": {
+              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "hit",
+            "age_ms"
+          ],
+          "type": "object"
+        },
         "DiagnosticsResult": {
           "description": "Result of a diagnostics request.",
           "properties": {
+            "cache": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DiagnosticsCacheMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Provenance when this result came from cached diagnostics."
+            },
             "diagnostics": {
               "description": "List of diagnostics for the document.",
               "items": {
@@ -14156,9 +14278,48 @@
             }
           ]
         },
+        "DiagnosticsCacheMetadata": {
+          "description": "Provenance for a cached diagnostics result.",
+          "properties": {
+            "age_ms": {
+              "description": "Age of the cached notification when this result was read.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "document_version": {
+              "description": "Cached document version, when supplied by the language server.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hit": {
+              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "hit",
+            "age_ms"
+          ],
+          "type": "object"
+        },
         "DiagnosticsResult": {
           "description": "Result of a diagnostics request.",
           "properties": {
+            "cache": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DiagnosticsCacheMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Provenance when this result came from cached diagnostics."
+            },
             "diagnostics": {
               "description": "List of diagnostics for the document.",
               "items": {

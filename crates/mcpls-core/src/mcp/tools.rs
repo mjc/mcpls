@@ -110,6 +110,9 @@ pub struct DiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
+    /// Request fresh analysis instead of using available cached diagnostics.
+    #[serde(default)]
+    pub fresh: bool,
     /// Filters, grouping behavior, and response bounds.
     #[serde(flatten)]
     pub options: crate::bridge::translator::DiagnosticOptions,

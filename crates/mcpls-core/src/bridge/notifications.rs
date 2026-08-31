@@ -560,6 +560,8 @@ pub struct DiagnosticInfo {
     pub uri: Uri,
     /// Document version when diagnostics were received.
     pub version: Option<i32>,
+    /// UTC time when the diagnostics notification was received.
+    pub received_at: DateTime<Utc>,
     /// List of diagnostics.
     pub diagnostics: Vec<LspDiagnostic>,
 }
@@ -845,6 +847,7 @@ impl NotificationCache {
         let info = DiagnosticInfo {
             uri: uri.clone(),
             version,
+            received_at: Utc::now(),
             diagnostics,
         };
 
@@ -1116,6 +1119,7 @@ mod tests {
         let stored = cache.get_diagnostics(uri.as_str()).unwrap();
         assert_eq!(stored.uri, uri);
         assert_eq!(stored.version, Some(1));
+        assert!(stored.received_at <= Utc::now());
         assert_eq!(stored.diagnostics.len(), 1);
         assert_eq!(stored.diagnostics[0].message, "test error");
     }

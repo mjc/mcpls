@@ -483,6 +483,21 @@ pub struct DiagnosticsResult {
     pub truncated: bool,
     /// Filters and bounds applied to this result.
     pub filters: DiagnosticOptions,
+    /// Provenance when this result came from cached diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<DiagnosticsCacheMetadata>,
+}
+
+/// Provenance for a cached diagnostics result.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DiagnosticsCacheMetadata {
+    /// Cached diagnostics were used instead of a fresh analysis request.
+    pub hit: bool,
+    /// Age of the cached notification when this result was read.
+    pub age_ms: u64,
+    /// Cached document version, when supplied by the language server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
 }
 
 /// Filters and explicit response bounds for diagnostics.
@@ -554,6 +569,7 @@ impl DiagnosticsResult {
             omitted_groups: 0,
             truncated: false,
             filters: DiagnosticOptions::default(),
+            cache: None,
         }
     }
 }

@@ -842,6 +842,13 @@ impl Translator {
     ) -> Result<super::DiagnosticsResult> {
         let uri = Self::cached_diagnostics_uri(&self.workspace_roots, file_path)?;
         let entry = self.actor_notification_cache.get_diagnostics(&uri);
+        let cache = entry.map(|entry| super::DiagnosticsCacheMetadata {
+            hit: true,
+            age_ms: (chrono::Utc::now() - entry.received_at)
+                .num_milliseconds()
+                .max(0) as u64,
+            document_version: entry.version,
+        });
         let encoding = self
             .actor_notification_cache
             .diagnostics_owner(&uri)
@@ -858,7 +865,9 @@ impl Translator {
             &mut budget,
         )
         .await;
-        Ok(Self::finish_diagnostics(result.diagnostics, options))
+        let mut result = Self::finish_diagnostics(result.diagnostics, options);
+        result.cache = cache;
+        Ok(result)
     }
 
     /// Return whether actor-owned diagnostics exist for a workspace file.

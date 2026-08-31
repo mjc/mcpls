@@ -12763,6 +12763,18 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let diagnostics = actor
+            .cached_diagnostics(file.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            diagnostics
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.document_version),
+            None
+        );
+        assert!(diagnostics.cache.as_ref().is_some_and(|cache| cache.hit));
     }
 
     #[tokio::test]

@@ -567,6 +567,7 @@ impl Translator {
             omitted_groups: total_groups.saturating_sub(returned_groups),
             truncated: byte_truncated || returned_groups < total_groups,
             filters: options,
+            cache: None,
         }
     }
 

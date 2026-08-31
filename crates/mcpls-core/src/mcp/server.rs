@@ -2397,21 +2397,37 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Diagnostics for a file. Returns errors, warnings, and hints with severity and location."
+        description = "Cached-preferred diagnostics for a file. Set fresh=true only when a new analysis is required."
     )]
     async fn get_diagnostics(
         &self,
-        Parameters(DiagnosticsParams { file_path, options }): Parameters<DiagnosticsParams>,
+        Parameters(DiagnosticsParams {
+            file_path,
+            fresh,
+            options,
+        }): Parameters<DiagnosticsParams>,
     ) -> Result<Json<crate::bridge::DiagnosticsResult>, McpError> {
         let actor = self
             .context
             .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = actor
-            .diagnostics_with_options(file_path, options)
-            .await
-            .map_err(|error| error.to_string());
+        let cached_available = !fresh
+            && actor
+                .has_cached_diagnostics(file_path.clone())
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let result = if cached_available {
+            actor
+                .cached_diagnostics_with_options(file_path, options)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            actor
+                .diagnostics_with_options(file_path, options)
+                .await
+                .map_err(|error| error.to_string())
+        };
 
         encode_tool_result(result)
     }
@@ -7280,6 +7296,7 @@ while True:
         let result = server
             .get_diagnostics(Parameters(DiagnosticsParams {
                 file_path: file_path.display().to_string(),
+                fresh: false,
                 options: DiagnosticOptions::default(),
             }))
             .await;
@@ -7656,6 +7673,7 @@ while True:
         let server = create_test_server();
         let params = Parameters(DiagnosticsParams {
             file_path: "/test/file.rs".to_string(),
+            fresh: false,
             options: DiagnosticOptions::default(),
         });
 
