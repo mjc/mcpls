@@ -1427,6 +1427,17 @@ pub enum ApplyEditPlanOutcome {
 }
 
 impl AppliedEditPlan {
+    fn estimated_bytes(&self) -> usize {
+        self.complete_unified_diff.len()
+            + self.unified_diff.len()
+            + self.operations.iter().map(String::len).sum::<usize>()
+            + self
+                .provider_synchronization
+                .iter()
+                .map(|result| result.provider.len() + result.message.as_deref().map_or(0, str::len))
+                .sum::<usize>()
+    }
+
     fn project_events(&self) -> [ProjectEvent; 2] {
         [
             ProjectEvent::FilesChanged {
@@ -3663,6 +3674,7 @@ struct ProjectRuntime {
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
     applied_edit_receipts: VecDeque<AppliedEditPlan>,
+    applied_edit_receipt_bytes: usize,
     edit_conflicts: VecDeque<EditConflict>,
     active_edit_workers: usize,
     activation_health: ActivationHealth,
@@ -3703,6 +3715,7 @@ const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
 const MAX_EDIT_ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_APPLIED_EDIT_RECEIPTS: usize = 256;
+const MAX_APPLIED_EDIT_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_RUST_RESIDENCY_LIMIT: usize = 5;
 const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(100),
@@ -4329,6 +4342,7 @@ impl ProjectRuntime {
             deferred_scope,
             inline_module_checks: HashMap::new(),
             applied_edit_receipts: VecDeque::new(),
+            applied_edit_receipt_bytes: 0,
             edit_conflicts: VecDeque::new(),
             active_edit_workers: 0,
             activation_health: ActivationHealth::Ready,
@@ -5298,10 +5312,26 @@ impl ProjectRuntime {
             verification: None,
             provider_synchronization: Vec::new(),
         };
-        if self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS {
-            self.applied_edit_receipts.pop_front();
+        let applied_bytes = applied.estimated_bytes();
+        while self.applied_edit_receipts.len() >= MAX_APPLIED_EDIT_RECEIPTS
+            || self
+                .applied_edit_receipt_bytes
+                .saturating_add(applied_bytes)
+                > MAX_APPLIED_EDIT_RECEIPT_BYTES
+        {
+            let Some(evicted) = self.applied_edit_receipts.pop_front() else {
+                break;
+            };
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_sub(evicted.estimated_bytes());
         }
-        self.applied_edit_receipts.push_back(applied.clone());
+        if applied_bytes <= MAX_APPLIED_EDIT_RECEIPT_BYTES {
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_add(applied_bytes);
+            self.applied_edit_receipts.push_back(applied.clone());
+        }
         drop(lease);
 
         let (provider_synchronization, verification) = self
@@ -5320,7 +5350,13 @@ impl ProjectRuntime {
             .iter_mut()
             .find(|receipt| receipt.plan_id == applied.plan_id)
         {
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_sub(receipt.estimated_bytes());
             *receipt = applied.clone();
+            self.applied_edit_receipt_bytes = self
+                .applied_edit_receipt_bytes
+                .saturating_add(receipt.estimated_bytes());
         }
         Ok(ApplyEditPlanOutcome::Applied(applied))
     }
