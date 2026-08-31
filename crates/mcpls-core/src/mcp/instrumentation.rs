@@ -154,6 +154,8 @@ impl RequestSpan {
             duration_ms = tracing::field::Empty,
             result_bytes = tracing::field::Empty,
             serialization_ms = tracing::field::Empty,
+            actor_queue_ms = tracing::field::Empty,
+            actor_execution_ms = tracing::field::Empty,
             cancelled = tracing::field::Empty,
             success = tracing::field::Empty,
             protocol_error = tracing::field::Empty,

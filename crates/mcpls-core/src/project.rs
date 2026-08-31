@@ -17,6 +17,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::bridge::DeferredResourceReference;
 use crate::bridge::ast_grep::byte_offset_to_position;
@@ -1219,6 +1220,20 @@ struct ProjectRequestSender {
     residency: Option<ProjectResidency>,
 }
 
+struct ProjectRequestTiming {
+    queued_at: Instant,
+    span: tracing::Span,
+}
+
+impl ProjectRequestTiming {
+    fn capture() -> Self {
+        Self {
+            queued_at: Instant::now(),
+            span: tracing::Span::current(),
+        }
+    }
+}
+
 impl ProjectRequestSender {
     #[cfg(test)]
     fn new(sender: mpsc::Sender<ProjectRequest>) -> Self {
@@ -1272,6 +1287,11 @@ impl ProjectRequestSender {
         if !self.gate.is_accepting() {
             return Err(mpsc::error::SendError(request));
         }
+
+        request = ProjectRequest::Timed {
+            request: Box::new(request),
+            timing: ProjectRequestTiming::capture(),
+        };
 
         if let Some(mode) = request.rust_residency_mode()
             && let Some(residency) = &self.residency
@@ -1520,6 +1540,10 @@ pub(crate) struct ResolvedSymbolTarget {
 }
 
 enum ProjectRequest {
+    Timed {
+        request: Box<Self>,
+        timing: ProjectRequestTiming,
+    },
     Resident {
         request: Box<Self>,
         guard: residency::RustResidencyGuard,
@@ -1858,7 +1882,23 @@ impl ProjectRequest {
         }
     }
 
+    fn into_timed(self) -> (Self, ProjectRequestTiming) {
+        match self {
+            Self::Timed { request, timing } => (*request, timing),
+            request => (
+                request,
+                ProjectRequestTiming {
+                    queued_at: Instant::now(),
+                    span: tracing::Span::none(),
+                },
+            ),
+        }
+    }
+
     const fn rust_residency_requirement(&self) -> RustResidencyRequirement {
+        if let Self::Timed { request, .. } = self {
+            return request.rust_residency_requirement();
+        }
         if matches!(
             self,
             Self::Activate { .. }
@@ -1994,6 +2034,7 @@ impl ProjectRequest {
 impl ProjectRequest {
     fn is_cancelled(&self) -> bool {
         match self {
+            Self::Timed { request, .. } => request.is_cancelled(),
             Self::Resident { request, .. } => request.is_cancelled(),
             Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
                 reply.is_closed()
@@ -6996,14 +7037,17 @@ async fn run_project_actor(
 ) {
     while let Some(request) = next_project_request(&mut receiver).await {
         let (request, _residency_guard) = request.into_resident();
+        let (request, timing) = request.into_timed();
         if matches!(&request, ProjectRequest::Shutdown { .. }) {
             while runtime.active_edit_workers > 0 {
                 let Some(next) = next_project_request(&mut receiver).await else {
                     break;
                 };
                 let (next, _residency_guard) = next.into_resident();
-                let stop = handle_project_request(
+                let (next, timing) = next.into_timed();
+                let stop = handle_timed_project_request(
                     next,
+                    timing,
                     &actor_sender,
                     &channels,
                     &mut state,
@@ -7025,8 +7069,9 @@ async fn run_project_actor(
         {
             resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
         }
-        let stop = handle_project_request(
+        let stop = handle_timed_project_request(
             request,
+            timing,
             &actor_sender,
             &channels,
             &mut state,
@@ -7046,6 +7091,30 @@ async fn run_project_actor(
     if let Some(residency) = residency {
         residency.controller.remove(residency.group);
     }
+}
+
+#[allow(clippy::large_futures)]
+async fn handle_timed_project_request(
+    request: ProjectRequest,
+    timing: ProjectRequestTiming,
+    actor_sender: &mpsc::WeakSender<ProjectRequest>,
+    channels: &ProjectActorChannels,
+    state: &mut ProjectState,
+    runtime: &mut ProjectRuntime,
+    residency: Option<&ProjectResidency>,
+) -> bool {
+    timing.span.record(
+        "actor_queue_ms",
+        timing.queued_at.elapsed().as_millis() as u64,
+    );
+    let started = Instant::now();
+    let stop = handle_project_request(request, actor_sender, channels, state, runtime, residency)
+        .instrument(timing.span.clone())
+        .await;
+    timing
+        .span
+        .record("actor_execution_ms", started.elapsed().as_millis() as u64);
+    stop
 }
 
 async fn resume_project_runtime(
@@ -7266,6 +7335,9 @@ async fn handle_project_request(
     };
 
     match request {
+        ProjectRequest::Timed { .. } => {
+            unreachable!("timed request must be unwrapped by the actor loop")
+        }
         ProjectRequest::Resident { .. } => {
             unreachable!("resident request must be unwrapped by the actor loop")
         }
@@ -12221,6 +12293,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_request_sender_attaches_queue_timing_before_enqueue() {
+        let (channel, mut receiver) = mpsc::channel(1);
+        let sender = ProjectRequestSender::new(channel);
+
+        sender
+            .send(ProjectRequest::ServerExited { generation: 0 })
+            .await
+            .unwrap();
+
+        let request = receiver.recv().await.unwrap();
+        let (request, timing) = request.into_timed();
+        assert!(matches!(
+            request,
+            ProjectRequest::ServerExited { generation: 0 }
+        ));
+        assert!(timing.queued_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
     async fn queued_resident_request_pins_group_before_actor_dequeues_it() {
         let controller = RustResidencyController::new(1);
         let (first_channel, mut first_receiver) = mpsc::channel(4);
@@ -14998,9 +15089,10 @@ while True:
         let project_id = ProjectId::new("retry-removal").unwrap();
         let identity =
             ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(root.path()).unwrap());
-        let (sender, mut receiver) = mpsc::channel(2);
+        let (sender, mut receiver) = mpsc::channel::<ProjectRequest>(2);
         tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
+                let (request, _) = request.into_timed();
                 match request {
                     ProjectRequest::PublishEvent { reply, .. }
                     | ProjectRequest::SetStatus { reply, .. } => {
