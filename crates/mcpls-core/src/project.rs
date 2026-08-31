@@ -28,7 +28,10 @@ use crate::bridge::lexical::{
 use crate::bridge::resources::SourceResource;
 use crate::bridge::resources::make_source_uri;
 use crate::bridge::translator::SourceBudget;
-use crate::bridge::translator::{CallHierarchyItemResult, DiagnosticOptions, page_items};
+use crate::bridge::translator::{
+    CallHierarchyItemResult, DiagnosticOptions, SourceUnavailableReason, WorkspaceSymbol,
+    page_items,
+};
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
@@ -3922,6 +3925,82 @@ fn attach_document_symbol_handles(
     }
 }
 
+fn rendered_workspace_symbol_position(
+    rendered: &str,
+    name: &str,
+    range: &crate::bridge::Range,
+) -> Option<(u32, u32)> {
+    (!name.is_empty()).then_some(())?;
+
+    rendered.lines().find_map(|rendered_line| {
+        let (number, text) = rendered_line.split_once(" | ")?;
+        let line = number.trim().parse::<u32>().ok()?;
+        if !(range.start.line..=range.end.line).contains(&line) {
+            return None;
+        }
+        symbol_position_in_line(line, text, name)
+    })
+}
+
+fn source_symbol_position(
+    source: &str,
+    name: &str,
+    range: &crate::bridge::Range,
+) -> Option<(u32, u32)> {
+    source.lines().enumerate().find_map(|(index, text)| {
+        let line = u32::try_from(index).ok()?.saturating_add(1);
+        (range.start.line..=range.end.line)
+            .contains(&line)
+            .then(|| symbol_position_in_line(line, text, name))
+            .flatten()
+    })
+}
+
+fn symbol_position_in_line(line: u32, text: &str, name: &str) -> Option<(u32, u32)> {
+    (!name.is_empty()).then_some(())?;
+    let text = text.trim_start();
+    if text.starts_with("//") || text.starts_with("#") {
+        return None;
+    }
+    text.match_indices(name).find_map(|(offset, _)| {
+        let before = text[..offset].chars().next_back();
+        let after = text[offset + name.len()..].chars().next();
+        if before.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+            && after.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+        {
+            Some((
+                line,
+                u32::try_from(text[..offset].encode_utf16().count()).ok()? + 1,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+#[test]
+fn rendered_workspace_symbol_position_skips_docs_and_declaration_prefixes() {
+    let range = crate::bridge::Range {
+        start: crate::bridge::Position2D {
+            line: 65,
+            character: 1,
+        },
+        end: crate::bridge::Position2D {
+            line: 65,
+            character: 24,
+        },
+    };
+
+    assert_eq!(
+        rendered_workspace_symbol_position(
+            "  64 | /// Adds two values.\n  65 | pub fn add(a: i32, b: i32) -> i32 {\n",
+            "add",
+            &range,
+        ),
+        Some((65, 8)),
+    );
+}
+
 fn missing_call_hierarchy_item() -> crate::bridge::InspectSection<crate::bridge::InspectCalls> {
     crate::bridge::InspectSection::unavailable(
         "call hierarchy provider returned no item at the symbol selection",
@@ -4158,6 +4237,97 @@ impl ProjectRuntime {
         locations
             .into_iter()
             .for_each(|location| self.attach_location_handle(location));
+    }
+
+    async fn attach_workspace_symbol_handle(
+        &self,
+        symbol: &mut WorkspaceSymbol,
+        snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
+    ) {
+        let location = &mut symbol.location;
+        let Some(path) = location.path.as_deref().map(PathBuf::from) else {
+            return;
+        };
+        let (line, character, snapshot) = match &location.source {
+            SourceContext::Available(frame) => {
+                let position =
+                    rendered_workspace_symbol_position(&frame.text, &symbol.name, &location.range)
+                        .unwrap_or((location.range.start.line, location.range.start.character));
+                let snapshot = frame.document_version.map_or_else(
+                    || SourceSnapshot::Hash(frame.content_hash.clone()),
+                    SourceSnapshot::Version,
+                );
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Deferred { resource } => {
+                let snapshot = resource.document_version.map_or_else(
+                    || SourceSnapshot::Hash(resource.snapshot_hash.clone()),
+                    SourceSnapshot::Version,
+                );
+                let position = self
+                    .workspace_symbol_position(&path, &symbol.name, &location.range, snapshots)
+                    .await
+                    .unwrap_or((location.range.start.line, location.range.start.character));
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Unavailable {
+                reason: SourceUnavailableReason::ResponseBudgetExhausted,
+            } => {
+                let Some((document_version, content_hash, source)) =
+                    self.workspace_symbol_snapshot(&path, snapshots).await
+                else {
+                    return;
+                };
+                let position = source_symbol_position(&source, &symbol.name, &location.range)
+                    .unwrap_or((location.range.start.line, location.range.start.character));
+                let snapshot = document_version.map_or_else(
+                    || SourceSnapshot::Hash(content_hash.to_owned()),
+                    SourceSnapshot::Version,
+                );
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Unavailable { .. } => return,
+        };
+        location.symbol_handle = Some(
+            self.symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(path, line, character, snapshot)),
+        );
+    }
+
+    async fn attach_workspace_symbol_handles<'a>(
+        &self,
+        symbols: impl IntoIterator<Item = &'a mut WorkspaceSymbol>,
+    ) {
+        let mut snapshots = HashMap::new();
+        for symbol in symbols {
+            self.attach_workspace_symbol_handle(symbol, &mut snapshots)
+                .await;
+        }
+    }
+
+    async fn workspace_symbol_position(
+        &self,
+        path: &Path,
+        name: &str,
+        range: &crate::bridge::Range,
+        snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
+    ) -> Option<(u32, u32)> {
+        let (_, _, source) = self.workspace_symbol_snapshot(path, snapshots).await?;
+        source_symbol_position(source, name, range)
+    }
+
+    async fn workspace_symbol_snapshot<'a>(
+        &self,
+        path: &Path,
+        snapshots: &'a mut HashMap<PathBuf, (Option<i32>, String, String)>,
+    ) -> Option<&'a (Option<i32>, String, String)> {
+        if !snapshots.contains_key(path) {
+            let (_, version, hash, source) = self.translator.source_snapshot(path).await.ok()?;
+            snapshots.insert(path.to_path_buf(), (version, hash, source));
+        }
+        snapshots.get(path)
     }
 
     fn attach_reference_handle(&self, reference: &mut crate::bridge::ReferenceUse) {
@@ -5340,7 +5510,8 @@ impl ProjectRuntime {
             )
             .await
             .map_err(|error| error.to_string())?;
-        self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
+        self.attach_workspace_symbol_handles(&mut result.symbols)
+            .await;
         Ok(result)
     }
 
@@ -5579,7 +5750,8 @@ impl ProjectRuntime {
             .handle_workspace_symbol_in_path(query, kind_filter, limit, match_mode, scope, path)
             .await
             .map_err(|error| error.to_string())?;
-        self.attach_location_handles(result.symbols.iter_mut().map(|symbol| &mut symbol.location));
+        self.attach_workspace_symbol_handles(&mut result.symbols)
+            .await;
         Ok(result)
     }
 
@@ -11005,6 +11177,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(target.file_path, source.display().to_string());
+        assert_eq!(target.character, 4);
         let other_actor = spawn_project_actor_with_translator(4, Translator::new());
         let isolation_error = other_actor
             .resolve_symbol_handle(handle.clone())
@@ -11015,6 +11188,61 @@ mod tests {
         fs::write(&source, "fn moved_target() {}\n").unwrap();
         let error = actor.resolve_symbol_handle(handle).await.unwrap_err();
         assert!(error.to_string().contains("stale_symbol_handle"));
+    }
+
+    #[tokio::test]
+    async fn deferred_workspace_symbol_handle_targets_the_identifier() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let (_, _, content_hash, _) = translator.source_snapshot(&source).await.unwrap();
+        let runtime = ProjectRuntime::new(translator);
+        let mut symbol = WorkspaceSymbol {
+            name: "add".to_owned(),
+            kind: "Function".to_owned(),
+            location: crate::bridge::Location {
+                path: Some(source.display().to_string()),
+                uri: crate::bridge::path_to_uri(&source).unwrap().to_string(),
+                range: crate::bridge::Range {
+                    start: crate::bridge::Position2D {
+                        line: 1,
+                        character: 1,
+                    },
+                    end: crate::bridge::Position2D {
+                        line: 1,
+                        character: 4,
+                    },
+                },
+                source: SourceContext::Deferred {
+                    resource: crate::bridge::translator::DeferredResourceReference {
+                        uri: "mcpls-source://test".to_owned(),
+                        kind: "source_context".to_owned(),
+                        snapshot_hash: content_hash,
+                        document_version: None,
+                        total_bytes: None,
+                    },
+                },
+                symbol_handle: None,
+            },
+            container_name: None,
+            match_class: crate::bridge::translator::WorkspaceSymbolMatch::Exact,
+            score: 100,
+            project_relative_path: Some("lib.rs".to_owned()),
+            origin: crate::bridge::translator::WorkspaceSymbolOrigin::ProjectLocal,
+            is_generated: false,
+        };
+
+        runtime
+            .attach_workspace_symbol_handle(&mut symbol, &mut HashMap::new())
+            .await;
+        let target = runtime
+            .resolve_symbol_target(symbol.location.symbol_handle.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!((target.line, target.character), (1, 8));
     }
 
     #[tokio::test]
