@@ -4762,6 +4762,7 @@ finally:
             "MCPLS-first",
             "workspace_symbol_search",
             "workspace_symbol_search_batch",
+            "lexical_search",
             "inspect_symbol",
             "inspect_symbol_batch",
             "ast-grep/SSR",
