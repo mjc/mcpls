@@ -1427,6 +1427,22 @@ pub enum ApplyEditPlanOutcome {
 }
 
 impl AppliedEditPlan {
+    fn detail_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "plan_id": self.plan_id.as_str(),
+            "operations": self.operations,
+            "unified_diff": self.complete_unified_diff,
+            "committed_files": self.committed_files,
+            "verification": self.verification.map(VerificationStatus::as_str),
+            "provider_synchronization": self.provider_synchronization.iter().map(|result| serde_json::json!({
+                "provider": result.provider,
+                "synchronized": result.synchronized,
+                "watched_file_notifications": result.watched_file_notifications,
+                "message": result.message,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     fn estimated_bytes(&self) -> usize {
         self.complete_unified_diff.len()
             + self.unified_diff.len()
@@ -5007,7 +5023,9 @@ impl ProjectRuntime {
                 .applied_edit_receipts
                 .iter()
                 .find(|receipt| &receipt.plan_id == plan_id)
-                .map(|receipt| receipt.complete_unified_diff.clone())
+                .map(|receipt| serde_json::to_string(&receipt.detail_json()))
+                .transpose()
+                .map_err(|serialization| serialization.to_string())?
                 .ok_or_else(|| error.to_string()),
         }
     }
