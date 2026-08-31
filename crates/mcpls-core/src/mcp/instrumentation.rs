@@ -73,17 +73,22 @@ fn completed_tool_result_metrics(
     };
     let value = result.structured_content.as_ref()?;
     let object = value.as_object()?;
-    let item_count = ["returned", "returned_items", "returned_lines"]
-        .into_iter()
-        .find_map(|name| object.get(name).and_then(serde_json::Value::as_u64))
-        .and_then(|count| usize::try_from(count).ok())
-        .or_else(|| {
-            ["items", "matches", "diagnostics"]
-                .into_iter()
-                .find_map(|name| object.get(name).and_then(serde_json::Value::as_array))
-                .map(Vec::len)
-        })
-        .unwrap_or_default();
+    let item_count = [
+        "returned",
+        "returned_items",
+        "returned_lines",
+        "returned_diagnostics",
+    ]
+    .into_iter()
+    .find_map(|name| object.get(name).and_then(serde_json::Value::as_u64))
+    .and_then(|count| usize::try_from(count).ok())
+    .or_else(|| {
+        ["items", "matches", "diagnostics"]
+            .into_iter()
+            .find_map(|name| object.get(name).and_then(serde_json::Value::as_array))
+            .map(Vec::len)
+    })
+    .unwrap_or_default();
     let mut metrics = ToolResultMetrics {
         cache_hit: object
             .get("cache_hit")
@@ -831,6 +836,21 @@ mod tests {
         assert_eq!(
             completed_tool_result_metrics(&result).unwrap().cache_hit,
             Some(true)
+        );
+    }
+
+    #[test]
+    fn completed_tool_result_metrics_prefers_reported_diagnostic_count() {
+        let mut payload = rmcp::model::CallToolResult::success(Vec::new());
+        payload.structured_content = Some(serde_json::json!({
+            "diagnostics": [{"occurrence_count": 4}],
+            "returned_diagnostics": 4
+        }));
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload));
+
+        assert_eq!(
+            completed_tool_result_metrics(&result).unwrap().item_count,
+            4
         );
     }
 }
