@@ -789,8 +789,7 @@ fn wait_project_ready(client: &mut HttpClient, project_id: &str) {
 }
 
 fn project_ids(client: &mut HttpClient) -> Vec<String> {
-    client
-        .call_tool("project_list", json!({}))
+    client.call_tool("project_list", json!({}))["projects"]
         .as_array()
         .unwrap()
         .iter()

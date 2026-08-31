@@ -240,7 +240,9 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
             report.deferred_resource_reads += usize::from(*deferred);
             latencies.push(*latency_ms);
         }
-        TraceEvent::SourceRead { output_bytes, .. } => report.source_read_output_bytes += output_bytes,
+        TraceEvent::SourceRead { output_bytes, .. } => {
+            report.source_read_output_bytes += output_bytes
+        }
         TraceEvent::ShellOutput { bytes } => report.shell_output_bytes += bytes,
         TraceEvent::Compaction => report.compactions += 1,
         TraceEvent::Semantic { .. } => {}
