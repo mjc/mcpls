@@ -33,8 +33,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
-    DeferredResource, SessionResource, event_resource_uris, parse_session_resource_uri,
-    project_event_resource_uri, project_events_resource_uri, project_status_resource_uri,
+    DeferredResource, SessionResource, edit_diff_resource_uri, event_resource_uris,
+    parse_session_resource_uri, project_event_resource_uri, project_events_resource_uri,
+    project_status_resource_uri,
 };
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
@@ -127,6 +128,61 @@ fn deferred_resource_page(
         }
         end = next_end;
         while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+}
+
+fn edit_diff_resource_page(
+    project_id: &ProjectId,
+    plan_id: &PlanId,
+    offset_bytes: usize,
+    diff: &str,
+) -> Result<SemanticResourceReadResult, McpError> {
+    if offset_bytes > diff.len() || !diff.is_char_boundary(offset_bytes) {
+        return Err(McpError::invalid_params(
+            "invalid edit diff offset; restart from the original URI",
+            None,
+        ));
+    }
+
+    let total_bytes = diff.len();
+    let snapshot_hash = format!("{:x}", Sha256::digest(diff.as_bytes()));
+    let mut end = (offset_bytes + MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2).min(total_bytes);
+    while end > offset_bytes && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let uri = edit_diff_resource_uri(project_id, plan_id, offset_bytes);
+        let next_uri =
+            (end < total_bytes).then(|| edit_diff_resource_uri(project_id, plan_id, end));
+        let result = SemanticResourceReadResult {
+            uri,
+            mime_type: "text/x-diff".to_owned(),
+            text: diff[offset_bytes..end].to_owned(),
+            next_uri,
+            total_bytes: Some(total_bytes),
+            offset_bytes: Some(offset_bytes),
+            returned_bytes: Some(end - offset_bytes),
+            remaining_bytes: Some(total_bytes - end),
+            snapshot_hash: Some(snapshot_hash.clone()),
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len()
+            <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+        {
+            return Ok(result);
+        }
+        let next_end = offset_bytes + (end - offset_bytes) / 2;
+        if next_end == offset_bytes {
+            return Err(McpError::internal_error(
+                "edit diff resource metadata exceeds the response budget",
+                None,
+            ));
+        }
+        end = next_end;
+        while !diff.is_char_boundary(end) {
             end -= 1;
         }
     }
@@ -899,6 +955,15 @@ fn preview_artifact_json(result: &PreviewArtifact, project_id: &str) -> serde_js
     if let Some(producer) = result.producer {
         value["producer"] = serde_json::json!(producer.as_str());
     }
+    if result.plan.diff_truncated() {
+        value["diff_resource"] = serde_json::json!({
+            "uri": format!(
+                "mcpls-edit-diff:///{project_id}?plan_id={}&offset_bytes=0",
+                result.plan.id().as_str(),
+            ),
+            "mime_type": "text/x-diff",
+        });
+    }
     value
 }
 
@@ -1377,6 +1442,40 @@ impl McplsServer {
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_edit_diff_resource(
+        &self,
+        project_id: ProjectId,
+        plan_id: PlanId,
+        offset_bytes: usize,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.context.owns_plan(&plan_id).await {
+            return Err(McpError::invalid_params(
+                "edit plan is not owned by this MCP session",
+                None,
+            ));
+        }
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let diff = actor
+            .read_edit_plan_diff(plan_id.clone(), project_id.as_str().to_owned())
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let page = edit_diff_resource_page(&project_id, &plan_id, offset_bytes, &diff)?;
+        let text = serde_json::to_string(&page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(text, uri)],
             supports_cache_hints,
         )
         .into())
@@ -3525,7 +3624,8 @@ impl McplsServer {
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
             | SessionResource::ProjectEvents { .. }
-            | SessionResource::ProjectEvent { .. } => {
+            | SessionResource::ProjectEvent { .. }
+            | SessionResource::EditDiff { .. } => {
                 return Err(McpError::invalid_params(
                     "read_semantic_resource accepts only mcpls-source:// or mcpls-deferred:// references",
                     None,
@@ -3694,6 +3794,12 @@ impl McplsServer {
                 SessionResource::Deferred(_) => {
                     return Err(McpError::invalid_params(
                         "deferred semantic resources are readable but not subscribable",
+                        None,
+                    ));
+                }
+                SessionResource::EditDiff { .. } => {
+                    return Err(McpError::invalid_params(
+                        "edit diff resources are readable but not subscribable",
                         None,
                     ));
                 }
@@ -3891,6 +3997,21 @@ impl ServerHandler for McplsServer {
                     )
                     .await;
             }
+            SessionResource::EditDiff {
+                project_id,
+                plan_id,
+                offset_bytes,
+            } => {
+                return self
+                    .read_edit_diff_resource(
+                        project_id,
+                        plan_id,
+                        offset_bytes,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => {
                 return self
@@ -4028,6 +4149,12 @@ impl ServerHandler for McplsServer {
                 .await?;
                 return Ok(());
             }
+            SessionResource::EditDiff { .. } => {
+                return Err(McpError::invalid_params(
+                    "edit diff resources are readable but not subscribable",
+                    None,
+                ));
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => source.path,
             SessionResource::Deferred(_) => {
@@ -4083,6 +4210,7 @@ impl ServerHandler for McplsServer {
             SessionResource::ProjectEvent { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
+            SessionResource::EditDiff { .. } => request.uri,
             SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
             | SessionResource::Source(_)
@@ -4395,6 +4523,98 @@ mod tests {
         assert_eq!(value["unsupported"][0], "unsupported");
         assert_eq!(value["preconditions"].as_array().unwrap().len(), 1);
         assert_eq!(value["safe_to_apply"], false);
+        assert_eq!(
+            value["diff_resource"]["uri"],
+            format!(
+                "mcpls-edit-diff:///project?plan_id={}&offset_bytes=0",
+                artifact.plan.id().as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_diff_resource_pages_the_complete_plan_diff_for_its_owner() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(1);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = EditPlan::new(
+            "project".to_owned(),
+            vec![FileSnapshot::from_contents(
+                root.path().join("huge.rs"),
+                SnapshotSource::Disk,
+                None,
+                numbered_lines("old line", 5_000),
+                numbered_lines("new line", 5_000),
+            )],
+            vec!["text huge.rs".to_owned()],
+            true,
+            std::time::Duration::from_secs(60),
+        );
+        let expected = plan.complete_unified_diff();
+        assert!(plan.diff_truncated());
+        let plan_id = plan.id().clone();
+        actor.store_edit_plan(plan).await.unwrap();
+
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        server.context.remember_plan(plan_id.clone()).await;
+        let mut offset_bytes = 0;
+        let mut recovered = String::new();
+        for _ in 0..32 {
+            let uri = edit_diff_resource_uri(&project_id, &plan_id, offset_bytes);
+            let response = server
+                .read_edit_diff_resource(
+                    project_id.clone(),
+                    plan_id.clone(),
+                    offset_bytes,
+                    uri,
+                    false,
+                )
+                .await
+                .unwrap();
+            let ReadResourceResponse::Complete(response) = response else {
+                panic!("edit diff resource unexpectedly requested input");
+            };
+            let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+                panic!("edit diff resource was not text");
+            };
+            let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            assert_eq!(page.offset_bytes, Some(offset_bytes));
+            recovered.push_str(&page.text);
+            let Some(next_uri) = page.next_uri else {
+                break;
+            };
+            let SessionResource::EditDiff {
+                offset_bytes: next, ..
+            } = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("edit diff continuation was not an edit diff resource");
+            };
+            offset_bytes = next;
+        }
+        assert_eq!(recovered, expected);
+
+        let other_session = server.for_session();
+        let error = other_session
+            .read_edit_diff_resource(
+                project_id,
+                plan_id,
+                0,
+                "mcpls-edit-diff:///project?plan_id=unowned&offset_bytes=0".to_owned(),
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not owned by this MCP session"));
     }
 
     #[tokio::test]

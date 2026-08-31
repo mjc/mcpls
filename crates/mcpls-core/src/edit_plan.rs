@@ -470,6 +470,16 @@ impl EditPlan {
         &self.unified_diff
     }
 
+    /// Render the complete unified diff from the immutable plan snapshots.
+    ///
+    /// The preview keeps only a bounded prefix inline, but the stored before
+    /// and after snapshots remain the source of truth for a lossless resource
+    /// read during the plan's lifetime.
+    #[must_use]
+    pub fn complete_unified_diff(&self) -> String {
+        render_complete_unified_diff(&self.files)
+    }
+
     /// Return complete per-file line counts, even when rendered diff text was truncated.
     #[must_use]
     pub fn diff_files(&self) -> &[FileDiffSummary] {
@@ -1135,37 +1145,66 @@ fn render_unified_diff(files: &[FileSnapshot]) -> (String, Vec<FileDiffSummary>,
         if snapshot.original_content == snapshot.planned_content {
             continue;
         }
-        let mut config = TextDiff::configure();
-        config.deadline(deadline);
-        let diff = config.diff_lines(&snapshot.original_content, &snapshot.planned_content);
-        let mut additions = 0;
-        let mut deletions = 0;
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Insert => additions += 1,
-                ChangeTag::Delete => deletions += 1,
-                ChangeTag::Equal => {}
-            }
-        }
-        summaries.push(FileDiffSummary {
-            path: snapshot.path.clone(),
-            additions,
-            deletions,
-        });
+        let (summary, file_diff) = render_file_diff(snapshot, Some(deadline));
+        summaries.push(summary);
 
         if truncated {
             continue;
         }
-        let path = snapshot.path.to_string_lossy();
-        let file_diff = diff
-            .unified_diff()
-            .context_radius(3)
-            .header(&path, &path)
-            .to_string();
         truncated = append_bounded_diff(&mut rendered, &file_diff);
     }
 
     (rendered, summaries, truncated)
+}
+
+fn render_complete_unified_diff(files: &[FileSnapshot]) -> String {
+    let mut rendered = String::new();
+    let deadline = Instant::now() + MAX_DIFF_COMPUTE_TIME;
+    for snapshot in files {
+        if snapshot.original_content == snapshot.planned_content {
+            continue;
+        }
+        let (_, file_diff) = render_file_diff(snapshot, Some(deadline));
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&file_diff);
+    }
+    rendered
+}
+
+fn render_file_diff(
+    snapshot: &FileSnapshot,
+    deadline: Option<Instant>,
+) -> (FileDiffSummary, String) {
+    let mut config = TextDiff::configure();
+    if let Some(deadline) = deadline {
+        config.deadline(deadline);
+    }
+    let diff = config.diff_lines(&snapshot.original_content, &snapshot.planned_content);
+    let mut additions = 0;
+    let mut deletions = 0;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => additions += 1,
+            ChangeTag::Delete => deletions += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    let path = snapshot.path.to_string_lossy();
+    let file_diff = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&path, &path)
+        .to_string();
+    (
+        FileDiffSummary {
+            path: snapshot.path.clone(),
+            additions,
+            deletions,
+        },
+        file_diff,
+    )
 }
 
 fn append_bounded_diff(rendered: &mut String, file_diff: &str) -> bool {

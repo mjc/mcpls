@@ -1829,6 +1829,11 @@ enum ProjectRequest {
         project_id: String,
         reply: oneshot::Sender<Result<crate::edit_plan::EditPlanApprovalSummary, String>>,
     },
+    ReadEditPlanDiff {
+        plan_id: PlanId,
+        project_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     ApplyEditPlan {
         plan_id: PlanId,
         project_id: String,
@@ -2136,6 +2141,7 @@ impl ProjectRequest {
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
+            Self::ReadEditPlanDiff { reply, .. } => reply.is_closed(),
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
@@ -3419,6 +3425,27 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::InspectEditPlan {
+                plan_id,
+                project_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Read the complete immutable unified diff for one retained edit plan.
+    pub(crate) async fn read_edit_plan_diff(
+        &self,
+        plan_id: PlanId,
+        project_id: String,
+    ) -> Result<String, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::ReadEditPlanDiff {
                 plan_id,
                 project_id,
                 reply,
@@ -4954,6 +4981,13 @@ impl ProjectRuntime {
         self.edit_plans
             .get_for_project(plan_id, project_id)
             .map(EditPlan::approval_summary)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_edit_plan_diff(&self, plan_id: &PlanId, project_id: &str) -> Result<String, String> {
+        self.edit_plans
+            .get_for_project(plan_id, project_id)
+            .map(EditPlan::complete_unified_diff)
             .map_err(|error| error.to_string())
     }
 
@@ -8208,6 +8242,13 @@ async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.inspect_edit_plan(&plan_id, &project_id));
+        }
+        ProjectRequest::ReadEditPlanDiff {
+            plan_id,
+            project_id,
+            reply,
+        } => {
+            let _ = reply.send(runtime.read_edit_plan_diff(&plan_id, &project_id));
         }
         ProjectRequest::ApplyEditPlan {
             plan_id,
