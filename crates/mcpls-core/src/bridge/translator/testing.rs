@@ -2,9 +2,10 @@
 //! submodules: an `EncodingCtx` builder, a fake in-process LSP server driven
 //! over `cat` pipes, and JSON-RPC framing helpers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -36,6 +37,7 @@ pub(super) fn test_ctx_with(encoding: PositionEncoding) -> EncodingCtx {
             ResourceLimits::default(),
             HashMap::new(),
         )),
+        approved_source_paths: Arc::new(StdMutex::new(HashSet::new())),
     }
 }
 

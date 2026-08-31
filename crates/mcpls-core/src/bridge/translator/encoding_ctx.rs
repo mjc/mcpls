@@ -1,7 +1,9 @@
 //! Per-response position/range encoding conversion between MCP's 1-based
 //! UTF-16 columns and an LSP server's negotiated encoding.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use super::dto::{Position2D, Range};
 use crate::bridge::DocumentTracker;
@@ -26,6 +28,8 @@ pub(super) struct EncodingCtx {
     /// actually sent the server via `didOpen`/`didChange` -- consulted
     /// before falling back to disk. See [`read_line_text`].
     pub(super) tracker: Arc<DocumentTracker>,
+    /// Canonical read-only files returned by the active LSP.
+    pub(super) approved_source_paths: Arc<StdMutex<HashSet<PathBuf>>>,
 }
 
 /// Text of the 0-based `line`'th line of the file at `uri`, or `None` if it
@@ -212,6 +216,7 @@ mod tests {
         let ctx = EncodingCtx {
             encoding: PositionEncoding::Utf8,
             tracker,
+            approved_source_paths: Arc::new(StdMutex::new(HashSet::new())),
         };
         let lsp_pos = ctx.to_lsp(&uri, 1, 3).await;
         assert_eq!(

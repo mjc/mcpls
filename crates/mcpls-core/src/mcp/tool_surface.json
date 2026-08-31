@@ -16353,6 +16353,502 @@
     }
   },
   {
+    "name": "lexical_search",
+    "description": "Bounded project lexical search over current document snapshots. Literal and Rust-regex modes preserve exact byte ranges; ignored and generated paths are excluded unless explicitly requested.",
+    "inputSchema": {
+      "$defs": {
+        "LexicalCaseMode": {
+          "description": "Case behavior for a lexical query.",
+          "oneOf": [
+            {
+              "const": "sensitive",
+              "description": "Match exact case.",
+              "type": "string"
+            },
+            {
+              "const": "insensitive",
+              "description": "Ignore case.",
+              "type": "string"
+            },
+            {
+              "const": "smart",
+              "description": "Ignore case unless the query contains an uppercase character.",
+              "type": "string"
+            }
+          ]
+        },
+        "LexicalMatchMode": {
+          "description": "Matching interpretation for a lexical query.",
+          "oneOf": [
+            {
+              "const": "literal",
+              "description": "Treat the query as literal text.",
+              "type": "string"
+            },
+            {
+              "const": "regex",
+              "description": "Interpret the query with Rust regex syntax.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "case": {
+          "$ref": "#/$defs/LexicalCaseMode",
+          "description": "Case sensitivity behavior."
+        },
+        "context_lines": {
+          "default": 0,
+          "description": "Context lines around each match; zero returns references only.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exclude_paths": {
+          "default": [],
+          "description": "Project-relative globs to exclude after inclusion.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_generated": {
+          "default": false,
+          "description": "Include generated/build-output files.",
+          "type": "boolean"
+        },
+        "include_paths": {
+          "default": [],
+          "description": "Optional project-relative globs to include.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_bytes": {
+          "default": 65536,
+          "description": "Maximum serialized structured response bytes (default: 65536).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_files": {
+          "default": 1024,
+          "description": "Maximum project files inspected (default: 1024).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_matches": {
+          "default": 100,
+          "description": "Maximum matches returned (default: 100).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/LexicalMatchMode",
+          "description": "Interpret `query` literally or as a Rust regex."
+        },
+        "multiline": {
+          "default": false,
+          "description": "Enable multiline regex anchors.",
+          "type": "boolean"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Decimal offset returned by a prior lexical-search `next_cursor`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "description": "Registered project identifier whose snapshots should be searched.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Literal text or Rust regex to find.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "query",
+        "mode",
+        "case"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
+        "LexicalSearchMatch": {
+          "description": "One snapshot-bound lexical match, retaining byte offsets until the MCP\nboundary chooses its negotiated position encoding.",
+          "properties": {
+            "byte_range": {
+              "$ref": "#/$defs/Range_of_uint",
+              "description": "UTF-8 byte range within the returned snapshot."
+            },
+            "content_hash": {
+              "description": "Content hash of the snapshot searched.",
+              "type": "string"
+            },
+            "document_version": {
+              "description": "Open-document version when this came from an unsaved document.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "project_relative_path": {
+              "description": "Canonical project-relative path.",
+              "type": "string"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceContext"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional bounded inline context around the match."
+            },
+            "source_uri": {
+              "description": "Snapshot-bound source resource for the exact match range.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "project_relative_path",
+            "content_hash",
+            "source_uri",
+            "byte_range"
+          ],
+          "type": "object"
+        },
+        "Position2D": {
+          "description": "Position in a document (1-based for MCP).",
+          "properties": {
+            "character": {
+              "description": "Character offset (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "line": {
+              "description": "Line number (1-based).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line",
+            "character"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "description": "Range in a document (1-based for MCP).",
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/Position2D",
+              "description": "End position."
+            },
+            "start": {
+              "$ref": "#/$defs/Position2D",
+              "description": "Start position."
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "Range_of_uint": {
+          "properties": {
+            "end": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "SourceContext": {
+          "description": "Source context attached to a semantic result location.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceFrame",
+              "description": "The source was safely resolved.",
+              "properties": {
+                "status": {
+                  "const": "available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The source exists but was omitted from the bounded response.",
+              "properties": {
+                "resource": {
+                  "$ref": "#/$defs/DeferredResourceReference",
+                  "description": "Direct snapshot-bound resource for the omitted source."
+                },
+                "status": {
+                  "const": "deferred",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The source could not be safely resolved.",
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceUnavailableReason",
+                  "description": "Stable machine-readable reason."
+                },
+                "status": {
+                  "const": "unavailable",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceFrame": {
+          "description": "A bounded, line-numbered source excerpt.",
+          "properties": {
+            "content_hash": {
+              "description": "SHA-256 of the exact content used for this frame.",
+              "type": "string"
+            },
+            "document_version": {
+              "description": "Open-document version, when the frame came from actor-owned state.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "highlighted_range": {
+              "$ref": "#/$defs/Range",
+              "description": "Normalized semantic result range highlighted within the source window."
+            },
+            "language_id": {
+              "description": "Language identifier when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Canonical filesystem path.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Inclusive 1-based line window covered by `text`."
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Direct resource for the complete selected context when this frame is bounded."
+            },
+            "returned_bytes": {
+              "description": "Number of source bytes returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_lines": {
+              "description": "Number of source lines returned.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "text": {
+              "description": "Line-numbered source text.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Number of source bytes available in the selected line window.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_lines": {
+              "description": "Number of source lines in the resolved snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether a line or byte budget shortened the frame.",
+              "type": "boolean"
+            },
+            "uri": {
+              "description": "Canonical file URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "uri",
+            "range",
+            "highlighted_range",
+            "text",
+            "content_hash",
+            "returned_lines",
+            "total_lines",
+            "returned_bytes",
+            "total_bytes",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "SourceUnavailableReason": {
+          "description": "Stable reasons source text is unavailable.",
+          "oneOf": [
+            {
+              "const": "non_file_uri",
+              "description": "The LSP returned a URI other than `file:`.",
+              "type": "string"
+            },
+            {
+              "const": "outside_approved_roots",
+              "description": "The path is outside registered workspace and approved source roots.",
+              "type": "string"
+            },
+            {
+              "const": "not_found",
+              "description": "The tracked or on-disk source no longer exists.",
+              "type": "string"
+            },
+            {
+              "const": "unreadable",
+              "description": "The source could not be read as UTF-8 text.",
+              "type": "string"
+            },
+            {
+              "const": "response_budget_exhausted",
+              "description": "The response-wide source budget was exhausted.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "matches": {
+          "description": "Compact identities returned on this page.",
+          "items": {
+            "$ref": "#/$defs/LexicalSearchMatch"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Decimal offset for the next page, when `truncated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Number of identities in `matches`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "Whether another page is available.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "matches",
+        "returned",
+        "truncated"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "name": "move_inline_module_preview",
     "description": "Preview moving a top-level inline Rust module to its own file using the project's current document state. Prefers rust-analyzer's native move_module_to_file edit and falls back to MCPLS's structural ast-grep refactor when unavailable; the response reports the selected producer. Supports raw and Unicode Rust identifiers. File-relative include/path constructs and ambiguous or nested modules fail closed. Apply the returned plan with workspace_edit_apply.",
     "inputSchema": {

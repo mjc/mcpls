@@ -77,6 +77,20 @@ pub(crate) struct LexicalSearchMatch {
     pub byte_range: Range<usize>,
 }
 
+/// One bounded lexical-search page with deterministic continuation metadata.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct LexicalSearchResult {
+    /// Compact identities returned on this page.
+    pub matches: Vec<LexicalSearchMatch>,
+    /// Number of identities in `matches`.
+    pub returned: usize,
+    /// Whether another page is available.
+    pub truncated: bool,
+    /// Decimal offset for the next page, when `truncated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// Find every non-overlapping match using the selected lexical semantics.
 ///
 /// Regex mode uses the Rust `regex` dialect; multiline enables line anchors

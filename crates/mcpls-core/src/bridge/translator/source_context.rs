@@ -7,6 +7,7 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::DocumentTracker;
+use crate::bridge::lock_std;
 use crate::bridge::resources::{SourceResource, make_source_uri};
 use crate::bridge::state::{path_to_uri, uri_to_path};
 use crate::error::Result;
@@ -252,6 +253,18 @@ fn numbered_line_bytes(line_number: usize, line: &str) -> usize {
 }
 
 impl EncodingCtx {
+    fn approved_source_paths(&self, uri: &lsp_types::Uri) -> Vec<PathBuf> {
+        if let Some(path) = uri_to_path(uri)
+            && let Ok(path) = dunce::canonicalize(path)
+        {
+            lock_std(&self.approved_source_paths).insert(path);
+        }
+        lock_std(&self.approved_source_paths)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub(super) async fn source_context(
         &self,
         workspace_roots: &[PathBuf],
@@ -259,7 +272,16 @@ impl EncodingCtx {
         range: Range,
         budget: &mut SourceBudget,
     ) -> SourceContext {
-        resolve_source_context(&self.tracker, workspace_roots, &[], uri, range, budget).await
+        let approved = self.approved_source_paths(uri);
+        resolve_source_context(
+            &self.tracker,
+            workspace_roots,
+            &approved,
+            uri,
+            range,
+            budget,
+        )
+        .await
     }
 
     pub(super) async fn source_context_with_max_lines(
@@ -270,10 +292,11 @@ impl EncodingCtx {
         budget: &mut SourceBudget,
         max_lines: usize,
     ) -> SourceContext {
+        let approved = self.approved_source_paths(uri);
         resolve_source_context_with_max_lines(
             &self.tracker,
             workspace_roots,
-            &[],
+            &approved,
             uri,
             range,
             budget,
@@ -315,6 +338,23 @@ fn source_snapshot_matches(
 }
 
 impl super::Translator {
+    fn validate_source_resource_path(&self, path: &Path) -> Result<PathBuf> {
+        self.validate_path(path).or_else(|_| {
+            let path = dunce::canonicalize(path).map_err(|source| crate::error::Error::FileIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if lock_std(&self.approved_source_paths).contains(&path) {
+                Ok(path)
+            } else {
+                Err(crate::error::Error::PathOutsideWorkspace(path))
+            }
+        })
+    }
+
+    pub(crate) fn source_path_is_authorized(&self, path: &Path) -> bool {
+        self.validate_source_resource_path(path).is_ok()
+    }
     pub(crate) async fn lexical_source_context(
         &self,
         path: &Path,
@@ -341,8 +381,8 @@ impl super::Translator {
         &self,
         resource: &SourceResource,
     ) -> Result<SourceFrame> {
-        let (path, document_version, content_hash, content) =
-            self.source_snapshot(&resource.path).await?;
+        let path = self.validate_source_resource_path(&resource.path)?;
+        let (path, document_version, content_hash, content) = self.source_snapshot_at(path).await?;
         let uri = path_to_uri(&path)?;
         let range = Range {
             start: super::dto::Position2D {
@@ -402,6 +442,13 @@ impl super::Translator {
         path: &Path,
     ) -> crate::error::Result<(PathBuf, Option<i32>, String, String)> {
         let path = self.validate_path(path)?;
+        self.source_snapshot_at(path).await
+    }
+
+    async fn source_snapshot_at(
+        &self,
+        path: PathBuf,
+    ) -> crate::error::Result<(PathBuf, Option<i32>, String, String)> {
         if let Some(document) = self.document_tracker.get(&path) {
             let content = document.content().to_owned();
             return Ok((
@@ -766,6 +813,40 @@ mod tests {
         )
         .await;
         assert!(matches!(source, SourceContext::Deferred { .. }));
+    }
+
+    #[tokio::test]
+    async fn lsp_discovered_dependency_source_is_read_only_but_replayable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dependency = tempfile::tempdir().unwrap();
+        let path = dependency.path().join("lib.rs");
+        tokio::fs::write(&path, "pub fn dependency() {}\n")
+            .await
+            .unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![workspace.path().to_path_buf()]);
+        let uri = path_to_uri(&path).unwrap();
+        let mut budget = SourceBudget::default();
+        let source = translator
+            .encoding_ctx(&crate::config::ServerId::from("active"))
+            .source_context(translator.workspace_roots(), &uri, range(1), &mut budget)
+            .await;
+        assert!(matches!(source, SourceContext::Available(_)));
+        let resource = SourceResource {
+            path: path.clone(),
+            start_line: 1,
+            start_character: 1,
+            end_line: 1,
+            end_character: 22,
+            snapshot_hash: "stale".to_owned(),
+            document_version: None,
+        };
+
+        let frame = translator.read_source_resource(&resource).await.unwrap();
+
+        assert!(frame.text.contains("dependency"));
+        assert!(translator.validate_path(&path).is_err());
     }
 
     #[tokio::test]

@@ -86,6 +86,9 @@ pub struct Translator {
     /// Allowed workspace roots for path validation. Read-only after `serve()`
     /// setup, so no lock is needed.
     workspace_roots: Arc<Vec<PathBuf>>,
+    /// Canonical dependency files surfaced by an active language server.
+    /// These are readable through source resources but never editable paths.
+    approved_source_paths: Arc<StdMutex<HashSet<PathBuf>>>,
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
     extension_map: Arc<HashMap<String, String>>,
@@ -168,6 +171,7 @@ impl Translator {
             )),
             resource_limits: ResourceLimits::default(),
             workspace_roots: Arc::new(Vec::new()),
+            approved_source_paths: Arc::new(StdMutex::new(HashSet::new())),
             extension_map: Arc::new(HashMap::new()),
             expected_servers: Arc::new(StdMutex::new(HashSet::new())),
             router: Arc::new(StdMutex::new(ToolRouter::default())),
@@ -280,6 +284,7 @@ impl Translator {
         EncodingCtx {
             encoding: self.position_encoding_for(server_id),
             tracker: self.document_tracker.clone(),
+            approved_source_paths: self.approved_source_paths.clone(),
         }
     }
 

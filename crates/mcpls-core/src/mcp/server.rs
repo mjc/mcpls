@@ -211,21 +211,22 @@ fn bounded_lexical_page(
     offset: usize,
     has_next_page: bool,
     max_bytes: usize,
-) -> serde_json::Value {
+) -> crate::bridge::lexical::LexicalSearchResult {
     let total_matches = matches.len();
     loop {
         let truncated = has_next_page || matches.len() < total_matches;
-        let page = serde_json::json!({
-            "matches": matches,
-            "returned": matches.len(),
-            "truncated": truncated,
-            "next_cursor": truncated.then(|| offset.saturating_add(matches.len()).to_string()),
-        });
+        let page = crate::bridge::lexical::LexicalSearchResult {
+            returned: matches.len(),
+            next_cursor: truncated.then(|| offset.saturating_add(matches.len()).to_string()),
+            truncated,
+            matches,
+        };
         if serde_json::to_vec(&page).is_ok_and(|encoded| encoded.len() <= max_bytes)
-            || matches.is_empty()
+            || page.matches.is_empty()
         {
             return page;
         }
+        matches = page.matches;
         if let Some(match_with_context) = matches
             .iter_mut()
             .rev()
@@ -2603,6 +2604,7 @@ impl McplsServer {
 
     /// Search project snapshots by literal text or Rust regex.
     #[tool(
+        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::bridge::lexical::LexicalSearchResult>(),
         description = "Bounded project lexical search over current document snapshots. Literal and Rust-regex modes preserve exact byte ranges; ignored and generated paths are excluded unless explicitly requested."
     )]
     async fn lexical_search(
@@ -2667,12 +2669,11 @@ impl McplsServer {
         let matches = matches
             .drain(offset.min(matches.len())..end)
             .collect::<Vec<_>>();
-        encode_tool_result(Ok::<_, String>(bounded_lexical_page(
-            matches,
-            offset,
-            has_next_page,
-            params.max_bytes,
-        )))
+        let page = bounded_lexical_page(matches, offset, has_next_page, params.max_bytes);
+        let value = serde_json::to_value(page)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let legacy = value.to_string();
+        Ok(Json::new(value, legacy))
     }
 
     /// Search several symbol names through one bounded actor request.
@@ -3280,11 +3281,15 @@ impl McplsServer {
         let mut response_uri = uri;
         let text = match resource {
             SessionResource::Source(source) => {
-                let actor = self
-                    .context
-                    .required_actor_for_path(&source.path)
-                    .await
-                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let actor = match self.context.required_actor_for_path(&source.path).await {
+                    Ok(actor) => actor,
+                    Err(_) => self
+                        .context
+                        .project_registry
+                        .actor_for_source_path(&source.path)
+                        .await
+                        .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+                };
                 let frame = actor
                     .read_source_resource(source)
                     .await
@@ -3335,11 +3340,15 @@ impl McplsServer {
         _uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&resource.path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let actor = match self.context.required_actor_for_path(&resource.path).await {
+            Ok(actor) => actor,
+            Err(_) => self
+                .context
+                .project_registry
+                .actor_for_source_path(&resource.path)
+                .await
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+        };
         let frame = actor
             .read_source_resource(resource)
             .await
@@ -5007,9 +5016,9 @@ finally:
         let page = bounded_lexical_page(matches, 0, false, 800);
 
         assert!(serde_json::to_vec(&page).unwrap().len() <= 800);
-        assert_eq!(page["returned"], 1);
-        assert_eq!(page["truncated"], true);
-        assert_eq!(page["next_cursor"], "1");
+        assert_eq!(page.returned, 1);
+        assert!(page.truncated);
+        assert_eq!(page.next_cursor.as_deref(), Some("1"));
     }
 
     #[tokio::test]

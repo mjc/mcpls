@@ -1737,6 +1737,10 @@ enum ProjectRequest {
         file_path: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    SourcePathAuthorized {
+        path: PathBuf,
+        reply: oneshot::Sender<bool>,
+    },
     AddWorkspaceRoot {
         root: PathBuf,
         reply: oneshot::Sender<Result<ProjectState, String>>,
@@ -2041,6 +2045,7 @@ impl ProjectRequest {
             Self::ValidatePath { reply, .. } | Self::StoreEditPlan { reply, .. } => {
                 reply.is_closed()
             }
+            Self::SourcePathAuthorized { reply, .. } => reply.is_closed(),
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
@@ -3115,6 +3120,19 @@ impl ProjectHandle {
             .await
             .map_err(|_| ProjectActorError::Cancelled)?
             .map_err(ProjectActorError::Operation)
+    }
+
+    /// Whether this actor has an active-LSP source-read capability for `path`.
+    pub async fn source_path_is_authorized(
+        &self,
+        path: PathBuf,
+    ) -> Result<bool, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::SourcePathAuthorized { path, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
     }
 
     /// Add a compatible linked-project root to this actor's workspace.
@@ -6447,6 +6465,10 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn source_path_is_authorized(&self, path: &Path) -> bool {
+        self.translator.source_path_is_authorized(path)
+    }
+
     fn server_logs(
         &self,
         limit: usize,
@@ -7683,6 +7705,9 @@ async fn handle_project_request(
         }
         ProjectRequest::ValidatePath { file_path, reply } => {
             let _ = reply.send(runtime.validate_path(&file_path));
+        }
+        ProjectRequest::SourcePathAuthorized { path, reply } => {
+            let _ = reply.send(runtime.source_path_is_authorized(&path));
         }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             let previous_status = state.status;
@@ -10075,6 +10100,31 @@ impl ProjectRegistry {
         path: impl AsRef<Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
         self.project_for_path(path).await.map(|(_, actor)| actor)
+    }
+
+    /// Resolve a dependency source previously surfaced by an active LSP.
+    pub async fn actor_for_source_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let path = canonicalize(path.as_ref())?;
+        let actors = self
+            .projects
+            .read()
+            .await
+            .values()
+            .flat_map(|project| project.actors.iter().map(|entry| entry.actor.clone()))
+            .collect::<Vec<_>>();
+        for actor in actors {
+            if actor
+                .source_path_is_authorized(path.clone())
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(actor);
+            }
+        }
+        Err(ProjectIdentityError::UnregisteredPath(path).into())
     }
 
     /// Resolve a file path to its owning project ID and actor.
