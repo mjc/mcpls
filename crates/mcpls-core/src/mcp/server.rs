@@ -4477,7 +4477,7 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn in_flight_request_pins_group_before_second_cold_request() {
+    async fn in_flight_request_blocks_second_semantic_request_until_it_can_resume() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
         let first_file = write_rust_fixture(first_root.path());
@@ -4546,14 +4546,14 @@ finally:
         std::fs::write(&release, "release").unwrap();
         blocked.await.unwrap().unwrap();
         let second_result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second_request).await;
-        assert!(
-            second_result.is_err(),
-            "recently used residency was evicted before the idle timeout"
-        );
-        second_request.abort();
-        second_request.await.unwrap_err();
-        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+            tokio::time::timeout(std::time::Duration::from_secs(3), &mut second_request)
+                .await
+                .expect("second semantic request should resume after the first request completes")
+                .unwrap()
+                .unwrap();
+        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
+        assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
             "1"
