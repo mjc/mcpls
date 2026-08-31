@@ -418,7 +418,8 @@ fn parse_response(bytes: &[u8]) -> Value {
     };
     let mut response = decoded
         .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"data: "))
+        .filter_map(|line| line.strip_prefix(b"data:"))
+        .map(|line| line.strip_prefix(b" ").unwrap_or(line))
         .filter(|line| !line.is_empty())
         .find_map(|line| {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -431,6 +432,15 @@ fn parse_response(bytes: &[u8]) -> Value {
         response["_session_id"] = json!(session_id);
     }
     response
+}
+
+#[test]
+fn parse_response_accepts_sse_data_without_a_space() {
+    let response = parse_response(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata:{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ready\":true}}\n\n",
+    );
+
+    assert_eq!(response["result"]["ready"], true);
 }
 
 fn decode_chunked(body: &[u8]) -> Vec<u8> {
