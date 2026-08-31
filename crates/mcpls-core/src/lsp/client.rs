@@ -250,13 +250,11 @@ async fn lsp_writer_loop(
     Ok(())
 }
 
-fn enqueue_outbound(
+async fn enqueue_outbound(
     outbound_tx: &mpsc::Sender<OutboundBatch>,
     batch: OutboundBatch,
 ) -> std::result::Result<(), OutboundBatch> {
-    outbound_tx
-        .try_send(batch)
-        .map_err(tokio::sync::mpsc::error::TrySendError::into_inner)
+    outbound_tx.send(batch).await.map_err(|error| error.0)
 }
 
 fn cancel_request_notification(id: &RequestId) -> Value {
@@ -764,7 +762,7 @@ impl LspClient {
                             );
 
                             let value = serde_json::to_value(&request)?;
-                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).is_err() {
+                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).await.is_err() {
                                 let response_tx = pending_requests.lock().await.remove(&id);
                                 if let Some(response_tx) = response_tx {
                                     let _ = response_tx.send(Err(Error::Transport(
@@ -783,6 +781,7 @@ impl LspClient {
                                 outbound_tx,
                                 OutboundBatch::one(notification),
                             )
+                            .await
                             .map_err(|_| {
                                 Error::Transport(
                                     "outbound LSP transport queue is full or closed".to_string(),
@@ -823,6 +822,7 @@ impl LspClient {
                                     written_tx: Some(written_tx),
                                 },
                             )
+                            .await
                             .is_err()
                             {
                                 let _ = response_tx.send(Err(Error::Transport(
@@ -845,6 +845,7 @@ impl LspClient {
                                 outbound_tx,
                                 OutboundBatch::one(cancel_request_notification(&id)),
                             )
+                            .await
                             .is_err()
                             {
                                 warn!("Dropping LSP cancellation because the transport queue is full");
@@ -882,9 +883,10 @@ impl LspClient {
                                 written_tx: None,
                             },
                         )
+                        .await
                         .is_err()
                     {
-                        warn!("Dropping watched-file notification because the transport queue is full");
+                        warn!("Watched-file notification could not be delivered because the transport is closed");
                     }
                 }
 
@@ -942,7 +944,7 @@ impl LspClient {
                                 watch_registry,
                             );
                             let value = serde_json::to_value(&response)?;
-                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).is_err() {
+                            if enqueue_outbound(outbound_tx, OutboundBatch::one(value)).await.is_err() {
                                 warn!("Dropping LSP server response because the transport queue is full");
                             }
                         }
@@ -1495,6 +1497,28 @@ mod tests {
         };
 
         assert!(matches!(result, Err(Error::Timeout(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn outbound_queue_backpressures_without_dropping_a_batch() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(OutboundBatch::one(serde_json::json!({"first": true})))
+            .await
+            .unwrap();
+        let queued = OutboundBatch::one(serde_json::json!({"second": true}));
+        let mut enqueue = Box::pin(enqueue_outbound(&sender, queued));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut enqueue)
+                .await
+                .is_err()
+        );
+        let first = receiver.recv().await.unwrap();
+        assert_eq!(first.messages, vec![serde_json::json!({"first": true})]);
+        assert!(enqueue.await.is_ok());
+        let second = receiver.recv().await.unwrap();
+        assert_eq!(second.messages, vec![serde_json::json!({"second": true})]);
     }
 
     /// #249 continuation: a client about to be discarded (e.g. superseded by
