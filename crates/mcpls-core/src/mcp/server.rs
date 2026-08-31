@@ -211,7 +211,7 @@ fn bounded_lexical_page(
     offset: usize,
     has_next_page: bool,
     max_bytes: usize,
-) -> crate::bridge::lexical::LexicalSearchResult {
+) -> Result<crate::bridge::lexical::LexicalSearchResult, usize> {
     let total_matches = matches.len();
     loop {
         let truncated = has_next_page || matches.len() < total_matches;
@@ -221,10 +221,9 @@ fn bounded_lexical_page(
             truncated,
             matches,
         };
-        if serde_json::to_vec(&page).is_ok_and(|encoded| encoded.len() <= max_bytes)
-            || page.matches.is_empty()
-        {
-            return page;
+        let encoded_bytes = serde_json::to_vec(&page).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_bytes <= max_bytes || page.matches.is_empty() {
+            return Ok(page);
         }
         matches = page.matches;
         if let Some(match_with_context) = matches
@@ -233,6 +232,8 @@ fn bounded_lexical_page(
             .find(|entry| entry.source.is_some())
         {
             match_with_context.source = None;
+        } else if matches.len() == 1 {
+            return Err(encoded_bytes);
         } else {
             matches.pop();
         }
@@ -2669,7 +2670,15 @@ impl McplsServer {
         let matches = matches
             .drain(offset.min(matches.len())..end)
             .collect::<Vec<_>>();
-        let page = bounded_lexical_page(matches, offset, has_next_page, params.max_bytes);
+        let page = bounded_lexical_page(matches, offset, has_next_page, params.max_bytes)
+            .map_err(|required_bytes| {
+                McpError::invalid_params(
+                    format!(
+                        "max_bytes must be at least {required_bytes} to return one lexical match identity"
+                    ),
+                    None,
+                )
+            })?;
         let value = serde_json::to_value(page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let legacy = value.to_string();
@@ -5015,12 +5024,26 @@ finally:
             })
             .collect();
 
-        let page = bounded_lexical_page(matches, 0, false, 800);
+        let page = bounded_lexical_page(matches, 0, false, 800).unwrap();
 
         assert!(serde_json::to_vec(&page).unwrap().len() <= 800);
         assert_eq!(page.returned, 1);
         assert!(page.truncated);
         assert_eq!(page.next_cursor.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn lexical_page_rejects_a_budget_that_cannot_return_one_identity() {
+        let matches = vec![crate::bridge::lexical::LexicalSearchMatch {
+            project_relative_path: format!("src/{}.rs", "a".repeat(8_000)),
+            document_version: None,
+            content_hash: "a".repeat(64),
+            source_uri: "mcpls-source:///src/too-long.rs".to_owned(),
+            source: None,
+            byte_range: 0..1,
+        }];
+
+        assert!(bounded_lexical_page(matches, 0, false, 4 * 1024).is_err());
     }
 
     #[tokio::test]
