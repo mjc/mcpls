@@ -10870,10 +10870,9 @@ mod tests {
             .strip_prefix("mcpls-deferred:///")
             .unwrap()
             .to_owned();
-        assert_eq!(
-            registry.read_deferred_resource(&token).unwrap().value,
-            serde_json::json!({"references": [1, 2]})
-        );
+        let payload = registry.read_deferred_resource(&token).unwrap();
+        assert_eq!(payload.value, serde_json::json!({"references": [1, 2]}));
+        assert_eq!(payload.snapshot_hash, "snapshot");
     }
 
     #[test]
