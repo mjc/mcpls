@@ -79,6 +79,7 @@ pub struct TraceReport {
     pub result_bytes: usize,
     pub deferred_bytes: usize,
     pub deferred_resource_reads: usize,
+    pub source_read_output_bytes: usize,
     pub shell_output_bytes: usize,
     pub compactions: usize,
     pub latency: LatencyPercentiles,
@@ -136,6 +137,7 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
         result_bytes: 0,
         deferred_bytes: 0,
         deferred_resource_reads: 0,
+        source_read_output_bytes: 0,
         shell_output_bytes: 0,
         compactions: 0,
         latency: LatencyPercentiles {
@@ -238,9 +240,10 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
             report.deferred_resource_reads += usize::from(*deferred);
             latencies.push(*latency_ms);
         }
+        TraceEvent::SourceRead { output_bytes, .. } => report.source_read_output_bytes += output_bytes,
         TraceEvent::ShellOutput { bytes } => report.shell_output_bytes += bytes,
         TraceEvent::Compaction => report.compactions += 1,
-        TraceEvent::SourceRead { .. } | TraceEvent::Semantic { .. } => {}
+        TraceEvent::Semantic { .. } => {}
     }
 }
 
@@ -697,12 +700,12 @@ mod tests {
         let events = [
             TraceEvent::SourceRead {
                 path: "/private/repo/src/lib.rs".to_owned(),
-                output_bytes: 0,
+                output_bytes: 7,
             },
             semantic("/private/repo/src/lib.rs", true),
             TraceEvent::SourceRead {
                 path: "/private/repo/src/lib.rs".to_owned(),
-                output_bytes: 0,
+                output_bytes: 11,
             },
             semantic("/private/repo/src/other.rs", false),
             TraceEvent::SourceRead {
@@ -725,6 +728,7 @@ mod tests {
                 result_bytes: 1024,
                 deferred_bytes: 0,
                 deferred_resource_reads: 0,
+                source_read_output_bytes: 18,
                 shell_output_bytes: 0,
                 compactions: 0,
                 latency: LatencyPercentiles {
