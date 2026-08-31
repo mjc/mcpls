@@ -85,6 +85,7 @@ pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticIn
         uri: "file:///test.rs".parse().unwrap(),
         version: Some(1),
         received_at: chrono::Utc::now(),
+        snapshot_identity: "test-snapshot".to_owned(),
         diagnostics,
     }
 }

@@ -847,6 +847,7 @@ impl Translator {
             age_ms: (chrono::Utc::now() - entry.received_at)
                 .num_milliseconds()
                 .max(0) as u64,
+            snapshot_identity: entry.snapshot_identity.clone(),
             document_version: entry.version,
         });
         let encoding = self

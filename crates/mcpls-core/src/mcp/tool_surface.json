@@ -3238,11 +3238,16 @@
             "hit": {
               "description": "Cached diagnostics were used instead of a fresh analysis request.",
               "type": "boolean"
+            },
+            "snapshot_identity": {
+              "description": "Opaque identity of the cached diagnostics publication.",
+              "type": "string"
             }
           },
           "required": [
             "hit",
-            "age_ms"
+            "age_ms",
+            "snapshot_identity"
           ],
           "type": "object"
         },
@@ -6051,11 +6056,16 @@
             "hit": {
               "description": "Cached diagnostics were used instead of a fresh analysis request.",
               "type": "boolean"
+            },
+            "snapshot_identity": {
+              "description": "Opaque identity of the cached diagnostics publication.",
+              "type": "string"
             }
           },
           "required": [
             "hit",
-            "age_ms"
+            "age_ms",
+            "snapshot_identity"
           ],
           "type": "object"
         },
@@ -11856,11 +11866,16 @@
             "hit": {
               "description": "Cached diagnostics were used instead of a fresh analysis request.",
               "type": "boolean"
+            },
+            "snapshot_identity": {
+              "description": "Opaque identity of the cached diagnostics publication.",
+              "type": "string"
             }
           },
           "required": [
             "hit",
-            "age_ms"
+            "age_ms",
+            "snapshot_identity"
           ],
           "type": "object"
         },
@@ -14298,11 +14313,16 @@
             "hit": {
               "description": "Cached diagnostics were used instead of a fresh analysis request.",
               "type": "boolean"
+            },
+            "snapshot_identity": {
+              "description": "Opaque identity of the cached diagnostics publication.",
+              "type": "string"
             }
           },
           "required": [
             "hit",
-            "age_ms"
+            "age_ms",
+            "snapshot_identity"
           ],
           "type": "object"
         },

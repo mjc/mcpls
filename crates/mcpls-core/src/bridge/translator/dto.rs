@@ -495,6 +495,8 @@ pub struct DiagnosticsCacheMetadata {
     pub hit: bool,
     /// Age of the cached notification when this result was read.
     pub age_ms: u64,
+    /// Opaque identity of the cached diagnostics publication.
+    pub snapshot_identity: String,
     /// Cached document version, when supplied by the language server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_version: Option<i32>,

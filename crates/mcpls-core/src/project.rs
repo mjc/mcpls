@@ -12775,6 +12775,13 @@ mod tests {
             None
         );
         assert!(diagnostics.cache.as_ref().is_some_and(|cache| cache.hit));
+        assert_eq!(
+            diagnostics
+                .cache
+                .as_ref()
+                .map(|cache| cache.snapshot_identity.len()),
+            Some(64)
+        );
     }
 
     #[tokio::test]
