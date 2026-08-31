@@ -113,7 +113,7 @@ pub struct SourceFrame {
     pub total_bytes: usize,
     /// Whether a line or byte budget shortened the frame.
     pub truncated: bool,
-    /// Direct resource for the complete selected context when this frame is bounded.
+    /// Direct snapshot-bound page for selected context omitted from this frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<DeferredResourceReference>,
 }

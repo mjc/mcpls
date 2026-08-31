@@ -410,19 +410,58 @@ impl super::Translator {
             .sum();
         let byte_limit = MAX_RESPONSE_BYTES;
         let mut text = String::new();
+        let mut returned_lines = 0;
         for (offset, line) in selected.iter().enumerate() {
             let rendered = format!("{:>4} | {line}\n", start + offset + 1);
-            if text.len() + rendered.len() > byte_limit {
+            if !text.is_empty() && text.len() + rendered.len() > byte_limit {
                 break;
             }
             text.push_str(&rendered);
+            returned_lines += 1;
         }
-        let returned_lines = text.lines().count();
         let returned_bytes = text.len();
+        let truncated = returned_lines < selected.len();
+        let returned_end = start + returned_lines;
+        let returned_range = Range {
+            start: super::dto::Position2D {
+                line: u32::try_from(start + 1).unwrap_or(u32::MAX),
+                character: resource.start_character,
+            },
+            end: super::dto::Position2D {
+                line: u32::try_from(returned_end).unwrap_or(u32::MAX),
+                character: if truncated { 1 } else { resource.end_character },
+            },
+        };
+        let remaining_bytes = selected[returned_lines..]
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| numbered_line_bytes(returned_end + offset + 1, line))
+            .sum();
+        let next_resource = truncated
+            .then(|| {
+                make_source_uri(
+                    &path,
+                    u32::try_from(returned_end + 1).unwrap_or(u32::MAX),
+                    1,
+                    resource.end_line,
+                    resource.end_character,
+                    &content_hash,
+                    document_version,
+                )
+                .ok()
+                .map(|uri| DeferredResourceReference {
+                    uri,
+                    kind: "source_context".to_owned(),
+                    snapshot_hash: content_hash.clone(),
+                    document_version,
+                    total_bytes: Some(remaining_bytes),
+                })
+            })
+            .flatten();
         Ok(SourceFrame {
             path: path.to_string_lossy().into_owned(),
             uri: uri.to_string(),
-            range: range.clone(),
+            range: returned_range,
             highlighted_range: range,
             text,
             language_id: language_id(&path),
@@ -432,8 +471,8 @@ impl super::Translator {
             total_lines: lines.len(),
             returned_bytes,
             total_bytes,
-            truncated: returned_lines < selected.len(),
-            resource: None,
+            truncated,
+            resource: next_resource,
         })
     }
 
@@ -672,6 +711,26 @@ mod tests {
         assert!(frame.returned_bytes <= MAX_RESPONSE_BYTES);
         assert_eq!(frame.total_lines, 40);
         assert!(frame.total_bytes > frame.returned_bytes);
+        assert_eq!(frame.range.start.line, 1);
+        assert_eq!(frame.range.end.line, frame.returned_lines as u32);
+        let next = frame
+            .resource
+            .as_ref()
+            .expect("truncated source has next page");
+        let next = crate::bridge::resources::parse_source_uri(&next.uri).unwrap();
+        assert_eq!(next.start_line, frame.range.end.line + 1);
+        assert_eq!(next.end_line, 40);
+
+        let next_frame = translator.read_source_resource(&next).await.unwrap();
+        assert_eq!(next_frame.range.start.line, next.start_line);
+        assert_eq!(next_frame.range.end.line, 40);
+        assert!(
+            next_frame
+                .text
+                .contains(&format!("line {}", next.start_line))
+        );
+        assert!(next_frame.text.contains("line 40"));
+        assert!(next_frame.resource.is_none());
     }
 
     #[tokio::test]

@@ -855,7 +855,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -1338,7 +1338,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -1798,7 +1798,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -2258,7 +2258,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -3426,7 +3426,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -3897,7 +3897,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -4579,7 +4579,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -5118,7 +5118,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -5568,7 +5568,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -6244,7 +6244,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -6735,7 +6735,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -7243,7 +7243,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -7759,7 +7759,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -8424,7 +8424,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -8889,7 +8889,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -9539,7 +9539,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -10022,7 +10022,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -10790,7 +10790,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -11210,7 +11210,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -13534,7 +13534,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -16104,7 +16104,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -16728,7 +16728,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -17360,7 +17360,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -19128,7 +19128,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
@@ -19652,7 +19652,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Direct resource for the complete selected context when this frame is bounded."
+              "description": "Direct snapshot-bound page for selected context omitted from this frame."
             },
             "returned_bytes": {
               "description": "Number of source bytes returned.",
