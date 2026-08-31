@@ -4918,6 +4918,33 @@ mod tests {
     }
 
     #[test]
+    fn approval_detail_resource_pages_complete_json() {
+        let project_id = ProjectId::new("project").unwrap();
+        let plan_id = PlanId::parse("plan").unwrap();
+        let detail =
+            serde_json::json!({"operations": ["x".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)]})
+                .to_string();
+        let mut offset_bytes = 0;
+        let mut recovered = String::new();
+        for _ in 0..8 {
+            let page =
+                edit_approval_resource_page(&project_id, &plan_id, offset_bytes, &detail).unwrap();
+            assert_eq!(page.mime_type, "application/json");
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            recovered.push_str(&page.text);
+            let Some(next_uri) = page.next_uri else { break };
+            let SessionResource::EditApproval {
+                offset_bytes: next, ..
+            } = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("continuation must remain an approval resource");
+            };
+            offset_bytes = next;
+        }
+        assert_eq!(recovered, detail);
+    }
+
+    #[test]
     fn applied_edit_result_resource_pages_complete_json() {
         let project_id = ProjectId::new("project").unwrap();
         let plan_id = PlanId::parse("plan").unwrap();
