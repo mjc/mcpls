@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeSet, ops::Range, path::PathBuf};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use schemars::JsonSchema;
@@ -49,6 +50,10 @@ pub(crate) struct LexicalSearchRequest {
     pub max_matches: usize,
     /// Whether generated paths are in scope.
     pub include_generated: bool,
+    /// Project-relative globs that include files; empty includes every file.
+    pub include_paths: Vec<String>,
+    /// Project-relative globs that exclude files after inclusion.
+    pub exclude_paths: Vec<String>,
     /// Context lines around each match.
     pub context_lines: usize,
 }
@@ -106,22 +111,25 @@ pub(crate) fn find_matches(
         .collect())
 }
 
-/// Collect canonical project files using the same ignore and generated-path
-/// policy as structural search. Content is deliberately read by the project
-/// actor through `Translator::source_snapshot`, preserving unsaved documents.
-pub(crate) async fn collect_project_paths(
+/// Collect canonical project files with optional project-relative glob filters.
+pub(crate) async fn collect_project_paths_filtered(
     roots: &[PathBuf],
     include_generated: bool,
     max_files: usize,
-) -> Vec<PathBuf> {
+    includes: &[String],
+    excludes: &[String],
+) -> Result<Vec<PathBuf>, String> {
     if max_files == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let includes = build_glob_set(includes)?;
+    let excludes = build_glob_set(excludes)?;
+    let has_includes = !includes.is_empty();
     let roots = roots.to_vec();
-    tokio::task::spawn_blocking(move || {
+    Ok(tokio::task::spawn_blocking(move || {
         let mut paths = BTreeSet::new();
         for root in roots {
-            for entry in WalkBuilder::new(root)
+            for entry in WalkBuilder::new(&root)
                 .standard_filters(true)
                 .filter_entry(move |entry| include_generated || !is_generated_path(entry.path()))
                 .build()
@@ -136,6 +144,12 @@ pub(crate) async fn collect_project_paths(
                 {
                     continue;
                 }
+                let Ok(relative) = entry.path().strip_prefix(&root) else {
+                    continue;
+                };
+                if (has_includes && !includes.is_match(relative)) || excludes.is_match(relative) {
+                    continue;
+                }
                 if let Ok(path) = std::fs::canonicalize(entry.path()) {
                     paths.insert(path);
                 }
@@ -147,7 +161,27 @@ pub(crate) async fn collect_project_paths(
         paths.into_iter().collect()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default())
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(
+            Glob::new(pattern)
+                .map_err(|error| format!("invalid lexical path glob {pattern:?}: {error}"))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|error| format!("invalid lexical path globs: {error}"))
+}
+
+/// Reject malformed path filters before queuing an actor request.
+pub(crate) fn validate_path_globs(includes: &[String], excludes: &[String]) -> Result<(), String> {
+    build_glob_set(includes)?;
+    build_glob_set(excludes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -223,7 +257,10 @@ mod tests {
         fs::create_dir(root.path().join("target")).unwrap();
         fs::write(root.path().join("target/generated.rs"), "generated").unwrap();
 
-        let paths = collect_project_paths(&[root.path().to_path_buf()], false, 2).await;
+        let paths =
+            collect_project_paths_filtered(&[root.path().to_path_buf()], false, 2, &[], &[])
+                .await
+                .unwrap();
 
         assert_eq!(
             paths,
@@ -231,6 +268,30 @@ mod tests {
                 root.path().join("a.rs").canonicalize().unwrap(),
                 root.path().join("z.rs").canonicalize().unwrap(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_paths_apply_include_and_exclude_globs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "lib").unwrap();
+        fs::write(root.path().join("src/test.rs"), "test").unwrap();
+        fs::write(root.path().join("README.md"), "readme").unwrap();
+
+        let paths = collect_project_paths_filtered(
+            &[root.path().to_path_buf()],
+            false,
+            16,
+            &["src/**/*.rs".to_owned()],
+            &["**/test.rs".to_owned()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            paths,
+            vec![root.path().join("src/lib.rs").canonicalize().unwrap()]
         );
     }
 }

@@ -398,6 +398,12 @@ pub struct LexicalSearchParams {
     /// Include generated/build-output files.
     #[serde(default)]
     pub include_generated: bool,
+    /// Optional project-relative globs to include.
+    #[serde(default)]
+    pub include_paths: Vec<String>,
+    /// Project-relative globs to exclude after inclusion.
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
 }
 
 const fn default_lexical_max_files() -> usize {

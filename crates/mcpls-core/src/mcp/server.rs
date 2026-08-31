@@ -54,7 +54,7 @@ use super::tools::{
 };
 #[cfg(test)]
 use crate::bridge::Translator;
-use crate::bridge::lexical::find_matches;
+use crate::bridge::lexical::{find_matches, validate_path_globs};
 use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
@@ -2591,6 +2591,8 @@ impl McplsServer {
             params.multiline,
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
+        validate_path_globs(&params.include_paths, &params.exclude_paths)
+            .map_err(|error| McpError::invalid_params(error, None))?;
         let offset = params.page_token.as_deref().map_or(Ok(0), |token| {
             token.parse::<usize>().map_err(|_| {
                 McpError::invalid_params(
@@ -2616,6 +2618,8 @@ impl McplsServer {
                 max_files: params.max_files,
                 max_matches: offset.saturating_add(limit).saturating_add(1),
                 include_generated: params.include_generated,
+                include_paths: params.include_paths,
+                exclude_paths: params.exclude_paths,
                 context_lines: params.context_lines,
             })
             .await

@@ -22,7 +22,7 @@ use crate::bridge::DeferredResourceReference;
 use crate::bridge::ast_grep::byte_offset_to_position;
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::lexical::{
-    LexicalSearchMatch, LexicalSearchRequest, collect_project_paths, find_matches,
+    LexicalSearchMatch, LexicalSearchRequest, collect_project_paths_filtered, find_matches,
 };
 use crate::bridge::resources::SourceResource;
 use crate::bridge::resources::make_source_uri;
@@ -5388,12 +5388,14 @@ impl ProjectRuntime {
         request: LexicalSearchRequest,
     ) -> Result<Vec<LexicalSearchMatch>, String> {
         const LEXICAL_CONTEXT_BYTES: usize = 16 * 1024;
-        let paths = collect_project_paths(
+        let paths = collect_project_paths_filtered(
             self.translator.workspace_roots(),
             request.include_generated,
             request.max_files,
+            &request.include_paths,
+            &request.exclude_paths,
         )
-        .await;
+        .await?;
         let mut matches = Vec::new();
         let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
         for path in paths {
