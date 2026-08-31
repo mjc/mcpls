@@ -2,7 +2,13 @@
 #![expect(deprecated)]
 #![allow(clippy::ignored_unit_patterns)]
 
-use std::{borrow::Cow, collections::HashMap, future::Future, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    future::Future,
+    io::{self, Write},
+    time::Instant,
+};
 
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
@@ -25,6 +31,30 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 const MAX_TRACEPARENT_BYTES: usize = 55;
 const MAX_TRACESTATE_BYTES: usize = 512;
 const MAX_BAGGAGE_BYTES: usize = 8 * 1024;
+
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn completed_tool_result_bytes(result: &Result<CallToolResponse, ErrorData>) -> Option<usize> {
+    let Ok(CallToolResponse::Complete(result)) = result else {
+        return None;
+    };
+    let mut bytes = ByteCounter::default();
+    serde_json::to_writer(&mut bytes, result)
+        .ok()
+        .map(|()| bytes.0)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteTrace {
@@ -122,6 +152,8 @@ impl RequestSpan {
             protocol_version = tracing::field::Empty,
             transport,
             duration_ms = tracing::field::Empty,
+            result_bytes = tracing::field::Empty,
+            serialization_ms = tracing::field::Empty,
             cancelled = tracing::field::Empty,
             success = tracing::field::Empty,
             protocol_error = tracing::field::Empty,
@@ -153,7 +185,22 @@ impl RequestSpan {
         }
     }
 
-    fn finish<T>(&self, result: &Result<T, ErrorData>, tool_error: bool) {
+    fn finish<T>(
+        &self,
+        result: &Result<T, ErrorData>,
+        tool_error: bool,
+        result_bytes: Option<usize>,
+        serialization_started: Option<Instant>,
+    ) {
+        if let Some(result_bytes) = result_bytes {
+            self.span.record("result_bytes", result_bytes);
+        }
+        if let Some(serialization_started) = serialization_started {
+            self.span.record(
+                "serialization_ms",
+                serialization_started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
         self.span.record(
             "duration_ms",
             self.started.elapsed().as_secs_f64() * 1_000.0,
@@ -188,7 +235,7 @@ where
     );
     let result = handler(context).instrument(span.span.clone()).await;
     let is_tool_error = result.as_ref().is_ok_and(tool_error);
-    span.finish(&result, is_tool_error);
+    span.finish(&result, is_tool_error, None, None);
     result
 }
 
@@ -394,7 +441,7 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
                 .listen(context)
                 .instrument(span.span.clone())
                 .await;
-            span.finish(&result, false);
+            span.finish(&result, false, None, None);
             result
         }
     }
@@ -439,18 +486,33 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
         let tool = request.name.clone();
-        dispatch(
-            self.transport,
+        let span = RequestSpan::new(
             "tools/call",
-            context,
-            Some(tool.into_owned()),
+            self.transport,
+            &context,
+            Some(tool.as_ref()),
             None,
-            |context| self.inner.call_tool(request, context),
-            |response| match response {
+        );
+        async move {
+            let result = self
+                .inner
+                .call_tool(request, context)
+                .instrument(span.span.clone())
+                .await;
+            let tool_error = result.as_ref().is_ok_and(|response| match response {
                 CallToolResponse::Complete(result) => result.is_error.unwrap_or(false),
                 _ => false,
-            },
-        )
+            });
+            let serialization_started = Instant::now();
+            let result_bytes = completed_tool_result_bytes(&result);
+            span.finish(
+                &result,
+                tool_error,
+                result_bytes,
+                result_bytes.map(|_| serialization_started),
+            );
+            result
+        }
     }
 
     fn list_tools(
@@ -616,5 +678,16 @@ mod tests {
     fn resource_labels_drop_uri_paths() {
         assert_eq!(resource_label("file:///secret/workspace/main.rs"), "file");
         assert_eq!(resource_label("resource"), "resource");
+    }
+
+    #[test]
+    fn completed_tool_result_bytes_count_payload_without_retaining_it() {
+        let payload = rmcp::model::CallToolResult::success(Vec::new());
+        let result = Ok::<_, ErrorData>(CallToolResponse::Complete(payload.clone()));
+
+        assert_eq!(
+            completed_tool_result_bytes(&result),
+            Some(serde_json::to_vec(&payload).unwrap().len())
+        );
     }
 }
