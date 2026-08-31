@@ -2914,7 +2914,9 @@ fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixtur
     add_and_activate_project(client, "second", &fixture.second, &fixture.second_lib);
 
     let projects = call_json(client, "project_list", &json!({})).unwrap();
-    assert_eq!(projects.as_array().unwrap().len(), 2);
+    assert_eq!(projects["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(projects["returned"], 2);
+    assert!(projects["next_cursor"].is_null());
 
     let first_symbols = call_json(
         client,
