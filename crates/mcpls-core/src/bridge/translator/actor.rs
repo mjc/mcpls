@@ -752,7 +752,6 @@ impl Translator {
             .count();
         self.actor_notification_cache
             .set_diagnostics_route_count(diagnostics_routes);
-        self.clear_expected_servers();
         Ok(ProjectActivation::new(receivers, health))
     }
 

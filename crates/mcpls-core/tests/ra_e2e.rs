@@ -2930,6 +2930,7 @@ fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixtur
     )
     .unwrap();
     assert!(!second_symbols["symbols"].as_array().unwrap().is_empty());
+    wait_until_ready(client, &fixture.second_lib);
 }
 
 fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {
