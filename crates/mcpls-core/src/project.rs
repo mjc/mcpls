@@ -10653,6 +10653,18 @@ impl ProjectRegistry {
         self.project_for_path(path).await.map(|(_, actor)| actor)
     }
 
+    /// Resolve a path and wake its registered project when it is dormant.
+    pub async fn active_actor_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let (project_id, actor) = self.project_for_path(path).await?;
+        if actor.query().await?.status() == ProjectStatus::Dormant {
+            self.activate(&project_id).await?;
+        }
+        Ok(actor)
+    }
+
     /// Resolve a dependency source previously surfaced by an active LSP.
     pub async fn actor_for_source_path(
         &self,
@@ -15751,6 +15763,35 @@ while True:
             ProjectStatus::Dormant
         );
         assert_eq!(store.load().unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_actor_for_path_wakes_a_dormant_restored_project() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let store = ProjectRegistrationStore::new(root.path().join("state/projects.json"));
+        store
+            .save(&[PersistedProject {
+                project_id: "dormant".to_owned(),
+                root: root.path().to_path_buf(),
+                additional_roots: Vec::new(),
+                config: None,
+            }])
+            .unwrap();
+        let registry = ProjectRegistry::new(2).with_persistence(store);
+        registry.restore_from_persistence().await.unwrap();
+
+        registry.active_actor_for_path(&file).await.unwrap();
+
+        assert_ne!(
+            registry
+                .status(&ProjectId::new("dormant").unwrap())
+                .await
+                .unwrap()
+                .status(),
+            ProjectStatus::Dormant
+        );
     }
 
     #[tokio::test]

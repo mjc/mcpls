@@ -306,7 +306,7 @@ impl HandlerContext {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.project_registry.actor_for_path(path).await
+        self.project_registry.active_actor_for_path(path).await
     }
 
     /// Resolve a handle through every actor group owned by an explicit project.
