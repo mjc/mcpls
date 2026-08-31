@@ -249,17 +249,26 @@ pub fn decode_sse(body: &str) -> Option<Value> {
     let mut last = None;
     let mut event = String::new();
     for line in body.lines().chain(std::iter::once("")) {
-        if let Some(data) = line.strip_prefix("data:") {
+        if let Some(data) = sse_data_field(line) {
             if !event.is_empty() {
                 event.push('\n');
             }
-            event.push_str(data.trim_start());
+            event.push_str(data);
         } else if line.is_empty() && !event.is_empty() {
             last = serde_json::from_str(&event).ok().or(last);
             event.clear();
         }
     }
     last.or_else(|| serde_json::from_str(body.trim()).ok())
+}
+
+/// Return an SSE `data` field after the one optional separator space.
+///
+/// The SSE grammar discards at most one U+0020 after the colon; other leading
+/// whitespace belongs to the event payload.
+fn sse_data_field(line: &str) -> Option<&str> {
+    line.strip_prefix("data:")
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
 }
 
 pub struct McpClient {
@@ -432,6 +441,11 @@ mod tests {
     fn decodes_multiline_sse_json_event() {
         let body = "data: stale\n\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":7}\n";
         assert_eq!(decode_sse(body).and_then(|v| v["id"].as_u64()), Some(7));
+    }
+
+    #[test]
+    fn sse_data_field_preserves_payload_whitespace_after_the_separator() {
+        assert_eq!(sse_data_field("data: \t  payload"), Some("\t  payload"));
     }
 
     #[test]
