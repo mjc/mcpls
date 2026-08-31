@@ -9793,6 +9793,19 @@ impl ProjectRegistry {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn acquire_test_edit_lease(
+        &self,
+        path: std::path::PathBuf,
+    ) -> crate::edit_coordinator::EditLease {
+        self.edit_coordinator
+            .try_acquire(
+                "test-session",
+                [crate::edit_coordinator::EditResource::exact(path)],
+            )
+            .unwrap_or_else(|error| panic!("test edit lease must be available: {error}"))
+    }
+
     /// Inspect a project-owned edit plan without consuming it.
     pub(crate) async fn inspect_edit_plan(
         &self,

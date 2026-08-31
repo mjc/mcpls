@@ -5576,6 +5576,108 @@ finally:
     }
 
     #[tokio::test]
+    async fn workspace_edit_apply_reports_competing_session_as_retryable() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        std::fs::write(&file, "before\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = |after| {
+            EditPlan::new(
+                project_id.to_string(),
+                vec![FileSnapshot::from_contents(
+                    file.clone(),
+                    SnapshotSource::Disk,
+                    None,
+                    "before\n",
+                    after,
+                )],
+                vec!["replace src.rs".to_owned()],
+                true,
+                std::time::Duration::from_secs(60),
+            )
+            .with_workspace_root(root.path().to_path_buf())
+        };
+        let first = plan("first\n");
+        let second = plan("second\n");
+        let first_id = first.id().as_str().to_owned();
+        let second_id = second.id().as_str().to_owned();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let server = McplsServer::new_with_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            registry.clone(),
+        );
+        let other_session = server.for_session();
+        server
+            .context
+            .remember_plan(PlanId::parse(first_id.clone()).unwrap())
+            .await;
+        other_session
+            .context
+            .remember_plan(PlanId::parse(second_id.clone()).unwrap())
+            .await;
+        let lease = registry.acquire_test_edit_lease(file.clone());
+
+        let busy: serde_json::Value = serde_json::from_str(
+            &other_session
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.to_string(),
+                    plan_id: second_id.clone(),
+                    wait_timeout_ms: Some(0),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(busy["status"], "not_ready");
+        assert_eq!(busy["reason"], "edit_in_progress");
+        assert_eq!(busy["retry"]["action"], "retry_apply");
+        assert_eq!(busy["retry"]["same_plan"], true);
+        assert_eq!(busy["contention"]["scope"], "same_worktree");
+        assert_eq!(
+            busy["contention"]["blocked_paths"],
+            serde_json::json!(["src.rs"])
+        );
+
+        drop(lease);
+        let first: serde_json::Value = serde_json::from_str(
+            &server
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.to_string(),
+                    plan_id: first_id,
+                    wait_timeout_ms: None,
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["status"], "applied");
+
+        let stale: serde_json::Value = serde_json::from_str(
+            &other_session
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: project_id.to_string(),
+                    plan_id: second_id,
+                    wait_timeout_ms: None,
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stale["status"], "conflict");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "first\n");
+    }
+
+    #[tokio::test]
     async fn structural_ast_grep_search_preview_and_apply_share_the_session_plan_path() {
         let root = TempDir::new().unwrap();
         let file = root.path().join("src.rs");
