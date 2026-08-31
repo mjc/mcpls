@@ -458,6 +458,40 @@ fn sc_get_definition(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     Ok(())
 }
 
+/// Dependency definitions returned by rust-analyzer expose read-only source context.
+fn sc_dependency_source_context(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let lib = workspace.join("src/lib.rs");
+    let (line, character) = find_position(&lib, "fmt;");
+    let result = call_json(
+        client,
+        "get_definition",
+        &json!({
+            "file_path": lib,
+            "line": line,
+            "character": character,
+        }),
+    )?;
+    let location = result["locations"]
+        .as_array()
+        .and_then(|locations| locations.first())
+        .ok_or_else(|| format!("dependency definition returned no locations: {result}"))?;
+    let path = location["path"]
+        .as_str()
+        .ok_or_else(|| format!("dependency definition omitted its path: {result}"))?;
+
+    if path.starts_with(workspace.to_string_lossy().as_ref())
+        || location["source"]["status"] != "available"
+        || location["source"]["text"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "dependency definition omitted read-only source context: {result}"
+        ));
+    }
+    Ok(())
+}
+
 /// Tool 3: `get_references` — find references to `add`.
 fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
@@ -2684,6 +2718,7 @@ fn ra_e2e_suite() {
     let sub_cases: &[SubCase] = &[
         sub_case!(sc_get_hover),
         sub_case!(sc_get_definition),
+        sub_case!(sc_dependency_source_context),
         sub_case!(sc_get_references),
         sub_case!(sc_get_diagnostics),
         sub_case!(sc_rename_symbol),
