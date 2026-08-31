@@ -3978,6 +3978,49 @@ fn symbol_position_in_line(line: u32, text: &str, name: &str) -> Option<(u32, u3
     })
 }
 
+fn rendered_struct_declaration(rendered: &str, name: &str, range: &crate::bridge::Range) -> bool {
+    rendered.lines().any(|rendered_line| {
+        let Some((number, text)) = rendered_line.split_once(" | ") else {
+            return false;
+        };
+        let Ok(line) = number.trim().parse::<u32>() else {
+            return false;
+        };
+        if line != range.start.line {
+            return false;
+        }
+        let text = text.trim_start();
+        let Some((prefix, _)) = text.split_once(name) else {
+            return false;
+        };
+        prefix.split_whitespace().next_back() == Some("struct")
+    })
+}
+
+fn discard_workspace_symbol_struct_uses(symbols: &mut Vec<WorkspaceSymbol>) {
+    let declarations = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.kind == "Struct"
+                && matches!(
+                    &symbol.location.source,
+                    SourceContext::Available(frame)
+                        if rendered_struct_declaration(&frame.text, &symbol.name, &symbol.location.range)
+                )
+        })
+        .map(|symbol| (symbol.name.clone(), symbol.location.uri.clone()))
+        .collect::<HashSet<_>>();
+    symbols.retain(|symbol| {
+        symbol.kind != "Struct"
+            || !declarations.contains(&(symbol.name.clone(), symbol.location.uri.clone()))
+            || matches!(
+                &symbol.location.source,
+                SourceContext::Available(frame)
+                    if rendered_struct_declaration(&frame.text, &symbol.name, &symbol.location.range)
+            )
+    });
+}
+
 #[test]
 fn rendered_workspace_symbol_position_skips_docs_and_declaration_prefixes() {
     let range = crate::bridge::Range {
@@ -3999,6 +4042,25 @@ fn rendered_workspace_symbol_position_skips_docs_and_declaration_prefixes() {
         ),
         Some((65, 8)),
     );
+}
+
+#[test]
+fn rendered_struct_declaration_rejects_struct_uses() {
+    let range = crate::bridge::Range {
+        start: crate::bridge::Position2D {
+            line: 2,
+            character: 13,
+        },
+        end: crate::bridge::Position2D {
+            line: 2,
+            character: 18,
+        },
+    };
+    assert!(!rendered_struct_declaration(
+        "   1 | pub struct Point { x: f64 }\n   2 | let p = Point { x: 1.0 };\n",
+        "Point",
+        &range,
+    ));
 }
 
 fn missing_call_hierarchy_item() -> crate::bridge::InspectSection<crate::bridge::InspectCalls> {
@@ -5510,6 +5572,8 @@ impl ProjectRuntime {
             )
             .await
             .map_err(|error| error.to_string())?;
+        discard_workspace_symbol_struct_uses(&mut result.symbols);
+        result.returned = result.symbols.len();
         self.attach_workspace_symbol_handles(&mut result.symbols)
             .await;
         Ok(result)
@@ -5750,6 +5814,8 @@ impl ProjectRuntime {
             .handle_workspace_symbol_in_path(query, kind_filter, limit, match_mode, scope, path)
             .await
             .map_err(|error| error.to_string())?;
+        discard_workspace_symbol_struct_uses(&mut result.symbols);
+        result.returned = result.symbols.len();
         self.attach_workspace_symbol_handles(&mut result.symbols)
             .await;
         Ok(result)
