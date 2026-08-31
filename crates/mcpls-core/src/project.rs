@@ -3818,8 +3818,16 @@ struct SymbolHandleStore {
     max_entries: usize,
 }
 
+/// Deferred payload and the immutable snapshot that produced it.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredResourcePayload {
+    pub value: serde_json::Value,
+    pub snapshot_hash: String,
+}
+
 struct StoredDeferredResult {
     value: serde_json::Value,
+    snapshot_hash: String,
     created_at: Instant,
     scope: String,
 }
@@ -3869,6 +3877,7 @@ impl DeferredResultStore {
             token.clone(),
             StoredDeferredResult {
                 value,
+                snapshot_hash: snapshot_hash.clone(),
                 created_at: Instant::now(),
                 scope: scope.to_owned(),
             },
@@ -3886,24 +3895,28 @@ impl DeferredResultStore {
         self.entries.retain(|_, result| result.scope != scope);
     }
 
-    fn read(&mut self, token: &str) -> Result<serde_json::Value, String> {
-        self.read_with_scope(token, None)
+    fn read(&mut self, token: &str) -> Result<DeferredResourcePayload, String> {
+        self.read_entry(token, None)
+            .map(|result| DeferredResourcePayload {
+                value: result.value.clone(),
+                snapshot_hash: result.snapshot_hash.clone(),
+            })
     }
 
     fn read_scoped(&mut self, token: &str, scope: &str) -> Result<serde_json::Value, String> {
-        self.read_with_scope(token, Some(scope))
+        self.read_entry(token, Some(scope))
+            .map(|result| result.value.clone())
     }
 
-    fn read_with_scope(
+    fn read_entry(
         &mut self,
         token: &str,
         scope: Option<&str>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<&StoredDeferredResult, String> {
         self.prune();
         self.entries
             .get(token)
             .filter(|result| scope.is_none_or(|scope| result.scope == scope))
-            .map(|result| result.value.clone())
             .ok_or_else(|| "stale_resource: deferred result is missing or expired".to_owned())
     }
 }
@@ -10570,7 +10583,10 @@ impl ProjectRegistry {
         Err("invalid_symbol_handle: unknown or forged handle; rerun symbol discovery".to_owned())
     }
 
-    pub(crate) fn read_deferred_resource(&self, token: &str) -> Result<serde_json::Value, String> {
+    pub(crate) fn read_deferred_resource(
+        &self,
+        token: &str,
+    ) -> Result<DeferredResourcePayload, String> {
         self.deferred_results
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10855,7 +10871,7 @@ mod tests {
             .unwrap()
             .to_owned();
         assert_eq!(
-            registry.read_deferred_resource(&token).unwrap(),
+            registry.read_deferred_resource(&token).unwrap().value,
             serde_json::json!({"references": [1, 2]})
         );
     }
@@ -10880,7 +10896,7 @@ mod tests {
 
         assert!(store.read(first_token).is_err());
         assert_eq!(
-            store.read(second_token).unwrap(),
+            store.read(second_token).unwrap().value,
             serde_json::json!({"project": "second"})
         );
     }
@@ -15334,7 +15350,7 @@ while True:
 
         assert!(registry.read_deferred_resource(first_token).is_err());
         assert_eq!(
-            registry.read_deferred_resource(second_token).unwrap(),
+            registry.read_deferred_resource(second_token).unwrap().value,
             serde_json::json!("second")
         );
     }

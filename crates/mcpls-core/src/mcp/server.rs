@@ -83,6 +83,7 @@ fn deferred_resource_page(
     deferred: &DeferredResource,
     uri: String,
     value: serde_json::Value,
+    snapshot_hash: &str,
 ) -> Result<SemanticResourceReadResult, McpError> {
     let json = serde_json::to_string(&value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -110,6 +111,7 @@ fn deferred_resource_page(
             offset_bytes: Some(deferred.offset_bytes),
             returned_bytes: Some(end - deferred.offset_bytes),
             remaining_bytes: Some(total_bytes - end),
+            snapshot_hash: Some(snapshot_hash.to_owned()),
         };
         let result_bytes = serde_json::to_vec(&result)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -3459,12 +3461,12 @@ impl McplsServer {
                 self.read_source_resource_as_tool_result(source).await?
             }
             SessionResource::Deferred(deferred) => {
-                let value = self
+                let payload = self
                     .context
                     .project_registry
                     .read_deferred_resource(&deferred.token)
                     .map_err(|error| McpError::invalid_params(error, None))?;
-                deferred_resource_page(&deferred, uri, value)?
+                deferred_resource_page(&deferred, uri, payload.value, &payload.snapshot_hash)?
             }
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
@@ -3522,6 +3524,7 @@ impl McplsServer {
                 offset_bytes: None,
                 returned_bytes: None,
                 remaining_bytes: None,
+                snapshot_hash: None,
             };
             let result_bytes = serde_json::to_vec(&result)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -3583,12 +3586,17 @@ impl McplsServer {
         uri: String,
         supports_cache_hints: bool,
     ) -> Result<ReadResourceResponse, McpError> {
-        let value = self
+        let payload = self
             .context
             .project_registry
             .read_deferred_resource(&deferred.token)
             .map_err(|error| McpError::invalid_params(error, None))?;
-        let page = deferred_resource_page(&deferred, uri.clone(), value)?;
+        let page = deferred_resource_page(
+            &deferred,
+            uri.clone(),
+            payload.value,
+            &payload.snapshot_hash,
+        )?;
         let json = serde_json::to_string(&page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
@@ -4067,6 +4075,7 @@ mod tests {
                 &deferred,
                 format!("mcpls-deferred:///token?offset_bytes={offset_bytes}"),
                 value.clone(),
+                "snapshot",
             )
             .unwrap();
             assert!(
@@ -4075,6 +4084,7 @@ mod tests {
             assert_eq!(result.total_bytes, Some(expected.len()));
             assert_eq!(result.offset_bytes, Some(offset_bytes));
             assert_eq!(result.returned_bytes, Some(result.text.len()));
+            assert_eq!(result.snapshot_hash.as_deref(), Some("snapshot"));
             assert_eq!(
                 result.remaining_bytes,
                 Some(expected.len() - offset_bytes - result.text.len())

@@ -17908,6 +17908,13 @@
             "null"
           ]
         },
+        "snapshot_hash": {
+          "description": "Snapshot identity of the immutable deferred payload.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "text": {
           "description": "Complete JSON resource payload, or an ordered UTF-8 JSON fragment when `next_uri` is set.",
           "type": "string"

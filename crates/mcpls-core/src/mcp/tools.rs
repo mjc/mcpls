@@ -1008,6 +1008,9 @@ pub struct SemanticResourceReadResult {
     /// Number of JSON bytes still available after this fragment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_bytes: Option<usize>,
+    /// Snapshot identity of the immutable deferred payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_hash: Option<String>,
 }
 
 #[cfg(test)]
