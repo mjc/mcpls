@@ -126,7 +126,7 @@ fn resolve_workspace_roots_from(config_roots: &[PathBuf], start: &Path) -> Vec<P
 
     let root = start
         .ancestors()
-        .find(|ancestor| ancestor.join(".git").try_exists().unwrap_or(false))
+        .find(|ancestor| has_git_worktree_marker(ancestor))
         .or_else(|| {
             start.ancestors().find(|ancestor| {
                 PROJECT_MANIFESTS
@@ -148,6 +148,16 @@ fn resolve_workspace_roots_from(config_roots: &[PathBuf], start: &Path) -> Vec<P
             vec![root.to_path_buf()]
         },
     )
+}
+
+fn has_git_worktree_marker(directory: &Path) -> bool {
+    let marker = directory.join(".git");
+    if marker.is_dir() {
+        return marker.join("HEAD").is_file();
+    }
+
+    std::fs::read_to_string(marker)
+        .is_ok_and(|contents| contents.trim_start().starts_with("gitdir:"))
 }
 
 async fn register_default_workspace_projects(
@@ -319,6 +329,7 @@ mod tests {
     fn detects_git_workspace_from_nested_directory() {
         let workspace = TempDir::new().unwrap();
         std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        std::fs::write(workspace.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let nested = workspace.path().join("crates").join("core");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"core\"\n").unwrap();
@@ -424,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn ignores_invalid_git_marker_above_manifest_workspace() {
+        let parent = TempDir::new().unwrap();
+        std::fs::create_dir(parent.path().join(".git")).unwrap();
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(
+            resolve_workspace_roots_from(&[], &workspace),
+            [workspace.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
     fn empty_config_without_project_marker_registers_nothing() {
         let directory = TempDir::new().unwrap();
 
@@ -434,6 +459,7 @@ mod tests {
     fn configured_roots_win_over_detected_workspace() {
         let workspace = TempDir::new().unwrap();
         std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        std::fs::write(workspace.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let configured = [PathBuf::from("/configured/root")];
 
         assert_eq!(
