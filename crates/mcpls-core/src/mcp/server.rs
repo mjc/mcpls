@@ -875,9 +875,23 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
 }
 
 const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
+const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
+const DEFAULT_TOOL_PAGE: &[&str] = &[
+    "project_list",
+    "workspace_symbol_search",
+    "workspace_symbol_search_batch",
+    "inspect_symbol",
+    "inspect_symbol_batch",
+    "lexical_search",
+    "read_semantic_resource",
+    "get_diagnostics",
+    "structural_replace_preview",
+    "workspace_edit_preview",
+    "workspace_edit_apply",
+];
 
 fn advertised_tools() -> Vec<Tool> {
-    McplsServer::tool_router()
+    let mut tools = McplsServer::tool_router()
         .list_all()
         .into_iter()
         .map(|mut tool| {
@@ -890,7 +904,42 @@ fn advertised_tools() -> Vec<Tool> {
             }
             tool
         })
-        .collect()
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| {
+        tool_catalog_rank(left.name.as_ref()).cmp(&tool_catalog_rank(right.name.as_ref()))
+    });
+    tools
+}
+
+fn tool_catalog_rank(name: &str) -> (usize, &str) {
+    (
+        DEFAULT_TOOL_PAGE
+            .iter()
+            .position(|candidate| *candidate == name)
+            .unwrap_or(DEFAULT_TOOL_PAGE.len()),
+        name,
+    )
+}
+
+fn advertised_tools_page(cursor: Option<&str>) -> Result<(Vec<Tool>, Option<String>), String> {
+    let tools = advertised_tools();
+    let start = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| format!("invalid tools/list cursor: {cursor}"))?,
+        None => 0,
+    };
+    if start >= tools.len() {
+        return Err(format!("tools/list cursor is outside the catalog: {start}"));
+    }
+
+    let end = start
+        .saturating_add(ADVERTISED_TOOL_PAGE_SIZE)
+        .min(tools.len());
+    Ok((
+        tools[start..end].to_vec(),
+        (end < tools.len()).then(|| end.to_string()),
+    ))
 }
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -3493,11 +3542,18 @@ impl McplsServer {
 impl ServerHandler for McplsServer {
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let supports_cache_hints = supports_cache_hints(&context);
-        let mut result = ListToolsResult::with_all_items(advertised_tools());
+        let (tools, next_cursor) = advertised_tools_page(
+            request
+                .as_ref()
+                .and_then(|request| request.cursor.as_deref()),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut result = ListToolsResult::with_all_items(tools);
+        result.next_cursor = next_cursor;
         if supports_cache_hints {
             result.ttl_ms = Some(0);
             result.cache_scope = Some(CacheScope::Public);
@@ -4928,7 +4984,10 @@ finally:
 
     #[test]
     fn advertised_tools_compact_expanded_output_schemas() {
-        let full = McplsServer::tool_router().list_all();
+        let mut full = McplsServer::tool_router().list_all();
+        full.sort_by(|left, right| {
+            tool_catalog_rank(left.name.as_ref()).cmp(&tool_catalog_rank(right.name.as_ref()))
+        });
         let advertised = advertised_tools();
         let full_bytes = serde_json::to_vec(&full).unwrap().len();
         let advertised_bytes = serde_json::to_vec(&advertised).unwrap().len();
@@ -4954,6 +5013,57 @@ finally:
                 full.name
             );
         }
+    }
+
+    #[test]
+    fn advertised_tool_pages_are_lossless_and_bounded() {
+        let full = advertised_tools();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        let (first_page, first_cursor) = advertised_tools_page(None).unwrap();
+        assert!(first_cursor.is_some());
+        for name in [
+            "project_list",
+            "workspace_symbol_search",
+            "workspace_symbol_search_batch",
+            "inspect_symbol",
+            "inspect_symbol_batch",
+            "lexical_search",
+            "read_semantic_resource",
+            "get_diagnostics",
+            "structural_replace_preview",
+            "workspace_edit_preview",
+            "workspace_edit_apply",
+        ] {
+            assert!(
+                first_page.iter().any(|tool| tool.name == name),
+                "default tools/list page is missing {name}"
+            );
+        }
+        assert!(
+            serde_json::to_vec(&first_page).unwrap().len() * 2 < full_bytes,
+            "default tools/list page must be less than half the full catalog"
+        );
+        let mut cursor = None;
+        let mut names = Vec::new();
+
+        loop {
+            let (page, next_cursor) = advertised_tools_page(cursor.as_deref()).unwrap();
+            assert!(page.len() <= ADVERTISED_TOOL_PAGE_SIZE);
+            names.extend(page.into_iter().map(|tool| tool.name.into_owned()));
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+
+        assert_eq!(
+            names,
+            full.into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(advertised_tools_page(Some("not-an-offset")).is_err());
+        assert!(advertised_tools_page(Some(&names.len().to_string())).is_err());
     }
 
     #[test]
