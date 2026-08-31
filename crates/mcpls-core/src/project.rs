@@ -14131,6 +14131,78 @@ while True:
     }
 
     #[tokio::test]
+    async fn registry_overlaps_linked_worktree_commits() {
+        let (_repository, _worktrees, roots) = compatible_worktree_fixture();
+        let registry = ProjectRegistry::new(4);
+        let project_id = ProjectId::new("project").unwrap();
+        add_compatible_roots(&registry, &project_id, &roots).await;
+        let actor = registry.actor_for_project(&project_id).await.unwrap();
+        let first_path = roots[0].join("src.rs");
+        let second_path = roots[1].join("src.rs");
+        fs::write(&first_path, "before first\n").unwrap();
+        fs::write(&second_path, "before second\n").unwrap();
+        let first = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                first_path.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before first\n",
+                "after first\n",
+            )],
+            vec!["replace first".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(roots[0].clone());
+        let second = EditPlan::new(
+            project_id.to_string(),
+            vec![crate::edit_plan::FileSnapshot::from_contents(
+                second_path.clone(),
+                crate::edit_plan::SnapshotSource::Disk,
+                None,
+                "before second\n",
+                "after second\n",
+            )],
+            vec!["replace second".to_owned()],
+            true,
+            Duration::from_secs(60),
+        )
+        .with_workspace_root(roots[1].clone());
+        let first_id = first.id().clone();
+        let second_id = second.id().clone();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let _barrier =
+            crate::edit_apply::install_test_apply_barrier([first_id.clone(), second_id.clone()], 2);
+        let (first_result, second_result) = tokio::join!(
+            registry.apply_edit_plan_with_context(
+                &project_id,
+                first_id,
+                Some("first-session".to_owned()),
+                None,
+            ),
+            registry.apply_edit_plan_with_context(
+                &project_id,
+                second_id,
+                Some("second-session".to_owned()),
+                None,
+            ),
+        );
+        assert!(matches!(
+            first_result.unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            second_result.unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert_eq!(fs::read_to_string(first_path).unwrap(), "after first\n");
+        assert_eq!(fs::read_to_string(second_path).unwrap(), "after second\n");
+    }
+
+    #[tokio::test]
     async fn registry_reports_busy_without_consuming_a_plan() {
         let root = TempDir::new().unwrap();
         let file = root.path().join("busy.rs");
@@ -14188,6 +14260,96 @@ while True:
                 .unwrap(),
             ApplyEditPlanOutcome::Applied(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn registry_competing_same_file_is_retryable_then_conflicts() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        fs::write(&file, "before\n").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let plan = |after| {
+            EditPlan::new(
+                project_id.to_string(),
+                vec![crate::edit_plan::FileSnapshot::from_contents(
+                    file.clone(),
+                    crate::edit_plan::SnapshotSource::Disk,
+                    None,
+                    "before\n",
+                    after,
+                )],
+                vec!["replace src.rs".to_owned()],
+                true,
+                Duration::from_secs(60),
+            )
+            .with_workspace_root(root.path().to_path_buf())
+        };
+        let first = plan("first\n");
+        let second = plan("second\n");
+        let first_id = first.id().clone();
+        let second_id = second.id().clone();
+        actor.store_edit_plan(first).await.unwrap();
+        actor.store_edit_plan(second).await.unwrap();
+
+        let lease = registry
+            .edit_coordinator
+            .try_acquire(
+                "first-session",
+                [crate::edit_coordinator::EditResource::exact(file.clone())],
+            )
+            .unwrap();
+        let busy = registry
+            .apply_edit_plan_with_wait(
+                &project_id,
+                second_id.clone(),
+                Some("second-session".to_owned()),
+                None,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(busy, ApplyEditPlanOutcome::NotReady(_)));
+        assert!(
+            actor
+                .inspect_edit_plan(second_id.clone(), project_id.to_string())
+                .await
+                .is_ok()
+        );
+
+        drop(lease);
+        assert!(matches!(
+            registry
+                .apply_edit_plan_with_context(
+                    &project_id,
+                    first_id,
+                    Some("first-session".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap(),
+            ApplyEditPlanOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            registry
+                .apply_edit_plan_with_context(
+                    &project_id,
+                    second_id,
+                    Some("second-session".to_owned()),
+                    None,
+                )
+                .await
+                .unwrap(),
+            ApplyEditPlanOutcome::Conflict(_)
+        ));
+        assert_eq!(fs::read_to_string(file).unwrap(), "first\n");
     }
 
     #[tokio::test]
