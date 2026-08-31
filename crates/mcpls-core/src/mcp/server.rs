@@ -469,7 +469,11 @@ fn project_events_json(
     serde_json::json!({
         "project_id": project_id.as_str(),
         "next_cursor": snapshot.next_sequence(),
+        "next_uri": snapshot.truncated().then(|| {
+            format!("mcpls-project-events:///{project_id}?since={}", snapshot.next_sequence())
+        }),
         "resync_required": snapshot.resync_required(),
+        "truncated": snapshot.truncated(),
         "retention_floor": snapshot.retention_floor(),
         "returned_events": snapshot.events().len(),
         "first_sequence": snapshot.first_sequence(),
@@ -937,6 +941,7 @@ const ADVERTISED_OUTPUT_SCHEMA_LIMIT: usize = 2_048;
 const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
 const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
+const PROJECT_EVENT_PAGE_SIZE: usize = 64;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
@@ -1323,7 +1328,7 @@ impl McplsServer {
             .actor_for_project(&project_id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let snapshot = actor.event_snapshot(cursor);
+        let snapshot = actor.event_snapshot(cursor, PROJECT_EVENT_PAGE_SIZE);
         let json = encode_json(&project_events_json(&project_id, &snapshot))?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json.legacy, uri)],
@@ -4059,6 +4064,21 @@ mod tests {
             writeln!(output, "{prefix} {line}").unwrap();
             output
         })
+    }
+
+    #[test]
+    fn truncated_project_event_pages_expose_a_direct_continuation_uri() {
+        let mut history = crate::project::ProjectEventHistory::new(2);
+        for generation in 1..=2 {
+            history.record(ProjectEvent::ServerExited { generation });
+        }
+        let project_id = ProjectId::new("project").unwrap();
+        let payload = project_events_json(&project_id, &history.snapshot_since(None, 1));
+
+        assert_eq!(
+            payload["next_uri"],
+            "mcpls-project-events:///project?since=1"
+        );
     }
 
     #[test]

@@ -933,6 +933,7 @@ impl ProjectEventRecord {
 pub struct ProjectEventSnapshot {
     events: Vec<ProjectEventRecord>,
     resync_required: bool,
+    truncated: bool,
     retention_floor: u64,
     next_sequence: u64,
 }
@@ -960,6 +961,12 @@ impl ProjectEventSnapshot {
     #[must_use]
     pub const fn resync_required(&self) -> bool {
         self.resync_required
+    }
+
+    /// Whether retained events remain after this page.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Return the latest cursor whose successor is entirely retained.
@@ -1008,23 +1015,29 @@ impl ProjectEventHistory {
 
     /// Return retained events newer than `cursor`, marking overflow when needed.
     #[must_use]
-    pub fn snapshot_since(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+    pub fn snapshot_since(&self, cursor: Option<u64>, max_events: usize) -> ProjectEventSnapshot {
         let oldest = self
             .records
             .front()
             .map_or(self.next_sequence, |record| record.sequence);
         let resync_required = cursor.is_some_and(|cursor| cursor < oldest.saturating_sub(1));
-        let events = self
+        let mut records = self
             .records
             .iter()
             .filter(|record| cursor.is_none_or(|cursor| record.sequence > cursor))
-            .cloned()
-            .collect();
+            .cloned();
+        let events = records.by_ref().take(max_events.max(1)).collect::<Vec<_>>();
+        let truncated = records.next().is_some();
+        let next_sequence = events.last().map_or_else(
+            || cursor.unwrap_or(self.next_sequence.saturating_sub(1)),
+            ProjectEventRecord::sequence,
+        );
         ProjectEventSnapshot {
             events,
             resync_required,
+            truncated,
             retention_floor: oldest.saturating_sub(1),
-            next_sequence: self.next_sequence.saturating_sub(1),
+            next_sequence,
         }
     }
 }
@@ -2163,11 +2176,11 @@ impl ProjectHandle {
 
     /// Return retained project events newer than an optional polling cursor.
     #[must_use]
-    pub fn event_snapshot(&self, cursor: Option<u64>) -> ProjectEventSnapshot {
+    pub fn event_snapshot(&self, cursor: Option<u64>, max_events: usize) -> ProjectEventSnapshot {
         self.event_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot_since(cursor)
+            .snapshot_since(cursor, max_events)
     }
 
     fn reject_new_work(&self) {
@@ -12784,7 +12797,7 @@ mod tests {
         });
         history.record(ProjectEvent::ServerExited { generation: 1 });
 
-        let snapshot = history.snapshot_since(Some(0));
+        let snapshot = history.snapshot_since(Some(0), 2);
         assert!(snapshot.resync_required());
         assert_eq!(snapshot.events().len(), 2);
         assert_eq!(snapshot.events()[0].sequence(), 2);
@@ -12792,9 +12805,41 @@ mod tests {
         assert_eq!(snapshot.next_sequence(), 3);
 
         history.record(ProjectEvent::ServerExited { generation: 2 });
-        let resumed = history.snapshot_since(Some(snapshot.next_sequence()));
+        let resumed = history.snapshot_since(Some(snapshot.next_sequence()), 2);
         assert_eq!(resumed.events().len(), 1);
         assert_eq!(resumed.events()[0].sequence(), 4);
+    }
+
+    #[test]
+    fn project_event_history_pages_an_exclusive_cursor_without_gaps() {
+        let mut history = ProjectEventHistory::new(4);
+        for generation in 1..=4 {
+            history.record(ProjectEvent::ServerExited { generation });
+        }
+
+        let first = history.snapshot_since(None, 2);
+        assert!(first.truncated());
+        assert_eq!(first.next_sequence(), 2);
+        assert_eq!(
+            first
+                .events()
+                .iter()
+                .map(ProjectEventRecord::sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second = history.snapshot_since(Some(first.next_sequence()), 2);
+        assert!(!second.truncated());
+        assert_eq!(second.next_sequence(), 4);
+        assert_eq!(
+            second
+                .events()
+                .iter()
+                .map(ProjectEventRecord::sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 
     #[test]
@@ -12810,7 +12855,7 @@ mod tests {
             operation_count: 1,
         });
 
-        let snapshot = history.snapshot_since(None);
+        let snapshot = history.snapshot_since(None, 4);
         assert!(matches!(
             snapshot.events()[0].event(),
             ProjectEvent::FilesChanged { paths } if paths.len() == 1
@@ -15030,7 +15075,7 @@ while True:
             .unwrap();
         assert!(
             duplicate
-                .event_snapshot(None)
+                .event_snapshot(None, 256)
                 .events()
                 .iter()
                 .any(|record| {
