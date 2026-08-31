@@ -389,6 +389,9 @@ pub struct LexicalSearchParams {
     /// Maximum matches returned (default: 100).
     #[serde(default = "default_lexical_max_matches")]
     pub max_matches: usize,
+    /// Maximum serialized structured response bytes (default: 65536).
+    #[serde(default = "default_lexical_max_bytes")]
+    pub max_bytes: usize,
     /// Decimal offset returned by a prior lexical-search `next_cursor`.
     #[serde(default)]
     pub page_token: Option<String>,
@@ -411,6 +414,9 @@ const fn default_lexical_max_files() -> usize {
 }
 const fn default_lexical_max_matches() -> usize {
     100
+}
+const fn default_lexical_max_bytes() -> usize {
+    64 * 1024
 }
 
 /// Parameters for one bounded batch of workspace-symbol searches.

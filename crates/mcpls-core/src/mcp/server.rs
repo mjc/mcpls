@@ -206,6 +206,38 @@ where
     )
 }
 
+fn bounded_lexical_page(
+    mut matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
+    offset: usize,
+    has_next_page: bool,
+    max_bytes: usize,
+) -> serde_json::Value {
+    let total_matches = matches.len();
+    loop {
+        let truncated = has_next_page || matches.len() < total_matches;
+        let page = serde_json::json!({
+            "matches": matches,
+            "returned": matches.len(),
+            "truncated": truncated,
+            "next_cursor": truncated.then(|| offset.saturating_add(matches.len()).to_string()),
+        });
+        if serde_json::to_vec(&page).is_ok_and(|encoded| encoded.len() <= max_bytes)
+            || matches.is_empty()
+        {
+            return page;
+        }
+        if let Some(match_with_context) = matches
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.source.is_some())
+        {
+            match_with_context.source = None;
+        } else {
+            matches.pop();
+        }
+    }
+}
+
 fn call_hierarchy_item_path(item: &serde_json::Value) -> Result<PathBuf, McpError> {
     let uri = item
         .get("uri")
@@ -2583,6 +2615,12 @@ impl McplsServer {
                 None,
             ));
         }
+        if !(4 * 1024..=1024 * 1024).contains(&params.max_bytes) {
+            return Err(McpError::invalid_params(
+                "max_bytes must be between 4096 and 1048576",
+                None,
+            ));
+        }
         find_matches(
             "",
             &params.query,
@@ -2629,12 +2667,12 @@ impl McplsServer {
         let matches = matches
             .drain(offset.min(matches.len())..end)
             .collect::<Vec<_>>();
-        encode_tool_result(Ok::<_, String>(serde_json::json!({
-            "matches": matches,
-            "returned": matches.len(),
-            "truncated": has_next_page,
-            "next_cursor": has_next_page.then(|| offset.saturating_add(limit).to_string()),
-        })))
+        encode_tool_result(Ok::<_, String>(bounded_lexical_page(
+            matches,
+            offset,
+            has_next_page,
+            params.max_bytes,
+        )))
     }
 
     /// Search several symbol names through one bounded actor request.
@@ -4950,6 +4988,28 @@ finally:
         assert!(schema.contains("regex"));
         assert!(schema.contains("smart"));
         assert!(tool.input_schema["properties"]["max_matches"].is_object());
+        assert!(tool.input_schema["properties"]["max_bytes"].is_object());
+    }
+
+    #[test]
+    fn lexical_page_respects_its_serialized_byte_budget() {
+        let matches = (0..2)
+            .map(|index| crate::bridge::lexical::LexicalSearchMatch {
+                project_relative_path: format!("src/{index:0200}.rs"),
+                document_version: None,
+                content_hash: "a".repeat(64),
+                source_uri: format!("mcpls-source:///src/{index:0200}.rs"),
+                source: None,
+                byte_range: 0..1,
+            })
+            .collect();
+
+        let page = bounded_lexical_page(matches, 0, false, 800);
+
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 800);
+        assert_eq!(page["returned"], 1);
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["next_cursor"], "1");
     }
 
     #[tokio::test]
