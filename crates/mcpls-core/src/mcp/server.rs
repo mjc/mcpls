@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
     DeferredResource, SessionResource, event_resource_uris, parse_session_resource_uri,
-    project_events_resource_uri, project_status_resource_uri,
+    project_event_resource_uri, project_events_resource_uri, project_status_resource_uri,
 };
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
@@ -481,8 +481,24 @@ fn project_events_json(
         "events": snapshot
             .events()
             .iter()
-            .map(ProjectEventRecord::json_value)
+            .map(|record| project_event_json(project_id, record))
             .collect::<Vec<_>>(),
+    })
+}
+
+fn project_event_json(project_id: &ProjectId, record: &ProjectEventRecord) -> serde_json::Value {
+    let event = record.event().json_value();
+    let total_bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
+    if total_bytes <= MAX_INLINE_PROJECT_EVENT_BYTES {
+        return record.json_value();
+    }
+    serde_json::json!({
+        "sequence": record.sequence(),
+        "event": {"kind": event.get("kind").cloned().unwrap_or(serde_json::Value::Null)},
+        "resource": {
+            "uri": project_event_resource_uri(project_id, record.sequence()),
+            "total_bytes": total_bytes,
+        },
     })
 }
 
@@ -942,6 +958,7 @@ const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
 const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
 const PROJECT_EVENT_PAGE_SIZE: usize = 64;
+const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
@@ -1332,6 +1349,34 @@ impl McplsServer {
         let json = encode_json(&project_events_json(&project_id, &snapshot))?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json.legacy, uri)],
+            supports_cache_hints,
+        )
+        .into())
+    }
+
+    async fn read_project_event_resource(
+        &self,
+        project_id: ProjectId,
+        sequence: u64,
+        uri: String,
+        supports_cache_hints: bool,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&project_id)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let record = actor.event_record(sequence).ok_or_else(|| {
+            McpError::invalid_params(
+                "stale_resource: project event is no longer retained; reread project events",
+                None,
+            )
+        })?;
+        let json = serde_json::to_string(&record.json_value())
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(private_resource_result(
+            vec![ResourceContents::text(json, uri)],
             supports_cache_hints,
         )
         .into())
@@ -3479,7 +3524,8 @@ impl McplsServer {
             }
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
-            | SessionResource::ProjectEvents { .. } => {
+            | SessionResource::ProjectEvents { .. }
+            | SessionResource::ProjectEvent { .. } => {
                 return Err(McpError::invalid_params(
                     "read_semantic_resource accepts only mcpls-source:// or mcpls-deferred:// references",
                     None,
@@ -3625,7 +3671,8 @@ impl McplsServer {
                 .map_err(|error| McpError::invalid_params(error.to_string(), None))?
             {
                 SessionResource::ProjectStatus(project_id)
-                | SessionResource::ProjectEvents { project_id, .. } => {
+                | SessionResource::ProjectEvents { project_id, .. }
+                | SessionResource::ProjectEvent { project_id, .. } => {
                     project_ids.insert(project_id);
                 }
                 SessionResource::Diagnostics(path) => {
@@ -3831,6 +3878,19 @@ impl ServerHandler for McplsServer {
                     )
                     .await;
             }
+            SessionResource::ProjectEvent {
+                project_id,
+                sequence,
+            } => {
+                return self
+                    .read_project_event_resource(
+                        project_id,
+                        sequence,
+                        request.uri,
+                        supports_cache_hints,
+                    )
+                    .await;
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => {
                 return self
@@ -3959,6 +4019,15 @@ impl ServerHandler for McplsServer {
                 .await?;
                 return Ok(());
             }
+            SessionResource::ProjectEvent { project_id, .. } => {
+                self.attach_project_subscription(
+                    project_id.clone(),
+                    project_events_resource_uri(&project_id),
+                    context.peer,
+                )
+                .await?;
+                return Ok(());
+            }
             SessionResource::Diagnostics(path) => path,
             SessionResource::Source(source) => source.path,
             SessionResource::Deferred(_) => {
@@ -4011,6 +4080,9 @@ impl ServerHandler for McplsServer {
             SessionResource::ProjectEvents { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
+            SessionResource::ProjectEvent { project_id, .. } => {
+                project_events_resource_uri(&project_id)
+            }
             SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
             | SessionResource::Source(_)
@@ -4052,6 +4124,7 @@ mod tests {
     use super::*;
     use crate::bridge::resources::parse_uri;
     use crate::edit_plan::{EditPlan, FileSnapshot, SnapshotSource};
+    use crate::project::ProjectStatus;
     use tempfile::TempDir;
 
     fn create_test_server() -> McplsServer {
@@ -4079,6 +4152,74 @@ mod tests {
             payload["next_uri"],
             "mcpls-project-events:///project?since=1"
         );
+    }
+
+    #[test]
+    fn oversized_project_event_body_is_referenced_without_losing_identity() {
+        let mut history = crate::project::ProjectEventHistory::new(1);
+        history.record(ProjectEvent::StatusChanged {
+            status: ProjectStatus::Failed,
+            last_error: Some("x".repeat(1024)),
+        });
+        let project_id = ProjectId::new("project").unwrap();
+        let payload = project_events_json(&project_id, &history.snapshot_since(None, 1));
+
+        assert_eq!(payload["events"][0]["sequence"], 1);
+        assert_eq!(payload["events"][0]["event"]["kind"], "status_changed");
+        assert_eq!(
+            payload["events"][0]["resource"]["uri"],
+            "mcpls-project-event:///project?sequence=1"
+        );
+        assert!(
+            payload["events"][0]["resource"]["total_bytes"]
+                .as_u64()
+                .unwrap()
+                > 1024
+        );
+        assert!(payload["events"][0]["event"].get("last_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_project_event_resources_are_readable_until_evicted() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(1);
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        actor.set_status(ProjectStatus::Ready).await.unwrap();
+
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let uri = project_event_resource_uri(&project_id, 1);
+        let response = server
+            .read_project_event_resource(project_id.clone(), 1, uri, false)
+            .await
+            .unwrap();
+        let ReadResourceResponse::Complete(response) = response else {
+            panic!("project event resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+            panic!("project event resource was not text");
+        };
+        let event: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(event["sequence"], 1);
+        assert_eq!(event["event"]["kind"], "status_changed");
+
+        let error = server
+            .read_project_event_resource(
+                project_id,
+                99,
+                "mcpls-project-event:///project?sequence=99".to_owned(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stale_resource:"));
     }
 
     #[test]

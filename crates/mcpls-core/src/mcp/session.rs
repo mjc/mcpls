@@ -18,6 +18,7 @@ use crate::project::{ProjectEvent, ProjectHandle, ProjectId};
 
 const PROJECT_STATUS_PREFIX: &str = "mcpls-project-status:///";
 const PROJECT_EVENTS_PREFIX: &str = "mcpls-project-events:///";
+const PROJECT_EVENT_PREFIX: &str = "mcpls-project-event:///";
 
 /// Encode a project identity as a subscribable MCP status resource URI.
 pub fn project_status_resource_uri(project_id: &ProjectId) -> String {
@@ -34,6 +35,22 @@ pub fn parse_project_status_resource_uri(uri: &str) -> Option<ProjectId> {
 /// Encode a project identity as a bounded event-history resource URI.
 pub fn project_events_resource_uri(project_id: &ProjectId) -> String {
     format!("{PROJECT_EVENTS_PREFIX}{project_id}")
+}
+
+/// Encode one retained immutable project event resource URI.
+pub fn project_event_resource_uri(project_id: &ProjectId, sequence: u64) -> String {
+    format!("{PROJECT_EVENT_PREFIX}{project_id}?sequence={sequence}")
+}
+
+/// Decode a retained immutable project event resource URI.
+pub fn parse_project_event_resource_uri(uri: &str) -> Option<(ProjectId, u64)> {
+    let value = uri.strip_prefix(PROJECT_EVENT_PREFIX)?;
+    let (id, query) = value.split_once('?')?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    let sequence = query.strip_prefix("sequence=")?.parse().ok()?;
+    Some((ProjectId::new(id.to_owned()).ok()?, sequence))
 }
 
 /// Decode a project event resource URI and optional polling cursor.
@@ -68,6 +85,13 @@ pub enum SessionResource {
         /// Return only events newer than this cursor.
         cursor: Option<u64>,
     },
+    /// One retained immutable project event body.
+    ProjectEvent {
+        /// Stable project identity.
+        project_id: ProjectId,
+        /// Monotonically increasing retained event sequence.
+        sequence: u64,
+    },
     /// Snapshot-bound source context omitted from a bounded semantic result.
     Source(SourceResource),
     /// Actor-owned deferred semantic section and byte cursor.
@@ -90,6 +114,12 @@ pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, Resource
     }
     if let Some((project_id, cursor)) = parse_project_events_resource_uri(uri) {
         return Ok(SessionResource::ProjectEvents { project_id, cursor });
+    }
+    if let Some((project_id, sequence)) = parse_project_event_resource_uri(uri) {
+        return Ok(SessionResource::ProjectEvent {
+            project_id,
+            sequence,
+        });
     }
     if uri.starts_with("mcpls-source://") {
         return parse_source_uri(uri).map(SessionResource::Source);
@@ -470,6 +500,22 @@ mod tests {
             })
         );
         assert!(parse_session_resource_uri("mcpls-deferred:///token?offset_bytes=nope").is_err());
+    }
+
+    #[test]
+    fn project_event_resource_uri_round_trips_a_retained_sequence() {
+        let project_id = ProjectId::new("project").unwrap();
+        let uri = super::project_event_resource_uri(&project_id, 42);
+        assert_eq!(
+            parse_session_resource_uri(&uri).unwrap(),
+            SessionResource::ProjectEvent {
+                project_id,
+                sequence: 42,
+            }
+        );
+        assert!(
+            parse_session_resource_uri("mcpls-project-event:///project?sequence=nope").is_err()
+        );
     }
 
     #[test]

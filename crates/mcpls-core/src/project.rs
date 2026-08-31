@@ -1013,6 +1013,15 @@ impl ProjectEventHistory {
         sequence
     }
 
+    /// Return one retained immutable event record by sequence.
+    #[must_use]
+    pub fn record_at(&self, sequence: u64) -> Option<ProjectEventRecord> {
+        self.records
+            .iter()
+            .find(|record| record.sequence == sequence)
+            .cloned()
+    }
+
     /// Return retained events newer than `cursor`, marking overflow when needed.
     #[must_use]
     pub fn snapshot_since(&self, cursor: Option<u64>, max_events: usize) -> ProjectEventSnapshot {
@@ -2181,6 +2190,15 @@ impl ProjectHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot_since(cursor, max_events)
+    }
+
+    /// Return one retained immutable event record by sequence.
+    #[must_use]
+    pub fn event_record(&self, sequence: u64) -> Option<ProjectEventRecord> {
+        self.event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_at(sequence)
     }
 
     fn reject_new_work(&self) {
