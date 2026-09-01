@@ -6635,12 +6635,17 @@ impl ProjectRuntime {
     #[allow(clippy::too_many_lines)]
     async fn inspect_symbol(
         &self,
-        request: InspectSymbolRequest,
+        mut request: InspectSymbolRequest,
     ) -> Result<InspectSymbolResult, String> {
         use crate::bridge::{
             InspectCalls, InspectSection, InspectSymbolResolution, InspectSymbolSectionKind,
             InspectSymbolSections,
         };
+
+        request.budget.max_bytes = request
+            .budget
+            .max_bytes
+            .min(crate::bridge::translator::INSPECT_SYMBOL_RESULT_MAX_BYTES);
 
         let (resolution, target) = if let Some(handle) = request.symbol_handle.clone() {
             let target = match self.resolve_symbol_target(&handle).await {
@@ -13293,6 +13298,48 @@ mod tests {
             candidate.location.source,
             crate::bridge::SourceContext::Available(_)
         )));
+    }
+
+    #[tokio::test]
+    async fn inspect_symbol_treats_a_large_requested_budget_as_an_upper_bound() {
+        const PAGE_LIMIT: usize = 16 * 1024;
+
+        let root = TempDir::new().unwrap();
+        for index in 0..40 {
+            fs::write(
+                root.path().join(format!("duplicate_{index}.rs")),
+                format!(
+                    "// {}\nfn duplicate() -> u8 {{ {index} }}\n",
+                    "x".repeat(1_024)
+                ),
+            )
+            .unwrap();
+        }
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        let result = actor
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: None,
+                query: Some("duplicate".to_owned()),
+                kind: Some("function".to_owned()),
+                path: None,
+                container: None,
+                candidate_limit: 100,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 45_000,
+                    max_items: 80,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.budget.max_bytes, PAGE_LIMIT);
+        assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
+        assert!(result.truncated);
     }
 
     #[test]

@@ -482,7 +482,7 @@ pub struct InspectSymbolParams {
     /// Sections to include; empty returns only the declaration source frame.
     #[serde(default)]
     pub sections: Vec<InspectSymbolSectionKind>,
-    /// Strict serialized-byte and per-provider item bounds for the complete bundle.
+    /// Caller upper bounds for the complete bundle; standalone responses are capped at 16 KiB.
     #[serde(default)]
     pub budget: InspectSymbolBudget,
 }

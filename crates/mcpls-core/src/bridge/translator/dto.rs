@@ -1088,6 +1088,7 @@ pub struct InspectSymbolBatchRequest {
 pub(crate) const INSPECT_SYMBOL_BATCH_MAX_TARGETS: usize = 16;
 pub(crate) const INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES: usize = 1024;
 pub(crate) const INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET: usize = 4096;
+pub(crate) const INSPECT_SYMBOL_RESULT_MAX_BYTES: usize = 16 * 1024;
 
 impl InspectSymbolRequest {
     /// Return whether the caller selected a section, defaulting to the declaration.

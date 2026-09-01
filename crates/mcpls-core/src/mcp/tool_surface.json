@@ -11769,7 +11769,7 @@
             "max_bytes": 65536,
             "max_items": 20
           },
-          "description": "Strict serialized-byte and per-provider item bounds for the complete bundle.",
+          "description": "Caller upper bounds for the complete bundle; standalone responses are capped at 16 KiB.",
           "properties": {
             "max_bytes": {
               "default": 65536,
