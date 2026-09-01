@@ -36,6 +36,12 @@ see
 
 Prefer MCPLS results before `rg`, `sed`, or a file-read tool:
 
+Registered projects need no setup call for normal work: project-scoped semantic,
+lexical, and edit calls attach to the registered actor and wake it when needed.
+Do not call `project_add` or `project_activate` unless the project is genuinely
+unknown; use `project_list` to discover registered IDs, then register a new root
+only when it is absent.
+
 1. Call `lexical_search` for literal or Rust-regex source text. It returns bounded snapshot references and optional context without `rg`.
 2. Call `workspace_symbol_search` with the registered `project_id` and an exact name. Its ranked candidates include bounded `source` frames and snapshot-bound `symbol_handle` values.
 3. If exactly one candidate matches, pass its `symbol_handle` with `project_id` to `inspect_symbol`, `get_hover`, `get_definition`, `get_references`, or call-hierarchy tools. Do not copy coordinates when a handle is available.

@@ -14,6 +14,12 @@ Legacy clients that only read text blocks can start MCPLS with `MCPLS_LEGACY_TEX
 
 Tool failures retain MCP's standard JSON-RPC error code and message. Operational failures also include stable `data` fields: `code`, `message`, `action`, and `retryable`.
 
+Registered projects are ready for normal project-scoped calls without a
+registration or activation round trip. Semantic, lexical, and edit calls attach
+to the registered actor and wake it when needed. Use `project_list` to find a
+registered ID; use `project_add` only for a genuinely unknown root, and reserve
+`project_activate` for explicit lifecycle control.
+
 ## Tool Index
 
 ### Code Intelligence Tools

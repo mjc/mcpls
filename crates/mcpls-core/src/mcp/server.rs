@@ -355,6 +355,34 @@ fn operation_error(error: impl std::fmt::Display) -> McpError {
     McpError::internal_error(error.message.clone(), serde_json::to_value(error).ok())
 }
 
+fn project_not_registered_error(message: String) -> McpError {
+    McpError::invalid_params(
+        message.clone(),
+        Some(serde_json::json!({
+            "code": "project_not_registered",
+            "message": message,
+            "action": "Call project_list to discover registered IDs; use project_add for a new root.",
+            "retryable": false,
+        })),
+    )
+}
+
+fn project_routing_error(error: impl std::fmt::Display) -> McpError {
+    let message = error.to_string();
+    if message.starts_with("project is not registered:") {
+        return project_not_registered_error(message);
+    }
+    McpError::invalid_params(message, None)
+}
+
+fn project_operation_error(error: impl std::fmt::Display) -> McpError {
+    let message = error.to_string();
+    if message.starts_with("project is not registered:") {
+        return project_not_registered_error(message);
+    }
+    operation_error(message)
+}
+
 fn encode_json<T: Serialize>(value: &T) -> Result<Json<StructuredObject>, McpError> {
     let value = serde_json::to_value(value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -1615,7 +1643,7 @@ impl McplsServer {
         } else {
             self.context.required_actor_for_path(&file_path).await
         }
-        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        .map_err(project_routing_error)?;
         Ok((actor, file_path, line, character))
     }
 
@@ -1785,7 +1813,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&project_id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let snapshot = actor.event_snapshot(cursor, PROJECT_EVENT_PAGE_SIZE);
         let json = encode_json(&project_events_json(&project_id, &snapshot))?;
         Ok(private_resource_result(
@@ -1807,7 +1835,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&project_id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let record = actor.event_record(sequence).ok_or_else(|| {
             McpError::invalid_params(
                 "stale_resource: project event is no longer retained; reread project events",
@@ -1842,7 +1870,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&project_id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let diff = actor
             .read_edit_plan_diff(plan_id.clone(), project_id.as_str().to_owned())
             .await
@@ -1876,7 +1904,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&project_id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let detail = actor
             .read_applied_edit_detail(plan_id.clone(), project_id.as_str().to_owned())
             .await
@@ -3382,7 +3410,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let result = actor
             .workspace_symbol(crate::bridge::WorkspaceSymbolPageRequest {
                 query,
@@ -3446,7 +3474,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let mut matches = actor
             .lexical_search(LexicalSearchRequest {
                 query: params.query,
@@ -3543,7 +3571,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&id)
             .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let result = actor
             .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
                 queries,
@@ -3586,7 +3614,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&id)
             .await
-            .map_err(operation_error)?;
+            .map_err(project_operation_error)?;
         let result = actor
             .inspect_symbol(crate::bridge::InspectSymbolRequest {
                 symbol_handle: params.symbol_handle,
@@ -3683,7 +3711,7 @@ impl McplsServer {
             .project_registry
             .actor_for_project(&id)
             .await
-            .map_err(operation_error)?;
+            .map_err(project_operation_error)?;
         let result = actor
             .inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
                 targets: params.targets,
@@ -3853,7 +3881,7 @@ impl McplsServer {
             } else {
                 self.context.required_actor_for_path(&file_path).await
             }
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
             (actor, file_path, line, character)
         } else {
             self.semantic_target(project_id, symbol_handle, file_path, line, character)
@@ -6366,6 +6394,7 @@ finally:
             "project_id",
             "attach/wake",
             "configured skill files directly",
+            "no registration/activation",
         ] {
             assert!(
                 instructions.contains(required),
@@ -6448,11 +6477,16 @@ finally:
     #[test]
     fn bundled_skill_and_tool_reference_share_the_no_reread_workflow() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for path in [
+        let skill = std::fs::read_to_string(root.join("skills/mcpls/SKILL.md")).unwrap();
+        let tools_reference =
+            std::fs::read_to_string(root.join("docs/user-guide/tools-reference.md")).unwrap();
+        for (path, guidance) in [
             root.join("skills/mcpls/SKILL.md"),
             root.join("docs/user-guide/tools-reference.md"),
-        ] {
-            let guidance = std::fs::read_to_string(&path).unwrap();
+        ]
+        .into_iter()
+        .zip([skill.as_str(), tools_reference.as_str()])
+        {
             for required in [
                 "workspace_symbol_search",
                 "inspect_symbol",
@@ -6470,6 +6504,8 @@ finally:
                 );
             }
         }
+        assert!(skill.contains("Registered projects need no setup call"));
+        assert!(tools_reference.contains("registration or activation round trip"));
     }
 
     #[test]
@@ -6578,6 +6614,12 @@ finally:
     fn advertised_tool_pages_are_lossless_and_bounded() {
         let full = advertised_tools();
         let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        for name in ["project_list", "project_add", "project_activate"] {
+            assert!(
+                full.iter().any(|tool| tool.name == name),
+                "catalog pagination dropped lifecycle tool {name}"
+            );
+        }
         let (first_page, first_cursor) = advertised_tools_page(None).unwrap();
         assert!(first_cursor.is_some());
         assert_eq!(
@@ -6936,6 +6978,39 @@ finally:
         assert_eq!(error.data.as_ref().unwrap()["code"], "operation_failed");
         assert_eq!(error.data.as_ref().unwrap()["retryable"], true);
         assert!(error.data.as_ref().unwrap()["action"].is_string());
+    }
+
+    #[tokio::test]
+    async fn unknown_project_routing_explains_recovery_without_activation() {
+        let server = create_test_server();
+        let error = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: "missing".to_owned(),
+                query: "needle".to_owned(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
+                limit: 1,
+                max_bytes: 4_096,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("project is not registered: missing")
+        );
+        let data = error
+            .data
+            .as_ref()
+            .expect("unknown project should be actionable");
+        assert_eq!(data["code"], "project_not_registered");
+        assert_eq!(data["retryable"], false);
+        assert!(data["action"].as_str().unwrap().contains("project_list"));
+        assert!(data["action"].as_str().unwrap().contains("project_add"));
     }
 
     #[tokio::test]
