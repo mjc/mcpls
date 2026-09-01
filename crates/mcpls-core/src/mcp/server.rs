@@ -1171,6 +1171,8 @@ const RESOURCE_PAGE_SIZE: usize = 64;
 const PROJECT_EVENT_PAGE_SIZE: usize = 64;
 const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
 const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 16 * 1024;
+#[cfg(test)]
+const NATIVE_TOOL_CATALOG_MAX_BYTES: usize = 48 * 1024;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
     &["rename_symbol", "format_document", "get_code_actions"];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
@@ -1227,6 +1229,24 @@ fn compact_advertised_schema_value(value: &mut Value) {
     }
 }
 
+fn compact_advertised_description(name: &str) -> String {
+    format!("MCPLS {}.", name.replace('_', " "))
+}
+
+#[cfg(test)]
+fn native_catalog_bytes(tools: &[Tool]) -> usize {
+    let instructions = include_str!("server_instructions.txt").trim_end().len();
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::to_vec(tool)
+                .unwrap()
+                .len()
+                .saturating_add(instructions)
+        })
+        .sum()
+}
+
 fn advertised_tools() -> Vec<Tool> {
     let mut tools = McplsServer::tool_router()
         .list_all()
@@ -1234,6 +1254,7 @@ fn advertised_tools() -> Vec<Tool> {
         .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
         .map(|mut tool| {
             compact_advertised_input_schema(Arc::make_mut(&mut tool.input_schema));
+            tool.description = Some(compact_advertised_description(tool.name.as_ref()).into());
             tool.output_schema = None;
             tool
         })
@@ -5945,7 +5966,7 @@ finally:
         let instructions = create_test_server().get_info().instructions.unwrap();
 
         assert!(
-            instructions.len() <= 512,
+            instructions.len() <= 320,
             "initialize instructions are {} bytes",
             instructions.len()
         );
@@ -5953,22 +5974,15 @@ finally:
         for required in [
             "MCPLS-first",
             "workspace_symbol_search",
-            "workspace_symbol_search_batch",
             "lexical_search",
             "inspect_symbol",
-            "inspect_symbol_batch",
             "ast-grep/SSR",
             "source frames",
             "symbol_handle",
             "stale handles",
             "snapshot resources",
-            "file read/shell",
             "preview/apply",
-            "registrations persist",
-            "not project-bound",
             "project_id",
-            "project_list once",
-            "stable ID",
             "attach/wake",
         ] {
             assert!(
@@ -6231,6 +6245,16 @@ finally:
         );
         assert!(advertised_tools_page(Some("not-an-offset")).is_err());
         assert!(advertised_tools_page(Some(&names.len().to_string())).is_err());
+    }
+    #[test]
+    fn advertised_catalog_fits_native_registration_budget() {
+        let tools = advertised_tools();
+        assert!(
+            native_catalog_bytes(&tools) <= NATIVE_TOOL_CATALOG_MAX_BYTES,
+            "native catalog is {} bytes",
+            native_catalog_bytes(&tools)
+        );
+        assert!(tools.iter().any(|tool| tool.name == "lexical_search"));
     }
 
     #[test]
