@@ -6756,11 +6756,16 @@ impl ProjectRuntime {
             if matches.len() >= request.max_matches {
                 break;
             }
-            let (path, document_version, content_hash, source) = self
-                .translator
-                .source_snapshot(&path)
-                .await
-                .map_err(|error| error.to_string())?;
+            let (path, document_version, content_hash, source) =
+                match self.translator.source_snapshot(&path).await {
+                    Ok(snapshot) => snapshot,
+                    Err(crate::error::Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::InvalidData =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
             let ranges = find_matches(
                 &source,
                 &request.query,
@@ -11925,6 +11930,35 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
+
+    #[tokio::test]
+    async fn lexical_search_skips_non_utf8_files() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("binary.dat"), [0xff]).unwrap();
+        fs::write(root.path().join("source.rs"), "fn status_chip() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let runtime = ProjectRuntime::new(translator);
+
+        let matches = runtime
+            .lexical_search(LexicalSearchRequest {
+                query: "status_chip".to_owned(),
+                mode: crate::bridge::LexicalMatchMode::Literal,
+                case: crate::bridge::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 10,
+                max_matches: 10,
+                include_generated: false,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+                context_lines: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].project_relative_path, "source.rs");
+    }
 
     #[tokio::test]
     async fn server_exit_forwarder_does_not_pin_after_intentional_shutdown() {
