@@ -6291,8 +6291,12 @@ impl ProjectRuntime {
                 .await
                 .map_err(|error| error.to_string())
         });
-        let (hover, definitions, implementations, references, calls, tests, runnables, diagnostics) = tokio::join!(
-            inspect_if_requested(wants_hover, hover_request),
+        // A newly opened document can make the first semantic request receive
+        // ContentModified while its language server settles. Complete the
+        // declaration preflight before fanning out independent sections so
+        // they share that synchronization instead of retrying together.
+        let hover = inspect_if_requested(wants_hover, hover_request).await;
+        let (definitions, implementations, references, calls, tests, runnables, diagnostics) = tokio::join!(
             inspect_if_requested(wants_definitions, definitions_request),
             inspect_if_requested(wants_implementations, implementations_request),
             inspect_if_requested(wants_references, references_request),
@@ -11956,7 +11960,30 @@ mod tests {
             let _processes = (_write_half, _read_half);
             let writer = Arc::new(TokioMutex::new(read_half_stdin));
             let mut reader = BufReader::new(&mut write_stdout);
-            let mut requests = 0;
+            let hover = loop {
+                let message = read_framed_message(&mut reader).await;
+                if message.get("id").is_some() {
+                    break message;
+                }
+            };
+            assert_eq!(hover["method"], "textDocument/hover");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), read_framed_message(&mut reader))
+                    .await
+                    .is_err(),
+                "sections must wait for the declaration preflight"
+            );
+            {
+                let mut writer = writer.lock().await;
+                write_response(
+                    &mut *writer,
+                    &hover["id"],
+                    serde_json::json!({"contents": {"kind": "plaintext", "value": "inspected"}}),
+                )
+                .await;
+            }
+
+            let mut requests = 1;
             let mut responses = Vec::new();
             while requests < 7 {
                 let message = read_framed_message(&mut reader).await;
