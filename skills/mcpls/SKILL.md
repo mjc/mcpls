@@ -55,6 +55,8 @@ inspect_symbol {project_id: "default", symbol_handle: "…", sections: ["declara
 
 Read a file directly only when the task intentionally needs the uncapped full file, or when inspecting a non-source/generated artifact that semantic results cannot represent. An unavailable or truncated source frame is a reason to narrow/retry first, not automatically to reread the same file.
 
+Configured Codex skill files are an explicit exception: they live outside registered MCPLS projects, so read them with the normal file reader when their instructions are required. Do not try to route them through a project-scoped MCPLS tool, and do not broaden the project guard to make unrelated paths readable.
+
 ## Prerequisites
 
 mcpls does not implement language analysis itself — it forwards to a real LSP server

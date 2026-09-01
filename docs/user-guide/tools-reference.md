@@ -729,6 +729,8 @@ Pass returned handles directly to handle-aware tools instead of copying line/cha
 
 Use a direct file read only when intentionally requesting an uncapped full file or inspecting a non-source/generated artifact. For ordinary navigation, an available source frame is already the authoritative snapshot used by the semantic result; for truncation, first request a tighter section or larger explicit budget.
 
+Configured Codex skill files are an explicit exception: they live outside registered MCPLS projects, so read them with the normal file reader when their instructions are required. Do not route them through a project-scoped MCPLS tool or broaden the project guard for unrelated paths.
+
 ## inspect_symbol_batch
 
 Inspect 1–16 handles or exact queries concurrently through one project actor request. Targets remain in caller order, including target-local failures, unresolved queries, and stale handles. `sections` is shared by every target; `budget.max_bytes` bounds the complete response and `budget.max_items` is divided across targets so one batch cannot multiply provider work without bound.

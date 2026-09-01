@@ -6365,6 +6365,7 @@ finally:
             "preview/apply",
             "project_id",
             "attach/wake",
+            "configured skill files directly",
         ] {
             assert!(
                 instructions.contains(required),
@@ -6459,6 +6460,8 @@ finally:
                 "symbol_handle",
                 "stale_symbol_handle",
                 "uncapped full file",
+                "Configured Codex skill files are an explicit exception",
+                "broaden the project guard",
             ] {
                 assert!(
                     guidance.contains(required),
