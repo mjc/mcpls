@@ -397,6 +397,18 @@ pub struct Diagnostic {
     pub context: DiagnosticContext,
 }
 
+/// Compact identity of one diagnostic occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DiagnosticOccurrence {
+    /// Human-readable filesystem path for file-backed diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Canonical document URI.
+    pub uri: String,
+    /// Exact range of this occurrence.
+    pub range: Range,
+}
+
 /// Model-ready context attached to a diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiagnosticContext {
@@ -427,11 +439,17 @@ pub struct DiagnosticContext {
     pub data: Option<serde_json::Value>,
     /// Number of identical diagnostics represented by this group.
     pub occurrence_count: usize,
+    /// Stable identity shared by every page of this diagnostic group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Zero-based offset of the first occurrence returned on this page.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub occurrence_offset: usize,
     /// Actor-owned code-action handles accepted by the preview flow.
     pub fix_handles: Vec<String>,
-    /// Exact additional locations represented by this group when requested.
+    /// Exact locations returned on this page when requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub occurrences: Vec<Location>,
+    pub occurrences: Vec<DiagnosticOccurrence>,
 }
 
 impl Default for DiagnosticContext {
@@ -449,6 +467,8 @@ impl Default for DiagnosticContext {
             related_information: Vec::new(),
             data: None,
             occurrence_count: 1,
+            group_id: None,
+            occurrence_offset: 0,
             fix_handles: Vec::new(),
             occurrences: Vec::new(),
         }
@@ -469,16 +489,32 @@ pub struct DiagnosticRelatedInformation {
 pub struct DiagnosticsResult {
     /// List of diagnostics for the document.
     pub diagnostics: Vec<Diagnostic>,
+    /// Snapshot-bound source shared by compact occurrence identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_resource: Option<DeferredResourceReference>,
     /// Diagnostics before filtering and grouping.
     pub total_diagnostics: usize,
     /// Diagnostic occurrences represented in the response.
     pub returned_diagnostics: usize,
+    /// Diagnostic occurrences available after this page.
+    pub remaining_diagnostics: usize,
     /// Stable groups before response limits.
     pub total_groups: usize,
     /// Stable groups returned.
     pub returned_groups: usize,
     /// Complete groups omitted by response limits.
     pub omitted_groups: usize,
+    /// Stable groups available after this page.
+    pub remaining_groups: usize,
+    /// Snapshot-owned continuation for the next deterministic page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Stable identity of the immutable diagnostic snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_identity: Option<String>,
+    /// Maximum serialized bytes requested for this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
     /// Whether filtering or response budgets shortened the result.
     pub truncated: bool,
     /// Filters and bounds applied to this result.
@@ -527,9 +563,12 @@ pub struct DiagnosticOptions {
     /// Maximum diagnostic groups returned.
     #[serde(default = "default_diagnostic_item_limit")]
     pub item_limit: usize,
-    /// Maximum source-frame bytes across the response.
+    /// Maximum serialized bytes returned on one response page.
     #[serde(default = "default_diagnostic_byte_limit")]
     pub byte_limit: usize,
+    /// Snapshot-owned continuation returned by the preceding page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_token: Option<String>,
 }
 
 const fn default_true() -> bool {
@@ -555,6 +594,7 @@ impl Default for DiagnosticOptions {
             preserve_locations: false,
             item_limit: default_diagnostic_item_limit(),
             byte_limit: default_diagnostic_byte_limit(),
+            page_token: None,
         }
     }
 }
@@ -565,11 +605,17 @@ impl DiagnosticsResult {
         let count = diagnostics.len();
         Self {
             diagnostics,
+            source_resource: None,
             total_diagnostics: count,
             returned_diagnostics: count,
+            remaining_diagnostics: 0,
             total_groups: count,
             returned_groups: count,
             omitted_groups: 0,
+            remaining_groups: 0,
+            next_cursor: None,
+            snapshot_identity: None,
+            max_bytes: None,
             truncated: false,
             filters: DiagnosticOptions::default(),
             cache: None,

@@ -6,13 +6,14 @@ use std::sync::Arc;
 
 use lsp_types::{PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::Translator;
 use super::dto::{
-    Diagnostic, DiagnosticContext, DiagnosticOptions, DiagnosticRelatedInformation,
-    DiagnosticSeverity, DiagnosticsResult, Location, Position2D, Range, ServerLogsResult,
-    ServerMessagesResult,
+    Diagnostic, DiagnosticContext, DiagnosticOccurrence, DiagnosticOptions,
+    DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticsResult, Position2D, Range,
+    ServerLogsResult, ServerMessagesResult,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::routing::validate_path_against_roots;
@@ -59,14 +60,37 @@ fn diagnostic_group_key(
     )
 }
 
-fn diagnostic_location(diagnostic: &Diagnostic) -> Location {
-    Location {
+fn diagnostic_location(diagnostic: &Diagnostic) -> DiagnosticOccurrence {
+    DiagnosticOccurrence {
         path: diagnostic.context.path.clone(),
         uri: diagnostic.context.uri.clone(),
         range: diagnostic.range.clone(),
-        source: diagnostic.context.source_frame.clone(),
-        symbol_handle: None,
     }
+}
+
+fn diagnostic_group_id(diagnostic: &Diagnostic) -> String {
+    let mut hasher = Sha256::new();
+    let severity = match diagnostic.severity {
+        DiagnosticSeverity::Error => "error",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Information => "information",
+        DiagnosticSeverity::Hint => "hint",
+    };
+    for part in [
+        diagnostic.context.uri.as_str(),
+        severity,
+        diagnostic
+            .context
+            .diagnostic_source
+            .as_deref()
+            .unwrap_or_default(),
+        diagnostic.code.as_deref().unwrap_or_default(),
+        diagnostic.message.as_str(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn diagnostic_matches(diagnostic: &Diagnostic, options: &DiagnosticOptions) -> bool {
@@ -537,7 +561,7 @@ impl Translator {
         });
 
         let mut groups: Vec<Diagnostic> = Vec::new();
-        for diagnostic in diagnostics {
+        for mut diagnostic in diagnostics {
             if let Some(group) = groups
                 .last_mut()
                 .filter(|group| diagnostic_group_key(group) == diagnostic_group_key(&diagnostic))
@@ -550,6 +574,11 @@ impl Translator {
                         .push(diagnostic_location(&diagnostic));
                 }
             } else {
+                diagnostic.context.group_id = Some(diagnostic_group_id(&diagnostic));
+                if options.preserve_locations {
+                    let location = diagnostic_location(&diagnostic);
+                    diagnostic.context.occurrences.push(location);
+                }
                 groups.push(diagnostic);
             }
         }
@@ -563,11 +592,17 @@ impl Translator {
             .sum();
         DiagnosticsResult {
             diagnostics: groups,
+            source_resource: None,
             total_diagnostics,
             returned_diagnostics,
+            remaining_diagnostics: total_diagnostics.saturating_sub(returned_diagnostics),
             total_groups,
             returned_groups,
             omitted_groups: total_groups.saturating_sub(returned_groups),
+            remaining_groups: total_groups.saturating_sub(returned_groups),
+            next_cursor: None,
+            snapshot_identity: None,
+            max_bytes: Some(options.byte_limit),
             truncated: byte_truncated || returned_groups < total_groups,
             filters: options,
             cache: None,
@@ -738,7 +773,49 @@ mod tests {
         assert_eq!(result.total_groups, 1);
         assert_eq!(result.returned_diagnostics, 2);
         assert_eq!(result.diagnostics[0].context.occurrence_count, 2);
-        assert_eq!(result.diagnostics[0].context.occurrences.len(), 1);
+        assert_eq!(result.diagnostics[0].context.occurrences.len(), 2);
+    }
+
+    #[test]
+    fn diagnostics_keep_occurrence_identities_compact() {
+        let diagnostics = (0..249)
+            .map(|line| {
+                let mut diagnostic =
+                    grouped_diagnostic(line, "macro-error", "rust-analyzer", "src/lib.rs");
+                diagnostic.context.source_frame = super::super::dto::SourceContext::Deferred {
+                    resource: super::super::dto::DeferredResourceReference {
+                        uri: format!(
+                            "mcpls-source:///workspace/src/lib.rs?start_line={line}&snapshot={}",
+                            "a".repeat(64)
+                        ),
+                        kind: "source_context".to_owned(),
+                        snapshot_hash: "a".repeat(64),
+                        document_version: Some(1),
+                        total_bytes: Some(512),
+                    },
+                };
+                diagnostic
+            })
+            .collect();
+        let result = Translator::finish_diagnostics(
+            diagnostics,
+            DiagnosticOptions {
+                preserve_locations: true,
+                item_limit: 20,
+                byte_limit: 6_000,
+                ..DiagnosticOptions::default()
+            },
+        );
+
+        let encoded = serde_json::to_vec(&result).unwrap();
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(result.diagnostics[0].context.occurrences.len(), 249);
+        assert!(
+            value["diagnostics"][0]["occurrences"][0]
+                .get("source")
+                .is_none()
+        );
+        assert!(encoded.len() < 64 * 1024, "{} bytes", encoded.len());
     }
 
     #[test]

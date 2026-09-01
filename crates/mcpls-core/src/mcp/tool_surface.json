@@ -569,6 +569,13 @@
               },
               "type": "array"
             },
+            "group_id": {
+              "description": "Stable identity shared by every page of this diagnostic group.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
@@ -579,10 +586,16 @@
               "minimum": 0,
               "type": "integer"
             },
+            "occurrence_offset": {
+              "description": "Zero-based offset of the first occurrence returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "occurrences": {
-              "description": "Exact additional locations represented by this group when requested.",
+              "description": "Exact locations returned on this page when requested.",
               "items": {
-                "$ref": "#/$defs/Location"
+                "$ref": "#/$defs/DiagnosticOccurrence"
               },
               "type": "array"
             },
@@ -646,6 +659,31 @@
             "source_frame",
             "occurrence_count",
             "fix_handles"
+          ],
+          "type": "object"
+        },
+        "DiagnosticOccurrence": {
+          "description": "Compact identity of one diagnostic occurrence.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed diagnostics.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Exact range of this occurrence."
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
           ],
           "type": "object"
         },
@@ -2972,7 +3010,7 @@
       "properties": {
         "byte_limit": {
           "default": 32768,
-          "description": "Maximum source-frame bytes across the response.",
+          "description": "Maximum serialized bytes returned on one response page.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -3005,6 +3043,13 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "description": "Snapshot-owned continuation returned by the preceding page.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "preserve_locations": {
           "default": false,
@@ -3102,6 +3147,13 @@
               },
               "type": "array"
             },
+            "group_id": {
+              "description": "Stable identity shared by every page of this diagnostic group.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
@@ -3112,10 +3164,16 @@
               "minimum": 0,
               "type": "integer"
             },
+            "occurrence_offset": {
+              "description": "Zero-based offset of the first occurrence returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "occurrences": {
-              "description": "Exact additional locations represented by this group when requested.",
+              "description": "Exact locations returned on this page when requested.",
               "items": {
-                "$ref": "#/$defs/Location"
+                "$ref": "#/$defs/DiagnosticOccurrence"
               },
               "type": "array"
             },
@@ -3182,12 +3240,37 @@
           ],
           "type": "object"
         },
+        "DiagnosticOccurrence": {
+          "description": "Compact identity of one diagnostic occurrence.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed diagnostics.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Exact range of this occurrence."
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
         "DiagnosticOptions": {
           "description": "Filters and explicit response bounds for diagnostics.",
           "properties": {
             "byte_limit": {
               "default": 32768,
-              "description": "Maximum source-frame bytes across the response.",
+              "description": "Maximum serialized bytes returned on one response page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -3216,6 +3299,13 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "page_token": {
+              "description": "Snapshot-owned continuation returned by the preceding page.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "preserve_locations": {
               "default": false,
@@ -3603,8 +3693,36 @@
           "$ref": "#/$defs/DiagnosticOptions",
           "description": "Filters and bounds applied to this result."
         },
+        "max_bytes": {
+          "description": "Maximum serialized bytes requested for this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_cursor": {
+          "description": "Snapshot-owned continuation for the next deterministic page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "omitted_groups": {
           "description": "Complete groups omitted by response limits.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_diagnostics": {
+          "description": "Diagnostic occurrences available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_groups": {
+          "description": "Stable groups available after this page.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -3620,6 +3738,24 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Stable identity of the immutable diagnostic snapshot.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Snapshot-bound source shared by compact occurrence identities."
         },
         "total_diagnostics": {
           "description": "Diagnostics before filtering and grouping.",
@@ -3642,9 +3778,11 @@
         "diagnostics",
         "total_diagnostics",
         "returned_diagnostics",
+        "remaining_diagnostics",
         "total_groups",
         "returned_groups",
         "omitted_groups",
+        "remaining_groups",
         "truncated",
         "filters"
       ],
@@ -4328,6 +4466,13 @@
               },
               "type": "array"
             },
+            "group_id": {
+              "description": "Stable identity shared by every page of this diagnostic group.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
@@ -4338,10 +4483,16 @@
               "minimum": 0,
               "type": "integer"
             },
+            "occurrence_offset": {
+              "description": "Zero-based offset of the first occurrence returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "occurrences": {
-              "description": "Exact additional locations represented by this group when requested.",
+              "description": "Exact locations returned on this page when requested.",
               "items": {
-                "$ref": "#/$defs/Location"
+                "$ref": "#/$defs/DiagnosticOccurrence"
               },
               "type": "array"
             },
@@ -4405,6 +4556,31 @@
             "source_frame",
             "occurrence_count",
             "fix_handles"
+          ],
+          "type": "object"
+        },
+        "DiagnosticOccurrence": {
+          "description": "Compact identity of one diagnostic occurrence.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed diagnostics.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Exact range of this occurrence."
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
           ],
           "type": "object"
         },
@@ -5787,7 +5963,7 @@
       "properties": {
         "byte_limit": {
           "default": 32768,
-          "description": "Maximum source-frame bytes across the response.",
+          "description": "Maximum serialized bytes returned on one response page.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -5825,6 +6001,13 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "description": "Snapshot-owned continuation returned by the preceding page.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "preserve_locations": {
           "default": false,
@@ -5922,6 +6105,13 @@
               },
               "type": "array"
             },
+            "group_id": {
+              "description": "Stable identity shared by every page of this diagnostic group.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
@@ -5932,10 +6122,16 @@
               "minimum": 0,
               "type": "integer"
             },
+            "occurrence_offset": {
+              "description": "Zero-based offset of the first occurrence returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "occurrences": {
-              "description": "Exact additional locations represented by this group when requested.",
+              "description": "Exact locations returned on this page when requested.",
               "items": {
-                "$ref": "#/$defs/Location"
+                "$ref": "#/$defs/DiagnosticOccurrence"
               },
               "type": "array"
             },
@@ -6002,12 +6198,37 @@
           ],
           "type": "object"
         },
+        "DiagnosticOccurrence": {
+          "description": "Compact identity of one diagnostic occurrence.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed diagnostics.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Exact range of this occurrence."
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
         "DiagnosticOptions": {
           "description": "Filters and explicit response bounds for diagnostics.",
           "properties": {
             "byte_limit": {
               "default": 32768,
-              "description": "Maximum source-frame bytes across the response.",
+              "description": "Maximum serialized bytes returned on one response page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -6036,6 +6257,13 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "page_token": {
+              "description": "Snapshot-owned continuation returned by the preceding page.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "preserve_locations": {
               "default": false,
@@ -6423,8 +6651,36 @@
           "$ref": "#/$defs/DiagnosticOptions",
           "description": "Filters and bounds applied to this result."
         },
+        "max_bytes": {
+          "description": "Maximum serialized bytes requested for this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_cursor": {
+          "description": "Snapshot-owned continuation for the next deterministic page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "omitted_groups": {
           "description": "Complete groups omitted by response limits.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_diagnostics": {
+          "description": "Diagnostic occurrences available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_groups": {
+          "description": "Stable groups available after this page.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -6440,6 +6696,24 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Stable identity of the immutable diagnostic snapshot.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Snapshot-bound source shared by compact occurrence identities."
         },
         "total_diagnostics": {
           "description": "Diagnostics before filtering and grouping.",
@@ -6462,9 +6736,11 @@
         "diagnostics",
         "total_diagnostics",
         "returned_diagnostics",
+        "remaining_diagnostics",
         "total_groups",
         "returned_groups",
         "omitted_groups",
+        "remaining_groups",
         "truncated",
         "filters"
       ],
@@ -11807,6 +12083,13 @@
               },
               "type": "array"
             },
+            "group_id": {
+              "description": "Stable identity shared by every page of this diagnostic group.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
@@ -11817,10 +12100,16 @@
               "minimum": 0,
               "type": "integer"
             },
+            "occurrence_offset": {
+              "description": "Zero-based offset of the first occurrence returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "occurrences": {
-              "description": "Exact additional locations represented by this group when requested.",
+              "description": "Exact locations returned on this page when requested.",
               "items": {
-                "$ref": "#/$defs/Location"
+                "$ref": "#/$defs/DiagnosticOccurrence"
               },
               "type": "array"
             },
@@ -11887,12 +12176,37 @@
           ],
           "type": "object"
         },
+        "DiagnosticOccurrence": {
+          "description": "Compact identity of one diagnostic occurrence.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed diagnostics.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Exact range of this occurrence."
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
         "DiagnosticOptions": {
           "description": "Filters and explicit response bounds for diagnostics.",
           "properties": {
             "byte_limit": {
               "default": 32768,
-              "description": "Maximum source-frame bytes across the response.",
+              "description": "Maximum serialized bytes returned on one response page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -11921,6 +12235,13 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "page_token": {
+              "description": "Snapshot-owned continuation returned by the preceding page.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "preserve_locations": {
               "default": false,
@@ -12049,8 +12370,36 @@
               "$ref": "#/$defs/DiagnosticOptions",
               "description": "Filters and bounds applied to this result."
             },
+            "max_bytes": {
+              "description": "Maximum serialized bytes requested for this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "next_cursor": {
+              "description": "Snapshot-owned continuation for the next deterministic page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Complete groups omitted by response limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_diagnostics": {
+              "description": "Diagnostic occurrences available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_groups": {
+              "description": "Stable groups available after this page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -12066,6 +12415,24 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Stable identity of the immutable diagnostic snapshot.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Snapshot-bound source shared by compact occurrence identities."
             },
             "total_diagnostics": {
               "description": "Diagnostics before filtering and grouping.",
@@ -12088,9 +12455,11 @@
             "diagnostics",
             "total_diagnostics",
             "returned_diagnostics",
+            "remaining_diagnostics",
             "total_groups",
             "returned_groups",
             "omitted_groups",
+            "remaining_groups",
             "truncated",
             "filters"
           ],
@@ -14260,6 +14629,13 @@
               },
               "type": "array"
             },
+            "group_id": {
+              "description": "Stable identity shared by every page of this diagnostic group.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
@@ -14270,10 +14646,16 @@
               "minimum": 0,
               "type": "integer"
             },
+            "occurrence_offset": {
+              "description": "Zero-based offset of the first occurrence returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "occurrences": {
-              "description": "Exact additional locations represented by this group when requested.",
+              "description": "Exact locations returned on this page when requested.",
               "items": {
-                "$ref": "#/$defs/Location"
+                "$ref": "#/$defs/DiagnosticOccurrence"
               },
               "type": "array"
             },
@@ -14340,12 +14722,37 @@
           ],
           "type": "object"
         },
+        "DiagnosticOccurrence": {
+          "description": "Compact identity of one diagnostic occurrence.",
+          "properties": {
+            "path": {
+              "description": "Human-readable filesystem path for file-backed diagnostics.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range",
+              "description": "Exact range of this occurrence."
+            },
+            "uri": {
+              "description": "Canonical document URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "range"
+          ],
+          "type": "object"
+        },
         "DiagnosticOptions": {
           "description": "Filters and explicit response bounds for diagnostics.",
           "properties": {
             "byte_limit": {
               "default": 32768,
-              "description": "Maximum source-frame bytes across the response.",
+              "description": "Maximum serialized bytes returned on one response page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -14374,6 +14781,13 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "page_token": {
+              "description": "Snapshot-owned continuation returned by the preceding page.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "preserve_locations": {
               "default": false,
@@ -14502,8 +14916,36 @@
               "$ref": "#/$defs/DiagnosticOptions",
               "description": "Filters and bounds applied to this result."
             },
+            "max_bytes": {
+              "description": "Maximum serialized bytes requested for this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "next_cursor": {
+              "description": "Snapshot-owned continuation for the next deterministic page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Complete groups omitted by response limits.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_diagnostics": {
+              "description": "Diagnostic occurrences available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_groups": {
+              "description": "Stable groups available after this page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -14519,6 +14961,24 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Stable identity of the immutable diagnostic snapshot.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Snapshot-bound source shared by compact occurrence identities."
             },
             "total_diagnostics": {
               "description": "Diagnostics before filtering and grouping.",
@@ -14541,9 +15001,11 @@
             "diagnostics",
             "total_diagnostics",
             "returned_diagnostics",
+            "remaining_diagnostics",
             "total_groups",
             "returned_groups",
             "omitted_groups",
+            "remaining_groups",
             "truncated",
             "filters"
           ],

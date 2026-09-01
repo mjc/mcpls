@@ -4366,6 +4366,181 @@ struct DocumentSymbolPageState {
     symbols: Vec<crate::bridge::Symbol>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DiagnosticsPageState {
+    file_path: String,
+    fresh: bool,
+    result: DiagnosticsResult,
+}
+
+fn remaining_diagnostic_occurrences(
+    diagnostics: &VecDeque<crate::bridge::Diagnostic>,
+    preserve_locations: bool,
+) -> usize {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            if preserve_locations {
+                diagnostic.context.occurrences.len()
+            } else {
+                diagnostic.context.occurrence_count
+            }
+        })
+        .sum()
+}
+
+fn set_diagnostics_page_metadata(
+    result: &mut DiagnosticsResult,
+    remaining_diagnostics: usize,
+    remaining_groups: usize,
+    source_truncated: bool,
+) {
+    const CURSOR_PLACEHOLDER: &str = "mcpls-deferred:///00000000-0000-0000-0000-000000000000";
+
+    result.returned_groups = result.diagnostics.len();
+    result.remaining_groups = remaining_groups;
+    result.omitted_groups = result.remaining_groups;
+    result.remaining_diagnostics = remaining_diagnostics;
+    let has_continuation = remaining_groups != 0;
+    result.next_cursor = has_continuation.then(|| CURSOR_PLACEHOLDER.to_owned());
+    result.truncated = source_truncated || has_continuation;
+}
+
+fn finish_diagnostics_page_metadata(
+    result: &mut DiagnosticsResult,
+    remaining: &VecDeque<crate::bridge::Diagnostic>,
+    source_truncated: bool,
+) {
+    set_diagnostics_page_metadata(
+        result,
+        remaining_diagnostic_occurrences(remaining, result.filters.preserve_locations),
+        remaining.len(),
+        source_truncated,
+    );
+}
+
+fn bounded_diagnostics_page(
+    mut state: DiagnosticsPageState,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<(DiagnosticsResult, Option<DiagnosticsPageState>), String> {
+    let source_truncated = state.result.truncated;
+    let preserve_locations = state.result.filters.preserve_locations;
+    let mut remaining = VecDeque::from(std::mem::take(&mut state.result.diagnostics));
+    let mut page = DiagnosticsResult {
+        diagnostics: Vec::new(),
+        source_resource: state.result.source_resource.clone(),
+        total_diagnostics: state.result.total_diagnostics,
+        returned_diagnostics: 0,
+        remaining_diagnostics: state.result.total_diagnostics,
+        total_groups: state.result.total_groups,
+        returned_groups: 0,
+        omitted_groups: state.result.total_groups,
+        remaining_groups: state.result.total_groups,
+        next_cursor: None,
+        snapshot_identity: state.result.snapshot_identity.clone(),
+        max_bytes: Some(max_bytes),
+        truncated: source_truncated,
+        filters: state.result.filters.clone(),
+        cache: state.result.cache.clone(),
+    };
+
+    while page.diagnostics.len() < max_items {
+        let Some(mut diagnostic) = remaining.pop_front() else {
+            break;
+        };
+
+        if !preserve_locations {
+            let represented = diagnostic.context.occurrence_count;
+            let mut candidate = page.clone();
+            candidate.diagnostics.push(diagnostic.clone());
+            candidate.returned_diagnostics += represented;
+            set_diagnostics_page_metadata(
+                &mut candidate,
+                remaining_diagnostic_occurrences(&remaining, false),
+                remaining.len(),
+                source_truncated,
+            );
+            if serde_json::to_vec(&candidate).map_or(usize::MAX, |encoded| encoded.len())
+                > max_bytes
+            {
+                remaining.push_front(diagnostic);
+                if page.diagnostics.is_empty() {
+                    return Err(
+                        "byte_limit is too small to return one diagnostic group identity"
+                            .to_owned(),
+                    );
+                }
+                break;
+            }
+            page = candidate;
+            continue;
+        }
+
+        let offset = diagnostic.context.occurrence_offset;
+        let mut occurrences = VecDeque::from(std::mem::take(&mut diagnostic.context.occurrences));
+        let mut page_group = diagnostic.clone();
+        page_group.context.occurrences.clear();
+        let page_before_group = page.clone();
+        let mut accepted = 0;
+
+        while let Some(occurrence) = occurrences.pop_front() {
+            let mut candidate_group = page_group.clone();
+            candidate_group.context.occurrences.push(occurrence.clone());
+            let mut candidate = page_before_group.clone();
+            candidate.diagnostics.push(candidate_group.clone());
+            candidate.returned_diagnostics =
+                page_before_group.returned_diagnostics + candidate_group.context.occurrences.len();
+
+            let remaining_occurrences =
+                occurrences.len() + remaining_diagnostic_occurrences(&remaining, true);
+            let remaining_groups = remaining.len() + usize::from(!occurrences.is_empty());
+            set_diagnostics_page_metadata(
+                &mut candidate,
+                remaining_occurrences,
+                remaining_groups,
+                source_truncated,
+            );
+            if serde_json::to_vec(&candidate).map_or(usize::MAX, |encoded| encoded.len())
+                > max_bytes
+            {
+                occurrences.push_front(occurrence);
+                break;
+            }
+
+            accepted += 1;
+            page_group = candidate_group;
+            page = candidate;
+        }
+
+        if accepted == 0 {
+            diagnostic.context.occurrences = occurrences.into();
+            remaining.push_front(diagnostic);
+            if page.diagnostics.is_empty() {
+                return Err(
+                    "byte_limit is too small to return one diagnostic occurrence identity"
+                        .to_owned(),
+                );
+            }
+            break;
+        }
+
+        if !occurrences.is_empty() {
+            diagnostic.context.occurrence_offset = offset + accepted;
+            diagnostic.context.occurrences = occurrences.into();
+            remaining.push_front(diagnostic);
+            break;
+        }
+    }
+
+    finish_diagnostics_page_metadata(&mut page, &remaining, source_truncated);
+    let continuation = (!remaining.is_empty()).then(|| {
+        state.result.diagnostics = remaining.into();
+        state
+    });
+    Ok((page, continuation))
+}
+
 fn flatten_document_symbols(symbols: Vec<crate::bridge::Symbol>) -> Vec<crate::bridge::Symbol> {
     fn flatten(symbol: crate::bridge::Symbol, output: &mut Vec<crate::bridge::Symbol>) {
         let mut symbol = symbol;
@@ -5791,12 +5966,110 @@ impl ProjectRuntime {
         file_path: String,
         options: DiagnosticOptions,
     ) -> Result<DiagnosticsResult, String> {
-        let mut result = self
-            .translator
-            .handle_actor_diagnostics(file_path, options)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.attach_diagnostic_fix_handles(&mut result).await;
+        self.diagnostics_page(file_path, options, true).await
+    }
+
+    async fn diagnostics_page(
+        &mut self,
+        file_path: String,
+        mut options: DiagnosticOptions,
+        fresh: bool,
+    ) -> Result<DiagnosticsResult, String> {
+        let page_token = options.page_token.take();
+        let scope = self.deferred_scope.clone().unwrap_or_default();
+        let state = if let Some(page_token) = page_token {
+            let token = page_token
+                .strip_prefix("mcpls-deferred:///")
+                .ok_or_else(|| {
+                    "page_token must be the next_cursor returned by get_diagnostics".to_owned()
+                })?;
+            let value = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_scoped(token, &scope)?;
+            let state: DiagnosticsPageState = serde_json::from_value(value)
+                .map_err(|error| format!("invalid diagnostics page: {error}"))?;
+            if state.file_path != file_path || state.fresh != fresh {
+                return Err("page_token belongs to a different diagnostics request".to_owned());
+            }
+            state
+        } else {
+            if options.item_limit == 0 || options.item_limit > 1_000 {
+                return Err("item_limit must be between 1 and 1000".to_owned());
+            }
+            if !(4_096..=1_048_576).contains(&options.byte_limit) {
+                return Err("byte_limit must be between 4096 and 1048576".to_owned());
+            }
+
+            let mut collection_options = options.clone();
+            collection_options.item_limit = usize::MAX;
+            let mut result = if fresh {
+                self.translator
+                    .handle_actor_diagnostics(file_path.clone(), collection_options)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                self.translator
+                    .handle_cached_diagnostics(&file_path, collection_options)
+                    .await
+                    .map_err(|error| error.to_string())?
+            };
+            if fresh {
+                self.attach_diagnostic_fix_handles(&mut result).await;
+            }
+            result.filters = options;
+            if let Ok((path, document_version, content_hash, content)) =
+                self.translator.source_snapshot(Path::new(&file_path)).await
+            {
+                let total_lines = u32::try_from(content.lines().count().max(1)).unwrap_or(u32::MAX);
+                result.source_resource = Some(DeferredResourceReference {
+                    uri: make_source_uri(
+                        &path,
+                        1,
+                        1,
+                        total_lines,
+                        1,
+                        &content_hash,
+                        document_version,
+                    )
+                    .map_err(|error| error.to_string())?,
+                    kind: "source_context".to_owned(),
+                    snapshot_hash: content_hash,
+                    document_version,
+                    total_bytes: Some(content.len()),
+                });
+            }
+            let encoded = serde_json::to_vec(&result.diagnostics)
+                .map_err(|error| format!("failed to identify diagnostics snapshot: {error}"))?;
+            result.snapshot_identity = Some(format!("{:x}", Sha256::digest(encoded)));
+            result.max_bytes = Some(result.filters.byte_limit);
+            DiagnosticsPageState {
+                file_path,
+                fresh,
+                result,
+            }
+        };
+
+        let max_items = state.result.filters.item_limit;
+        let max_bytes = state.result.filters.byte_limit;
+        let (mut result, continuation) = bounded_diagnostics_page(state, max_items, max_bytes)?;
+        if let Some(continuation) = continuation {
+            let snapshot_identity = continuation
+                .result
+                .snapshot_identity
+                .clone()
+                .ok_or_else(|| "diagnostics page is missing its snapshot identity".to_owned())?;
+            let value = serde_json::to_value(continuation)
+                .map_err(|error| format!("failed to store diagnostics page: {error}"))?;
+            let reference = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped(value, snapshot_identity, &scope);
+            result.next_cursor = Some(reference.uri);
+        }
+        debug_assert!(serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() <= max_bytes));
         Ok(result)
     }
 
@@ -7262,14 +7535,12 @@ impl ProjectRuntime {
     }
 
     async fn cached_diagnostics(
-        &self,
+        &mut self,
         file_path: &str,
         options: DiagnosticOptions,
     ) -> Result<DiagnosticsResult, String> {
-        self.translator
-            .handle_cached_diagnostics(file_path, options)
+        self.diagnostics_page(file_path.to_owned(), options, false)
             .await
-            .map_err(|error| error.to_string())
     }
 
     fn has_cached_diagnostics(&self, file_path: &str) -> Result<bool, String> {
@@ -12251,6 +12522,99 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_pages_bound_the_transcript_shape_without_losing_occurrences() {
+        let diagnostics = (0..249)
+            .map(|line| crate::bridge::Diagnostic {
+                range: crate::bridge::Range {
+                    start: crate::bridge::Position2D { line, character: 1 },
+                    end: crate::bridge::Position2D { line, character: 2 },
+                },
+                severity: DiagnosticSeverity::Hint,
+                message: "uniffi::constructor: internal café 🚗 proc-macro error".to_owned(),
+                code: Some("macro-error".to_owned()),
+                context: crate::bridge::translator::DiagnosticContext {
+                    path: Some("/workspace/src/lib.rs".to_owned()),
+                    project_relative_path: Some("src/lib.rs".to_owned()),
+                    uri: "file:///workspace/src/lib.rs".to_owned(),
+                    source_frame: SourceContext::Deferred {
+                        resource: DeferredResourceReference {
+                            uri: format!(
+                                "mcpls-source:///workspace/src/lib.rs?start_line={line}&snapshot={}",
+                                "a".repeat(64)
+                            ),
+                            kind: "source_context".to_owned(),
+                            snapshot_hash: "a".repeat(64),
+                            document_version: Some(1),
+                            total_bytes: Some(512),
+                        },
+                    },
+                    diagnostic_source: Some("rust-analyzer".to_owned()),
+                    ..crate::bridge::translator::DiagnosticContext::default()
+                },
+            })
+            .collect();
+        let options = DiagnosticOptions {
+            preserve_locations: true,
+            item_limit: 20,
+            byte_limit: 6_000,
+            ..DiagnosticOptions::default()
+        };
+        let mut result = Translator::finish_diagnostics(diagnostics, options);
+        result.snapshot_identity = Some("diagnostics-snapshot".to_owned());
+        let mut state = DiagnosticsPageState {
+            file_path: "/workspace/src/lib.rs".to_owned(),
+            fresh: false,
+            result,
+        };
+
+        let mut lines = Vec::new();
+        let mut group_id = None;
+        let mut encoded_bytes = 0;
+        loop {
+            let (page, continuation) = bounded_diagnostics_page(state, 20, 6_000).unwrap();
+            let encoded = serde_json::to_vec(&page).unwrap();
+            encoded_bytes += encoded.len();
+            assert!(encoded.len() <= 6_000, "page used {} bytes", encoded.len());
+            assert_eq!(page.total_diagnostics, 249);
+            assert_eq!(page.total_groups, 1);
+            assert_eq!(
+                page.snapshot_identity.as_deref(),
+                Some("diagnostics-snapshot")
+            );
+            assert_eq!(page.diagnostics.len(), 1);
+            let group = &page.diagnostics[0];
+            if let Some(group_id) = &group_id {
+                assert_eq!(group.context.group_id.as_ref(), Some(group_id));
+            } else {
+                group_id = group.context.group_id.clone();
+            }
+            assert_eq!(group.context.occurrence_offset, lines.len());
+            lines.extend(
+                group
+                    .context
+                    .occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.range.start.line),
+            );
+            assert_eq!(page.returned_diagnostics, group.context.occurrences.len());
+            assert_eq!(page.remaining_diagnostics, 249 - lines.len());
+
+            let Some(continuation) = continuation else {
+                assert!(page.next_cursor.is_none());
+                break;
+            };
+            assert!(page.next_cursor.is_some());
+            state = continuation;
+        }
+
+        assert_eq!(lines, (0..249).collect::<Vec<_>>());
+        assert!(
+            encoded_bytes < 64 * 1024,
+            "pages used {encoded_bytes} bytes"
+        );
+    }
+
+    #[test]
     fn measured_swift_outline_fits_one_default_page() {
         let range = crate::bridge::Range {
             start: crate::bridge::Position2D {
@@ -14373,6 +14737,102 @@ mod tests {
                 .map(String::len),
             Some(64)
         );
+    }
+
+    #[tokio::test]
+    async fn project_actor_pages_cached_diagnostics_with_snapshot_owned_cursors() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        fs::write(&file, "fn item() {}\n".repeat(300)).unwrap();
+        let actor = spawn_project_actor_for_root(2, &CanonicalRoot::new(root.path()).unwrap());
+        let uri = crate::bridge::path_to_uri(&file).unwrap();
+        let diagnostics = (0..249)
+            .map(|line| {
+                serde_json::json!({
+                    "range": {
+                        "start": {"line": line, "character": 0},
+                        "end": {"line": line, "character": 2}
+                    },
+                    "severity": 4,
+                    "code": "macro-error",
+                    "source": "rust-analyzer",
+                    "message": "uniffi::constructor: internal café 🚗 proc-macro error"
+                })
+            })
+            .collect::<Vec<_>>();
+        actor
+            .sender
+            .send(ProjectRequest::Notification {
+                generation: 0,
+                server_id: ServerId::from("rust"),
+                notification: LspNotification::parse(
+                    "textDocument/publishDiagnostics",
+                    Some(serde_json::json!({
+                        "uri": uri,
+                        "version": 7,
+                        "diagnostics": diagnostics
+                    })),
+                ),
+            })
+            .await
+            .unwrap();
+
+        let mut options = DiagnosticOptions {
+            preserve_locations: true,
+            item_limit: 20,
+            byte_limit: 6_000,
+            ..DiagnosticOptions::default()
+        };
+        let mut lines = Vec::new();
+        let mut snapshot_identity = None;
+        let mut first_cursor = None;
+        loop {
+            let result = actor
+                .cached_diagnostics_with_options(file.display().to_string(), options)
+                .await
+                .unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len() <= 6_000);
+            assert_eq!(result.total_diagnostics, 249);
+            assert!(result.source_resource.is_some());
+            if let Some(identity) = &snapshot_identity {
+                assert_eq!(result.snapshot_identity.as_ref(), Some(identity));
+            } else {
+                snapshot_identity = result.snapshot_identity.clone();
+            }
+            lines.extend(
+                result
+                    .diagnostics
+                    .iter()
+                    .flat_map(|group| &group.context.occurrences)
+                    .map(|occurrence| occurrence.range.start.line),
+            );
+            assert_eq!(result.remaining_diagnostics, 249 - lines.len());
+
+            let Some(cursor) = result.next_cursor else {
+                break;
+            };
+            first_cursor.get_or_insert_with(|| cursor.clone());
+            options = DiagnosticOptions {
+                page_token: Some(cursor),
+                ..DiagnosticOptions::default()
+            };
+        }
+
+        assert_eq!(lines, (1..=249).collect::<Vec<_>>());
+        let mismatched = actor
+            .diagnostics_with_options(
+                file.display().to_string(),
+                DiagnosticOptions {
+                    page_token: first_cursor,
+                    ..DiagnosticOptions::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            mismatched,
+            Err(ProjectActorError::Operation(message))
+                if message.contains("different diagnostics request")
+        ));
     }
 
     #[tokio::test]
