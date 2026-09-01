@@ -7417,6 +7417,132 @@ finally:
     }
 
     #[tokio::test]
+    async fn oversized_structural_preview_is_bounded_lossless_and_atomic() {
+        const MATCH_COUNT: usize = 81;
+        const RESPONSE_LIMIT: usize = 16 * 1024;
+
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        let mut source = String::new();
+        for index in 0..MATCH_COUNT {
+            writeln!(
+                source,
+                "fn fixture_{index}() {{ foo({index}); }} // {}",
+                "padding".repeat(24)
+            )
+            .unwrap();
+        }
+        std::fs::write(&file, source).unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let response = server
+            .structural_replace_preview(Parameters(StructuralReplacePreviewParams {
+                project_id: "project".to_owned(),
+                file_path: file.display().to_string(),
+                dialect: "ast_grep".to_owned(),
+                query: "foo($A)".to_owned(),
+                replacement: Some("bar($A)".to_owned()),
+                language_id: Some("rust".to_owned()),
+                parse_only: false,
+                position_encoding: None,
+            }))
+            .await
+            .unwrap();
+        assert!(response.len() <= RESPONSE_LIMIT, "{} bytes", response.len());
+        let preview: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(preview["match_count"], MATCH_COUNT);
+        assert_eq!(
+            preview["returned_match_count"].as_u64().unwrap()
+                + preview["remaining_match_count"].as_u64().unwrap(),
+            MATCH_COUNT as u64
+        );
+
+        async fn read_all(server: &McplsServer, mut uri: String) -> serde_json::Value {
+            let mut encoded = String::new();
+            loop {
+                let page = server
+                    .read_semantic_resource(Parameters(SemanticResourceReadParams { uri }))
+                    .await
+                    .unwrap();
+                let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+                assert!(serde_json::to_vec(&page).unwrap().len() <= 16 * 1024);
+                encoded.push_str(page["text"].as_str().unwrap());
+                let Some(next_uri) = page["next_uri"].as_str() else {
+                    break;
+                };
+                uri = next_uri.to_owned();
+            }
+            serde_json::from_str(&encoded).unwrap()
+        }
+
+        let matches = read_all(
+            &server,
+            preview["matches_resource"]["uri"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .await;
+        assert_eq!(matches["files"].as_array().unwrap().len(), 1);
+        assert_eq!(matches["matches"].as_array().unwrap().len(), MATCH_COUNT);
+        let unique = matches["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), MATCH_COUNT);
+        let source_uri = matches["files"][0]["source_resource"]["uri"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let details = read_all(
+            &server,
+            preview["plan_details_resource"]["uri"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .await;
+        assert_eq!(details["preconditions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            details["preconditions"].as_array().unwrap().len(),
+            preview["precondition_count"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            details["operations"].as_array().unwrap().len(),
+            preview["operation_count"].as_u64().unwrap() as usize
+        );
+
+        server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_owned(),
+                plan_id: preview["plan_id"].as_str().unwrap().to_owned(),
+                wait_timeout_ms: None,
+            }))
+            .await
+            .unwrap();
+        let applied = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(applied.matches("bar(").count(), MATCH_COUNT);
+        assert_eq!(applied.matches("foo(").count(), 0);
+
+        let stale = server
+            .read_semantic_resource(Parameters(SemanticResourceReadParams { uri: source_uri }))
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale_resource:"), "{stale}");
+    }
+
+    #[tokio::test]
     async fn workspace_edit_preview_returns_plan_for_lsp_workspace_edit() {
         let root = TempDir::new().unwrap();
         let file = root.path().join("src.rs");
