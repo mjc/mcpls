@@ -554,6 +554,7 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
         .call_tool(
             "get_diagnostics",
             &json!({
+                "fresh": true,
                 "file_path": broken.to_string_lossy(),
                 "item_limit": 20,
                 "byte_limit": 32768
