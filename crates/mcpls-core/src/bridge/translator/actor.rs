@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lsp_types::{
     DidChangeTextDocumentParams, TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
@@ -34,6 +35,17 @@ pub enum ActivationHealth {
     Degraded,
     /// No configured language server applies; structural tools remain usable.
     StructuralOnly,
+}
+
+fn spawn_external_change_forwarder(
+    mut receiver: mpsc::UnboundedReceiver<PathBuf>,
+    tracker: Arc<DocumentTracker>,
+) {
+    tokio::spawn(async move {
+        while let Some(path) = receiver.recv().await {
+            tracker.mark_external_change(&path);
+        }
+    });
 }
 
 /// Language-server handles produced by one project activation.
@@ -712,6 +724,10 @@ impl Translator {
             let client = server.client().clone();
             let server_roots = server.workspace_roots().to_vec();
             receivers.push((id.clone(), server.take_notification_rx()));
+            spawn_external_change_forwarder(
+                server.take_watch_change_rx(),
+                Arc::clone(&self.document_tracker),
+            );
             self.register_server_roots(id.clone(), server_roots);
             self.register_client(id.clone(), client.clone());
             self.register_server(id.clone(), server);

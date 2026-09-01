@@ -22,7 +22,7 @@ use crate::lsp::transport::{LspReader, LspTransport, LspWriter};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
 };
-use crate::lsp::watcher::{WATCH_EVENT_CHANNEL_CAPACITY, WatchRegistry, WatchSignal};
+use crate::lsp::watcher::{WATCH_EVENT_CHANNEL_CAPACITY, WatchRegistry, WatchSignal, signal_paths};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -142,6 +142,11 @@ pub struct LspClient {
     /// that only when its own timeout elapses.
     pending_requests: Arc<Mutex<PendingRequests>>,
 
+    /// Filesystem paths reported by the native watcher. The owning project
+    /// consumes this stream to invalidate its shared document tracker; the
+    /// LSP `didChangeWatchedFiles` notification remains a separate concern.
+    watch_change_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
+
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
 }
@@ -158,6 +163,7 @@ impl Clone for LspClient {
             request_counter: Arc::clone(&self.request_counter),
             command_queue: self.command_queue.clone(),
             pending_requests: Arc::clone(&self.pending_requests),
+            watch_change_rx: None,
             receiver_task: None,
         }
     }
@@ -283,6 +289,7 @@ impl LspClient {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_queue: LspCommandQueue::new(command_tx),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            watch_change_rx: None,
             receiver_task: None,
         }
     }
@@ -298,12 +305,14 @@ impl LspClient {
 
         let (command_tx, command_rx) = mpsc::channel(100);
 
+        let (watch_change_tx, watch_change_rx) = mpsc::unbounded_channel();
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
             Arc::clone(&pending_requests),
             None,
             Vec::new(),
+            watch_change_tx,
         ));
 
         Self {
@@ -312,6 +321,7 @@ impl LspClient {
             request_counter,
             command_queue: LspCommandQueue::new(command_tx),
             pending_requests,
+            watch_change_rx: Some(watch_change_rx),
             receiver_task: Some(receiver_task),
         }
     }
@@ -331,12 +341,14 @@ impl LspClient {
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
         let (command_tx, command_rx) = mpsc::channel(100);
+        let (watch_change_tx, watch_change_rx) = mpsc::unbounded_channel();
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
             Arc::clone(&pending_requests),
             Some(notification_sink),
             workspace_roots,
+            watch_change_tx,
         ));
 
         Self {
@@ -345,6 +357,7 @@ impl LspClient {
             request_counter,
             command_queue: LspCommandQueue::new(command_tx),
             pending_requests,
+            watch_change_rx: Some(watch_change_rx),
             receiver_task: Some(receiver_task),
         }
     }
@@ -358,6 +371,14 @@ impl LspClient {
     /// Get the current server state.
     pub async fn state(&self) -> super::ServerState {
         *self.state.lock().await
+    }
+
+    /// Take the filesystem watcher stream out of the owning client.
+    pub(super) fn take_watch_change_rx(&mut self) -> mpsc::UnboundedReceiver<PathBuf> {
+        self.watch_change_rx.take().unwrap_or_else(|| {
+            let (_, receiver) = mpsc::unbounded_channel();
+            receiver
+        })
     }
 
     pub(crate) async fn set_ready(&self) {
@@ -692,6 +713,7 @@ impl LspClient {
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_sink: Option<NonBlockingNotificationSink>,
         workspace_roots: Vec<std::path::PathBuf>,
+        watch_change_tx: mpsc::UnboundedSender<PathBuf>,
     ) -> Result<()> {
         debug!("Message loop started");
         let (writer, mut reader) = transport.split();
@@ -708,6 +730,7 @@ impl LspClient {
             &mut watch_registry,
             &mut watch_signal_rx,
             &outbound_tx,
+            &watch_change_tx,
         )
         .await;
         drop(outbound_tx);
@@ -749,6 +772,7 @@ impl LspClient {
         watch_registry: &mut WatchRegistry,
         watch_signal_rx: &mut mpsc::Receiver<WatchSignal>,
         outbound_tx: &mpsc::Sender<OutboundBatch>,
+        watch_change_tx: &mpsc::UnboundedSender<PathBuf>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -859,6 +883,9 @@ impl LspClient {
                 }
 
                 Some(signal) = watch_signal_rx.recv() => {
+                    for path in signal_paths(&signal) {
+                        let _ = watch_change_tx.send(path);
+                    }
                     let events = match watch_registry.handle_signal(signal) {
                         Ok(events) => events,
                         Err(error) => {
@@ -1480,6 +1507,7 @@ mod tests {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_queue: LspCommandQueue::new(command_tx),
             pending_requests,
+            watch_change_rx: None,
             receiver_task: None,
         };
 
@@ -1535,6 +1563,7 @@ mod tests {
             request_counter: Arc::new(AtomicI64::new(1)),
             command_queue: LspCommandQueue::new(command_tx),
             pending_requests: Arc::clone(&pending_requests),
+            watch_change_rx: None,
             receiver_task: None,
         };
 

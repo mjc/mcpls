@@ -64,7 +64,8 @@ fn mtime_settled(mtime: Option<SystemTime>, read_at: SystemTime) -> bool {
 /// content is trusted without touching the file's bytes again. This is what
 /// keeps the common "file unchanged" path cheap while still detecting
 /// external edits (git checkout/stash, formatters, the MCP host's own
-/// edits) made outside mcpls.
+/// edits) made outside mcpls. Native watcher events invalidate the snapshot
+/// first, so atomic rewrites that preserve `(mtime, size)` are still observed.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskSync {
     /// Last observed modification time, or `None` if the filesystem or
@@ -126,13 +127,17 @@ pub struct DocumentState {
     version: i32,
     content: String,
     disk: Option<DiskSync>,
+    local_edit: bool,
+    external_conflict: bool,
     synced: HashMap<ServerId, i32>,
     last_used: u64,
 }
 
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
-    /// provenance and no server yet recorded as synced.
+    /// provenance and no server yet recorded as synced. Until a caller
+    /// verifies the bytes against disk, the supplied content is treated as a
+    /// local edit so an external refresh cannot overwrite it silently.
     fn new(uri: Uri, language_id: String, content: String) -> Self {
         Self {
             uri,
@@ -140,6 +145,8 @@ impl DocumentState {
             version: 1,
             content,
             disk: None,
+            local_edit: true,
+            external_conflict: false,
             synced: HashMap::new(),
             last_used: 0,
         }
@@ -190,6 +197,12 @@ impl DocumentState {
         self.synced.get(server).copied()
     }
 
+    /// Whether disk changed while this document had an unsaved local edit.
+    #[must_use]
+    pub const fn has_external_conflict(&self) -> bool {
+        self.external_conflict
+    }
+
     /// Whether no server has ever synced this document.
     fn has_never_synced(&self) -> bool {
         self.synced.is_empty()
@@ -202,6 +215,8 @@ impl DocumentState {
         self.version += 1;
         self.content = content;
         self.disk = None;
+        self.local_edit = true;
+        self.external_conflict = false;
         self.version
     }
 
@@ -218,11 +233,27 @@ impl DocumentState {
         self.version = version;
         self.content = content;
         self.disk = snap;
+        self.local_edit = false;
+        self.external_conflict = false;
     }
 
     /// Sets the disk snapshot without changing `content` or `version`.
     const fn set_disk(&mut self, snap: DiskSync) {
         self.disk = Some(snap);
+        self.local_edit = false;
+        self.external_conflict = false;
+    }
+
+    /// Mark the tracked snapshot as invalid because the filesystem watcher
+    /// observed an external rewrite. The next synchronization reads bytes;
+    /// the event itself never replaces in-memory content.
+    const fn invalidate_external(&mut self) {
+        self.disk = None;
+    }
+
+    const fn mark_external_conflict(&mut self, snap: DiskSync) {
+        self.disk = Some(snap);
+        self.external_conflict = true;
     }
 
     /// Records that `server` has synced up to `version`.
@@ -430,6 +461,71 @@ impl DocumentTracker {
             .map(|state| state.apply_local_edit(content))
     }
 
+    /// Invalidate a tracked document's disk provenance after a filesystem
+    /// watcher reports an external change. No bytes are read or overwritten
+    /// here; the next path synchronization performs the authoritative read.
+    pub(crate) fn mark_external_change(&self, path: &Path) {
+        if let Some(state) = lock_std(&self.documents).get_mut(path) {
+            state.invalidate_external();
+        }
+    }
+
+    /// Refresh a tracked document from disk for source-resource reads.
+    ///
+    /// Unlike [`Self::ensure_open`], this deliberately reads the file even
+    /// when its stat appears unchanged. A source resource is an explicit
+    /// request for current text, and this closes the settled-mtime hole that
+    /// a formatter or atomic replacement can otherwise leave behind.
+    pub(crate) async fn refresh_from_disk(&self, path: &Path) -> Result<()> {
+        self.refresh_from_disk_status(path).await.map(|_| ())
+    }
+
+    async fn refresh_from_disk_status(&self, path: &Path) -> Result<ExternalChange> {
+        let _path_guard = self.lock_path(path).await;
+        let Some((current, local_edit, external_conflict)) =
+            lock_std(&self.documents).get(path).map(|state| {
+                (
+                    state.content.clone(),
+                    state.local_edit,
+                    state.external_conflict,
+                )
+            })
+        else {
+            return Err(Error::DocumentNotFound(path.to_path_buf()));
+        };
+        let read_at = SystemTime::now();
+        let (fresh, mtime, size) = match self.read_to_string_checked(path).await {
+            Ok(read) => read,
+            Err(Error::FileIo { .. }) if local_edit || external_conflict => {
+                return Ok(ExternalChange::Conflict);
+            }
+            Err(error) => return Err(error),
+        };
+        let snap = DiskSync {
+            mtime,
+            size,
+            mtime_settled: mtime_settled(mtime, read_at),
+            content_checked_at: Instant::now(),
+        };
+        if fresh == current {
+            if let Some(state) = lock_std(&self.documents).get_mut(path) {
+                state.set_disk(snap);
+            }
+            return Ok(ExternalChange::Unchanged);
+        }
+        if local_edit {
+            if let Some(state) = lock_std(&self.documents).get_mut(path) {
+                state.mark_external_conflict(snap);
+            }
+            return Ok(ExternalChange::Conflict);
+        }
+        if let Some(state) = lock_std(&self.documents).get_mut(path) {
+            let version = state.version.saturating_add(1);
+            state.commit_reload(version, fresh, Some(snap));
+        }
+        Ok(ExternalChange::Reloaded)
+    }
+
     /// Returns an error if `size` exceeds the configured file size limit.
     const fn check_file_size(&self, size: u64) -> Result<()> {
         if self.limits.max_file_size > 0 && size > self.limits.max_file_size {
@@ -598,15 +694,8 @@ impl DocumentTracker {
     /// again never catches up to a later edit -- which is correct, since a
     /// server that is never asked never needs the content.
     ///
-    /// Two cases fall outside the disk-change-detection mechanism entirely:
-    /// - A tool that restores a file with an mtime and size identical to the
-    ///   last ones observed (e.g. `tar x`, `rsync -a`, `cp -p`) is
-    ///   indistinguishable from "unchanged", however long ago that snapshot
-    ///   was taken -- not just within the racy detection window. Once a
-    ///   snapshot is `mtime_settled`, restoring its exact `(mtime, size)`
-    ///   retakes the fast path forever. Closing this would require hashing
-    ///   content on every access.
-    /// - `workspace_symbol_search` is served from the LSP server's own
+    /// One case falls outside the disk-change-detection mechanism entirely:
+    /// `workspace_symbol_search` is served from the LSP server's own
     ///   index and is unaffected by this per-document mechanism for files
     ///   mcpls has never opened.
     ///
@@ -632,16 +721,34 @@ impl DocumentTracker {
         server: &ServerId,
         lsp_client: &LspClient,
     ) -> Result<Uri> {
+        self.ensure_open_with_status(path, server, lsp_client)
+            .await
+            .map(|outcome| outcome.uri)
+    }
+
+    /// Synchronize a document and report whether an external rewrite was
+    /// observed. A conflicting unsaved edit is reported as a status while
+    /// preserving the local text; it is never silently overwritten.
+    async fn ensure_open_with_status(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        lsp_client: &LspClient,
+    ) -> Result<EnsureOpenOutcome> {
         let _path_guard = self.lock_path(path).await;
         let generation = self.generation(server);
         let decision = self.disk_phase(path).await?;
+        let external_change = decision.external_change;
         let result = self
             .sync_phase(path, server, lsp_client, decision, generation)
             .await;
         if result.is_ok() {
             self.touch(path);
         }
-        result
+        result.map(|uri| EnsureOpenOutcome {
+            uri,
+            external_change,
+        })
     }
 
     /// Push the authoritative in-memory state of an already tracked document
@@ -707,7 +814,11 @@ impl DocumentTracker {
                     }
                     _ => false,
                 };
-                (st.uri.clone(), st.version, fast_path)
+                (
+                    st.uri.clone(),
+                    st.version,
+                    fast_path && !st.external_conflict,
+                )
             })
         else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
@@ -724,16 +835,35 @@ impl DocumentTracker {
             content_checked_at: Instant::now(),
         };
 
-        let Some(unchanged) = lock_std(&self.documents)
+        let Some((unchanged, local_edit)) = lock_std(&self.documents)
             .get(path)
-            .map(|st| fresh == st.content)
+            .map(|st| (fresh == st.content, st.local_edit))
         else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
 
         if unchanged {
             self.set_disk(path, snap);
-            return Ok(Decision::unchanged(uri, current_version));
+            return Ok(Decision {
+                uri,
+                target_version: current_version,
+                fresh_content: None,
+                snap: None,
+                external_change: ExternalChange::Unchanged,
+            });
+        }
+
+        if local_edit {
+            if let Some(state) = lock_std(&self.documents).get_mut(path) {
+                state.mark_external_conflict(snap);
+            }
+            return Ok(Decision {
+                uri,
+                target_version: current_version,
+                fresh_content: None,
+                snap: None,
+                external_change: ExternalChange::Conflict,
+            });
         }
 
         Ok(Decision {
@@ -741,6 +871,7 @@ impl DocumentTracker {
             target_version: current_version.saturating_add(1),
             fresh_content: Some(fresh),
             snap: Some(snap),
+            external_change: ExternalChange::Reloaded,
         })
     }
 
@@ -822,6 +953,7 @@ impl DocumentTracker {
             target_version,
             fresh_content,
             snap,
+            external_change: _,
         } = decision;
 
         // Cheap check first: the common case (an already-synced document,
@@ -980,6 +1112,7 @@ struct Decision {
     target_version: i32,
     fresh_content: Option<String>,
     snap: Option<DiskSync>,
+    external_change: ExternalChange,
 }
 
 impl Decision {
@@ -991,8 +1124,28 @@ impl Decision {
             target_version,
             fresh_content: None,
             snap: None,
+            external_change: ExternalChange::Unchanged,
         }
     }
+}
+
+/// Result of synchronizing a tracked document against external filesystem
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalChange {
+    /// No new bytes were observed.
+    Unchanged,
+    /// Clean tracked content was replaced by newer bytes from disk.
+    Reloaded,
+    /// Disk differs while an unsaved local edit is retained.
+    Conflict,
+}
+
+/// URI and external-change status returned by [`DocumentTracker::ensure_open_with_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnsureOpenOutcome {
+    uri: Uri,
+    external_change: ExternalChange,
 }
 
 /// Convert a file path to a URI.
@@ -1346,6 +1499,8 @@ mod tests {
             version: 5,
             content: "fn main() {}".to_string(),
             disk: None,
+            local_edit: false,
+            external_conflict: false,
             synced: HashMap::new(),
             last_used: 0,
         };
@@ -2258,6 +2413,94 @@ mod tests {
         let state = tracker.get(&path).unwrap();
         assert_eq!(state.version(), 1, "documented limitation: fast path taken");
         assert_eq!(state.content(), "AAAA");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ensure_open_resyncs_after_watcher_invalidation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Simulate cargo fmt's atomic replacement while preserving the
+        // settled stat tuple. The watcher event is the missing invalidation
+        // signal that makes this rewrite observable without hashing every
+        // unchanged file.
+        std::fs::write(&path, "BBBB").unwrap();
+        set_mtime(&path, original_mtime);
+        tracker.mark_external_change(&path);
+
+        let outcome = tracker
+            .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.external_change, ExternalChange::Reloaded);
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.version(), 2);
+        assert_eq!(state.content(), "BBBB");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_open_resyncs_after_formatter_temp_rename() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        let replacement = dir.path().join("a.rs.tmp");
+        std::fs::write(&path, "AAAA").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+
+        std::fs::write(&replacement, "BBBB").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        tracker.mark_external_change(&path);
+
+        let outcome = tracker
+            .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.external_change, ExternalChange::Reloaded);
+        assert_eq!(tracker.get(&path).unwrap().content(), "BBBB");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_external_rewrite_preserves_unsaved_edit_and_reports_conflict() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "AAAA").unwrap();
+        set_mtime(&path, settled_past());
+
+        let (client, _server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        tracker
+            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        tracker.update(&path, "LOCAL".to_owned()).unwrap();
+
+        std::fs::write(&path, "BBBB").unwrap();
+        tracker.mark_external_change(&path);
+
+        let outcome = tracker
+            .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.external_change, ExternalChange::Conflict);
+        let state = tracker.get(&path).unwrap();
+        assert_eq!(state.content(), "LOCAL");
+        assert!(state.has_external_conflict());
     }
 
     #[tokio::test(start_paused = true)]

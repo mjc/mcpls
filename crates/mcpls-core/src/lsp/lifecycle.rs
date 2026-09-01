@@ -425,6 +425,14 @@ impl LspServer {
         std::mem::replace(&mut self.notification_rx, dummy)
     }
 
+    /// Take the native filesystem-watcher stream out of this server.
+    ///
+    /// The project owns the shared document tracker, so it consumes these
+    /// paths and invalidates tracked snapshots before the next semantic call.
+    pub fn take_watch_change_rx(&mut self) -> mpsc::UnboundedReceiver<PathBuf> {
+        self.client.take_watch_change_rx()
+    }
+
     /// Spawn and initialize LSP server.
     ///
     /// This performs the complete initialization sequence:

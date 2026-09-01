@@ -141,6 +141,19 @@ pub(super) enum WatchSignal {
     Error(String),
 }
 
+/// Return the concrete filesystem paths represented by an OS watcher signal.
+/// Rescans have no bounded path list; callers should rely on their own
+/// snapshot reconciliation for those signals.
+pub(super) fn signal_paths(signal: &WatchSignal) -> Vec<PathBuf> {
+    match signal {
+        WatchSignal::Event(event) => event_changes(event)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect(),
+        WatchSignal::Rescan | WatchSignal::Error(_) => Vec::new(),
+    }
+}
+
 pub(super) struct WatchRegistry {
     roots: Vec<PathBuf>,
     registrations: HashMap<String, RegisteredWatch>,

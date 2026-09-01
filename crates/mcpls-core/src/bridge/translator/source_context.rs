@@ -625,6 +625,9 @@ impl super::Translator {
         &self,
         path: PathBuf,
     ) -> crate::error::Result<(PathBuf, Option<i32>, String, String)> {
+        if self.document_tracker.is_open(&path) {
+            self.document_tracker.refresh_from_disk(&path).await?;
+        }
         if let Some(document) = self.document_tracker.get(&path) {
             let content = document.content().to_owned();
             return Ok((
@@ -717,6 +720,33 @@ mod tests {
 
         assert!(frame.text.contains("new_name"), "{}", frame.text);
         assert_ne!(frame.content_hash, resource.snapshot_hash);
+    }
+
+    #[tokio::test]
+    async fn tracked_source_snapshot_refreshes_after_external_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        tokio::fs::write(&path, "fn old_name() {}\n").await.unwrap();
+        let mut translator = crate::bridge::Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), "rust".to_owned())]));
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker()
+            .open(path.clone(), "fn old_name() {}\n".to_owned())
+            .unwrap();
+
+        let (_, old_version, old_hash, old_content) =
+            translator.source_snapshot(&path).await.unwrap();
+        assert_eq!(old_version, Some(1));
+        assert!(old_content.contains("old_name"));
+
+        tokio::fs::write(&path, "fn new_name() {}\n").await.unwrap();
+        let (_, new_version, new_hash, new_content) =
+            translator.source_snapshot(&path).await.unwrap();
+
+        assert_eq!(new_version, Some(2));
+        assert_ne!(new_hash, old_hash);
+        assert!(new_content.contains("new_name"));
     }
 
     #[tokio::test]
