@@ -1081,13 +1081,16 @@ pub struct InspectSymbolBatchRequest {
     pub candidate_limit: u32,
     /// Sections requested for every target.
     pub sections: Vec<InspectSymbolSectionKind>,
-    /// Shared bounds applied across the batch.
+    /// Shared collection bounds; result pages apply the server-owned byte ceiling.
     pub budget: InspectSymbolBudget,
+    /// Opaque cursor returned by an earlier page of this batch.
+    pub page_token: Option<String>,
 }
 
 pub(crate) const INSPECT_SYMBOL_BATCH_MAX_TARGETS: usize = 16;
 pub(crate) const INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES: usize = 1024;
 pub(crate) const INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET: usize = 4096;
+pub(crate) const INSPECT_SYMBOL_BATCH_MAX_ENTRY_BYTES: usize = 8 * 1024;
 pub(crate) const INSPECT_SYMBOL_RESULT_MAX_BYTES: usize = 16 * 1024;
 
 impl InspectSymbolRequest {
@@ -1399,6 +1402,9 @@ pub struct InspectSymbolBatchEntry {
     /// Target-local failure; successful siblings remain available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Snapshot-bound complete entry when its inline payload exceeds a page-safe bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<DeferredResourceReference>,
 }
 
 /// Bounded results for a caller-ordered batch of symbol inspections.
@@ -1408,9 +1414,20 @@ pub struct InspectSymbolBatchResult {
     pub entries: Vec<InspectSymbolBatchEntry>,
     /// Number of target inspections started concurrently.
     pub inspections_started: usize,
+    /// Number of caller targets across every page.
+    pub total_targets: usize,
+    /// Number of target entries in this page.
+    pub returned_targets: usize,
+    /// Number of target entries available after this page.
+    pub remaining_targets: usize,
+    /// Opaque cursor for the next caller-ordered page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Stable identity of the retained batch snapshot.
+    pub snapshot_identity: String,
     /// Total section items returned across all targets.
     pub returned_items: usize,
-    /// Shared bounds applied across the batch.
+    /// Effective page-byte limit and original shared item bound.
     pub budget: InspectSymbolBudget,
     /// Serialized bytes in this bundle before the MCP envelope.
     pub returned_bytes: usize,

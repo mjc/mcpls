@@ -3710,6 +3710,7 @@ struct ProjectRuntime {
     code_actions: CodeActionStore,
     symbol_handles: std::sync::Mutex<SymbolHandleStore>,
     workspace_symbol_results: std::sync::Mutex<HashMap<String, WorkspaceSymbolResult>>,
+    inspect_symbol_batch_pages: std::sync::Mutex<InspectSymbolBatchPageStore>,
     deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
     deferred_scope: Option<String>,
     inline_module_checks: HashMap<PlanId, InlineModuleSemanticCheck>,
@@ -3969,6 +3970,176 @@ struct DeferredResultStore {
     entries: HashMap<String, StoredDeferredResult>,
     ttl: Duration,
     max_entries: usize,
+}
+
+#[derive(Clone)]
+struct InspectSymbolBatchSnapshot {
+    entries: Vec<InspectSymbolBatchEntry>,
+    inspections_started: usize,
+    snapshot_identity: String,
+    truncated: bool,
+    max_items: usize,
+}
+
+struct StoredInspectSymbolBatchSnapshot {
+    snapshot: InspectSymbolBatchSnapshot,
+    scope: String,
+    created_at: Instant,
+}
+
+struct InspectSymbolBatchPageStore {
+    entries: HashMap<String, StoredInspectSymbolBatchSnapshot>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl InspectSymbolBatchPageStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: Duration::from_secs(15 * 60),
+            max_entries: 64,
+        }
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.created_at) < self.ttl);
+    }
+
+    fn insert(&mut self, snapshot: InspectSymbolBatchSnapshot, scope: &str) -> String {
+        self.prune();
+        while self.entries.len() >= self.max_entries {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        self.entries.insert(
+            token.clone(),
+            StoredInspectSymbolBatchSnapshot {
+                snapshot,
+                scope: scope.to_owned(),
+                created_at: Instant::now(),
+            },
+        );
+        token
+    }
+
+    fn read(&mut self, token: &str, scope: &str) -> Result<InspectSymbolBatchSnapshot, String> {
+        self.prune();
+        self.entries
+            .get(token)
+            .filter(|entry| entry.scope == scope)
+            .map(|entry| entry.snapshot.clone())
+            .ok_or_else(|| "stale_resource: inspect batch page is missing or expired".to_owned())
+    }
+
+    fn remove(&mut self, token: &str) {
+        self.entries.remove(token);
+    }
+}
+
+fn inspect_symbol_batch_cursor(token: &str, offset: usize) -> String {
+    format!("mcpls-inspect-batch:///{token}?offset={offset:020}")
+}
+
+fn parse_inspect_symbol_batch_cursor(cursor: &str) -> Result<(&str, usize), String> {
+    let cursor = cursor
+        .strip_prefix("mcpls-inspect-batch:///")
+        .ok_or_else(|| {
+            "page_token must be the next_cursor returned by inspect_symbol_batch".to_owned()
+        })?;
+    let (token, offset) = cursor
+        .split_once("?offset=")
+        .ok_or_else(|| "invalid inspect batch page_token".to_owned())?;
+    if token.is_empty() {
+        return Err("invalid inspect batch page_token".to_owned());
+    }
+    let offset = offset
+        .parse::<usize>()
+        .map_err(|_| "invalid inspect batch page_token offset".to_owned())?;
+    Ok((token, offset))
+}
+
+fn update_inspect_symbol_batch_page_metadata(
+    result: &mut InspectSymbolBatchResult,
+    snapshot: &InspectSymbolBatchSnapshot,
+    token: &str,
+    offset: usize,
+) {
+    result.returned_targets = result.entries.len();
+    result.remaining_targets = snapshot
+        .entries
+        .len()
+        .saturating_sub(offset + result.returned_targets);
+    result.next_cursor = (result.remaining_targets > 0)
+        .then(|| inspect_symbol_batch_cursor(token, offset + result.returned_targets));
+    result.returned_items = result
+        .entries
+        .iter()
+        .filter_map(|entry| entry.result.as_ref())
+        .map(|entry| entry.sections.returned_items())
+        .sum();
+    result.truncated = snapshot.truncated || result.remaining_targets > 0;
+    result.returned_bytes = 0;
+    for _ in 0..4 {
+        let returned_bytes = serde_json::to_vec(result).map_or(usize::MAX, |json| json.len());
+        if result.returned_bytes == returned_bytes {
+            break;
+        }
+        result.returned_bytes = returned_bytes;
+    }
+}
+
+fn bounded_inspect_symbol_batch_page(
+    snapshot: &InspectSymbolBatchSnapshot,
+    token: &str,
+    offset: usize,
+) -> Result<InspectSymbolBatchResult, String> {
+    if offset > snapshot.entries.len() {
+        return Err("inspect batch page_token offset is outside the retained result".to_owned());
+    }
+    let max_bytes = crate::bridge::translator::INSPECT_SYMBOL_RESULT_MAX_BYTES;
+    let mut result = InspectSymbolBatchResult {
+        entries: Vec::new(),
+        inspections_started: snapshot.inspections_started,
+        total_targets: snapshot.entries.len(),
+        returned_targets: 0,
+        remaining_targets: snapshot.entries.len().saturating_sub(offset),
+        next_cursor: None,
+        snapshot_identity: snapshot.snapshot_identity.clone(),
+        returned_items: 0,
+        budget: crate::bridge::InspectSymbolBudget {
+            max_bytes,
+            max_items: snapshot.max_items,
+        },
+        returned_bytes: 0,
+        truncated: snapshot.truncated,
+    };
+
+    for entry in snapshot.entries.iter().skip(offset) {
+        result.entries.push(entry.clone());
+        update_inspect_symbol_batch_page_metadata(&mut result, snapshot, token, offset);
+        if serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len()) > max_bytes {
+            result.entries.pop();
+            update_inspect_symbol_batch_page_metadata(&mut result, snapshot, token, offset);
+            break;
+        }
+    }
+
+    if result.entries.is_empty() && offset < snapshot.entries.len() {
+        return Err("inspect batch target metadata exceeds the response page budget".to_owned());
+    }
+    debug_assert!(serde_json::to_vec(&result).is_ok_and(|json| json.len() <= max_bytes));
+    Ok(result)
 }
 
 impl DeferredResultStore {
@@ -4732,6 +4903,7 @@ impl ProjectRuntime {
             code_actions: CodeActionStore::new(),
             symbol_handles: std::sync::Mutex::new(SymbolHandleStore::new()),
             workspace_symbol_results: std::sync::Mutex::new(HashMap::new()),
+            inspect_symbol_batch_pages: std::sync::Mutex::new(InspectSymbolBatchPageStore::new()),
             deferred_results,
             deferred_scope,
             inline_module_checks: HashMap::new(),
@@ -7135,10 +7307,11 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    async fn inspect_symbol_batch(
+    async fn collect_inspect_symbol_batch(
         &self,
         request: InspectSymbolBatchRequest,
-    ) -> Result<InspectSymbolBatchResult, String> {
+        scope: &str,
+    ) -> Result<InspectSymbolBatchSnapshot, String> {
         let target_count = request.targets.len();
         if target_count == 0
             || target_count > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
@@ -7153,7 +7326,8 @@ impl ProjectRuntime {
                 + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES,
         );
         let target_budget = crate::bridge::InspectSymbolBudget {
-            max_bytes: available_bytes / target_count,
+            max_bytes: (available_bytes / target_count)
+                .min(crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_ENTRY_BYTES),
             max_items: request.budget.max_items / target_count,
         };
         if target_budget.max_bytes
@@ -7180,37 +7354,81 @@ impl ProjectRuntime {
                         target,
                         result: Some(result),
                         error: None,
+                        resource: None,
                     },
                     Err(error) => InspectSymbolBatchEntry {
                         target,
                         result: None,
                         error: Some(error),
+                        resource: None,
                     },
                 }
             }
         });
-        let entries = futures::future::join_all(inspections).await;
-        let returned_items = entries
-            .iter()
-            .filter_map(|entry| entry.result.as_ref())
-            .map(|result| result.sections.returned_items())
-            .sum();
+        let mut entries = futures::future::join_all(inspections).await;
         let truncated = entries
             .iter()
             .filter_map(|entry| entry.result.as_ref())
             .any(|result| result.truncated);
-        let mut result = InspectSymbolBatchResult {
+        let encoded = serde_json::to_vec(&entries)
+            .map_err(|error| format!("failed to identify inspect batch snapshot: {error}"))?;
+        let snapshot_identity = format!("{:x}", Sha256::digest(encoded));
+        for entry in &mut entries {
+            if serde_json::to_vec(entry).map_or(usize::MAX, |json| json.len())
+                <= crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_ENTRY_BYTES
+            {
+                continue;
+            }
+            let value = serde_json::to_value(&*entry)
+                .map_err(|error| format!("failed to defer inspect batch entry: {error}"))?;
+            let resource = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped(value, snapshot_identity.clone(), scope);
+            entry.result = None;
+            entry.error = None;
+            entry.resource = Some(resource);
+        }
+        Ok(InspectSymbolBatchSnapshot {
             inspections_started: entries.len(),
             entries,
-            returned_items,
-            budget: request.budget,
-            returned_bytes: 0,
+            snapshot_identity,
             truncated,
-        };
-        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
-        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
-        if result.returned_bytes > result.budget.max_bytes {
-            return Err("batch response metadata exceeds max_bytes".to_owned());
+            max_items: request.budget.max_items,
+        })
+    }
+
+    async fn inspect_symbol_batch(
+        &self,
+        request: InspectSymbolBatchRequest,
+    ) -> Result<InspectSymbolBatchResult, String> {
+        let scope = self.deferred_scope.as_deref().unwrap_or_default();
+        if let Some(page_token) = request.page_token.as_deref() {
+            if !request.targets.is_empty() {
+                return Err("targets must be empty when page_token is supplied".to_owned());
+            }
+            let (token, offset) = parse_inspect_symbol_batch_cursor(page_token)?;
+            let snapshot = self
+                .inspect_symbol_batch_pages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read(token, scope)?;
+            return bounded_inspect_symbol_batch_page(&snapshot, token, offset);
+        }
+
+        let snapshot = self.collect_inspect_symbol_batch(request, scope).await?;
+        let token = self
+            .inspect_symbol_batch_pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(snapshot.clone(), scope);
+        let result = bounded_inspect_symbol_batch_page(&snapshot, &token, 0)?;
+        if result.next_cursor.is_none() {
+            self.inspect_symbol_batch_pages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&token);
         }
         Ok(result)
     }
@@ -12047,6 +12265,7 @@ mod tests {
                 candidate_limit: 10,
                 sections: Vec::new(),
                 budget: crate::bridge::InspectSymbolBudget::default(),
+                page_token: None,
             }),
             reply,
         };
@@ -12916,6 +13135,7 @@ mod tests {
                     max_bytes: 24 * 1024,
                     max_items: 3,
                 },
+                page_token: None,
             }),
         )
         .await
@@ -12924,6 +13144,11 @@ mod tests {
 
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.inspections_started, 3);
+        assert_eq!(result.total_targets, 3);
+        assert_eq!(result.returned_targets, 3);
+        assert_eq!(result.remaining_targets, 0);
+        assert!(result.next_cursor.is_none());
+        assert_eq!(result.budget.max_bytes, 16 * 1024);
         assert_eq!(result.returned_items, 2, "{result:#?}");
         assert!(result.entries[..2].iter().all(|entry| matches!(
             entry.result.as_ref().unwrap().resolution,
@@ -12944,6 +13169,65 @@ mod tests {
         assert!(result.returned_bytes <= result.budget.max_bytes);
         release_server.send(()).unwrap();
         assert_eq!(responder.await.unwrap(), 2);
+    }
+
+    #[test]
+    fn inspect_symbol_batch_pages_are_bounded_replayable_and_lossless() {
+        let entries = (0..4)
+            .map(|index| InspectSymbolBatchEntry {
+                target: crate::bridge::InspectSymbolTarget {
+                    symbol_handle: None,
+                    query: Some(format!("target-{index}")),
+                    kind: None,
+                    path: None,
+                    container: None,
+                },
+                result: None,
+                error: Some("x".repeat(5_000)),
+                resource: None,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = InspectSymbolBatchSnapshot {
+            inspections_started: entries.len(),
+            entries,
+            snapshot_identity: "snapshot".to_owned(),
+            truncated: false,
+            max_items: 40,
+        };
+        let mut store = InspectSymbolBatchPageStore::new();
+        let token = store.insert(snapshot.clone(), "session");
+        assert!(store.read(&token, "different-session").is_err());
+
+        let first = bounded_inspect_symbol_batch_page(&snapshot, &token, 0).unwrap();
+        let first_json = serde_json::to_value(&first).unwrap();
+        assert!(first.next_cursor.is_some());
+        let mut cursor = Some(inspect_symbol_batch_cursor(&token, 0));
+        let mut queries = Vec::new();
+        let mut pages = 0;
+        while let Some(page_cursor) = cursor {
+            let (page_token, offset) = parse_inspect_symbol_batch_cursor(&page_cursor).unwrap();
+            let retained = store.read(page_token, "session").unwrap();
+            let page = bounded_inspect_symbol_batch_page(&retained, page_token, offset).unwrap();
+            let encoded_len = serde_json::to_vec(&page).unwrap().len();
+            assert!(encoded_len <= 16 * 1024);
+            assert_eq!(page.returned_bytes, encoded_len);
+            queries.extend(
+                page.entries
+                    .iter()
+                    .map(|entry| entry.target.query.clone().unwrap()),
+            );
+            cursor = page.next_cursor;
+            pages += 1;
+        }
+
+        assert!(pages > 1);
+        assert_eq!(queries, ["target-0", "target-1", "target-2", "target-3"]);
+        assert_eq!(
+            serde_json::to_value(bounded_inspect_symbol_batch_page(&snapshot, &token, 0).unwrap())
+                .unwrap(),
+            first_json,
+            "replaying a page must return the same cursor and content"
+        );
     }
 
     #[tokio::test]

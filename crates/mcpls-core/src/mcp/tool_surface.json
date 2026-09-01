@@ -14287,7 +14287,7 @@
   },
   {
     "name": "inspect_symbol_batch",
-    "description": "Inspect 1-16 symbol handles or exact queries concurrently in one actor request. Returns every target identity and source-bearing sections in caller order under one shared budget.",
+    "description": "Inspect 1-16 symbol handles or queries concurrently, returning caller-ordered source-bearing 16 KiB pages. Continue with page_token and no targets; provider work is retained rather than repeated.",
     "inputSchema": {
       "$defs": {
         "InspectSymbolTarget": {
@@ -14342,7 +14342,7 @@
             "max_bytes": 131072,
             "max_items": 20
           },
-          "description": "Strict serialized-byte and per-provider item bounds shared by the batch.",
+          "description": "Shared collection bounds; serialized result pages are capped at 16 KiB.",
           "properties": {
             "max_bytes": {
               "default": 65536,
@@ -14367,6 +14367,13 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "description": "Opaque cursor returned by the previous batch page; omit targets when continuing.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Stable project identifier whose symbols should be inspected.",
@@ -14428,6 +14435,7 @@
           "type": "array"
         },
         "targets": {
+          "default": [],
           "description": "Caller-ordered symbol identities; every target is retained in the response.",
           "items": {
             "$ref": "#/$defs/InspectSymbolTarget"
@@ -14436,8 +14444,7 @@
         }
       },
       "required": [
-        "project_id",
-        "targets"
+        "project_id"
       ],
       "type": "object"
     },
@@ -15732,6 +15739,17 @@
                 "null"
               ]
             },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Snapshot-bound complete entry when its inline payload exceeds a page-safe bound."
+            },
             "result": {
               "anyOf": [
                 {
@@ -16908,7 +16926,7 @@
       "properties": {
         "budget": {
           "additionalProperties": false,
-          "description": "Shared bounds applied across the batch.",
+          "description": "Effective page-byte limit and original shared item bound.",
           "properties": {
             "max_bytes": {
               "default": 65536,
@@ -16940,6 +16958,19 @@
           "minimum": 0,
           "type": "integer"
         },
+        "next_cursor": {
+          "description": "Opaque cursor for the next caller-ordered page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_targets": {
+          "description": "Number of target entries available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "returned_bytes": {
           "description": "Serialized bytes in this bundle before the MCP envelope.",
           "format": "uint",
@@ -16952,6 +16983,22 @@
           "minimum": 0,
           "type": "integer"
         },
+        "returned_targets": {
+          "description": "Number of target entries in this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Stable identity of the retained batch snapshot.",
+          "type": "string"
+        },
+        "total_targets": {
+          "description": "Number of caller targets across every page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "truncated": {
           "description": "Whether any target result was truncated.",
           "type": "boolean"
@@ -16960,6 +17007,10 @@
       "required": [
         "entries",
         "inspections_started",
+        "total_targets",
+        "returned_targets",
+        "remaining_targets",
+        "snapshot_identity",
         "returned_items",
         "budget",
         "returned_bytes",

@@ -3459,58 +3459,76 @@ impl McplsServer {
 
     /// Inspect several symbols concurrently without repeating actor round trips.
     #[tool(
-        description = "Inspect 1-16 symbol handles or exact queries concurrently in one actor request. Returns every target identity and source-bearing sections in caller order under one shared budget."
+        description = "Inspect 1-16 symbol handles or queries concurrently, returning caller-ordered source-bearing 16 KiB pages. Continue with page_token and no targets; provider work is retained rather than repeated."
     )]
     async fn inspect_symbol_batch(
         &self,
         Parameters(params): Parameters<InspectSymbolBatchParams>,
     ) -> Result<Json<crate::bridge::InspectSymbolBatchResult>, McpError> {
-        if params.targets.is_empty()
-            || params.targets.len() > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
-        {
-            return Err(McpError::invalid_params(
-                "targets must contain between 1 and 16 symbols",
-                None,
-            ));
-        }
-        if params.targets.iter().any(|target| {
-            target.symbol_handle.is_none()
-                && target
-                    .query
-                    .as_ref()
-                    .is_none_or(|query| query.trim().is_empty())
-        }) {
-            return Err(McpError::invalid_params(
-                "every target requires query or symbol_handle",
-                None,
-            ));
-        }
-        if params.candidate_limit == 0 || params.candidate_limit > 100 {
-            return Err(McpError::invalid_params(
-                "candidate_limit must be between 1 and 100",
-                None,
-            ));
-        }
-        if params.budget.max_items < params.targets.len() {
-            return Err(McpError::invalid_params(
-                "budget.max_items must allow at least one item per target",
-                None,
-            ));
-        }
-        let identity_bytes = serde_json::to_vec(&params.targets)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
-            .len();
-        let minimum_bytes = identity_bytes
-            + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES
-            + params.targets.len()
-                * crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET;
-        if params.budget.max_bytes < minimum_bytes || params.budget.max_bytes > 1024 * 1024 {
-            return Err(McpError::invalid_params(
-                format!(
-                    "budget.max_bytes must be between {minimum_bytes} and 1048576 for these targets"
-                ),
-                None,
-            ));
+        if params.page_token.is_some() {
+            if !params.targets.is_empty() {
+                return Err(McpError::invalid_params(
+                    "targets must be empty when page_token is supplied",
+                    None,
+                ));
+            }
+        } else {
+            if params.targets.is_empty()
+                || params.targets.len()
+                    > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
+            {
+                return Err(McpError::invalid_params(
+                    "targets must contain between 1 and 16 symbols",
+                    None,
+                ));
+            }
+            if params.targets.iter().any(|target| {
+                target.symbol_handle.is_none()
+                    && target
+                        .query
+                        .as_ref()
+                        .is_none_or(|query| query.trim().is_empty())
+            }) {
+                return Err(McpError::invalid_params(
+                    "every target requires query or symbol_handle",
+                    None,
+                ));
+            }
+            if params.targets.iter().any(|target| {
+                serde_json::to_vec(target).map_or(usize::MAX, |encoded| encoded.len()) > 4_096
+            }) {
+                return Err(McpError::invalid_params(
+                    "each target identity must fit within 4096 serialized bytes",
+                    None,
+                ));
+            }
+            if params.candidate_limit == 0 || params.candidate_limit > 100 {
+                return Err(McpError::invalid_params(
+                    "candidate_limit must be between 1 and 100",
+                    None,
+                ));
+            }
+            if params.budget.max_items < params.targets.len() {
+                return Err(McpError::invalid_params(
+                    "budget.max_items must allow at least one item per target",
+                    None,
+                ));
+            }
+            let identity_bytes = serde_json::to_vec(&params.targets)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+                .len();
+            let minimum_bytes = identity_bytes
+                + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES
+                + params.targets.len()
+                    * crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET;
+            if params.budget.max_bytes < minimum_bytes || params.budget.max_bytes > 1024 * 1024 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "budget.max_bytes must be between {minimum_bytes} and 1048576 for these targets"
+                    ),
+                    None,
+                ));
+            }
         }
 
         let id = parse_project_id(params.project_id)?;
@@ -3526,6 +3544,7 @@ impl McplsServer {
                 candidate_limit: params.candidate_limit,
                 sections: params.sections,
                 budget: params.budget,
+                page_token: params.page_token,
             })
             .await
             .map_err(operation_error);
@@ -6586,6 +6605,7 @@ finally:
                     max_bytes: 16 * 1024,
                     max_items: 1,
                 },
+                page_token: None,
             }))
             .await
             .unwrap_err();

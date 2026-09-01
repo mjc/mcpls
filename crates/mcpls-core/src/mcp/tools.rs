@@ -494,6 +494,7 @@ pub struct InspectSymbolBatchParams {
     /// Stable project identifier whose symbols should be inspected.
     pub project_id: String,
     /// Caller-ordered symbol identities; every target is retained in the response.
+    #[serde(default)]
     pub targets: Vec<crate::bridge::InspectSymbolTarget>,
     /// Maximum ranked candidates returned for each ambiguous query.
     #[serde(default = "default_inspect_candidates")]
@@ -501,9 +502,11 @@ pub struct InspectSymbolBatchParams {
     /// Sections requested for every target.
     #[serde(default)]
     pub sections: Vec<InspectSymbolSectionKind>,
-    /// Strict serialized-byte and per-provider item bounds shared by the batch.
+    /// Shared collection bounds; serialized result pages are capped at 16 KiB.
     #[serde(default = "default_inspect_batch_budget")]
     pub budget: InspectSymbolBudget,
+    /// Opaque cursor returned by the previous batch page; omit targets when continuing.
+    pub page_token: Option<String>,
 }
 
 const fn default_inspect_candidates() -> u32 {
