@@ -40,8 +40,8 @@ pub use translator::{
     ServerMessagesResult, SignatureHelpResult, SourceContext, SourceFrame, SupportedWorkspaceEdit,
     Symbol, SymbolHandle, TextEdit, Translator, TranslatorTemplate, WillRenameFilesResult,
     WorkspaceSymbolBatchEntry, WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult,
-    WorkspaceSymbolMatchMode, WorkspaceSymbolResult, WorkspaceSymbolScope,
-    convert_code_action_or_command,
+    WorkspaceSymbolMatchMode, WorkspaceSymbolPageRequest, WorkspaceSymbolResult,
+    WorkspaceSymbolScope, convert_code_action_or_command,
 };
 
 /// Lock a `std::sync::Mutex`, recovering the guard if a previous holder

@@ -837,16 +837,48 @@ pub enum WorkspaceSymbolOrigin {
     External,
 }
 
+/// Actor-owned inputs for one bounded page of workspace symbols.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolPageRequest {
+    /// Symbol name query.
+    pub query: String,
+    /// Optional symbol-kind filter.
+    pub kind_filter: Option<String>,
+    /// Name-matching behavior.
+    pub match_mode: WorkspaceSymbolMatchMode,
+    /// Source scope.
+    pub scope: WorkspaceSymbolScope,
+    /// Whether generated symbols may be returned.
+    pub include_generated: bool,
+    /// Maximum symbols returned on this page.
+    pub max_items: usize,
+    /// Maximum serialized bytes returned on this page.
+    pub max_bytes: usize,
+    /// Snapshot-owned continuation returned by the preceding page.
+    pub page_token: Option<String>,
+}
+
 /// Result of workspace symbol search.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceSymbolResult {
-    /// List of symbols found.
+    /// List of symbols found on this page.
     pub symbols: Vec<WorkspaceSymbol>,
-    /// Number of matching symbols before the item budget.
+    /// Number of matching symbols across every page.
     pub total: usize,
     /// Number of symbols in this response.
     pub returned: usize,
-    /// Whether the item budget omitted matching symbols.
+    /// Number of matching symbols available after this page.
+    pub remaining: usize,
+    /// Snapshot-owned continuation for the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Stable identity of the immutable result snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_identity: Option<String>,
+    /// Serialized-byte budget applied to this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// Whether a later page contains matching symbols.
     pub truncated: bool,
 }
 

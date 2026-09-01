@@ -3176,9 +3176,23 @@ impl McplsServer {
             match_mode,
             scope,
             limit,
+            max_bytes,
+            page_token,
             include_generated,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<crate::bridge::WorkspaceSymbolResult>, McpError> {
+        if limit == 0 || limit > 1_000 {
+            return Err(McpError::invalid_params(
+                "limit must be between 1 and 1000",
+                None,
+            ));
+        }
+        if !(4_096..=1_048_576).contains(&max_bytes) {
+            return Err(McpError::invalid_params(
+                "max_bytes must be between 4096 and 1048576",
+                None,
+            ));
+        }
         let id = parse_project_id(project_id)?;
         let actor = self
             .context
@@ -3187,14 +3201,16 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .workspace_symbol(
+            .workspace_symbol(crate::bridge::WorkspaceSymbolPageRequest {
                 query,
                 kind_filter,
-                limit,
                 match_mode,
                 scope,
                 include_generated,
-            )
+                max_items: limit as usize,
+                max_bytes,
+                page_token,
+            })
             .await
             .map_err(|error| error.to_string());
 
@@ -5509,6 +5525,8 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             }))
             .await
@@ -5523,6 +5541,8 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             }))
             .await
@@ -5558,6 +5578,8 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             })),
             server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
@@ -5567,6 +5589,8 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             })),
         );
@@ -5674,6 +5698,8 @@ finally:
                     match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                     scope: crate::bridge::WorkspaceSymbolScope::default(),
                     limit: 20,
+                    max_bytes: 16 * 1024,
+                    page_token: None,
                     include_generated: false,
                 }))
                 .await
@@ -5747,6 +5773,8 @@ finally:
                     match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                     scope: crate::bridge::WorkspaceSymbolScope::default(),
                     limit: 20,
+                    max_bytes: 16 * 1024,
+                    page_token: None,
                     include_generated: false,
                 }))
                 .await
@@ -6746,6 +6774,8 @@ finally:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             }))
             .await
@@ -8725,6 +8755,8 @@ while True:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             }))
             .await
@@ -8827,6 +8859,8 @@ while True:
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
                 limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
                 include_generated: false,
             }))
             .await
@@ -9458,6 +9492,8 @@ while True:
             match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
             scope: crate::bridge::WorkspaceSymbolScope::default(),
             limit: 100,
+            max_bytes: 16 * 1024,
+            page_token: None,
             include_generated: false,
         });
         let result = server.workspace_symbol_search(params).await;

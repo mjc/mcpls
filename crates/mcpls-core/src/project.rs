@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ignore::WalkBuilder;
 const CALL_HIERARCHY_PAGE_SIZE: usize = 64;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -44,7 +44,8 @@ use crate::bridge::{
     SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
     SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolBatchEntry,
     WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult, WorkspaceSymbolMatchMode,
-    WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri, uri_to_path,
+    WorkspaceSymbolPageRequest, WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri,
+    uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1728,12 +1729,7 @@ enum ProjectRequest {
         reply: oneshot::Sender<Result<SemanticDiscoveryResult, String>>,
     },
     WorkspaceSymbol {
-        query: String,
-        kind_filter: Option<String>,
-        limit: u32,
-        match_mode: WorkspaceSymbolMatchMode,
-        scope: WorkspaceSymbolScope,
-        include_generated: bool,
+        request: WorkspaceSymbolPageRequest,
         reply: oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
     },
     WorkspaceSymbolBatch {
@@ -2760,7 +2756,7 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
-    /// Route a workspace-symbol request through this project's actor-owned translator.
+    /// Route a bounded workspace-symbol page through this project's actor-owned translator.
     ///
     /// # Errors
     ///
@@ -2768,24 +2764,11 @@ impl ProjectHandle {
     /// actor-owned translator rejects the request.
     pub async fn workspace_symbol(
         &self,
-        query: String,
-        kind_filter: Option<String>,
-        limit: u32,
-        match_mode: WorkspaceSymbolMatchMode,
-        scope: WorkspaceSymbolScope,
-        include_generated: bool,
+        request: WorkspaceSymbolPageRequest,
     ) -> Result<WorkspaceSymbolResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::WorkspaceSymbol {
-                query,
-                kind_filter,
-                limit,
-                match_mode,
-                scope,
-                include_generated,
-                reply,
-            })
+            .send(ProjectRequest::WorkspaceSymbol { request, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -4346,10 +4329,69 @@ fn trim_workspace_symbol_batch(batch: &mut WorkspaceSymbolBatchResult) {
         };
         result.symbols.pop();
         result.returned = result.symbols.len();
+        result.remaining = result.total.saturating_sub(result.returned);
         result.truncated = true;
         batch.returned = batch.returned.saturating_sub(1);
         batch.truncated = true;
     }
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceSymbolPageState {
+    total: usize,
+    snapshot_identity: String,
+    symbols: Vec<WorkspaceSymbol>,
+}
+
+fn workspace_symbol_snapshot_identity(symbols: &[WorkspaceSymbol]) -> Result<String, String> {
+    let encoded = serde_json::to_vec(symbols)
+        .map_err(|error| format!("failed to identify workspace-symbol snapshot: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn bounded_workspace_symbol_page(
+    state: WorkspaceSymbolPageState,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<(WorkspaceSymbolResult, Option<WorkspaceSymbolPageState>), String> {
+    const CURSOR_PLACEHOLDER: &str = "mcpls-deferred:///00000000-0000-0000-0000-000000000000";
+
+    let total = state.total;
+    let snapshot_identity = state.snapshot_identity;
+    let mut symbols = state.symbols;
+    let mut remaining = VecDeque::from(symbols.split_off(max_items.min(symbols.len())));
+    let mut result = WorkspaceSymbolResult {
+        symbols,
+        total,
+        returned: 0,
+        remaining: 0,
+        next_cursor: None,
+        snapshot_identity: Some(snapshot_identity.clone()),
+        max_bytes: Some(max_bytes),
+        truncated: false,
+    };
+
+    loop {
+        result.returned = result.symbols.len();
+        result.remaining = remaining.len();
+        result.truncated = !remaining.is_empty();
+        result.next_cursor = result.truncated.then(|| CURSOR_PLACEHOLDER.to_owned());
+        if serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+            break;
+        }
+        let Some(symbol) = result.symbols.pop() else {
+            return Err(
+                "max_bytes is too small to return one workspace symbol identity".to_owned(),
+            );
+        };
+        remaining.push_front(symbol);
+    }
+
+    let remaining = (!remaining.is_empty()).then(|| WorkspaceSymbolPageState {
+        total,
+        snapshot_identity,
+        symbols: remaining.into(),
+    });
+    Ok((result, remaining))
 }
 
 impl ProjectRuntime {
@@ -5782,6 +5824,73 @@ impl ProjectRuntime {
         result.returned = result.symbols.len();
         self.attach_workspace_symbol_handles(&mut result.symbols)
             .await;
+        Ok(result)
+    }
+    async fn workspace_symbol_page(
+        &self,
+        request: WorkspaceSymbolPageRequest,
+    ) -> Result<WorkspaceSymbolResult, String> {
+        if request.max_items == 0 || request.max_items > 1_000 {
+            return Err("max_items must be between 1 and 1000".to_owned());
+        }
+        if !(4_096..=1_048_576).contains(&request.max_bytes) {
+            return Err("max_bytes must be between 4096 and 1048576".to_owned());
+        }
+
+        let scope = self.deferred_scope.as_deref().unwrap_or_default();
+        let state = if let Some(page_token) = request.page_token {
+            let token = page_token
+                .strip_prefix("mcpls-deferred:///")
+                .ok_or_else(|| {
+                    "page_token must be the next_cursor returned by workspace_symbol_search"
+                        .to_owned()
+                })?;
+            let value = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_scoped(token, scope)?;
+            serde_json::from_value(value)
+                .map_err(|error| format!("invalid workspace-symbol page: {error}"))?
+        } else {
+            let mut result = self
+                .translator
+                .handle_workspace_symbol_all_with_generated(
+                    request.query,
+                    request.kind_filter,
+                    request.match_mode,
+                    request.scope,
+                    request.include_generated,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            discard_workspace_symbol_struct_uses(&mut result.symbols);
+            self.attach_workspace_symbol_handles(&mut result.symbols)
+                .await;
+            let snapshot_identity = workspace_symbol_snapshot_identity(&result.symbols)?;
+            WorkspaceSymbolPageState {
+                total: result.symbols.len(),
+                snapshot_identity,
+                symbols: result.symbols,
+            }
+        };
+
+        let (mut result, remaining) =
+            bounded_workspace_symbol_page(state, request.max_items, request.max_bytes)?;
+        if let Some(remaining) = remaining {
+            let snapshot_identity = remaining.snapshot_identity.clone();
+            let value = serde_json::to_value(remaining)
+                .map_err(|error| format!("failed to store workspace-symbol page: {error}"))?;
+            let reference = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped(value, snapshot_identity, scope);
+            result.next_cursor = Some(reference.uri);
+        }
+        debug_assert!(
+            serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() <= request.max_bytes)
+        );
         Ok(result)
     }
 
@@ -8024,21 +8133,13 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::WorkspaceSymbol {
-            query,
-            kind_filter,
-            limit,
-            match_mode,
-            scope,
-            include_generated,
-            mut reply,
-        } => {
+        ProjectRequest::WorkspaceSymbol { request, mut reply } => {
             if reply.is_closed() {
                 return false;
             }
             let result = tokio::select! {
                 () = reply.closed() => return false,
-                result = runtime.workspace_symbol(query, kind_filter, limit, match_mode, scope, include_generated) => result,
+                result = runtime.workspace_symbol_page(request) => result,
             };
             let _ = reply.send(result);
         }
@@ -11470,14 +11571,16 @@ mod tests {
         let actor = spawn_project_actor_with_translator(4, translator);
 
         let result = actor
-            .workspace_symbol(
-                "handle_target".to_owned(),
-                None,
-                10,
-                WorkspaceSymbolMatchMode::default(),
-                WorkspaceSymbolScope::default(),
-                false,
-            )
+            .workspace_symbol(WorkspaceSymbolPageRequest {
+                query: "handle_target".to_owned(),
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::default(),
+                scope: WorkspaceSymbolScope::default(),
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+                page_token: None,
+            })
             .await
             .unwrap();
         let Some(handle) = result.symbols[0].location.symbol_handle.clone() else {
@@ -11676,6 +11779,130 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workspace_symbol_search_is_bounded_and_pageable() {
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("symbols.rs");
+        fs::write(&source, "fn get_symbol() {}\n".repeat(100)).unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half: write_half,
+            _read_half: read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let responder_source = source.clone();
+        let responder = tokio::spawn(async move {
+            let _processes = (write_half, read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let message = read_framed_message(&mut reader).await;
+            let id = message.get("id").unwrap();
+            let symbols = (0..100)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": format!("get_symbol_{index:03}"),
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(&responder_source).unwrap(),
+                            "range": {
+                                "start": {"line": index, "character": 3},
+                                "end": {"line": index, "character": 17}
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            write_response(&mut read_half_stdin, id, serde_json::json!(symbols)).await;
+        });
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        let mut page_token = None;
+        let mut snapshot_identity = None;
+        let mut source_resource = None;
+        let mut names = Vec::new();
+        let mut encoded_bytes = 0;
+        loop {
+            let result = actor
+                .workspace_symbol(WorkspaceSymbolPageRequest {
+                    query: "get".to_owned(),
+                    kind_filter: None,
+                    match_mode: WorkspaceSymbolMatchMode::Fuzzy,
+                    scope: WorkspaceSymbolScope::Project,
+                    include_generated: false,
+                    max_items: 100,
+                    max_bytes: 16 * 1024,
+                    page_token,
+                })
+                .await
+                .unwrap();
+            let encoded = serde_json::to_vec(&result).unwrap();
+            encoded_bytes += encoded.len();
+            assert!(
+                encoded.len() <= 16 * 1024,
+                "single workspace-symbol page used {} bytes",
+                encoded.len()
+            );
+            assert_eq!(result.total, 100);
+            assert!(
+                result.symbols.iter().all(|symbol| matches!(
+                    &symbol.location.source,
+                    SourceContext::Deferred { .. }
+                )),
+                "workspace-symbol pages must defer source context"
+            );
+            if source_resource.is_none() {
+                let SourceContext::Deferred { resource } = &result.symbols[0].location.source
+                else {
+                    unreachable!("source contexts were checked above")
+                };
+                source_resource = Some(resource.uri.clone());
+            }
+            if let Some(identity) = &snapshot_identity {
+                assert_eq!(result.snapshot_identity.as_ref(), Some(identity));
+            } else {
+                snapshot_identity = result.snapshot_identity.clone();
+            }
+            names.extend(result.symbols.into_iter().map(|symbol| symbol.name));
+            assert_eq!(result.remaining, 100 - names.len());
+            let Some(cursor) = result.next_cursor else {
+                assert!(!result.truncated);
+                break;
+            };
+            assert!(result.truncated);
+            page_token = Some(cursor);
+        }
+
+        assert_eq!(
+            names,
+            (0..100)
+                .map(|index| format!("get_symbol_{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            encoded_bytes < 96 * 1024,
+            "workspace-symbol pages used {encoded_bytes} bytes total"
+        );
+        let source = actor
+            .read_source_resource(
+                crate::bridge::resources::parse_source_uri(&source_resource.unwrap()).unwrap(),
+                16 * 1024,
+            )
+            .await
+            .unwrap();
+        assert!(source.text.contains("fn get_symbol()"));
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls() {
         use crate::bridge::translator::testing::{
             FakeServer, read_framed_message, translator_with_capabilities, write_response,
@@ -11808,14 +12035,16 @@ mod tests {
         let mut targets = Vec::new();
         for query in ["alpha", "beta"] {
             let symbol = actor
-                .workspace_symbol(
-                    query.to_owned(),
-                    None,
-                    1,
-                    WorkspaceSymbolMatchMode::Exact,
-                    WorkspaceSymbolScope::Project,
-                    false,
-                )
+                .workspace_symbol(WorkspaceSymbolPageRequest {
+                    query: query.to_owned(),
+                    kind_filter: None,
+                    match_mode: WorkspaceSymbolMatchMode::Exact,
+                    scope: WorkspaceSymbolScope::Project,
+                    include_generated: false,
+                    max_items: 1,
+                    max_bytes: 16 * 1024,
+                    page_token: None,
+                })
                 .await
                 .unwrap()
                 .symbols
@@ -11886,14 +12115,16 @@ mod tests {
         translator.set_workspace_roots(vec![root.path().to_path_buf()]);
         let actor = spawn_project_actor_with_translator(4, translator);
         let mut symbols = actor
-            .workspace_symbol(
-                "inspected".to_owned(),
-                None,
-                10,
-                WorkspaceSymbolMatchMode::Exact,
-                WorkspaceSymbolScope::Project,
-                false,
-            )
+            .workspace_symbol(WorkspaceSymbolPageRequest {
+                query: "inspected".to_owned(),
+                kind_filter: None,
+                match_mode: WorkspaceSymbolMatchMode::Exact,
+                scope: WorkspaceSymbolScope::Project,
+                include_generated: false,
+                max_items: 10,
+                max_bytes: 16 * 1024,
+                page_token: None,
+            })
             .await
             .unwrap()
             .symbols;

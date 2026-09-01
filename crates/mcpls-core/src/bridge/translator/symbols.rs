@@ -122,6 +122,7 @@ fn workspace_symbol_origin(
 async fn finish_workspace_symbols(
     mut candidates: Vec<WorkspaceSymbolCandidate>,
     limit: usize,
+    source_bytes: Option<usize>,
     ctx: &EncodingCtx,
     roots: &[std::path::PathBuf],
 ) -> WorkspaceSymbolResult {
@@ -149,16 +150,24 @@ async fn finish_workspace_symbols(
     });
     let total = candidates.len();
     candidates.truncate(limit);
-    let mut budget = super::source_context::SourceBudget::default();
+    let mut budget = source_bytes.map_or_else(
+        super::source_context::SourceBudget::default,
+        super::source_context::SourceBudget::new,
+    );
     let mut symbols = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         symbols.push(convert_workspace_symbol(candidate, ctx, roots, &mut budget).await);
     }
+    let returned = symbols.len();
     WorkspaceSymbolResult {
-        returned: symbols.len(),
-        truncated: symbols.len() < total,
+        remaining: total.saturating_sub(returned),
+        returned,
+        truncated: returned < total,
         total,
         symbols,
+        next_cursor: None,
+        snapshot_identity: None,
+        max_bytes: None,
     }
 }
 
@@ -671,11 +680,34 @@ impl Translator {
         self.handle_workspace_symbol_filtered(
             query,
             kind_filter,
-            limit,
+            Some(limit),
             match_mode,
             scope,
             include_generated,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Resolve the complete provider result for actor-owned paging.
+    pub(crate) async fn handle_workspace_symbol_all_with_generated(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
+        include_generated: bool,
+    ) -> Result<WorkspaceSymbolResult> {
+        self.handle_workspace_symbol_filtered(
+            query,
+            kind_filter,
+            None,
+            match_mode,
+            scope,
+            include_generated,
+            None,
+            Some(0),
         )
         .await
     }
@@ -686,7 +718,7 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::handle_workspace_symbol`].
+    /// Returns the same errors as `handle_workspace_symbol`.
     pub(crate) async fn handle_workspace_symbol_in_path(
         &self,
         query: String,
@@ -699,11 +731,12 @@ impl Translator {
         self.handle_workspace_symbol_filtered(
             query,
             kind_filter,
-            limit,
+            Some(limit),
             match_mode,
             scope,
             false,
             Some(path),
+            None,
         )
         .await
     }
@@ -713,18 +746,23 @@ impl Translator {
         &self,
         query: String,
         kind_filter: Option<String>,
-        limit: u32,
+        limit: Option<u32>,
         match_mode: WorkspaceSymbolMatchMode,
         scope: WorkspaceSymbolScope,
         include_generated: bool,
         path: Option<&std::path::Path>,
+        source_bytes: Option<usize>,
     ) -> Result<WorkspaceSymbolResult> {
-        validate_workspace_symbol_params(&query, kind_filter.as_deref(), limit)?;
-        if limit == 0 {
+        validate_workspace_symbol_params(&query, kind_filter.as_deref(), limit.unwrap_or(1))?;
+        if limit == Some(0) {
             return Ok(WorkspaceSymbolResult {
                 symbols: Vec::new(),
                 total: 0,
                 returned: 0,
+                remaining: 0,
+                next_cursor: None,
+                snapshot_identity: None,
+                max_bytes: None,
                 truncated: false,
             });
         }
@@ -747,9 +785,10 @@ impl Translator {
                     &languages,
                     &query,
                     kind_filter.as_deref(),
-                    limit as usize,
+                    limit.map_or(usize::MAX, |limit| limit as usize),
                     match_mode,
                     include_generated,
+                    source_bytes,
                 )
                 .await)
         };
@@ -853,7 +892,14 @@ impl Translator {
             return fallback().await;
         }
 
-        Ok(finish_workspace_symbols(candidates, limit as usize, &ctx, &self.workspace_roots).await)
+        Ok(finish_workspace_symbols(
+            candidates,
+            limit.map_or(usize::MAX, |limit| limit as usize),
+            source_bytes,
+            &ctx,
+            &self.workspace_roots,
+        )
+        .await)
     }
 
     async fn ast_grep_workspace_symbols(
@@ -865,6 +911,7 @@ impl Translator {
         limit: usize,
         match_mode: WorkspaceSymbolMatchMode,
         include_generated: bool,
+        source_bytes: Option<usize>,
     ) -> WorkspaceSymbolResult {
         let candidate_query = query
             .chars()
@@ -923,7 +970,7 @@ impl Translator {
                 is_generated,
             });
         }
-        finish_workspace_symbols(candidates, limit, &ctx, &self.workspace_roots).await
+        finish_workspace_symbols(candidates, limit, source_bytes, &ctx, &self.workspace_roots).await
     }
 }
 

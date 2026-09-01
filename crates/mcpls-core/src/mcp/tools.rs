@@ -360,10 +360,16 @@ pub struct WorkspaceSymbolParams {
     /// Source scope; dependencies and external symbols require explicit `all`.
     #[serde(default)]
     pub scope: WorkspaceSymbolScope,
-    /// Maximum results to return (default: 100).
-    #[schemars(description = "Maximum results to return (default: 100).")]
+    /// Maximum results to return on one page (default: 100).
+    #[schemars(description = "Maximum results to return on one page (default: 100).")]
     #[serde(default = "default_max_results")]
     pub limit: u32,
+    /// Maximum serialized response bytes (default: 16384).
+    #[serde(default = "default_workspace_symbol_batch_bytes")]
+    pub max_bytes: usize,
+    /// Snapshot-owned continuation returned by the preceding page.
+    #[serde(default)]
+    pub page_token: Option<String>,
     /// Include symbols under generated/build-output directories (default: false).
     #[serde(default)]
     pub include_generated: bool,
@@ -506,7 +512,7 @@ const fn default_max_results() -> u32 {
 }
 
 const fn default_workspace_symbol_batch_bytes() -> usize {
-    64 * 1024
+    16 * 1024
 }
 
 /// Parameters for the `get_code_actions` tool.
