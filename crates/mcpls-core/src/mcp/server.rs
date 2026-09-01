@@ -4875,6 +4875,11 @@ mod tests {
 
         let value = preview_artifact_json(&artifact, "project");
 
+        let serialized_bytes = serde_json::to_vec(&value).unwrap().len();
+        assert!(
+            serialized_bytes <= 16 * 1024,
+            "preview used {serialized_bytes} serialized bytes"
+        );
         assert_eq!(value["diff_truncated"], true);
         assert_eq!(value["diff_files"][0]["additions"], 20_000);
         assert_eq!(value["diff_files"][0]["deletions"], 20_000);

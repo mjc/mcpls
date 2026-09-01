@@ -256,7 +256,7 @@ impl FileSnapshot {
     }
 }
 
-const MAX_RENDERED_DIFF_BYTES: usize = 64 * 1024;
+const MAX_RENDERED_DIFF_BYTES: usize = 8 * 1024;
 const MAX_DIFF_COMPUTE_TIME: Duration = Duration::from_millis(500);
 const DIFF_TRUNCATION_MARKER: &str = "\n... diff truncated ...\n";
 
