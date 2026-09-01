@@ -184,6 +184,12 @@ pub struct DocumentSymbolsParams {
     /// Optional query, filters, hierarchy bounds, and body controls.
     #[serde(flatten)]
     pub options: DocumentSymbolOptions,
+    /// Maximum serialized bytes returned on this page.
+    #[serde(default = "default_workspace_symbol_batch_bytes")]
+    pub max_bytes: usize,
+    /// Snapshot-owned continuation returned by a prior response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `format_document` tool.

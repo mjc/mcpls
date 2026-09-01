@@ -636,6 +636,9 @@ pub struct Symbol {
     /// Snapshot-bound target for coordinate-free semantic follow-ups.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_handle: Option<SymbolHandle>,
+    /// Stable identity of this declaration's parent in a paged flat outline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_symbol_handle: Option<SymbolHandle>,
     /// Parent symbol name when this is a nested declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
@@ -659,6 +662,19 @@ pub struct Symbol {
     pub children: Option<Vec<Self>>,
 }
 
+/// Actor-owned inputs for one bounded page of document symbols.
+#[derive(Debug, Clone)]
+pub struct DocumentSymbolPageRequest {
+    /// Absolute source path for the initial page and actor routing.
+    pub file_path: String,
+    /// Semantic outline filters.
+    pub options: DocumentSymbolOptions,
+    /// Maximum serialized bytes returned on this page.
+    pub max_bytes: usize,
+    /// Snapshot-owned continuation returned by the preceding page.
+    pub page_token: Option<String>,
+}
+
 /// Query and output bounds for a document semantic outline.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DocumentSymbolOptions {
@@ -671,7 +687,7 @@ pub struct DocumentSymbolOptions {
     pub kind_filter: Option<String>,
     /// Maximum hierarchy depth; defaults to one for compact no-query outlines.
     pub max_depth: Option<u32>,
-    /// Maximum matched declarations returned.
+    /// Maximum matched declarations returned per page.
     #[serde(default = "default_document_symbol_limit")]
     pub limit: u32,
     /// Include test modules and test declarations.
@@ -721,14 +737,32 @@ impl DocumentSymbolOptions {
 /// Result of a document symbols request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DocumentSymbolsResult {
-    /// List of symbols in the document.
+    /// Flat declaration entries for this page; parent handles preserve hierarchy.
     pub symbols: Vec<Symbol>,
     /// Path relative to the owning project root.
     pub project_relative_path: Option<String>,
+    /// Snapshot-bound source for the outlined document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_resource: Option<DeferredResourceReference>,
     /// Matching declarations before the result limit.
     pub total: usize,
     /// Matching declarations returned.
     pub returned: usize,
+    /// Matching declarations available after this page.
+    #[serde(default)]
+    pub remaining: usize,
+    /// Snapshot-owned continuation for the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Stable identity of the immutable outline snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_identity: Option<String>,
+    /// Open-document version shared by every symbol in this outline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
+    /// Serialized-byte budget applied to this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
     /// Whether result or source budgets shortened the response.
     pub truncated: bool,
     /// Filters and bounds applied to this outline.

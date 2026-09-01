@@ -35,10 +35,10 @@ use crate::bridge::translator::{
 use crate::bridge::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, CompletionsResult,
     DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolOptions,
-    DocumentSymbolsResult, FormatDocumentResult, HoverResult, IncomingCallsResult,
-    InlayHintsResult, InspectSymbolBatchEntry, InspectSymbolBatchRequest, InspectSymbolBatchResult,
-    InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry, LogLevel,
-    OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
+    DocumentSymbolPageRequest, DocumentSymbolsResult, FormatDocumentResult, HoverResult,
+    IncomingCallsResult, InlayHintsResult, InspectSymbolBatchEntry, InspectSymbolBatchRequest,
+    InspectSymbolBatchResult, InspectSymbolRequest, InspectSymbolResult, LocationsResult, LogEntry,
+    LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
     SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
@@ -1698,8 +1698,7 @@ enum ProjectRequest {
         reply: oneshot::Sender<Result<CompletionsResult, String>>,
     },
     DocumentSymbols {
-        file_path: String,
-        options: DocumentSymbolOptions,
+        request: DocumentSymbolPageRequest,
         reply: oneshot::Sender<Result<DocumentSymbolsResult, String>>,
     },
     FormatDocument {
@@ -2636,13 +2635,28 @@ impl ProjectHandle {
         file_path: String,
         options: DocumentSymbolOptions,
     ) -> Result<DocumentSymbolsResult, ProjectActorError> {
+        self.document_symbol_page(DocumentSymbolPageRequest {
+            file_path,
+            options,
+            max_bytes: 16 * 1024,
+            page_token: None,
+        })
+        .await
+    }
+
+    /// Route one bounded document-symbol page through this project's actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor closes, the caller cancels, or outline
+    /// generation or continuation validation fails.
+    pub async fn document_symbol_page(
+        &self,
+        request: DocumentSymbolPageRequest,
+    ) -> Result<DocumentSymbolsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::DocumentSymbols {
-                file_path,
-                options,
-                reply,
-            })
+            .send(ProjectRequest::DocumentSymbols { request, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -4043,22 +4057,21 @@ impl DeferredResultStore {
 fn attach_document_symbol_handles(
     store: &mut SymbolHandleStore,
     symbols: &mut [crate::bridge::Symbol],
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    parent: Option<&SymbolHandle>,
 ) {
     for symbol in symbols {
-        if let Some(SourceContext::Available(frame)) = &symbol.source {
-            let snapshot = frame.document_version.map_or_else(
-                || SourceSnapshot::Hash(frame.content_hash.clone()),
-                SourceSnapshot::Version,
-            );
-            symbol.symbol_handle = Some(store.insert(StoredSymbolTarget::new(
-                PathBuf::from(&frame.path),
-                symbol.selection_range.start.line,
-                symbol.selection_range.start.character,
-                snapshot,
-            )));
-        }
+        symbol.parent_symbol_handle = parent.cloned();
+        let handle = store.insert(StoredSymbolTarget::new(
+            path.to_path_buf(),
+            symbol.selection_range.start.line,
+            symbol.selection_range.start.character,
+            snapshot.clone(),
+        ));
+        symbol.symbol_handle = Some(handle.clone());
         if let Some(children) = &mut symbol.children {
-            attach_document_symbol_handles(store, children);
+            attach_document_symbol_handles(store, children, path, snapshot, Some(&handle));
         }
     }
 }
@@ -4340,6 +4353,127 @@ struct WorkspaceSymbolPageState {
     total: usize,
     snapshot_identity: String,
     symbols: Vec<WorkspaceSymbol>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocumentSymbolPageState {
+    total: usize,
+    snapshot_identity: String,
+    document_version: Option<i32>,
+    project_relative_path: Option<String>,
+    source_resource: DeferredResourceReference,
+    filters: DocumentSymbolOptions,
+    symbols: Vec<crate::bridge::Symbol>,
+}
+
+fn flatten_document_symbols(symbols: Vec<crate::bridge::Symbol>) -> Vec<crate::bridge::Symbol> {
+    fn flatten(symbol: crate::bridge::Symbol, output: &mut Vec<crate::bridge::Symbol>) {
+        let mut symbol = symbol;
+        let children = symbol.children.take().unwrap_or_default();
+        output.push(symbol);
+        children
+            .into_iter()
+            .for_each(|child| flatten(child, output));
+    }
+
+    let mut output = Vec::new();
+    symbols
+        .into_iter()
+        .for_each(|symbol| flatten(symbol, &mut output));
+    output
+}
+
+fn clear_document_symbol_sources(symbols: &mut [crate::bridge::Symbol]) {
+    for symbol in symbols {
+        symbol.source = None;
+        if let Some(children) = &mut symbol.children {
+            clear_document_symbol_sources(children);
+        }
+    }
+}
+
+fn document_symbol_matches(symbol: &crate::bridge::Symbol, has_query: bool) -> bool {
+    !has_query || symbol.match_class.is_some()
+}
+
+fn bounded_document_symbol_page(
+    state: DocumentSymbolPageState,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<(DocumentSymbolsResult, Option<DocumentSymbolPageState>), String> {
+    const CURSOR_PLACEHOLDER: &str = "mcpls-deferred:///00000000-0000-0000-0000-000000000000";
+
+    let DocumentSymbolPageState {
+        total,
+        snapshot_identity,
+        document_version,
+        project_relative_path,
+        source_resource,
+        filters,
+        symbols,
+    } = state;
+    let has_query = filters.query.is_some();
+    let mut remaining = VecDeque::from(symbols);
+    let mut result = DocumentSymbolsResult {
+        symbols: Vec::new(),
+        project_relative_path: project_relative_path.clone(),
+        source_resource: Some(source_resource.clone()),
+        total,
+        returned: 0,
+        remaining: total,
+        next_cursor: None,
+        snapshot_identity: Some(snapshot_identity.clone()),
+        document_version,
+        max_bytes: Some(max_bytes),
+        truncated: false,
+        filters: filters.clone(),
+    };
+
+    while let Some(symbol) = remaining.pop_front() {
+        let matched = document_symbol_matches(&symbol, has_query);
+        if matched && result.returned >= max_items {
+            remaining.push_front(symbol);
+            break;
+        }
+        result.symbols.push(symbol);
+        result.returned += usize::from(matched);
+        result.remaining = remaining
+            .iter()
+            .filter(|symbol| document_symbol_matches(symbol, has_query))
+            .count();
+        result.truncated = !remaining.is_empty();
+        result.next_cursor = result.truncated.then(|| CURSOR_PLACEHOLDER.to_owned());
+        if serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+            continue;
+        }
+
+        let Some(symbol) = result.symbols.pop() else {
+            return Err("document-symbol page lost its inserted symbol".to_owned());
+        };
+        result.returned -= usize::from(matched);
+        remaining.push_front(symbol);
+        if result.symbols.is_empty() {
+            return Err("max_bytes is too small to return one document symbol identity".to_owned());
+        }
+        break;
+    }
+
+    result.remaining = remaining
+        .iter()
+        .filter(|symbol| document_symbol_matches(symbol, has_query))
+        .count();
+    result.truncated = !remaining.is_empty();
+    result.next_cursor = result.truncated.then(|| CURSOR_PLACEHOLDER.to_owned());
+    let remaining = (!remaining.is_empty()).then(|| DocumentSymbolPageState {
+        total,
+        snapshot_identity,
+        document_version,
+        project_relative_path,
+        source_resource,
+        filters,
+        symbols: remaining.into(),
+    });
+    Ok((result, remaining))
 }
 
 fn workspace_symbol_snapshot_identity(symbols: &[WorkspaceSymbol]) -> Result<String, String> {
@@ -5741,20 +5875,108 @@ impl ProjectRuntime {
 
     async fn document_symbols(
         &self,
-        file_path: String,
-        options: DocumentSymbolOptions,
+        request: DocumentSymbolPageRequest,
     ) -> Result<DocumentSymbolsResult, String> {
-        let mut result = self
-            .translator
-            .handle_document_symbols(file_path, options)
-            .await
-            .map_err(|error| error.to_string())?;
-        attach_document_symbol_handles(
-            &mut self
-                .symbol_handles
+        if request.options.limit == 0 || request.options.limit > 1_000 {
+            return Err("limit must be between 1 and 1000".to_owned());
+        }
+        if !(4_096..=1_048_576).contains(&request.max_bytes) {
+            return Err("max_bytes must be between 4096 and 1048576".to_owned());
+        }
+
+        let scope = self.deferred_scope.as_deref().unwrap_or_default();
+        let state = if let Some(page_token) = request.page_token {
+            let token = page_token
+                .strip_prefix("mcpls-deferred:///")
+                .ok_or_else(|| {
+                    "page_token must be the next_cursor returned by get_document_symbols".to_owned()
+                })?;
+            let value = self
+                .deferred_results
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            &mut result.symbols,
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_scoped(token, scope)?;
+            serde_json::from_value(value)
+                .map_err(|error| format!("invalid document-symbol page: {error}"))?
+        } else {
+            let mut result = self
+                .translator
+                .handle_document_symbols_for_page(
+                    request.file_path.clone(),
+                    request.options.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let snapshot_identity = result.snapshot_identity.clone().ok_or_else(|| {
+                "document-symbol result is missing its snapshot identity".to_owned()
+            })?;
+            let (path, document_version, content_hash, content) = self
+                .translator
+                .source_snapshot(Path::new(&request.file_path))
+                .await
+                .map_err(|error| error.to_string())?;
+            if content_hash != snapshot_identity {
+                return Err("source changed while preparing the document-symbol page".to_owned());
+            }
+            let snapshot = document_version.map_or_else(
+                || SourceSnapshot::Hash(content_hash),
+                SourceSnapshot::Version,
+            );
+            attach_document_symbol_handles(
+                &mut self
+                    .symbol_handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                &mut result.symbols,
+                &path,
+                &snapshot,
+                None,
+            );
+            clear_document_symbol_sources(&mut result.symbols);
+            let total_lines = u32::try_from(content.lines().count().max(1)).unwrap_or(u32::MAX);
+            let source_resource = DeferredResourceReference {
+                uri: make_source_uri(
+                    &path,
+                    1,
+                    1,
+                    total_lines,
+                    1,
+                    &snapshot_identity,
+                    document_version,
+                )
+                .map_err(|error| error.to_string())?,
+                kind: "source_context".to_owned(),
+                snapshot_hash: snapshot_identity.clone(),
+                document_version,
+                total_bytes: Some(content.len()),
+            };
+            DocumentSymbolPageState {
+                total: result.total,
+                snapshot_identity,
+                document_version: result.document_version,
+                project_relative_path: result.project_relative_path,
+                source_resource,
+                filters: request.options.clone(),
+                symbols: flatten_document_symbols(result.symbols),
+            }
+        };
+
+        let max_items = state.filters.limit as usize;
+        let (mut result, remaining) =
+            bounded_document_symbol_page(state, max_items, request.max_bytes)?;
+        if let Some(remaining) = remaining {
+            let snapshot_identity = remaining.snapshot_identity.clone();
+            let value = serde_json::to_value(remaining)
+                .map_err(|error| format!("failed to store document-symbol page: {error}"))?;
+            let reference = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped(value, snapshot_identity, scope);
+            result.next_cursor = Some(reference.uri);
+        }
+        debug_assert!(
+            serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() <= request.max_bytes)
         );
         Ok(result)
     }
@@ -8076,12 +8298,8 @@ async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::DocumentSymbols {
-            file_path,
-            options,
-            reply,
-        } => {
-            let _ = reply.send(runtime.document_symbols(file_path, options).await);
+        ProjectRequest::DocumentSymbols { request, reply } => {
+            let _ = reply.send(runtime.document_symbols(request).await);
         }
         ProjectRequest::FormatDocument {
             file_path,
@@ -11900,6 +12118,260 @@ mod tests {
             .unwrap();
         assert!(source.text.contains("fn get_symbol()"));
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn document_symbols_default_page_is_bounded() {
+        use std::fmt::Write as _;
+
+        use crate::bridge::translator::testing::{
+            FakeServer, read_framed_message, translator_with_capabilities, write_response,
+        };
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("outline.rs");
+        let content = (0..100).fold(String::new(), |mut content, index| {
+            writeln!(content, "pub fn caf\u{e9}_{index:03}() {{}}").unwrap();
+            content
+        });
+        fs::write(&source, content).unwrap();
+        let capabilities = lsp_types::ServerCapabilities {
+            document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, server) =
+            translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+        let FakeServer {
+            _write_half: write_half,
+            _read_half: read_half,
+            mut read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let responder_source = source.clone();
+        let responder = tokio::spawn(async move {
+            let _processes = (write_half, read_half);
+            let mut reader = BufReader::new(&mut write_stdout);
+            let message = loop {
+                let message = read_framed_message(&mut reader).await;
+                if !message["id"].is_null() {
+                    break message;
+                }
+            };
+            let id = message.get("id").unwrap();
+            let symbols = (0..100)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": format!("caf\u{e9}_{index:03}"),
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(&responder_source).unwrap(),
+                            "range": {
+                                "start": {"line": index, "character": 7},
+                                "end": {"line": index, "character": 15}
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            write_response(&mut read_half_stdin, id, serde_json::json!(symbols)).await;
+        });
+        let actor = spawn_project_actor_with_translator(4, translator);
+
+        let mut page_token = None;
+        let mut snapshot_identity = None;
+        let mut source_resource = None;
+        let mut names = Vec::new();
+        let mut encoded_bytes = 0;
+        loop {
+            let result = actor
+                .document_symbol_page(DocumentSymbolPageRequest {
+                    file_path: source.display().to_string(),
+                    options: DocumentSymbolOptions::default(),
+                    max_bytes: 16 * 1024,
+                    page_token,
+                })
+                .await
+                .unwrap();
+            let encoded = serde_json::to_vec(&result).unwrap();
+            encoded_bytes += encoded.len();
+            assert!(
+                encoded.len() <= 16 * 1024,
+                "document-symbol page used {} bytes",
+                encoded.len()
+            );
+            assert_eq!(result.total, 100);
+            assert!(
+                result
+                    .symbols
+                    .iter()
+                    .all(|symbol| symbol.children.is_none() && symbol.source.is_none())
+            );
+            if source_resource.is_none() {
+                source_resource = result
+                    .source_resource
+                    .as_ref()
+                    .map(|resource| resource.uri.clone());
+            }
+            if let Some(identity) = &snapshot_identity {
+                assert_eq!(result.snapshot_identity.as_ref(), Some(identity));
+            } else {
+                snapshot_identity = result.snapshot_identity.clone();
+            }
+            names.extend(result.symbols.into_iter().map(|symbol| symbol.name));
+            assert_eq!(result.remaining, 100 - names.len());
+            let Some(cursor) = result.next_cursor else {
+                assert!(!result.truncated);
+                break;
+            };
+            assert!(result.truncated);
+            page_token = Some(cursor);
+        }
+
+        assert_eq!(
+            names,
+            (0..100)
+                .map(|index| format!("caf\u{e9}_{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            encoded_bytes < 32 * 1024,
+            "document-symbol pages used {encoded_bytes} bytes"
+        );
+        let source_page = actor
+            .read_source_resource(
+                crate::bridge::resources::parse_source_uri(&source_resource.unwrap()).unwrap(),
+                16 * 1024,
+            )
+            .await
+            .unwrap();
+        assert!(source_page.text.contains("pub fn caf\u{e9}_000"));
+        assert!(source_page.text.contains("pub fn caf\u{e9}_099"));
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn measured_swift_outline_fits_one_default_page() {
+        let range = crate::bridge::Range {
+            start: crate::bridge::Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: crate::bridge::Position2D {
+                line: 1,
+                character: 2,
+            },
+        };
+        let parent_handle = SymbolHandle::new();
+        let symbols = (0..33)
+            .map(|index| crate::bridge::Symbol {
+                name: format!("RideMapLiveContentView_caf\u{e9}_{index:02}"),
+                kind: if index == 0 { "Struct" } else { "Property" }.to_owned(),
+                range: range.clone(),
+                selection_range: range.clone(),
+                symbol_handle: Some(if index == 0 {
+                    parent_handle.clone()
+                } else {
+                    SymbolHandle::new()
+                }),
+                parent_symbol_handle: (index != 0).then(|| parent_handle.clone()),
+                container_name: (index != 0).then(|| "RideMapLiveContentView".to_owned()),
+                match_class: None,
+                score: None,
+                source: None,
+                is_private: false,
+                is_test: false,
+                children: None,
+            })
+            .collect();
+        let state = DocumentSymbolPageState {
+            total: 33,
+            snapshot_identity: "e0f3f3e91aa47c772291d7106b5000a1d487f071bf0eb8d6f8d495f0246f8c06"
+                .to_owned(),
+            document_version: Some(2),
+            project_relative_path: Some(
+                "swift/CutoutMobile/Apps/CutoutApp/RideMapLiveContentView.swift".to_owned(),
+            ),
+            source_resource: DeferredResourceReference {
+                uri: "mcpls-source:///Users/mjc/projects/libcutout/swift/CutoutMobile/Apps/CutoutApp/RideMapLiveContentView.swift?start_line=1&start_character=1&end_line=270&end_character=1&snapshot=e0f3f3e91aa47c772291d7106b5000a1d487f071bf0eb8d6f8d495f0246f8c06&version=2".to_owned(),
+                kind: "source_context".to_owned(),
+                snapshot_hash:
+                    "e0f3f3e91aa47c772291d7106b5000a1d487f071bf0eb8d6f8d495f0246f8c06"
+                        .to_owned(),
+                document_version: Some(2),
+                total_bytes: Some(10_346),
+            },
+            filters: DocumentSymbolOptions {
+                include_private: true,
+                limit: 50,
+                max_depth: Some(2),
+                ..DocumentSymbolOptions::default()
+            },
+            symbols,
+        };
+
+        let (result, continuation) = bounded_document_symbol_page(state, 50, 16 * 1024).unwrap();
+
+        assert!(continuation.is_none());
+        assert_eq!(result.returned, 33);
+        assert_eq!(result.remaining, 0);
+        assert!(!result.truncated);
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 16 * 1024);
+        assert_eq!(result.symbols[0].symbol_handle, Some(parent_handle.clone()));
+        assert!(
+            result.symbols[1..]
+                .iter()
+                .all(|symbol| symbol.parent_symbol_handle.as_ref() == Some(&parent_handle))
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name.contains('é'))
+        );
+    }
+
+    #[test]
+    fn flattened_document_symbols_keep_exact_parent_identity() {
+        let range = crate::bridge::Range {
+            start: crate::bridge::Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: crate::bridge::Position2D {
+                line: 1,
+                character: 2,
+            },
+        };
+        let symbol = |name: &str, children| crate::bridge::Symbol {
+            name: name.to_owned(),
+            kind: "Function".to_owned(),
+            range: range.clone(),
+            selection_range: range.clone(),
+            symbol_handle: None,
+            parent_symbol_handle: None,
+            container_name: None,
+            match_class: None,
+            score: None,
+            source: None,
+            is_private: false,
+            is_test: false,
+            children,
+        };
+        let mut symbols = vec![symbol("parent", Some(vec![symbol("child", None)]))];
+        attach_document_symbol_handles(
+            &mut SymbolHandleStore::new(),
+            &mut symbols,
+            Path::new("/tmp/outline.rs"),
+            &SourceSnapshot::Hash("snapshot".to_owned()),
+            None,
+        );
+
+        let flat = flatten_document_symbols(symbols);
+
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat[1].parent_symbol_handle, flat[0].symbol_handle);
+        assert!(flat.iter().all(|symbol| symbol.children.is_none()));
     }
 
     #[tokio::test]

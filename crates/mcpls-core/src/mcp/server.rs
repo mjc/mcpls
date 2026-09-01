@@ -3119,11 +3119,16 @@ impl McplsServer {
 
     /// Get all symbols in a document.
     #[tool(
-        description = "Bounded semantic outline for one file. Supports name/kind queries, hierarchy depth, private/test controls, declaration frames, optional bodies, and reusable symbol handles."
+        description = "Bounded, pageable semantic outline for one file. Returns flat declaration entries with exact parent handles, a shared snapshot source reference, and reusable symbol handles."
     )]
     async fn get_document_symbols(
         &self,
-        Parameters(DocumentSymbolsParams { file_path, options }): Parameters<DocumentSymbolsParams>,
+        Parameters(DocumentSymbolsParams {
+            file_path,
+            options,
+            max_bytes,
+            page_token,
+        }): Parameters<DocumentSymbolsParams>,
     ) -> Result<Json<crate::bridge::DocumentSymbolsResult>, McpError> {
         let actor = self
             .context
@@ -3131,7 +3136,12 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .document_symbols(file_path, options)
+            .document_symbol_page(crate::bridge::DocumentSymbolPageRequest {
+                file_path,
+                options,
+                max_bytes,
+                page_token,
+            })
             .await
             .map_err(|error| error.to_string());
 
@@ -5445,6 +5455,8 @@ finally:
         Parameters(DocumentSymbolsParams {
             file_path: path.display().to_string(),
             options: DocumentSymbolOptions::default(),
+            max_bytes: 16 * 1024,
+            page_token: None,
         })
     }
 
@@ -7711,6 +7723,8 @@ while True:
                 .get_document_symbols(Parameters(DocumentSymbolsParams {
                     file_path: path.display().to_string(),
                     options: DocumentSymbolOptions::default(),
+                    max_bytes: 16 * 1024,
+                    page_token: None,
                 }))
                 .await
                 .unwrap();
@@ -9134,6 +9148,8 @@ while True:
             .get_document_symbols(Parameters(DocumentSymbolsParams {
                 file_path: file_path.display().to_string(),
                 options: DocumentSymbolOptions::default(),
+                max_bytes: 16 * 1024,
+                page_token: None,
             }))
             .await;
 
@@ -9463,6 +9479,8 @@ while True:
         let params = Parameters(DocumentSymbolsParams {
             file_path: "/test/file.rs".to_string(),
             options: DocumentSymbolOptions::default(),
+            max_bytes: 16 * 1024,
+            page_token: None,
         });
 
         let result = server.get_document_symbols(params).await;

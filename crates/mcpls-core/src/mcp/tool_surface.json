@@ -6473,7 +6473,7 @@
   },
   {
     "name": "get_document_symbols",
-    "description": "Bounded semantic outline for one file. Supports name/kind queries, hierarchy depth, private/test controls, declaration frames, optional bodies, and reusable symbol handles.",
+    "description": "Bounded, pageable semantic outline for one file. Returns flat declaration entries with exact parent handles, a shared snapshot source reference, and reusable symbol handles.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -6505,7 +6505,7 @@
         },
         "limit": {
           "default": 100,
-          "description": "Maximum matched declarations returned.",
+          "description": "Maximum matched declarations returned per page.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -6531,12 +6531,27 @@
             }
           ]
         },
+        "max_bytes": {
+          "default": 16384,
+          "description": "Maximum serialized bytes returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_depth": {
           "description": "Maximum hierarchy depth; defaults to one for compact no-query outlines.",
           "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-owned continuation returned by a prior response.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -6622,7 +6637,7 @@
             },
             "limit": {
               "default": 100,
-              "description": "Maximum matched declarations returned.",
+              "description": "Maximum matched declarations returned per page.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -6928,6 +6943,13 @@
               "description": "Name of the symbol.",
               "type": "string"
             },
+            "parent_symbol_handle": {
+              "description": "Stable identity of this declaration's parent in a paged flat outline.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "range": {
               "$ref": "#/$defs/Range",
               "description": "Range of the symbol."
@@ -7001,9 +7023,33 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "document_version": {
+          "description": "Open-document version shared by every symbol in this outline.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "filters": {
           "$ref": "#/$defs/DocumentSymbolOptions",
           "description": "Filters and bounds applied to this outline."
+        },
+        "max_bytes": {
+          "description": "Serialized-byte budget applied to this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_cursor": {
+          "description": "Snapshot-owned continuation for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_relative_path": {
           "description": "Path relative to the owning project root.",
@@ -7012,14 +7058,39 @@
             "null"
           ]
         },
+        "remaining": {
+          "default": 0,
+          "description": "Matching declarations available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "returned": {
           "description": "Matching declarations returned.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
+        "snapshot_identity": {
+          "description": "Stable identity of the immutable outline snapshot.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Snapshot-bound source for the outlined document."
+        },
         "symbols": {
-          "description": "List of symbols in the document.",
+          "description": "Flat declaration entries for this page; parent handles preserve hierarchy.",
           "items": {
             "$ref": "#/$defs/Symbol"
           },

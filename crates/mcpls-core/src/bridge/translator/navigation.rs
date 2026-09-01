@@ -903,6 +903,7 @@ mod tests {
             selection_range: range.clone(),
             range,
             symbol_handle: None,
+            parent_symbol_handle: None,
             container_name: None,
             match_class: None,
             score: None,

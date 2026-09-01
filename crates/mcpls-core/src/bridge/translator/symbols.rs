@@ -316,6 +316,14 @@ fn apply_document_symbol_options(
     symbols: Vec<Symbol>,
     options: &DocumentSymbolOptions,
 ) -> DocumentSymbolsResult {
+    apply_document_symbol_options_with_limit(symbols, options, options.limit.min(1_000) as usize)
+}
+
+fn apply_document_symbol_options_with_limit(
+    symbols: Vec<Symbol>,
+    options: &DocumentSymbolOptions,
+    limit: usize,
+) -> DocumentSymbolsResult {
     let max_depth = options
         .max_depth
         .unwrap_or_else(|| if options.query.is_some() { 16 } else { 1 })
@@ -323,7 +331,7 @@ fn apply_document_symbol_options(
     let mut state = DocumentSymbolFilterState {
         total: 0,
         returned: 0,
-        limit: options.limit.min(1_000) as usize,
+        limit,
     };
     let symbols = symbols
         .into_iter()
@@ -336,8 +344,14 @@ fn apply_document_symbol_options(
     DocumentSymbolsResult {
         symbols,
         project_relative_path: None,
+        source_resource: None,
         total: state.total,
         returned: state.returned,
+        remaining: state.total.saturating_sub(state.returned),
+        next_cursor: None,
+        snapshot_identity: None,
+        document_version: None,
+        max_bytes: None,
         truncated: state.returned < state.total,
         filters,
     }
@@ -524,6 +538,7 @@ fn convert_document_symbol<'a>(
             range,
             selection_range,
             symbol_handle: None,
+            parent_symbol_handle: None,
             container_name: None,
             match_class: None,
             score: None,
@@ -546,6 +561,32 @@ impl Translator {
         &self,
         file_path: String,
         options: DocumentSymbolOptions,
+    ) -> Result<DocumentSymbolsResult> {
+        self.handle_document_symbols_with_source_budget(file_path, options, None, None)
+            .await
+    }
+
+    /// Resolve a complete compact outline for actor-owned paging.
+    pub(crate) async fn handle_document_symbols_for_page(
+        &self,
+        file_path: String,
+        options: DocumentSymbolOptions,
+    ) -> Result<DocumentSymbolsResult> {
+        self.handle_document_symbols_with_source_budget(
+            file_path,
+            options,
+            Some(usize::MAX),
+            Some(0),
+        )
+        .await
+    }
+
+    async fn handle_document_symbols_with_source_budget(
+        &self,
+        file_path: String,
+        options: DocumentSymbolOptions,
+        result_limit: Option<usize>,
+        source_bytes: Option<usize>,
     ) -> Result<DocumentSymbolsResult> {
         validate_document_symbol_options(&options)?;
         let (server_id, client, uri) = self
@@ -594,6 +635,7 @@ impl Translator {
                         range,
                         selection_range,
                         symbol_handle: None,
+                        parent_symbol_handle: None,
                         container_name: sym.container_name,
                         match_class: None,
                         score: None,
@@ -615,12 +657,15 @@ impl Translator {
             None => vec![],
         };
 
-        let (path, _, _, content) = self
+        let (path, document_version, content_hash, content) = self
             .source_snapshot(std::path::Path::new(&file_path))
             .await?;
         let lines = content.lines().collect::<Vec<_>>();
         sort_document_symbols(&mut symbols);
-        let mut budget = super::source_context::SourceBudget::default();
+        let mut budget = source_bytes.map_or_else(
+            super::source_context::SourceBudget::default,
+            super::source_context::SourceBudget::new,
+        );
         DocumentSymbolEnrichment {
             ctx: &ctx,
             uri: &response_uri,
@@ -630,13 +675,19 @@ impl Translator {
         }
         .enrich(&mut symbols, &mut budget, false)
         .await;
-        let mut result = apply_document_symbol_options(symbols, &options);
+        let mut result = if let Some(limit) = result_limit {
+            apply_document_symbol_options_with_limit(symbols, &options, limit)
+        } else {
+            apply_document_symbol_options(symbols, &options)
+        };
         result.truncated |= outline_source_budget_exhausted(&result.symbols);
         result.project_relative_path = self.workspace_roots.iter().find_map(|root| {
             path.strip_prefix(root)
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned())
         });
+        result.snapshot_identity = Some(content_hash);
+        result.document_version = document_version;
         Ok(result)
     }
 
@@ -1026,6 +1077,7 @@ mod tests {
             range: range.clone(),
             selection_range: range,
             symbol_handle: None,
+            parent_symbol_handle: None,
             container_name: None,
             match_class: None,
             score: None,
