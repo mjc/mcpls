@@ -82,7 +82,7 @@ use crate::project::{
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
-const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 32 * 1024;
+const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 16 * 1024;
 
 fn deferred_resource_page(
     deferred: &DeferredResource,
@@ -4740,6 +4740,7 @@ mod tests {
 
     #[test]
     fn deferred_resource_pages_are_bounded_and_lossless() {
+        const PAGE_LIMIT: usize = 16 * 1024;
         let value = serde_json::json!({
             "references": ["λ\"".repeat(MAX_SEMANTIC_RESOURCE_RESULT_BYTES)],
         });
@@ -4759,9 +4760,7 @@ mod tests {
                 "snapshot",
             )
             .unwrap();
-            assert!(
-                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
-            );
+            assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
             assert_eq!(result.total_bytes, Some(expected.len()));
             assert_eq!(result.offset_bytes, Some(offset_bytes));
             assert_eq!(result.returned_bytes, Some(result.text.len()));
@@ -4786,6 +4785,7 @@ mod tests {
 
     #[tokio::test]
     async fn semantic_resource_tool_pages_an_escaped_source_frame_to_its_outer_budget() {
+        const PAGE_LIMIT: usize = 16 * 1024;
         let root = TempDir::new().unwrap();
         let source = root.path().join("quoted.rs");
         let content = format!(
@@ -4820,9 +4820,7 @@ mod tests {
             .unwrap();
         let mut recovered = String::new();
         for _ in 0..16 {
-            assert!(
-                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
-            );
+            assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
             let frame: crate::bridge::SourceFrame = serde_json::from_str(&result.text).unwrap();
             recovered.push_str(&frame.text);
             if !frame.truncated {
