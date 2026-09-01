@@ -12,6 +12,7 @@ use ast_grep_core::tree_sitter::{LanguageExt, StrDoc};
 use ast_grep_core::{Node, Pattern};
 use ast_grep_language::{Language, SupportLang};
 use ignore::WalkBuilder;
+use sha2::{Digest, Sha256};
 
 use super::encoding::{EncodingConverter, PositionEncoding};
 use super::state::path_to_uri;
@@ -52,10 +53,17 @@ pub struct StructuralMatch {
     pub range: lsp_types::Range,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralFileSnapshot {
+    pub path: PathBuf,
+    pub content_hash: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct StructuralSearchResult {
     pub edit: Option<lsp_types::WorkspaceEdit>,
     pub matches: Vec<StructuralMatch>,
+    pub snapshots: Vec<StructuralFileSnapshot>,
 }
 
 /// Search or replace an explicit ast-grep pattern without touching the filesystem.
@@ -143,6 +151,7 @@ fn structural_search_sync(
         return Ok(StructuralSearchResult {
             edit: None,
             matches: Vec::new(),
+            snapshots: Vec::new(),
         });
     }
 
@@ -180,6 +189,7 @@ fn structural_search_sync(
     }
 
     let mut matches = Vec::new();
+    let mut snapshots = Vec::new();
     let mut changes = HashMap::new();
     let mut affected_files = 0usize;
     let mut total_bytes = 0u64;
@@ -221,6 +231,10 @@ fn structural_search_sync(
         if affected_files > MAX_AFFECTED_FILES {
             return Err("ast-grep search exceeded affected-file limit".to_string());
         }
+        snapshots.push(StructuralFileSnapshot {
+            path: path.clone(),
+            content_hash: format!("{:x}", Sha256::digest(source.as_bytes())),
+        });
 
         let mut previous_end = 0usize;
         for range in &ranges {
@@ -301,6 +315,7 @@ fn structural_search_sync(
             change_annotations: None,
         }),
         matches,
+        snapshots,
     })
 }
 
@@ -930,6 +945,15 @@ mod tests {
         .expect("structural replacement should succeed");
 
         assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].path, path);
+        assert_eq!(
+            result.snapshots[0].content_hash,
+            format!(
+                "{:x}",
+                Sha256::digest(b"fn main() { foo(2); }\n".as_slice())
+            )
+        );
         let changes = result
             .edit
             .and_then(|edit| edit.changes)

@@ -41,11 +41,11 @@ use crate::bridge::{
     LogLevel, OutgoingCallsResult, PositionEncoding, ProjectActivation, ProviderSynchronization,
     ReferencesResult, RenameResult, SemanticDiscoveryKind, SemanticDiscoveryResult,
     SemanticResultLimits, ServerCapability, ServerLogsResult, ServerMessage, ServerMessagesResult,
-    SignatureHelpResult, SourceContext, SourceFrame, StructuralMatch, StructuralSearchResult,
-    SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult, WorkspaceSymbolBatchEntry,
-    WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult, WorkspaceSymbolMatchMode,
-    WorkspaceSymbolPageRequest, WorkspaceSymbolResult, WorkspaceSymbolScope, path_to_uri,
-    uri_to_path,
+    SignatureHelpResult, SourceContext, SourceFrame, StructuralFileSnapshot, StructuralMatch,
+    StructuralSearchResult, SymbolHandle, Translator, TranslatorTemplate, WillRenameFilesResult,
+    WorkspaceSymbolBatchEntry, WorkspaceSymbolBatchRequest, WorkspaceSymbolBatchResult,
+    WorkspaceSymbolMatchMode, WorkspaceSymbolPageRequest, WorkspaceSymbolResult,
+    WorkspaceSymbolScope, path_to_uri, uri_to_path,
 };
 use crate::config::{EditSafetyConfig, ProjectConfig, ServerId};
 use crate::edit_apply::{
@@ -1555,8 +1555,20 @@ pub(crate) struct StructuralPreview {
     pub(crate) dialect: StructuralDialect,
     /// Matched source ranges before replacement.
     pub(crate) matches: Vec<StructuralMatch>,
+    /// Exact source snapshots containing those matches, listed once per file.
+    pub(crate) matched_files: Vec<StructuralMatchedFile>,
     /// Whether only parser validation was requested.
     pub(crate) parse_only: bool,
+}
+
+/// Snapshot metadata needed to fetch source context without repeating file paths per match.
+#[derive(Debug, Clone)]
+pub(crate) struct StructuralMatchedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) content_hash: String,
+    pub(crate) document_version: Option<i32>,
+    pub(crate) total_bytes: usize,
+    pub(crate) total_lines: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -4163,6 +4175,16 @@ impl DeferredResultStore {
         snapshot_hash: String,
         scope: &str,
     ) -> DeferredResourceReference {
+        self.insert_scoped_kind(value, snapshot_hash, scope, "inspect_symbol_section")
+    }
+
+    fn insert_scoped_kind(
+        &mut self,
+        value: serde_json::Value,
+        snapshot_hash: String,
+        scope: &str,
+        kind: &str,
+    ) -> DeferredResourceReference {
         self.prune();
         while self.entries.len() >= self.max_entries {
             let Some(oldest) = self
@@ -4188,7 +4210,7 @@ impl DeferredResultStore {
         );
         DeferredResourceReference {
             uri: format!("mcpls-deferred:///{token}"),
-            kind: "inspect_symbol_section".to_owned(),
+            kind: kind.to_owned(),
             snapshot_hash,
             document_version: None,
             total_bytes,
@@ -5265,7 +5287,7 @@ impl ProjectRuntime {
         self.translator
             .validate_path(Path::new(&file_path))
             .map_err(|error| error.to_string())?;
-        let (edit, matches, verification, producer) = match dialect {
+        let (edit, matches, snapshots, verification, producer) = match dialect {
             StructuralDialect::RustAnalyzerSsr => {
                 if replacement.is_some() || language_id.is_some() {
                     return Err(
@@ -5286,6 +5308,7 @@ impl ProjectRuntime {
                 (
                     (!parse_only && !matches.is_empty()).then_some(edit),
                     matches,
+                    Vec::new(),
                     VerificationStatus::SemanticVerified,
                     EditProducer::RustAnalyzer,
                 )
@@ -5295,7 +5318,11 @@ impl ProjectRuntime {
                     "ast_grep requires an explicit language_id; syntax is never inferred or translated"
                         .to_string()
                 })?;
-                let StructuralSearchResult { edit, matches } = self
+                let StructuralSearchResult {
+                    edit,
+                    matches,
+                    snapshots,
+                } = self
                     .translator
                     .structural_ast_grep_search(
                         root.to_path_buf(),
@@ -5309,11 +5336,13 @@ impl ProjectRuntime {
                 (
                     edit.filter(|_| !matches.is_empty()),
                     matches,
+                    snapshots,
                     VerificationStatus::StructuralUnverified,
                     EditProducer::StructuralAstGrep,
                 )
             }
         };
+        let scanned_files = self.validate_structural_snapshots(&snapshots).await?;
         let artifact = edit
             .map(|edit| {
                 let mut artifact = self.preview_edit(project_id, edit, encoding, root)?;
@@ -5322,12 +5351,61 @@ impl ProjectRuntime {
                 Ok::<_, String>(artifact)
             })
             .transpose()?;
+        let matched_files = artifact.as_ref().map_or(scanned_files, |artifact| {
+            let matched_paths = matches
+                .iter()
+                .map(|matched| matched.path.as_path())
+                .collect::<HashSet<_>>();
+            artifact
+                .plan
+                .files()
+                .iter()
+                .filter(|file| matched_paths.contains(file.path().as_path()))
+                .map(|file| StructuralMatchedFile {
+                    path: file.path().clone(),
+                    content_hash: file.content_hash().to_owned(),
+                    document_version: file.version(),
+                    total_bytes: file.original_content().len(),
+                    total_lines: u32::try_from(file.original_content().lines().count().max(1))
+                        .unwrap_or(u32::MAX),
+                })
+                .collect()
+        });
         Ok(StructuralPreview {
             artifact,
             dialect,
             matches,
+            matched_files,
             parse_only,
         })
+    }
+
+    async fn validate_structural_snapshots(
+        &self,
+        snapshots: &[StructuralFileSnapshot],
+    ) -> Result<Vec<StructuralMatchedFile>, String> {
+        let mut matched_files = Vec::with_capacity(snapshots.len());
+        for expected in snapshots {
+            let (path, document_version, content_hash, content) = self
+                .translator
+                .source_snapshot(&expected.path)
+                .await
+                .map_err(|error| error.to_string())?;
+            if content_hash != expected.content_hash {
+                return Err(format!(
+                    "stale_resource: {} changed during structural search; rerun the preview",
+                    path.display()
+                ));
+            }
+            matched_files.push(StructuralMatchedFile {
+                path,
+                content_hash,
+                document_version,
+                total_bytes: content.len(),
+                total_lines: u32::try_from(content.lines().count().max(1)).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(matched_files)
     }
 
     async fn path_rename_preview(
@@ -11617,6 +11695,22 @@ impl ProjectRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .read(token)
+    }
+
+    pub(crate) fn store_deferred_resource(
+        &self,
+        id: &ProjectId,
+        kind: &str,
+        value: serde_json::Value,
+    ) -> Result<DeferredResourceReference, String> {
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|error| format!("failed to encode deferred {kind}: {error}"))?;
+        let snapshot_hash = format!("{:x}", Sha256::digest(&encoded));
+        Ok(self
+            .deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert_scoped_kind(value, snapshot_hash, id.as_str(), kind))
     }
 
     /// Return the number of actor groups backing one logical project.

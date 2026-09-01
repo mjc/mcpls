@@ -65,8 +65,8 @@ use crate::bridge::resources::make_uri;
 #[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
 use crate::bridge::{
-    LexicalSearchRequest, PositionEncoding, ResourceSubscriptions, SemanticDiscoveryKind,
-    SymbolHandle, WorkspaceSymbolBatchRequest,
+    DeferredResourceReference, LexicalSearchRequest, PositionEncoding, ResourceSubscriptions,
+    SemanticDiscoveryKind, SymbolHandle, WorkspaceSymbolBatchRequest,
 };
 use crate::edit_paths::FileOperation;
 use crate::edit_plan::EditPlanApprovalSummary;
@@ -77,8 +77,8 @@ use crate::project::{
     GeneratedEditRequest, GitRepositoryIdentity, PathRenamePreview, PathRenameRequest,
     ProjectEvent, ProjectEventRecord, ProjectEventSnapshot, ProjectHandle, ProjectId,
     ProjectIdentity, ProjectQueuePressure, ProjectRegistry, ProjectServerCapability, ProjectState,
-    ProjectStatusCounts, ProjectStatusSummary, StructuralDialect, StructuralPreview,
-    StructuralReplaceRequest,
+    ProjectStatusCounts, ProjectStatusSummary, StructuralDialect, StructuralMatchedFile,
+    StructuralPreview, StructuralReplaceRequest,
 };
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
@@ -1176,12 +1176,154 @@ fn structural_preview_json(result: &StructuralPreview, project_id: &str) -> serd
     });
     value["parse_only"] = serde_json::json!(result.parse_only);
     value["match_count"] = serde_json::json!(matches.len());
+    value["returned_match_count"] = serde_json::json!(matches.len());
+    value["remaining_match_count"] = serde_json::json!(0);
+    value["matched_file_count"] = serde_json::json!(matched_files.len());
     value["matched_files"] = serde_json::json!(matched_files);
     value["matches"] = serde_json::json!(matches);
     if result.artifact.is_none() {
         value["unsupported"] = serde_json::json!(Vec::<String>::new());
     }
     value
+}
+
+fn structural_source_resource(
+    file: &StructuralMatchedFile,
+) -> Result<DeferredResourceReference, McpError> {
+    Ok(DeferredResourceReference {
+        uri: make_source_uri(
+            &file.path,
+            1,
+            1,
+            file.total_lines,
+            1,
+            &file.content_hash,
+            file.document_version,
+        )
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+        kind: "source_context".to_owned(),
+        snapshot_hash: file.content_hash.clone(),
+        document_version: file.document_version,
+        total_bytes: Some(file.total_bytes),
+    })
+}
+
+fn structural_match_inventory_json(
+    result: &StructuralPreview,
+) -> Result<serde_json::Value, McpError> {
+    let files = result
+        .matched_files
+        .iter()
+        .enumerate()
+        .map(|(file, matched)| {
+            Ok(serde_json::json!({
+                "file": file,
+                "path": matched.path,
+                "snapshot_hash": matched.content_hash,
+                "document_version": matched.document_version,
+                "source_resource": structural_source_resource(matched)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, McpError>>()?;
+    let file_indexes = result
+        .matched_files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (file.path.as_path(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let matches = result
+        .matches
+        .iter()
+        .map(|matched| {
+            let file = file_indexes.get(matched.path.as_path()).ok_or_else(|| {
+                McpError::internal_error("structural match has no source snapshot", None)
+            })?;
+            Ok(serde_json::json!({
+                "file": file,
+                "range": [
+                    matched.range.start.line,
+                    matched.range.start.character,
+                    matched.range.end.line,
+                    matched.range.end.character,
+                ],
+            }))
+        })
+        .collect::<Result<Vec<_>, McpError>>()?;
+    Ok(serde_json::json!({
+        "file_count": files.len(),
+        "match_count": matches.len(),
+        "files": files,
+        "matches": matches,
+    }))
+}
+
+fn bounded_structural_preview_json(
+    registry: &ProjectRegistry,
+    project_id: &ProjectId,
+    result: &StructuralPreview,
+) -> Result<serde_json::Value, McpError> {
+    let value = structural_preview_json(result, project_id.as_str());
+    if serde_json::to_vec(&value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        .len()
+        <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+    {
+        return Ok(value);
+    }
+
+    let matches_resource = registry
+        .store_deferred_resource(
+            project_id,
+            "structural_match_inventory",
+            structural_match_inventory_json(result)?,
+        )
+        .map_err(|error| McpError::internal_error(error, None))?;
+    let mut compact = serde_json::json!({
+        "project_id": project_id.as_str(),
+        "engine": result.dialect.engine(),
+        "dialect": result.dialect.as_str(),
+        "semantic_confidence": match result.dialect {
+            StructuralDialect::RustAnalyzerSsr => "semantic",
+            StructuralDialect::AstGrep => "structural",
+        },
+        "parse_only": result.parse_only,
+        "match_count": result.matches.len(),
+        "returned_match_count": 0,
+        "remaining_match_count": result.matches.len(),
+        "matched_file_count": result.matched_files.len(),
+        "matched_files": Vec::<String>::new(),
+        "matches": Vec::<serde_json::Value>::new(),
+        "matches_resource": matches_resource,
+        "safe_to_apply": false,
+        "unsupported": Vec::<String>::new(),
+    });
+    if let Some(artifact) = &result.artifact {
+        let details = preview_artifact_json(artifact, project_id.as_str());
+        let details_resource = registry
+            .store_deferred_resource(project_id, "structural_plan_details", details)
+            .map_err(|error| McpError::internal_error(error, None))?;
+        compact["plan_id"] = serde_json::json!(artifact.plan.id().as_str());
+        compact["safe_to_apply"] = serde_json::json!(artifact.plan.safe_to_apply());
+        compact["affected_file_count"] = serde_json::json!(artifact.affected_files.len());
+        compact["operation_count"] = serde_json::json!(artifact.plan.operations().len());
+        compact["precondition_count"] = serde_json::json!(artifact.plan.files().len());
+        compact["diff_file_count"] = serde_json::json!(artifact.plan.diff_files().len());
+        compact["conflict_count"] = serde_json::json!(artifact.conflicts.len());
+        compact["unsupported_count"] = serde_json::json!(artifact.unsupported.len());
+        compact["diff_truncated"] = serde_json::json!(artifact.plan.diff_truncated());
+        compact["plan_details_resource"] = serde_json::json!(details_resource);
+        if let Some(verification) = artifact.verification {
+            compact["verification"] = serde_json::json!(verification.as_str());
+        }
+        if let Some(producer) = artifact.producer {
+            compact["producer"] = serde_json::json!(producer.as_str());
+        }
+    }
+    debug_assert!(
+        serde_json::to_vec(&compact)
+            .is_ok_and(|json| json.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES)
+    );
+    Ok(compact)
 }
 
 fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> serde_json::Value {
@@ -2687,7 +2829,11 @@ impl McplsServer {
         if let Some(artifact) = &result.artifact {
             self.context.remember_plan(artifact.plan.id().clone()).await;
         }
-        encode_json(&structural_preview_json(&result, id.as_str()))
+        encode_json(&bounded_structural_preview_json(
+            &self.context.project_registry,
+            &id,
+            &result,
+        )?)
     }
 
     /// Apply a previously previewed, session-owned workspace edit plan.
@@ -4672,6 +4818,77 @@ mod tests {
             writeln!(output, "{prefix} {line}").unwrap();
             output
         })
+    }
+
+    async fn read_all_semantic_json(server: &McplsServer, mut uri: String) -> serde_json::Value {
+        let mut encoded = String::new();
+        loop {
+            let page = server
+                .read_semantic_resource(Parameters(SemanticResourceReadParams { uri }))
+                .await
+                .unwrap();
+            let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= 16 * 1024);
+            encoded.push_str(page["text"].as_str().unwrap());
+            let Some(next_uri) = page["next_uri"].as_str() else {
+                break;
+            };
+            uri = next_uri.to_owned();
+        }
+        serde_json::from_str(&encoded).unwrap()
+    }
+
+    async fn assert_structural_source_replays_and_stale_plan_conflicts(
+        server: &McplsServer,
+        file: &Path,
+        source_uri: String,
+        original_hash: &serde_json::Value,
+        applied: String,
+    ) {
+        let refreshed = server
+            .read_semantic_resource(Parameters(SemanticResourceReadParams { uri: source_uri }))
+            .await
+            .unwrap();
+        let refreshed: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
+        let refreshed: serde_json::Value =
+            serde_json::from_str(refreshed["text"].as_str().unwrap()).unwrap();
+        assert_ne!(&refreshed["content_hash"], original_hash);
+        assert!(refreshed["text"].as_str().unwrap().contains("bar("));
+
+        let stale_preview: serde_json::Value = serde_json::from_str(
+            &server
+                .structural_replace_preview(Parameters(StructuralReplacePreviewParams {
+                    project_id: "project".to_owned(),
+                    file_path: file.display().to_string(),
+                    dialect: "ast_grep".to_owned(),
+                    query: "bar($A)".to_owned(),
+                    replacement: Some("baz($A)".to_owned()),
+                    language_id: Some("rust".to_owned()),
+                    parse_only: false,
+                    position_encoding: None,
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let mut externally_changed = applied;
+        externally_changed.push_str("// external change\n");
+        std::fs::write(file, externally_changed).unwrap();
+        let conflict: serde_json::Value = serde_json::from_str(
+            &server
+                .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                    project_id: "project".to_owned(),
+                    plan_id: stale_preview["plan_id"].as_str().unwrap().to_owned(),
+                    wait_timeout_ms: None,
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(conflict["status"], "conflict");
+        let unchanged = std::fs::read_to_string(file).unwrap();
+        assert!(unchanged.contains("// external change"));
+        assert!(!unchanged.contains("baz("));
     }
 
     #[test]
@@ -7419,7 +7636,6 @@ finally:
     #[tokio::test]
     async fn oversized_structural_preview_is_bounded_lossless_and_atomic() {
         const MATCH_COUNT: usize = 81;
-        const RESPONSE_LIMIT: usize = 16 * 1024;
 
         let root = TempDir::new().unwrap();
         let file = root.path().join("src.rs");
@@ -7457,7 +7673,7 @@ finally:
             }))
             .await
             .unwrap();
-        assert!(response.len() <= RESPONSE_LIMIT, "{} bytes", response.len());
+        assert!(response.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
         let preview: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(preview["match_count"], MATCH_COUNT);
         assert_eq!(
@@ -7466,25 +7682,7 @@ finally:
             MATCH_COUNT as u64
         );
 
-        async fn read_all(server: &McplsServer, mut uri: String) -> serde_json::Value {
-            let mut encoded = String::new();
-            loop {
-                let page = server
-                    .read_semantic_resource(Parameters(SemanticResourceReadParams { uri }))
-                    .await
-                    .unwrap();
-                let page: serde_json::Value = serde_json::from_str(&page).unwrap();
-                assert!(serde_json::to_vec(&page).unwrap().len() <= 16 * 1024);
-                encoded.push_str(page["text"].as_str().unwrap());
-                let Some(next_uri) = page["next_uri"].as_str() else {
-                    break;
-                };
-                uri = next_uri.to_owned();
-            }
-            serde_json::from_str(&encoded).unwrap()
-        }
-
-        let matches = read_all(
+        let matches = read_all_semantic_json(
             &server,
             preview["matches_resource"]["uri"]
                 .as_str()
@@ -7505,7 +7703,7 @@ finally:
             .unwrap()
             .to_owned();
 
-        let details = read_all(
+        let details = read_all_semantic_json(
             &server,
             preview["plan_details_resource"]["uri"]
                 .as_str()
@@ -7515,12 +7713,12 @@ finally:
         .await;
         assert_eq!(details["preconditions"].as_array().unwrap().len(), 1);
         assert_eq!(
-            details["preconditions"].as_array().unwrap().len(),
-            preview["precondition_count"].as_u64().unwrap() as usize
+            u64::try_from(details["preconditions"].as_array().unwrap().len()).unwrap(),
+            preview["precondition_count"].as_u64().unwrap()
         );
         assert_eq!(
-            details["operations"].as_array().unwrap().len(),
-            preview["operation_count"].as_u64().unwrap() as usize
+            u64::try_from(details["operations"].as_array().unwrap().len()).unwrap(),
+            preview["operation_count"].as_u64().unwrap()
         );
 
         server
@@ -7535,11 +7733,68 @@ finally:
         assert_eq!(applied.matches("bar(").count(), MATCH_COUNT);
         assert_eq!(applied.matches("foo(").count(), 0);
 
-        let stale = server
-            .read_semantic_resource(Parameters(SemanticResourceReadParams { uri: source_uri }))
+        assert_structural_source_replays_and_stale_plan_conflicts(
+            &server,
+            &file,
+            source_uri,
+            &matches["files"][0]["snapshot_hash"],
+            applied,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oversized_structural_search_lists_every_match_through_its_resource() {
+        const MATCH_COUNT: usize = 256;
+
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("src.rs");
+        let mut source = String::new();
+        for index in 0..MATCH_COUNT {
+            writeln!(source, "fn fixture_{index}() {{ foo({index}); }}").unwrap();
+        }
+        std::fs::write(&file, source).unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
             .await
-            .unwrap_err();
-        assert!(stale.to_string().contains("stale_resource:"), "{stale}");
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let response = server
+            .structural_replace_preview(Parameters(StructuralReplacePreviewParams {
+                project_id: "project".to_owned(),
+                file_path: file.display().to_string(),
+                dialect: "ast_grep".to_owned(),
+                query: "foo($A)".to_owned(),
+                replacement: None,
+                language_id: Some("rust".to_owned()),
+                parse_only: false,
+                position_encoding: None,
+            }))
+            .await
+            .unwrap();
+        assert!(response.len() <= 16 * 1024, "{} bytes", response.len());
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["match_count"], MATCH_COUNT);
+        assert!(response.get("plan_id").is_none());
+        assert!(response.get("plan_details_resource").is_none());
+
+        let inventory = read_all_semantic_json(
+            &server,
+            response["matches_resource"]["uri"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .await;
+        assert_eq!(inventory["file_count"], 1);
+        assert_eq!(inventory["match_count"], MATCH_COUNT);
+        assert_eq!(inventory["matches"].as_array().unwrap().len(), MATCH_COUNT);
     }
 
     #[tokio::test]
