@@ -460,6 +460,7 @@ pub struct WorkspaceSymbolBatchParams {
 
 /// Parameters for a bounded, project-scoped symbol inspection bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InspectSymbolParams {
     /// Stable project identifier whose symbol should be inspected.
     pub project_id: String,
@@ -486,6 +487,7 @@ pub struct InspectSymbolParams {
 
 /// Parameters for one bounded batch of symbol inspections.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InspectSymbolBatchParams {
     /// Stable project identifier whose symbols should be inspected.
     pub project_id: String,
@@ -1093,6 +1095,66 @@ mod tests {
         assert_eq!(params.sections.len(), 3);
         assert_eq!(params.budget.max_bytes, 8192);
         assert_eq!(params.budget.max_items, 7);
+    }
+
+    #[test]
+    fn inspect_symbol_rejects_ignored_budget_and_section_fields() {
+        for params in [
+            serde_json::json!({
+                "project_id": "project",
+                "query": "run",
+                "max_chars": 18_000
+            }),
+            serde_json::json!({
+                "project_id": "project",
+                "query": "run",
+                "max_bytes": 18_000
+            }),
+            serde_json::json!({
+                "project_id": "project",
+                "query": "run",
+                "section": "declaration"
+            }),
+            serde_json::json!({
+                "project_id": "project",
+                "query": "run",
+                "budget": {"byte_budget": 18_000}
+            }),
+        ] {
+            let error = serde_json::from_value::<InspectSymbolParams>(params).unwrap_err();
+            assert!(error.to_string().contains("unknown field"));
+        }
+    }
+
+    #[test]
+    fn inspect_symbol_batch_rejects_unknown_target_and_budget_fields() {
+        for params in [
+            serde_json::json!({
+                "project_id": "project",
+                "targets": [{"query": "run", "section": "declaration"}]
+            }),
+            serde_json::json!({
+                "project_id": "project",
+                "targets": [{"query": "run"}],
+                "budget": {"item_budget": 7}
+            }),
+        ] {
+            let error = serde_json::from_value::<InspectSymbolBatchParams>(params).unwrap_err();
+            assert!(error.to_string().contains("unknown field"));
+        }
+    }
+
+    #[test]
+    fn inspect_symbol_schemas_are_closed_objects() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(InspectSymbolParams)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(InspectSymbolBatchParams)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(crate::bridge::InspectSymbolTarget))
+                .unwrap(),
+            serde_json::to_value(schemars::schema_for!(InspectSymbolBudget)).unwrap(),
+        ] {
+            assert_eq!(schema["additionalProperties"], false);
+        }
     }
 
     #[test]

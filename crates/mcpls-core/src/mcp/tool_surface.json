@@ -11485,8 +11485,10 @@
     "description": "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
       "properties": {
         "budget": {
+          "additionalProperties": false,
           "default": {
             "max_bytes": 65536,
             "max_items": 20
@@ -13865,6 +13867,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "budget": {
+          "additionalProperties": false,
           "description": "Bounds applied to the response.",
           "properties": {
             "max_bytes": {
@@ -13919,6 +13922,7 @@
     "inputSchema": {
       "$defs": {
         "InspectSymbolTarget": {
+          "additionalProperties": false,
           "description": "One symbol identity in a batch inspection request.",
           "properties": {
             "container": {
@@ -13961,8 +13965,10 @@
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
       "properties": {
         "budget": {
+          "additionalProperties": false,
           "default": {
             "max_bytes": 131072,
             "max_items": 20
@@ -15387,6 +15393,7 @@
           "description": "Bounded, snapshot-coherent answer about one project symbol.",
           "properties": {
             "budget": {
+              "additionalProperties": false,
               "description": "Bounds applied to the response.",
               "properties": {
                 "max_bytes": {
@@ -15477,6 +15484,7 @@
           "type": "object"
         },
         "InspectSymbolTarget": {
+          "additionalProperties": false,
           "description": "One symbol identity in a batch inspection request.",
           "properties": {
             "container": {
@@ -16437,6 +16445,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "budget": {
+          "additionalProperties": false,
           "description": "Shared bounds applied across the batch.",
           "properties": {
             "max_bytes": {

@@ -319,6 +319,44 @@ fn test_e2e_tool_call_missing_params() -> Result<()> {
     Ok(())
 }
 
+/// Test that inspection calls reject fields which would otherwise disable caller bounds.
+#[test]
+#[ignore = "Requires mcpls binary built"]
+fn test_e2e_inspect_symbol_rejects_unknown_params() -> Result<()> {
+    let mut client = McpClient::spawn()?;
+    client.initialize()?;
+
+    for (field, arguments) in [
+        (
+            "max_chars",
+            json!({"project_id": "missing", "query": "run", "max_chars": 18_000}),
+        ),
+        (
+            "max_bytes",
+            json!({"project_id": "missing", "query": "run", "max_bytes": 18_000}),
+        ),
+        (
+            "section",
+            json!({"project_id": "missing", "query": "run", "section": "declaration"}),
+        ),
+        (
+            "byte_budget",
+            json!({
+                "project_id": "missing",
+                "query": "run",
+                "budget": {"byte_budget": 18_000}
+            }),
+        ),
+    ] {
+        let error = client.call_tool("inspect_symbol", &arguments).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("unknown field"), "{message}");
+        assert!(message.contains(field), "{message}");
+    }
+
+    Ok(())
+}
+
 /// Test calling `get_hover` with invalid file path.
 ///
 /// Validates that the server properly handles file path validation

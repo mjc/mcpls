@@ -1012,6 +1012,7 @@ pub struct InspectSymbolRequest {
 
 /// One symbol identity in a batch inspection request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InspectSymbolTarget {
     /// Snapshot-bound handle returned by symbol discovery.
     pub symbol_handle: Option<SymbolHandle>,
@@ -1054,6 +1055,7 @@ impl InspectSymbolRequest {
 /// Cross-section bounds for a symbol inspection response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(inline)]
+#[serde(deny_unknown_fields)]
 pub struct InspectSymbolBudget {
     /// Maximum serialized response bytes.
     #[serde(default = "default_inspect_bytes")]

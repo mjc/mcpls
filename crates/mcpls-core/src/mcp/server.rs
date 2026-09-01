@@ -6351,11 +6351,25 @@ finally:
             "references"
         );
         assert!(inspect.input_schema["properties"]["budget"]["properties"].is_object());
+        assert_eq!(inspect.input_schema["additionalProperties"], false);
+        assert_eq!(
+            inspect.input_schema["properties"]["budget"]["additionalProperties"],
+            false
+        );
         assert!(inspect.output_schema.as_ref().is_some_and(|schema| {
             schema["properties"]["resolution"].is_object()
                 && schema["properties"]["sections"].is_object()
         }));
         assert!(batch.input_schema["properties"]["targets"]["items"].is_object());
+        assert_eq!(batch.input_schema["additionalProperties"], false);
+        assert_eq!(
+            batch.input_schema["properties"]["budget"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            batch.input_schema["$defs"]["InspectSymbolTarget"]["additionalProperties"],
+            false
+        );
         assert!(batch.output_schema.as_ref().is_some_and(|schema| {
             schema["properties"]["entries"].is_object()
                 && schema["properties"]["budget"].is_object()
