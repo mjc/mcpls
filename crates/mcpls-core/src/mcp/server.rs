@@ -1173,8 +1173,12 @@ const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
 const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 16 * 1024;
 #[cfg(test)]
 const NATIVE_TOOL_CATALOG_MAX_BYTES: usize = 48 * 1024;
-const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] =
-    &["rename_symbol", "format_document", "get_code_actions"];
+const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] = &[
+    "rename_symbol",
+    "format_document",
+    "get_code_actions",
+    "get_cached_diagnostics",
+];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
     "workspace_symbol_search",
     "inspect_symbol",
@@ -3032,9 +3036,7 @@ impl McplsServer {
     }
 
     /// Get diagnostics for a file.
-    #[tool(
-        description = "Cached-preferred diagnostics for a file. Set fresh=true only when a new analysis is required."
-    )]
+    #[tool(description = "Cached diagnostics by default; set fresh=true to start LSP analysis.")]
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams {
@@ -3048,19 +3050,14 @@ impl McplsServer {
             .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let cached_available = !fresh
-            && actor
-                .has_cached_diagnostics(file_path.clone())
-                .await
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = if cached_available {
+        let result = if fresh {
             actor
-                .cached_diagnostics_with_options(file_path, options)
+                .diagnostics_with_options(file_path, options)
                 .await
                 .map_err(|error| error.to_string())
         } else {
             actor
-                .diagnostics_with_options(file_path, options)
+                .cached_diagnostics_with_options(file_path, options)
                 .await
                 .map_err(|error| error.to_string())
         };
@@ -9016,8 +9013,10 @@ while True:
             }))
             .await;
 
-        let error = result.unwrap_err().to_string();
-        assert!(!error.contains("outside workspace"), "{error}");
+        let response = result.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["diagnostics"], serde_json::json!([]));
+        assert_eq!(response["cache"]["hit"], false);
     }
 
     #[tokio::test]

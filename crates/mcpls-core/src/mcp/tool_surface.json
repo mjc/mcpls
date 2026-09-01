@@ -3285,10 +3285,10 @@
           ]
         },
         "DiagnosticsCacheMetadata": {
-          "description": "Provenance for a cached diagnostics result.",
+          "description": "Cache outcome for a diagnostics request.",
           "properties": {
             "age_ms": {
-              "description": "Age of the cached notification when this result was read.",
+              "description": "Age of the cached notification when this result was read; zero on a miss.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -3302,18 +3302,20 @@
               ]
             },
             "hit": {
-              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "description": "Whether cached diagnostics were returned instead of fresh analysis.",
               "type": "boolean"
             },
             "snapshot_identity": {
-              "description": "Opaque identity of the cached diagnostics publication.",
-              "type": "string"
+              "description": "Opaque identity of the cached diagnostics publication, when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
             "hit",
-            "age_ms",
-            "snapshot_identity"
+            "age_ms"
           ],
           "type": "object"
         },
@@ -5752,7 +5754,7 @@
   },
   {
     "name": "get_diagnostics",
-    "description": "Cached-preferred diagnostics for a file. Set fresh=true only when a new analysis is required.",
+    "description": "Cached diagnostics by default; set fresh=true to start LSP analysis.",
     "inputSchema": {
       "$defs": {
         "DiagnosticSeverity": {
@@ -6103,10 +6105,10 @@
           ]
         },
         "DiagnosticsCacheMetadata": {
-          "description": "Provenance for a cached diagnostics result.",
+          "description": "Cache outcome for a diagnostics request.",
           "properties": {
             "age_ms": {
-              "description": "Age of the cached notification when this result was read.",
+              "description": "Age of the cached notification when this result was read; zero on a miss.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -6120,18 +6122,20 @@
               ]
             },
             "hit": {
-              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "description": "Whether cached diagnostics were returned instead of fresh analysis.",
               "type": "boolean"
             },
             "snapshot_identity": {
-              "description": "Opaque identity of the cached diagnostics publication.",
-              "type": "string"
+              "description": "Opaque identity of the cached diagnostics publication, when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
             "hit",
-            "age_ms",
-            "snapshot_identity"
+            "age_ms"
           ],
           "type": "object"
         },
@@ -11913,10 +11917,10 @@
           ]
         },
         "DiagnosticsCacheMetadata": {
-          "description": "Provenance for a cached diagnostics result.",
+          "description": "Cache outcome for a diagnostics request.",
           "properties": {
             "age_ms": {
-              "description": "Age of the cached notification when this result was read.",
+              "description": "Age of the cached notification when this result was read; zero on a miss.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -11930,18 +11934,20 @@
               ]
             },
             "hit": {
-              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "description": "Whether cached diagnostics were returned instead of fresh analysis.",
               "type": "boolean"
             },
             "snapshot_identity": {
-              "description": "Opaque identity of the cached diagnostics publication.",
-              "type": "string"
+              "description": "Opaque identity of the cached diagnostics publication, when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
             "hit",
-            "age_ms",
-            "snapshot_identity"
+            "age_ms"
           ],
           "type": "object"
         },
@@ -14360,10 +14366,10 @@
           ]
         },
         "DiagnosticsCacheMetadata": {
-          "description": "Provenance for a cached diagnostics result.",
+          "description": "Cache outcome for a diagnostics request.",
           "properties": {
             "age_ms": {
-              "description": "Age of the cached notification when this result was read.",
+              "description": "Age of the cached notification when this result was read; zero on a miss.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -14377,18 +14383,20 @@
               ]
             },
             "hit": {
-              "description": "Cached diagnostics were used instead of a fresh analysis request.",
+              "description": "Whether cached diagnostics were returned instead of fresh analysis.",
               "type": "boolean"
             },
             "snapshot_identity": {
-              "description": "Opaque identity of the cached diagnostics publication.",
-              "type": "string"
+              "description": "Opaque identity of the cached diagnostics publication, when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
             "hit",
-            "age_ms",
-            "snapshot_identity"
+            "age_ms"
           ],
           "type": "object"
         },

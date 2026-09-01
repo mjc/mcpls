@@ -13666,7 +13666,8 @@ mod tests {
             diagnostics
                 .cache
                 .as_ref()
-                .map(|cache| cache.snapshot_identity.len()),
+                .and_then(|cache| cache.snapshot_identity.as_ref())
+                .map(String::len),
             Some(64)
         );
     }

@@ -488,15 +488,16 @@ pub struct DiagnosticsResult {
     pub cache: Option<DiagnosticsCacheMetadata>,
 }
 
-/// Provenance for a cached diagnostics result.
+/// Cache outcome for a diagnostics request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DiagnosticsCacheMetadata {
-    /// Cached diagnostics were used instead of a fresh analysis request.
+    /// Whether cached diagnostics were returned instead of fresh analysis.
     pub hit: bool,
-    /// Age of the cached notification when this result was read.
+    /// Age of the cached notification when this result was read; zero on a miss.
     pub age_ms: u64,
-    /// Opaque identity of the cached diagnostics publication.
-    pub snapshot_identity: String,
+    /// Opaque identity of the cached diagnostics publication, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_identity: Option<String>,
     /// Cached document version, when supplied by the language server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_version: Option<i32>,

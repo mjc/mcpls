@@ -841,14 +841,24 @@ impl Translator {
     ) -> Result<super::DiagnosticsResult> {
         let uri = Self::cached_diagnostics_uri(&self.workspace_roots, file_path)?;
         let entry = self.actor_notification_cache.get_diagnostics(&uri);
-        let cache = entry.map(|entry| super::DiagnosticsCacheMetadata {
-            hit: true,
-            age_ms: (chrono::Utc::now() - entry.received_at)
-                .num_milliseconds()
-                .max(0) as u64,
-            snapshot_identity: entry.snapshot_identity.clone(),
-            document_version: entry.version,
-        });
+        let cache = Some(entry.map_or_else(
+            || super::DiagnosticsCacheMetadata {
+                hit: false,
+                age_ms: 0,
+                snapshot_identity: None,
+                document_version: None,
+            },
+            |entry| {
+                super::DiagnosticsCacheMetadata {
+                    hit: true,
+                    age_ms: (chrono::Utc::now() - entry.received_at)
+                        .num_milliseconds()
+                        .max(0) as u64,
+                    snapshot_identity: Some(entry.snapshot_identity.clone()),
+                    document_version: entry.version,
+                }
+            },
+        ));
         let encoding = self
             .actor_notification_cache
             .diagnostics_owner(&uri)
