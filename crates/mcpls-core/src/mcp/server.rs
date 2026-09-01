@@ -631,7 +631,7 @@ fn project_relative_paths(roots: &[PathBuf], paths: Vec<PathBuf>) -> Vec<String>
         .collect()
 }
 
-const MAX_INLINE_APPLIED_ITEMS: usize = 64;
+const MAX_INLINE_APPLIED_ITEMS: usize = 8;
 
 fn workspace_edit_apply_result(
     outcome: ApplyEditPlanOutcome,
@@ -655,7 +655,20 @@ fn workspace_edit_apply_result(
             let details_truncated = unified_diff.len() > MAX_INLINE_APPLIED_DIFF_BYTES
                 || committed_file_count > MAX_INLINE_APPLIED_ITEMS
                 || operation_count > MAX_INLINE_APPLIED_ITEMS
-                || provider_synchronization_count > MAX_INLINE_APPLIED_ITEMS;
+                || provider_synchronization_count > MAX_INLINE_APPLIED_ITEMS
+                || committed_files
+                    .iter()
+                    .any(|path| path.len() > MAX_APPROVAL_TEXT_BYTES)
+                || operations
+                    .iter()
+                    .any(|operation| operation.len() > MAX_APPROVAL_TEXT_BYTES)
+                || provider_synchronization.iter().any(|provider| {
+                    provider.provider.len() > MAX_APPROVAL_TEXT_BYTES
+                        || provider
+                            .message
+                            .as_ref()
+                            .is_some_and(|message| message.len() > MAX_APPROVAL_TEXT_BYTES)
+                });
             let detail_resource = details_truncated.then(|| {
                 applied_edit_result_resource_uri(
                     &ProjectId::new(project_id.to_owned()).expect("registered project id"),
@@ -679,10 +692,12 @@ fn workspace_edit_apply_result(
                 .into_iter()
                 .take(MAX_INLINE_APPLIED_ITEMS)
                 .map(|provider| WorkspaceEditProviderSynchronization {
-                    provider: provider.provider,
+                    provider: bounded_approval_text(&provider.provider),
                     synchronized: provider.synchronized,
                     watched_file_notifications: provider.watched_file_notifications,
-                    message: provider.message,
+                    message: provider
+                        .message
+                        .map(|message| bounded_approval_text(&message)),
                 })
                 .collect();
             WorkspaceEditApplyResult::Applied {
@@ -692,11 +707,13 @@ fn workspace_edit_apply_result(
                 committed_files: committed_files
                     .into_iter()
                     .take(MAX_INLINE_APPLIED_ITEMS)
+                    .map(|path| bounded_approval_text(&path))
                     .collect(),
                 committed_file_count,
                 operations: operations
                     .into_iter()
                     .take(MAX_INLINE_APPLIED_ITEMS)
+                    .map(|operation| bounded_approval_text(&operation))
                     .collect(),
                 operation_count,
                 unified_diff,
@@ -1170,7 +1187,7 @@ const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
 const PROJECT_EVENT_PAGE_SIZE: usize = 64;
 const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
-const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 16 * 1024;
+const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 4 * 1024;
 #[cfg(test)]
 const NATIVE_TOOL_CATALOG_MAX_BYTES: usize = 48 * 1024;
 const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] = &[
@@ -4904,18 +4921,43 @@ mod tests {
             ApplyEditPlanOutcome::Applied(AppliedEditPlan {
                 plan_id: plan_id.clone(),
                 operations: (0..=MAX_INLINE_APPLIED_ITEMS)
-                    .map(|index| format!("edit src/{index}.rs"))
+                    .map(|index| {
+                        format!(
+                            "edit src/{index}-{}.rs",
+                            "o".repeat(MAX_APPROVAL_TEXT_BYTES + 1)
+                        )
+                    })
                     .collect(),
                 unified_diff: "x".repeat(MAX_INLINE_APPLIED_DIFF_BYTES + 1),
                 complete_unified_diff: "complete diff".to_owned(),
                 committed_files: (0..=MAX_INLINE_APPLIED_ITEMS)
-                    .map(|index| PathBuf::from(format!("/workspace/src/{index}.rs")))
+                    .map(|index| {
+                        PathBuf::from(format!(
+                            "/workspace/src/{index}-{}.rs",
+                            "p".repeat(MAX_APPROVAL_TEXT_BYTES + 1)
+                        ))
+                    })
                     .collect(),
                 verification: None,
-                provider_synchronization: Vec::new(),
+                provider_synchronization: (0..=MAX_INLINE_APPLIED_ITEMS)
+                    .map(|index| crate::bridge::ProviderSynchronization {
+                        provider: format!(
+                            "provider-{index}-{}",
+                            "n".repeat(MAX_APPROVAL_TEXT_BYTES + 1)
+                        ),
+                        synchronized: false,
+                        watched_file_notifications: index,
+                        message: Some("m".repeat(MAX_APPROVAL_TEXT_BYTES + 1)),
+                    })
+                    .collect(),
             }),
             "project",
             &[PathBuf::from("/workspace")],
+        );
+        let serialized_bytes = serde_json::to_vec(&result).unwrap().len();
+        assert!(
+            serialized_bytes <= 16 * 1024,
+            "applied result used {serialized_bytes} serialized bytes"
         );
 
         let WorkspaceEditApplyResult::Applied {
@@ -4925,6 +4967,8 @@ mod tests {
             operation_count,
             detail_resource,
             details_truncated,
+            provider_synchronization,
+            provider_synchronization_count,
             ..
         } = result
         else {
@@ -4934,6 +4978,8 @@ mod tests {
         assert_eq!(committed_files.len(), MAX_INLINE_APPLIED_ITEMS);
         assert_eq!(operation_count, MAX_INLINE_APPLIED_ITEMS + 1);
         assert_eq!(operations.len(), MAX_INLINE_APPLIED_ITEMS);
+        assert_eq!(provider_synchronization_count, MAX_INLINE_APPLIED_ITEMS + 1);
+        assert_eq!(provider_synchronization.len(), MAX_INLINE_APPLIED_ITEMS);
         assert!(details_truncated);
         assert_eq!(
             detail_resource,
@@ -4942,6 +4988,54 @@ mod tests {
                 &plan_id,
                 0,
             ))
+        );
+    }
+
+    #[test]
+    fn applied_edit_result_defers_one_oversized_string() {
+        let plan_id = PlanId::parse("plan").unwrap();
+        let result = workspace_edit_apply_result(
+            ApplyEditPlanOutcome::Applied(AppliedEditPlan {
+                plan_id: plan_id.clone(),
+                operations: vec!["o".repeat(MAX_APPROVAL_TEXT_BYTES + 1)],
+                unified_diff: "small diff".to_owned(),
+                complete_unified_diff: "small diff".to_owned(),
+                committed_files: vec![PathBuf::from("/workspace/src/lib.rs")],
+                verification: None,
+                provider_synchronization: vec![crate::bridge::ProviderSynchronization {
+                    provider: "p".repeat(MAX_APPROVAL_TEXT_BYTES + 1),
+                    synchronized: false,
+                    watched_file_notifications: 0,
+                    message: Some("m".repeat(MAX_APPROVAL_TEXT_BYTES + 1)),
+                }],
+            }),
+            "project",
+            &[PathBuf::from("/workspace")],
+        );
+
+        let WorkspaceEditApplyResult::Applied {
+            operations,
+            provider_synchronization,
+            detail_resource,
+            details_truncated,
+            ..
+        } = result
+        else {
+            panic!("expected an applied edit result");
+        };
+        assert!(details_truncated);
+        assert!(detail_resource.is_some());
+        assert!(operations[0].ends_with("... (truncated)"));
+        assert!(
+            provider_synchronization[0]
+                .provider
+                .ends_with("... (truncated)")
+        );
+        assert!(
+            provider_synchronization[0]
+                .message
+                .as_ref()
+                .is_some_and(|message| message.ends_with("... (truncated)"))
         );
     }
 
