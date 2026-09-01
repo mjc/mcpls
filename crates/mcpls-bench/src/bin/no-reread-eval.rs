@@ -59,14 +59,39 @@ fn run(args: &Args) -> Result<Vec<u8>> {
     serde_json::to_vec_pretty(&evaluate(&events)).map_err(Into::into)
 }
 
+fn write_report(path: &Path, report: &[u8]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, report).with_context(|| format!("writing {}", path.display()))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let report = run(&args)?;
     if let Some(path) = &args.output {
-        fs::write(path, &report).with_context(|| format!("writing {}", path.display()))?;
+        write_report(path, &report)?;
     } else {
         std::io::stdout().write_all(&report)?;
         println!();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_report;
+
+    #[test]
+    fn output_creates_missing_parent_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("reports/no-reread.json");
+
+        write_report(&output, b"{}").unwrap();
+
+        assert_eq!(std::fs::read(output).unwrap(), b"{}");
+    }
 }
