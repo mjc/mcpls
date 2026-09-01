@@ -84,6 +84,8 @@ pub(crate) struct LexicalSearchResult {
     pub matches: Vec<LexicalSearchMatch>,
     /// Number of identities in `matches`.
     pub returned: usize,
+    /// Effective serialized byte ceiling applied to this page.
+    pub max_bytes: usize,
     /// Whether another page is available.
     pub truncated: bool,
     /// Decimal offset for the next page, when `truncated`.

@@ -17044,8 +17044,8 @@
           "type": "array"
         },
         "max_bytes": {
-          "default": 65536,
-          "description": "Maximum serialized structured response bytes (default: 65536).",
+          "default": 16384,
+          "description": "Caller byte ceiling; the server returns at most 16384 bytes per page.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -17438,6 +17438,12 @@
           },
           "type": "array"
         },
+        "max_bytes": {
+          "description": "Effective serialized byte ceiling applied to this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "next_cursor": {
           "description": "Decimal offset for the next page, when `truncated`.",
           "type": [
@@ -17459,6 +17465,7 @@
       "required": [
         "matches",
         "returned",
+        "max_bytes",
         "truncated"
       ],
       "type": "object"

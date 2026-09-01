@@ -46,15 +46,16 @@ use super::tools::{
     CompletionsParams, DaemonStatusParams, DefinitionParams, DiagnosticsParams,
     DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, GoToImplementationParams,
     GoToTypeDefinitionParams, HoverParams, InlayHintsParams, InspectSymbolBatchParams,
-    InspectSymbolParams, LexicalSearchParams, MoveInlineModulePreviewParams, MoveItemPreviewParams,
-    PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams,
-    ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams,
-    RenameParams, RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
-    SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
-    StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
-    WorkspaceEditApplyResult, WorkspaceEditContention, WorkspaceEditContentionScope,
-    WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization, WorkspaceEditRetry,
-    WorkspaceEditRetryAction, WorkspaceSymbolBatchParams, WorkspaceSymbolParams,
+    InspectSymbolParams, LEXICAL_PAGE_BYTES, LexicalSearchParams, MoveInlineModulePreviewParams,
+    MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams,
+    ProjectIdParams, ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams,
+    ReferencesParams, RenameParams, RenamePreviewParams, SemanticPositionParams,
+    SemanticResourceReadParams, SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams,
+    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
+    WorkspaceEditApplyParams, WorkspaceEditApplyResult, WorkspaceEditContention,
+    WorkspaceEditContentionScope, WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization,
+    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolBatchParams,
+    WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -386,6 +387,7 @@ fn bounded_lexical_page(
         let truncated = has_next_page || matches.len() < total_matches;
         let page = crate::bridge::lexical::LexicalSearchResult {
             returned: matches.len(),
+            max_bytes,
             next_cursor: truncated.then(|| offset.saturating_add(matches.len()).to_string()),
             truncated,
             matches,
@@ -406,6 +408,14 @@ fn bounded_lexical_page(
         } else {
             matches.pop();
         }
+    }
+}
+
+const fn effective_lexical_page_bytes(requested: usize) -> usize {
+    if requested < LEXICAL_PAGE_BYTES {
+        requested
+    } else {
+        LEXICAL_PAGE_BYTES
     }
 }
 
@@ -3311,7 +3321,8 @@ impl McplsServer {
         let matches = matches
             .drain(offset.min(matches.len())..end)
             .collect::<Vec<_>>();
-        let page = bounded_lexical_page(matches, offset, has_next_page, params.max_bytes)
+        let max_bytes = effective_lexical_page_bytes(params.max_bytes);
+        let page = bounded_lexical_page(matches, offset, has_next_page, max_bytes)
             .map_err(|required_bytes| {
                 McpError::invalid_params(
                     format!(
@@ -6489,6 +6500,37 @@ finally:
         assert!(schema.contains("smart"));
         assert!(tool.input_schema["properties"]["max_matches"].is_object());
         assert!(tool.input_schema["properties"]["max_bytes"].is_object());
+        assert_eq!(
+            tool.input_schema["properties"]["max_bytes"]["default"],
+            16 * 1024
+        );
+        assert!(tool.output_schema.as_ref().is_some_and(|schema| {
+            schema["properties"]["max_bytes"].is_object()
+                && schema["properties"]["next_cursor"].is_object()
+        }));
+    }
+
+    #[test]
+    fn lexical_page_caps_transcript_sized_caller_budgets() {
+        assert_eq!(effective_lexical_page_bytes(50_000), 16 * 1024);
+        assert_eq!(effective_lexical_page_bytes(6_000), 6_000);
+
+        let matches = (0..100)
+            .map(|index| crate::bridge::lexical::LexicalSearchMatch {
+                project_relative_path: format!("swift/RideMapState{index:03}.swift"),
+                document_version: None,
+                content_hash: "a".repeat(64),
+                source_uri: format!("mcpls-source:///swift/RideMapState{index:03}.swift"),
+                source: None,
+                byte_range: 0..1,
+            })
+            .collect();
+        let page =
+            bounded_lexical_page(matches, 0, false, effective_lexical_page_bytes(50_000)).unwrap();
+
+        assert_eq!(page.max_bytes, 16 * 1024);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= page.max_bytes);
+        assert!(page.next_cursor.is_some());
     }
 
     #[test]
