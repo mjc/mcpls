@@ -33,15 +33,17 @@ registered ID; use `project_add` only for a genuinely unknown root, and reserve
 | [get_document_symbols](#get_document_symbols) | `textDocument/documentSymbol` | Document symbol outline |
 | [workspace_symbol_search](#workspace_symbol_search) | `workspace/symbol` | Search symbols across workspace |
 | [inspect_symbol](#inspect_symbol) | Multiple read-only semantic methods | Bounded symbol definition and usage bundle |
-| [inspect_symbol_batch](#inspect_symbol_batch) | Multiple read-only semantic methods | Concurrent bounded bundles for several symbols |
 
 ### Diagnostics & Formatting Tools
 
 | Tool | LSP Method | Description |
 |------|------------|-------------|
-| [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` + push notifications | Compiler errors, warnings, and hints (merged from pull and push) |
-| [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications only |
-| [format_document](#format_document) | `textDocument/formatting` | Document formatting |
+| [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` + push notifications | Compiler errors, warnings, and hints; select `mode` for fresh, cache-preferred, or cache-only reads |
+| `format_preview` | `textDocument/formatting` / `textDocument/rangeFormatting` | Preview whole-document or optional-range formatting as an edit plan |
+
+### Consolidated tool compatibility
+
+Use `queries` on `workspace_symbol_search` and `targets` on `inspect_symbol` for one-or-many requests. Use `get_diagnostics.mode=cache_only` for notification-cache reads, and `format_preview.range` for range formatting. The former `*_batch`, `get_cached_diagnostics`, and `range_format_preview` routes remain callable for compatibility but are no longer advertised and will be removed only after callers migrate.
 
 ### Refactoring Tools
 
@@ -307,13 +309,15 @@ Get compiler errors, warnings, and hints for a file, including diagnostics from 
 
 ```json
 {
-  "file_path": "/absolute/path/to/file.rs"
+  "file_path": "/absolute/path/to/file.rs",
+  "mode": "cached_preferred"
 }
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | Yes | Absolute path to the file |
+| `mode` | `cached_preferred`, `fresh`, or `cache_only` | No | Prefer a snapshot, force provider analysis, or never request analysis |
 
 ### Returns
 

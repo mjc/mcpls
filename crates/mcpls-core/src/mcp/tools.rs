@@ -111,12 +111,29 @@ pub struct DiagnosticsParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: String,
-    /// Request fresh analysis instead of using available cached diagnostics.
+    /// Whether to prefer cached diagnostics, force fresh analysis, or only read the cache.
     #[serde(default)]
-    pub fresh: bool,
+    pub mode: DiagnosticsMode,
+    /// Backward-compatible alias for `mode=fresh`; omitted from the canonical schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub fresh: Option<bool>,
     /// Filters, grouping behavior, and response bounds.
     #[serde(flatten)]
     pub options: crate::bridge::translator::DiagnosticOptions,
+}
+
+/// Source policy for `get_diagnostics`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsMode {
+    /// Use the cached-notification behavior that existing `get_diagnostics` callers receive.
+    #[default]
+    CachedPreferred,
+    /// Always request fresh analysis from the routed language server.
+    Fresh,
+    /// Read only server-notification diagnostics without requesting analysis.
+    CacheOnly,
 }
 
 /// Parameters for the `rename_symbol` tool.
@@ -226,6 +243,22 @@ pub struct FormatPreviewParams {
     /// Optional negotiated LSP position encoding.
     #[serde(default)]
     pub position_encoding: Option<String>,
+    /// Optional one-based range for capability-gated LSP range formatting.
+    #[serde(default)]
+    pub range: Option<FormatRange>,
+}
+
+/// One-based range used by `format_preview`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FormatRange {
+    /// One-based start line.
+    pub start_line: u32,
+    /// One-based start character in UTF-16 code units.
+    pub start_character: u32,
+    /// One-based end line.
+    pub end_line: u32,
+    /// One-based end character in UTF-16 code units.
+    pub end_character: u32,
 }
 
 /// Parameters for previewing standard LSP range formatting.
@@ -355,7 +388,10 @@ pub struct WorkspaceSymbolParams {
     pub project_id: String,
     /// Search query for symbol names (supports partial matching).
     #[schemars(description = "Search query for symbol names (supports partial matching).")]
-    pub query: String,
+    pub query: Option<String>,
+    /// Caller-ordered queries. Exact duplicates reuse the first provider result.
+    #[serde(default)]
+    pub queries: Vec<String>,
     /// Optional filter by symbol kind (function, class, variable, etc.).
     #[schemars(description = "Optional filter by symbol kind (function, class, variable, etc.).")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -468,6 +504,9 @@ pub struct InspectSymbolParams {
     pub project_id: String,
     /// Snapshot-bound handle returned by symbol discovery; preferred over repeating coordinates.
     pub symbol_handle: Option<SymbolHandle>,
+    /// Caller-ordered symbol identities. Use this instead of a single query or handle for 1-16 inspections.
+    #[serde(default)]
+    pub targets: Vec<crate::bridge::InspectSymbolTarget>,
     /// Exact symbol name to resolve when no handle is supplied.
     pub query: Option<String>,
     /// Optional symbol-kind disambiguator.
@@ -485,6 +524,9 @@ pub struct InspectSymbolParams {
     /// Caller upper bounds for the complete bundle; standalone responses are capped at 16 KiB.
     #[serde(default)]
     pub budget: InspectSymbolBudget,
+    /// Opaque cursor returned by a previous multi-symbol inspection page.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for one bounded batch of symbol inspections.

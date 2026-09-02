@@ -26,6 +26,7 @@ use rmcp::model::{
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,19 +44,19 @@ use super::session::{
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CallHierarchyPrepareParams,
     CodeActionApplyParams, CodeActionListParams, CodeActionPreviewParams, CodeActionsParams,
-    CompletionsParams, DaemonStatusParams, DefinitionParams, DiagnosticsParams,
-    DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, GoToImplementationParams,
-    GoToTypeDefinitionParams, HoverParams, InlayHintsParams, InspectSymbolBatchParams,
-    InspectSymbolParams, LEXICAL_PAGE_BYTES, LexicalSearchParams, MoveInlineModulePreviewParams,
-    MoveItemPreviewParams, PathRenamePreviewParams, ProjectAddParams, ProjectCargoFeaturesParams,
-    ProjectIdParams, ProjectListParams, ProjectLspCapabilitiesParams, RangeFormatPreviewParams,
-    ReferencesParams, RenameParams, RenamePreviewParams, SemanticPositionParams,
-    SemanticResourceReadParams, SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams,
-    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
-    WorkspaceEditApplyParams, WorkspaceEditApplyResult, WorkspaceEditContention,
-    WorkspaceEditContentionScope, WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization,
-    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolBatchParams,
-    WorkspaceSymbolParams,
+    CompletionsParams, DaemonStatusParams, DefinitionParams, DiagnosticsMode, DiagnosticsParams,
+    DocumentSymbolsParams, FormatDocumentParams, FormatPreviewParams, FormatRange,
+    GoToImplementationParams, GoToTypeDefinitionParams, HoverParams, InlayHintsParams,
+    InspectSymbolBatchParams, InspectSymbolParams, LEXICAL_PAGE_BYTES, LexicalSearchParams,
+    MoveInlineModulePreviewParams, MoveItemPreviewParams, PathRenamePreviewParams,
+    ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams, ProjectListParams,
+    ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams, RenameParams,
+    RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
+    SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
+    StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
+    WorkspaceEditApplyResult, WorkspaceEditContention, WorkspaceEditContentionScope,
+    WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization, WorkspaceEditRetry,
+    WorkspaceEditRetryAction, WorkspaceSymbolBatchParams, WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -402,6 +403,115 @@ where
             Ok(Json::new(structured.clone(), structured.to_string()))
         },
     )
+}
+
+fn validate_workspace_symbol_batch(params: &WorkspaceSymbolBatchParams) -> Result<(), McpError> {
+    if params.queries.is_empty() || params.queries.len() > 32 {
+        return Err(McpError::invalid_params(
+            "queries must contain between 1 and 32 entries",
+            None,
+        ));
+    }
+    if params
+        .queries
+        .iter()
+        .any(|query| query.is_empty() || query.len() > 1_000)
+    {
+        return Err(McpError::invalid_params(
+            "each query must contain between 1 and 1000 bytes",
+            None,
+        ));
+    }
+    if params.max_items == 0 || params.max_items > 1_000 {
+        return Err(McpError::invalid_params(
+            "max_items must be between 1 and 1000",
+            None,
+        ));
+    }
+    if !(4_096..=1_048_576).contains(&params.max_bytes) {
+        return Err(McpError::invalid_params(
+            "max_bytes must be between 4096 and 1048576",
+            None,
+        ));
+    }
+    let identity_bytes = params.queries.iter().map(String::len).sum::<usize>()
+        + params.queries.len().saturating_mul(128)
+        + 256;
+    if identity_bytes > params.max_bytes {
+        return Err(McpError::invalid_params(
+            "max_bytes is too small to return every query identity",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_inspect_symbol_batch(params: &InspectSymbolBatchParams) -> Result<(), McpError> {
+    if params.page_token.is_some() {
+        if !params.targets.is_empty() {
+            return Err(McpError::invalid_params(
+                "targets must be empty when page_token is supplied",
+                None,
+            ));
+        }
+        return Ok(());
+    }
+    if params.targets.is_empty()
+        || params.targets.len() > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
+    {
+        return Err(McpError::invalid_params(
+            "targets must contain between 1 and 16 symbols",
+            None,
+        ));
+    }
+    if params.targets.iter().any(|target| {
+        target.symbol_handle.is_none()
+            && target
+                .query
+                .as_ref()
+                .is_none_or(|query| query.trim().is_empty())
+    }) {
+        return Err(McpError::invalid_params(
+            "every target requires query or symbol_handle",
+            None,
+        ));
+    }
+    if params.targets.iter().any(|target| {
+        serde_json::to_vec(target).map_or(usize::MAX, |encoded| encoded.len()) > 4_096
+    }) {
+        return Err(McpError::invalid_params(
+            "each target identity must fit within 4096 serialized bytes",
+            None,
+        ));
+    }
+    if params.candidate_limit == 0 || params.candidate_limit > 100 {
+        return Err(McpError::invalid_params(
+            "candidate_limit must be between 1 and 100",
+            None,
+        ));
+    }
+    if params.budget.max_items < params.targets.len() {
+        return Err(McpError::invalid_params(
+            "budget.max_items must allow at least one item per target",
+            None,
+        ));
+    }
+    let identity_bytes = serde_json::to_vec(&params.targets)
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+        .len();
+    let minimum_bytes = identity_bytes
+        + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES
+        + params.targets.len()
+            * crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET;
+    if params.budget.max_bytes < minimum_bytes || params.budget.max_bytes > 1024 * 1024 {
+        return Err(McpError::invalid_params(
+            format!(
+                "budget.max_bytes must be between {minimum_bytes} and 1048576 for these targets"
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn bounded_lexical_page(
@@ -1370,26 +1480,42 @@ const MAX_INLINE_PROJECT_EVENT_BYTES: usize = 128;
 const MAX_INLINE_APPLIED_DIFF_BYTES: usize = 4 * 1024;
 #[cfg(test)]
 const NATIVE_TOOL_CATALOG_MAX_BYTES: usize = 48 * 1024;
-const LEGACY_DIRECT_MUTATION_TOOLS: &[&str] = &[
+const LEGACY_COMPATIBILITY_TOOLS: &[&str] = &[
     "rename_symbol",
     "format_document",
     "get_code_actions",
     "get_cached_diagnostics",
+    "workspace_symbol_search_batch",
+    "inspect_symbol_batch",
+    "range_format_preview",
 ];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
     "workspace_symbol_search",
     "inspect_symbol",
     "get_diagnostics",
+    "format_preview",
     "lexical_search",
     "read_semantic_resource",
-    "workspace_symbol_search_batch",
-    "inspect_symbol_batch",
     "structural_replace_preview",
     "workspace_edit_preview",
     "workspace_edit_apply",
     "code_action_apply",
     "project_list",
 ];
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum WorkspaceSymbolSearchResponse {
+    One(Box<crate::bridge::WorkspaceSymbolResult>),
+    Many(Box<crate::bridge::WorkspaceSymbolBatchResult>),
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum InspectSymbolResponse {
+    One(Box<crate::bridge::InspectSymbolResult>),
+    Many(Box<crate::bridge::InspectSymbolBatchResult>),
+}
 
 /// Remove JSON Schema presentation metadata while retaining every invocation contract.
 fn compact_advertised_input_schema(schema: &mut JsonObject) {
@@ -1452,7 +1578,7 @@ fn advertised_tools() -> Vec<Tool> {
     let mut tools = McplsServer::tool_router()
         .list_all()
         .into_iter()
-        .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
+        .filter(|tool| !LEGACY_COMPATIBILITY_TOOLS.contains(&tool.name.as_ref()))
         .map(|mut tool| {
             compact_advertised_input_schema(Arc::make_mut(&mut tool.input_schema));
             tool.description = Some(compact_advertised_description(tool.name.as_ref()).into());
@@ -2683,20 +2809,39 @@ impl McplsServer {
             tab_size,
             insert_spaces,
             position_encoding,
+            range,
         }): Parameters<FormatPreviewParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let encoding = parse_position_encoding(position_encoding.as_deref())?;
-        self.preview_generated_edit(
-            &id,
-            GeneratedEditRequest::Format {
-                file_path,
-                tab_size,
-                insert_spaces,
-            },
-            encoding,
-        )
-        .await
+        match range {
+            Some(range) => {
+                self.preview_generated_supported_edit(
+                    &id,
+                    GeneratedEditRequest::RangeFormat {
+                        file_path,
+                        start: (range.start_line, range.start_character),
+                        end: (range.end_line, range.end_character),
+                        tab_size,
+                        insert_spaces,
+                    },
+                    encoding,
+                )
+                .await
+            }
+            None => {
+                self.preview_generated_edit(
+                    &id,
+                    GeneratedEditRequest::Format {
+                        file_path,
+                        tab_size,
+                        insert_spaces,
+                    },
+                    encoding,
+                )
+                .await
+            }
+        }
     }
 
     /// Preview standard range formatting when the project server supports it.
@@ -2707,19 +2852,19 @@ impl McplsServer {
         &self,
         Parameters(params): Parameters<RangeFormatPreviewParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
-        let id = parse_project_id(params.project_id)?;
-        let encoding = parse_position_encoding(params.position_encoding.as_deref())?;
-        self.preview_generated_supported_edit(
-            &id,
-            GeneratedEditRequest::RangeFormat {
-                file_path: params.file_path,
-                start: (params.start_line, params.start_character),
-                end: (params.end_line, params.end_character),
-                tab_size: params.tab_size,
-                insert_spaces: params.insert_spaces,
-            },
-            encoding,
-        )
+        self.format_preview(Parameters(FormatPreviewParams {
+            project_id: params.project_id,
+            file_path: params.file_path,
+            tab_size: params.tab_size,
+            insert_spaces: params.insert_spaces,
+            position_encoding: params.position_encoding,
+            range: Some(FormatRange {
+                start_line: params.start_line,
+                start_character: params.start_character,
+                end_line: params.end_line,
+                end_character: params.end_character,
+            }),
+        }))
         .await
     }
 
@@ -3237,11 +3382,14 @@ impl McplsServer {
     }
 
     /// Get diagnostics for a file.
-    #[tool(description = "Cached diagnostics by default; set fresh=true to start LSP analysis.")]
+    #[tool(
+        description = "Get diagnostics with mode=cached_preferred (default), fresh, or cache_only. cache_only never starts provider analysis."
+    )]
     async fn get_diagnostics(
         &self,
         Parameters(DiagnosticsParams {
             file_path,
+            mode,
             fresh,
             options,
         }): Parameters<DiagnosticsParams>,
@@ -3251,16 +3399,30 @@ impl McplsServer {
             .required_actor_for_path(&file_path)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = if fresh {
-            actor
+        let mode = match fresh {
+            Some(true) if mode == DiagnosticsMode::CachedPreferred => DiagnosticsMode::Fresh,
+            Some(false) if mode == DiagnosticsMode::CachedPreferred => DiagnosticsMode::CacheOnly,
+            Some(_) if mode != DiagnosticsMode::CachedPreferred => {
+                return Err(McpError::invalid_params(
+                    "fresh cannot be combined with mode".to_owned(),
+                    None,
+                ));
+            }
+            _ => mode,
+        };
+        let result = match mode {
+            DiagnosticsMode::Fresh => actor
                 .diagnostics_with_options(file_path, options)
                 .await
-                .map_err(|error| error.to_string())
-        } else {
-            actor
+                .map_err(|error| error.to_string()),
+            DiagnosticsMode::CacheOnly => actor
                 .cached_diagnostics_with_options(file_path, options)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string()),
+            DiagnosticsMode::CachedPreferred => actor
+                .cached_diagnostics_with_options(file_path, options)
+                .await
+                .map_err(|error| error.to_string()),
         };
 
         encode_tool_result(result)
@@ -3374,37 +3536,54 @@ impl McplsServer {
         encode_tool_result(result)
     }
 
-    /// Search for symbols across the workspace.
+    /// Search one symbol query or several queries across the workspace.
     #[tool(
-        description = "Preferred first call for an unknown symbol: exact-first ranked project matches with bounded source frames and reusable symbol_handle values. Disambiguate before follow-ups; external/dependency symbols require scope=all."
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceSymbolSearchResponse>(),
+        description = "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; results have bounded source frames and reusable symbol handles."
     )]
     async fn workspace_symbol_search(
         &self,
-        Parameters(WorkspaceSymbolParams {
-            project_id,
-            query,
-            kind_filter,
-            match_mode,
-            scope,
-            limit,
-            max_bytes,
-            page_token,
-            include_generated,
-        }): Parameters<WorkspaceSymbolParams>,
-    ) -> Result<Json<crate::bridge::WorkspaceSymbolResult>, McpError> {
-        if limit == 0 || limit > 1_000 {
+        Parameters(params): Parameters<WorkspaceSymbolParams>,
+    ) -> Result<Json<WorkspaceSymbolSearchResponse>, McpError> {
+        if !params.queries.is_empty() {
+            if params.query.is_some() || params.page_token.is_some() {
+                return Err(McpError::invalid_params(
+                    "queries cannot be combined with query or page_token",
+                    None,
+                ));
+            }
+            let batch = WorkspaceSymbolBatchParams {
+                project_id: params.project_id,
+                queries: params.queries,
+                kind_filter: params.kind_filter,
+                match_mode: params.match_mode,
+                scope: params.scope,
+                max_items: params.limit,
+                max_bytes: params.max_bytes,
+                include_generated: params.include_generated,
+            };
+            return encode_tool_result(
+                self.workspace_symbol_batch_result(batch)
+                    .await
+                    .map(|result| WorkspaceSymbolSearchResponse::Many(Box::new(result))),
+            );
+        }
+        let query = params
+            .query
+            .ok_or_else(|| McpError::invalid_params("query or queries is required", None))?;
+        if params.limit == 0 || params.limit > 1_000 {
             return Err(McpError::invalid_params(
                 "limit must be between 1 and 1000",
                 None,
             ));
         }
-        if !(4_096..=1_048_576).contains(&max_bytes) {
+        if !(4_096..=1_048_576).contains(&params.max_bytes) {
             return Err(McpError::invalid_params(
                 "max_bytes must be between 4096 and 1048576",
                 None,
             ));
         }
-        let id = parse_project_id(project_id)?;
+        let id = parse_project_id(params.project_id)?;
         let actor = self
             .context
             .project_registry
@@ -3414,18 +3593,46 @@ impl McplsServer {
         let result = actor
             .workspace_symbol(crate::bridge::WorkspaceSymbolPageRequest {
                 query,
-                kind_filter,
-                match_mode,
-                scope,
-                include_generated,
-                max_items: limit as usize,
-                max_bytes,
-                page_token,
+                kind_filter: params.kind_filter,
+                match_mode: params.match_mode,
+                scope: params.scope,
+                include_generated: params.include_generated,
+                max_items: params.limit as usize,
+                max_bytes: params.max_bytes,
+                page_token: params.page_token,
             })
             .await
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())
+            .map(|result| WorkspaceSymbolSearchResponse::One(Box::new(result)));
 
         encode_tool_result(result)
+    }
+
+    async fn workspace_symbol_batch_result(
+        &self,
+        params: WorkspaceSymbolBatchParams,
+    ) -> Result<crate::bridge::WorkspaceSymbolBatchResult, String> {
+        validate_workspace_symbol_batch(&params).map_err(|error| error.to_string())?;
+        let id = parse_project_id(params.project_id).map_err(|error| error.to_string())?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(project_routing_error)
+            .map_err(|error| error.to_string())?;
+        actor
+            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+                queries: params.queries,
+                kind_filter: params.kind_filter,
+                match_mode: params.match_mode,
+                scope: params.scope,
+                include_generated: params.include_generated,
+                max_items: params.max_items as usize,
+                max_bytes: params.max_bytes,
+            })
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Search project snapshots by literal text or Rust regex.
@@ -3517,85 +3724,45 @@ impl McplsServer {
     )]
     async fn workspace_symbol_search_batch(
         &self,
-        Parameters(WorkspaceSymbolBatchParams {
-            project_id,
-            queries,
-            kind_filter,
-            match_mode,
-            scope,
-            max_items,
-            max_bytes,
-            include_generated,
-        }): Parameters<WorkspaceSymbolBatchParams>,
+        Parameters(params): Parameters<WorkspaceSymbolBatchParams>,
     ) -> Result<Json<crate::bridge::WorkspaceSymbolBatchResult>, McpError> {
-        if queries.is_empty() || queries.len() > 32 {
-            return Err(McpError::invalid_params(
-                "queries must contain between 1 and 32 entries",
-                None,
-            ));
-        }
-        if queries
-            .iter()
-            .any(|query| query.is_empty() || query.len() > 1_000)
-        {
-            return Err(McpError::invalid_params(
-                "each query must contain between 1 and 1000 bytes",
-                None,
-            ));
-        }
-        if max_items == 0 || max_items > 1_000 {
-            return Err(McpError::invalid_params(
-                "max_items must be between 1 and 1000",
-                None,
-            ));
-        }
-        if !(4_096..=1_048_576).contains(&max_bytes) {
-            return Err(McpError::invalid_params(
-                "max_bytes must be between 4096 and 1048576",
-                None,
-            ));
-        }
-        let identity_bytes = queries.iter().map(String::len).sum::<usize>()
-            + queries.len().saturating_mul(128)
-            + 256;
-        if identity_bytes > max_bytes {
-            return Err(McpError::invalid_params(
-                "max_bytes is too small to return every query identity",
-                None,
-            ));
-        }
-
-        let id = parse_project_id(project_id)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(project_routing_error)?;
-        let result = actor
-            .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
-                queries,
-                kind_filter,
-                match_mode,
-                scope,
-                include_generated,
-                max_items: max_items as usize,
-                max_bytes,
-            })
-            .await
-            .map_err(|error| error.to_string());
-
-        encode_tool_result(result)
+        encode_tool_result(self.workspace_symbol_batch_result(params).await)
     }
 
-    /// Resolve and inspect one symbol without requiring a file read between semantic calls.
+    /// Resolve and inspect one symbol or several symbols without rereading files.
     #[tool(
-        description = "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles."
+        output_schema = rmcp::handler::server::tool::schema_for_output::<InspectSymbolResponse>(),
+        description = "Inspect one query or symbol handle, or 1-16 caller-ordered targets, with bounded source frames. Multi-target results use retained 16 KiB pages; continuation reuses the original provider work."
     )]
     async fn inspect_symbol(
         &self,
         Parameters(params): Parameters<InspectSymbolParams>,
-    ) -> Result<Json<crate::bridge::InspectSymbolResult>, McpError> {
+    ) -> Result<Json<InspectSymbolResponse>, McpError> {
+        if !params.targets.is_empty() || params.page_token.is_some() {
+            if params.symbol_handle.is_some()
+                || params.query.is_some()
+                || params.kind.is_some()
+                || params.path.is_some()
+                || params.container.is_some()
+            {
+                return Err(McpError::invalid_params(
+                    "targets or page_token cannot be combined with a single-symbol identity",
+                    None,
+                ));
+            }
+            return encode_tool_result(
+                self.inspect_symbol_batch_result(InspectSymbolBatchParams {
+                    project_id: params.project_id,
+                    targets: params.targets,
+                    candidate_limit: params.candidate_limit,
+                    sections: params.sections,
+                    budget: params.budget,
+                    page_token: params.page_token,
+                })
+                .await
+                .map(|result| InspectSymbolResponse::Many(Box::new(result))),
+            );
+        }
         if params.symbol_handle.is_none() && params.query.as_ref().is_none_or(String::is_empty) {
             return Err(McpError::invalid_params(
                 "query or symbol_handle is required",
@@ -3627,8 +3794,35 @@ impl McplsServer {
                 budget: params.budget,
             })
             .await
-            .map_err(operation_error);
+            .map_err(operation_error)
+            .map(|result| InspectSymbolResponse::One(Box::new(result)));
         encode_tool_result(result)
+    }
+
+    async fn inspect_symbol_batch_result(
+        &self,
+        params: InspectSymbolBatchParams,
+    ) -> Result<crate::bridge::InspectSymbolBatchResult, String> {
+        validate_inspect_symbol_batch(&params).map_err(|error| error.to_string())?;
+        let id = parse_project_id(params.project_id).map_err(|error| error.to_string())?;
+        let actor = self
+            .context
+            .project_registry
+            .actor_for_project(&id)
+            .await
+            .map_err(project_operation_error)
+            .map_err(|error| error.to_string())?;
+        actor
+            .inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
+                targets: params.targets,
+                candidate_limit: params.candidate_limit,
+                sections: params.sections,
+                budget: params.budget,
+                page_token: params.page_token,
+            })
+            .await
+            .map_err(operation_error)
+            .map_err(|error| error.to_string())
     }
 
     /// Inspect several symbols concurrently without repeating actor round trips.
@@ -3639,90 +3833,7 @@ impl McplsServer {
         &self,
         Parameters(params): Parameters<InspectSymbolBatchParams>,
     ) -> Result<Json<crate::bridge::InspectSymbolBatchResult>, McpError> {
-        if params.page_token.is_some() {
-            if !params.targets.is_empty() {
-                return Err(McpError::invalid_params(
-                    "targets must be empty when page_token is supplied",
-                    None,
-                ));
-            }
-        } else {
-            if params.targets.is_empty()
-                || params.targets.len()
-                    > crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_TARGETS
-            {
-                return Err(McpError::invalid_params(
-                    "targets must contain between 1 and 16 symbols",
-                    None,
-                ));
-            }
-            if params.targets.iter().any(|target| {
-                target.symbol_handle.is_none()
-                    && target
-                        .query
-                        .as_ref()
-                        .is_none_or(|query| query.trim().is_empty())
-            }) {
-                return Err(McpError::invalid_params(
-                    "every target requires query or symbol_handle",
-                    None,
-                ));
-            }
-            if params.targets.iter().any(|target| {
-                serde_json::to_vec(target).map_or(usize::MAX, |encoded| encoded.len()) > 4_096
-            }) {
-                return Err(McpError::invalid_params(
-                    "each target identity must fit within 4096 serialized bytes",
-                    None,
-                ));
-            }
-            if params.candidate_limit == 0 || params.candidate_limit > 100 {
-                return Err(McpError::invalid_params(
-                    "candidate_limit must be between 1 and 100",
-                    None,
-                ));
-            }
-            if params.budget.max_items < params.targets.len() {
-                return Err(McpError::invalid_params(
-                    "budget.max_items must allow at least one item per target",
-                    None,
-                ));
-            }
-            let identity_bytes = serde_json::to_vec(&params.targets)
-                .map_err(|error| McpError::invalid_params(error.to_string(), None))?
-                .len();
-            let minimum_bytes = identity_bytes
-                + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES
-                + params.targets.len()
-                    * crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET;
-            if params.budget.max_bytes < minimum_bytes || params.budget.max_bytes > 1024 * 1024 {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "budget.max_bytes must be between {minimum_bytes} and 1048576 for these targets"
-                    ),
-                    None,
-                ));
-            }
-        }
-
-        let id = parse_project_id(params.project_id)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(project_operation_error)?;
-        let result = actor
-            .inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
-                targets: params.targets,
-                candidate_limit: params.candidate_limit,
-                sections: params.sections,
-                budget: params.budget,
-                page_token: params.page_token,
-            })
-            .await
-            .map_err(operation_error);
-        encode_tool_result(result)
+        encode_tool_result(self.inspect_symbol_batch_result(params).await)
     }
 
     /// Get code actions for a range.
@@ -3939,17 +4050,13 @@ impl McplsServer {
             CachedDiagnosticsParams,
         >,
     ) -> Result<Json<crate::bridge::DiagnosticsResult>, McpError> {
-        let actor = self
-            .context
-            .required_actor_for_path(&file_path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let result = actor
-            .cached_diagnostics_with_options(file_path, options)
-            .await
-            .map_err(|error| error.to_string());
-
-        encode_tool_result(result)
+        self.get_diagnostics(Parameters(DiagnosticsParams {
+            file_path,
+            mode: DiagnosticsMode::CacheOnly,
+            fresh: None,
+            options,
+        }))
+        .await
     }
 
     /// Get recent LSP server log messages.
@@ -5904,7 +6011,8 @@ finally:
         server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "dormant".to_string(),
-                query: "fixture".to_string(),
+                query: Some("fixture".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -5920,7 +6028,8 @@ finally:
         let result = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "dormant".to_string(),
-                query: "fixture".to_string(),
+                query: Some("fixture".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -5957,7 +6066,8 @@ finally:
         let (first, second) = tokio::join!(
             server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: first_id.as_str().to_string(),
-                query: "fixture".to_string(),
+                query: Some("fixture".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -5968,7 +6078,8 @@ finally:
             })),
             server.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: second_id.as_str().to_string(),
-                query: "fixture".to_string(),
+                query: Some("fixture".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -6077,7 +6188,8 @@ finally:
             second_server
                 .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                     project_id: second_id.as_str().to_string(),
-                    query: "fixture".to_string(),
+                    query: Some("fixture".to_string()),
+                    queries: Vec::new(),
                     kind_filter: None,
                     match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                     scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -6152,7 +6264,8 @@ finally:
             blocked_server
                 .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                     project_id: blocked_id,
-                    query: "fixture".to_string(),
+                    query: Some("fixture".to_string()),
+                    queries: Vec::new(),
                     kind_filter: None,
                     match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                     scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -6555,7 +6668,7 @@ finally:
 
         assert_eq!(
             full.iter()
-                .filter(|tool| !LEGACY_DIRECT_MUTATION_TOOLS.contains(&tool.name.as_ref()))
+                .filter(|tool| !LEGACY_COMPATIBILITY_TOOLS.contains(&tool.name.as_ref()))
                 .map(|tool| &tool.name)
                 .collect::<Vec<_>>(),
             advertised.iter().map(|tool| &tool.name).collect::<Vec<_>>()
@@ -6598,7 +6711,7 @@ finally:
         let router_tools = McplsServer::tool_router().list_all();
         let advertised = advertised_tools();
 
-        for name in LEGACY_DIRECT_MUTATION_TOOLS {
+        for name in LEGACY_COMPATIBILITY_TOOLS {
             assert!(
                 router_tools.iter().any(|tool| tool.name == *name),
                 "legacy compatibility route is missing {name}"
@@ -6608,6 +6721,67 @@ finally:
                 "legacy direct mutation is still advertised {name}"
             );
         }
+    }
+
+    #[test]
+    fn advertised_tools_consolidate_read_only_operation_families() {
+        let router_tools = McplsServer::tool_router().list_all();
+        let advertised = advertised_tools();
+        let mut before = router_tools
+            .iter()
+            .filter(|tool| {
+                ![
+                    "rename_symbol",
+                    "format_document",
+                    "get_code_actions",
+                    "get_cached_diagnostics",
+                ]
+                .contains(&tool.name.as_ref())
+            })
+            .cloned()
+            .map(|mut tool| {
+                compact_advertised_input_schema(Arc::make_mut(&mut tool.input_schema));
+                tool.description = Some(compact_advertised_description(tool.name.as_ref()).into());
+                tool.output_schema = None;
+                tool
+            })
+            .collect::<Vec<_>>();
+        before.sort_by(|left, right| {
+            tool_catalog_rank(left.name.as_ref()).cmp(&tool_catalog_rank(right.name.as_ref()))
+        });
+
+        for name in [
+            "workspace_symbol_search_batch",
+            "inspect_symbol_batch",
+            "get_cached_diagnostics",
+            "range_format_preview",
+        ] {
+            assert!(
+                router_tools.iter().any(|tool| tool.name == name),
+                "legacy compatibility route is missing {name}"
+            );
+            assert!(
+                !advertised.iter().any(|tool| tool.name == name),
+                "legacy compatibility route is still advertised {name}"
+            );
+        }
+
+        for name in [
+            "workspace_symbol_search",
+            "inspect_symbol",
+            "get_diagnostics",
+            "format_preview",
+        ] {
+            assert!(
+                advertised.iter().any(|tool| tool.name == name),
+                "canonical tool is missing {name}"
+            );
+        }
+        assert!(
+            serde_json::to_vec(&advertised).unwrap().len()
+                < serde_json::to_vec(&before).unwrap().len(),
+            "canonical tools/list catalog must be smaller than the compatibility catalog"
+        );
     }
 
     #[test]
@@ -6631,15 +6805,15 @@ finally:
                 "workspace_symbol_search",
                 "inspect_symbol",
                 "get_diagnostics",
+                "format_preview",
                 "lexical_search",
                 "read_semantic_resource",
-                "workspace_symbol_search_batch",
-                "inspect_symbol_batch",
                 "structural_replace_preview",
                 "workspace_edit_preview",
                 "workspace_edit_apply",
                 "code_action_apply",
                 "project_list",
+                "code_action_list",
             ]
         );
         assert!(
@@ -6713,18 +6887,13 @@ finally:
     }
 
     #[test]
-    fn inspect_symbol_tools_are_advertised_with_typed_contracts() {
+    fn canonical_symbol_tools_advertise_one_or_many_typed_contracts() {
         let tools = McplsServer::tool_router().list_all();
         let workspace = tools
             .iter()
             .find(|tool| tool.name == "workspace_symbol_search")
             .unwrap();
         let inspect = tools.iter().find(|tool| tool.name == "inspect_symbol");
-        let batch = tools
-            .iter()
-            .find(|tool| tool.name == "inspect_symbol_batch")
-            .expect("inspect_symbol_batch is missing from tools/list");
-
         assert!(
             inspect.is_some(),
             "inspect_symbol is missing from tools/list"
@@ -6739,30 +6908,27 @@ finally:
             inspect.input_schema["properties"]["sections"]["items"]["oneOf"][4]["const"],
             "references"
         );
+        assert!(workspace.input_schema["properties"]["query"].is_object());
+        assert!(workspace.input_schema["properties"]["queries"]["items"].is_object());
+        assert!(inspect.input_schema["properties"]["targets"]["items"].is_object());
         assert!(inspect.input_schema["properties"]["budget"]["properties"].is_object());
         assert_eq!(inspect.input_schema["additionalProperties"], false);
         assert_eq!(
             inspect.input_schema["properties"]["budget"]["additionalProperties"],
             false
         );
-        assert!(inspect.output_schema.as_ref().is_some_and(|schema| {
-            schema["properties"]["resolution"].is_object()
-                && schema["properties"]["sections"].is_object()
-        }));
-        assert!(batch.input_schema["properties"]["targets"]["items"].is_object());
-        assert_eq!(batch.input_schema["additionalProperties"], false);
-        assert_eq!(
-            batch.input_schema["properties"]["budget"]["additionalProperties"],
-            false
+        assert!(
+            inspect
+                .output_schema
+                .as_ref()
+                .is_some_and(|schema| schema["anyOf"].is_array())
         );
-        assert_eq!(
-            batch.input_schema["$defs"]["InspectSymbolTarget"]["additionalProperties"],
-            false
+        assert!(
+            workspace
+                .output_schema
+                .as_ref()
+                .is_some_and(|schema| schema["anyOf"].is_array())
         );
-        assert!(batch.output_schema.as_ref().is_some_and(|schema| {
-            schema["properties"]["entries"].is_object()
-                && schema["properties"]["budget"].is_object()
-        }));
     }
 
     #[test]
@@ -6986,7 +7152,8 @@ finally:
         let error = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "missing".to_owned(),
-                query: "needle".to_owned(),
+                query: Some("needle".to_owned()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -7249,7 +7416,8 @@ finally:
         let result = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "activation-fallback".to_string(),
-                query: "fixture_symbol".to_string(),
+                query: Some("fixture_symbol".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -7966,6 +8134,7 @@ finally:
                 tab_size: 4,
                 insert_spaces: true,
                 position_encoding: None,
+                range: None,
             }))
             .await
             .unwrap_err()
@@ -8519,6 +8688,7 @@ while True:
                 tab_size: 4,
                 insert_spaces: true,
                 position_encoding: Some("utf-8".to_string()),
+                range: None,
             }))
             .await
             .unwrap();
@@ -8707,16 +8877,18 @@ while True:
 
         let ranged: serde_json::Value = serde_json::from_str(
             &server
-                .range_format_preview(Parameters(RangeFormatPreviewParams {
+                .format_preview(Parameters(FormatPreviewParams {
                     project_id: project_id.as_str().to_string(),
                     file_path: renamed.display().to_string(),
-                    start_line: 1,
-                    start_character: 1,
-                    end_line: 2,
-                    end_character: 1,
                     tab_size: 4,
                     insert_spaces: true,
                     position_encoding: Some("utf-8".to_string()),
+                    range: Some(FormatRange {
+                        start_line: 1,
+                        start_character: 1,
+                        end_line: 2,
+                        end_character: 1,
+                    }),
                 }))
                 .await
                 .unwrap(),
@@ -9053,16 +9225,18 @@ while True:
 
         let range: serde_json::Value = serde_json::from_str(
             &server
-                .range_format_preview(Parameters(RangeFormatPreviewParams {
+                .format_preview(Parameters(FormatPreviewParams {
                     project_id: project_id.as_str().to_string(),
                     file_path: source.display().to_string(),
-                    start_line: 1,
-                    start_character: 1,
-                    end_line: 1,
-                    end_character: 3,
                     tab_size: 4,
                     insert_spaces: true,
                     position_encoding: None,
+                    range: Some(FormatRange {
+                        start_line: 1,
+                        start_character: 1,
+                        end_line: 1,
+                        end_character: 3,
+                    }),
                 }))
                 .await
                 .unwrap(),
@@ -9396,7 +9570,8 @@ while True:
         let symbols = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "fallback-only".to_string(),
-                query: "fallback_symbol".to_string(),
+                query: Some("fallback_symbol".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -9500,7 +9675,8 @@ while True:
         let symbols = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "missing-optional".to_string(),
-                query: "missing_server_fallback".to_string(),
+                query: Some("missing_server_fallback".to_string()),
+                queries: Vec::new(),
                 kind_filter: None,
                 match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
                 scope: crate::bridge::WorkspaceSymbolScope::default(),
@@ -9688,7 +9864,8 @@ while True:
         let result = server
             .get_diagnostics(Parameters(DiagnosticsParams {
                 file_path: file_path.display().to_string(),
-                fresh: false,
+                mode: DiagnosticsMode::CacheOnly,
+                fresh: None,
                 options: DiagnosticOptions::default(),
             }))
             .await;
@@ -10003,7 +10180,7 @@ while True:
     }
 
     #[tokio::test]
-    async fn test_cached_diagnostics_routes_registered_paths_to_project_actor() {
+    async fn cache_only_diagnostics_never_requires_provider_analysis() {
         let project_root = TempDir::new().unwrap();
         let file_path = project_root.path().join("src.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
@@ -10019,8 +10196,10 @@ while True:
         let server = McplsServer::new_with_registry(subscriptions, registry);
 
         let result = server
-            .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+            .get_diagnostics(Parameters(DiagnosticsParams {
                 file_path: file_path.display().to_string(),
+                mode: DiagnosticsMode::CacheOnly,
+                fresh: None,
                 options: DiagnosticOptions::default(),
             }))
             .await;
@@ -10069,7 +10248,8 @@ while True:
         let server = create_test_server();
         let params = Parameters(DiagnosticsParams {
             file_path: "/test/file.rs".to_string(),
-            fresh: false,
+            mode: DiagnosticsMode::CacheOnly,
+            fresh: None,
             options: DiagnosticOptions::default(),
         });
 
@@ -10137,7 +10317,8 @@ while True:
         let server = create_test_server();
         let params = Parameters(WorkspaceSymbolParams {
             project_id: "missing".to_string(),
-            query: "User".to_string(),
+            query: Some("User".to_string()),
+            queries: Vec::new(),
             kind_filter: None,
             match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
             scope: crate::bridge::WorkspaceSymbolScope::default(),

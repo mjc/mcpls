@@ -2932,6 +2932,44 @@
     "name": "format_preview",
     "description": "Preview LSP document formatting as a session-owned workspace edit plan. Apply the returned plan from this MCP session with workspace_edit_apply.",
     "inputSchema": {
+      "$defs": {
+        "FormatRange": {
+          "description": "One-based range used by `format_preview`.",
+          "properties": {
+            "end_character": {
+              "description": "One-based end character in UTF-16 code units.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "end_line": {
+              "description": "One-based end line.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_character": {
+              "description": "One-based start character in UTF-16 code units.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_line": {
+              "description": "One-based start line.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "start_line",
+            "start_character",
+            "end_line",
+            "end_character"
+          ],
+          "type": "object"
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "file_path": {
@@ -2954,6 +2992,18 @@
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FormatRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional one-based range for capability-gated LSP range formatting."
         },
         "tab_size": {
           "default": 4,
@@ -5930,7 +5980,7 @@
   },
   {
     "name": "get_diagnostics",
-    "description": "Cached diagnostics by default; set fresh=true to start LSP analysis.",
+    "description": "Get diagnostics with mode=cached_preferred (default), fresh, or cache_only. cache_only never starts provider analysis.",
     "inputSchema": {
       "$defs": {
         "DiagnosticSeverity": {
@@ -5957,6 +6007,26 @@
               "type": "string"
             }
           ]
+        },
+        "DiagnosticsMode": {
+          "description": "Source policy for `get_diagnostics`.",
+          "oneOf": [
+            {
+              "const": "cached_preferred",
+              "description": "Use the cached-notification behavior that existing `get_diagnostics` callers receive.",
+              "type": "string"
+            },
+            {
+              "const": "fresh",
+              "description": "Always request fresh analysis from the routed language server.",
+              "type": "string"
+            },
+            {
+              "const": "cache_only",
+              "description": "Read only server-notification diagnostics without requesting analysis.",
+              "type": "string"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5980,11 +6050,6 @@
           "description": "Absolute path to the file.",
           "type": "string"
         },
-        "fresh": {
-          "default": false,
-          "description": "Request fresh analysis instead of using available cached diagnostics.",
-          "type": "boolean"
-        },
         "include_generated": {
           "default": true,
           "description": "Include diagnostics under generated output paths.",
@@ -6001,6 +6066,11 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/DiagnosticsMode",
+          "default": "cached_preferred",
+          "description": "Whether to prefer cached diagnostics, force fresh analysis, or only read the cache."
         },
         "page_token": {
           "description": "Snapshot-owned continuation returned by the preceding page.",
@@ -11758,8 +11828,52 @@
   },
   {
     "name": "inspect_symbol",
-    "description": "Resolve an exact query or symbol_handle without rereading files. An empty sections list returns only the declaration source frame; request additional sections together. Ambiguous names return candidates; refresh stale handles.",
+    "description": "Inspect one query or symbol handle, or 1-16 caller-ordered targets, with bounded source frames. Multi-target results use retained 16 KiB pages; continuation reuses the original provider work.",
     "inputSchema": {
+      "$defs": {
+        "InspectSymbolTarget": {
+          "additionalProperties": false,
+          "description": "One symbol identity in a batch inspection request.",
+          "properties": {
+            "container": {
+              "description": "Optional container-name disambiguator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Optional symbol-kind disambiguator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Optional project-relative path disambiguator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "description": "Exact symbol name used when no handle is supplied.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "symbol_handle": {
+              "description": "Snapshot-bound handle returned by symbol discovery.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
@@ -11804,6 +11918,14 @@
         },
         "kind": {
           "description": "Optional symbol-kind disambiguator.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "page_token": {
+          "default": null,
+          "description": "Opaque cursor returned by a previous multi-symbol inspection page.",
           "type": [
             "string",
             "null"
@@ -11888,6 +12010,14 @@
             "string",
             "null"
           ]
+        },
+        "targets": {
+          "default": [],
+          "description": "Caller-ordered symbol identities. Use this instead of a single query or handle for 1-16 inspections.",
+          "items": {
+            "$ref": "#/$defs/InspectSymbolTarget"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -13176,6 +13306,145 @@
             }
           ]
         },
+        "InspectSymbolBatchEntry": {
+          "description": "One caller-ordered result in a batch symbol inspection.",
+          "properties": {
+            "error": {
+              "description": "Target-local failure; successful siblings remain available.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Snapshot-bound complete entry when its inline payload exceeds a page-safe bound."
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InspectSymbolResult"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Bounded inspection result for this target."
+            },
+            "target": {
+              "$ref": "#/$defs/InspectSymbolTarget",
+              "description": "Original symbol identity at this position."
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "InspectSymbolBatchResult": {
+          "description": "Bounded results for a caller-ordered batch of symbol inspections.",
+          "properties": {
+            "budget": {
+              "additionalProperties": false,
+              "description": "Effective page-byte limit and original shared item bound.",
+              "properties": {
+                "max_bytes": {
+                  "default": 65536,
+                  "description": "Maximum serialized response bytes.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "max_items": {
+                  "default": 20,
+                  "description": "Maximum items requested from each collection-producing provider.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "entries": {
+              "description": "One result for every input target, in input order.",
+              "items": {
+                "$ref": "#/$defs/InspectSymbolBatchEntry"
+              },
+              "type": "array"
+            },
+            "inspections_started": {
+              "description": "Number of target inspections started concurrently.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "next_cursor": {
+              "description": "Opaque cursor for the next caller-ordered page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "remaining_targets": {
+              "description": "Number of target entries available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_bytes": {
+              "description": "Serialized bytes in this bundle before the MCP envelope.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_items": {
+              "description": "Total section items returned across all targets.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_targets": {
+              "description": "Number of target entries in this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Stable identity of the retained batch snapshot.",
+              "type": "string"
+            },
+            "total_targets": {
+              "description": "Number of caller targets across every page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether any target result was truncated.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "entries",
+            "inspections_started",
+            "total_targets",
+            "returned_targets",
+            "remaining_targets",
+            "snapshot_identity",
+            "returned_items",
+            "budget",
+            "returned_bytes",
+            "truncated"
+          ],
+          "type": "object"
+        },
         "InspectSymbolResolution": {
           "description": "Exact resolution outcome for a symbol inspection request.",
           "oneOf": [
@@ -13274,6 +13543,58 @@
             }
           ]
         },
+        "InspectSymbolResult": {
+          "description": "Bounded, snapshot-coherent answer about one project symbol.",
+          "properties": {
+            "budget": {
+              "additionalProperties": false,
+              "description": "Bounds applied to the response.",
+              "properties": {
+                "max_bytes": {
+                  "default": 65536,
+                  "description": "Maximum serialized response bytes.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "max_items": {
+                  "default": 20,
+                  "description": "Maximum items requested from each collection-producing provider.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "resolution": {
+              "$ref": "#/$defs/InspectSymbolResolution",
+              "description": "Exact, ambiguous, or missing resolution outcome."
+            },
+            "returned_bytes": {
+              "description": "Serialized bytes in this bundle before the MCP envelope.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sections": {
+              "$ref": "#/$defs/InspectSymbolSections",
+              "description": "Requested typed semantic sections and uniform metadata."
+            },
+            "truncated": {
+              "description": "Whether the total budget removed lower-priority sections or candidates.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "resolution",
+            "sections",
+            "budget",
+            "returned_bytes",
+            "truncated"
+          ],
+          "type": "object"
+        },
         "InspectSymbolSections": {
           "description": "Typed semantic sections returned for one selected symbol.",
           "properties": {
@@ -13312,6 +13633,48 @@
             "tests": {
               "$ref": "#/$defs/InspectSection7",
               "description": "Related tests discovered without executing them."
+            }
+          },
+          "type": "object"
+        },
+        "InspectSymbolTarget": {
+          "additionalProperties": false,
+          "description": "One symbol identity in a batch inspection request.",
+          "properties": {
+            "container": {
+              "description": "Optional container-name disambiguator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Optional symbol-kind disambiguator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Optional project-relative path disambiguator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "description": "Exact symbol name used when no handle is supplied.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "symbol_handle": {
+              "description": "Snapshot-bound handle returned by symbol discovery.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "type": "object"
@@ -14234,55 +14597,14 @@
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "budget": {
-          "additionalProperties": false,
-          "description": "Bounds applied to the response.",
-          "properties": {
-            "max_bytes": {
-              "default": 65536,
-              "description": "Maximum serialized response bytes.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "max_items": {
-              "default": 20,
-              "description": "Maximum items requested from each collection-producing provider.",
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "type": "object"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InspectSymbolResult"
         },
-        "resolution": {
-          "$ref": "#/$defs/InspectSymbolResolution",
-          "description": "Exact, ambiguous, or missing resolution outcome."
-        },
-        "returned_bytes": {
-          "description": "Serialized bytes in this bundle before the MCP envelope.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "sections": {
-          "$ref": "#/$defs/InspectSymbolSections",
-          "description": "Requested typed semantic sections and uniform metadata."
-        },
-        "truncated": {
-          "description": "Whether the total budget removed lower-priority sections or candidates.",
-          "type": "boolean"
+        {
+          "$ref": "#/$defs/InspectSymbolBatchResult"
         }
-      },
-      "required": [
-        "resolution",
-        "sections",
-        "budget",
-        "returned_bytes",
-        "truncated"
-      ],
-      "type": "object"
+      ]
     }
   },
   {
@@ -19636,7 +19958,7 @@
   },
   {
     "name": "workspace_symbol_search",
-    "description": "Preferred first call for an unknown symbol: exact-first ranked project matches with bounded source frames and reusable symbol_handle values. Disambiguate before follow-ups; external/dependency symbols require scope=all.",
+    "description": "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; results have bounded source frames and reusable symbol handles.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -19699,9 +20021,20 @@
           "description": "Registered project identifier whose workspace should be searched.",
           "type": "string"
         },
+        "queries": {
+          "default": [],
+          "description": "Caller-ordered queries. Exact duplicates reuse the first provider result.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "query": {
           "description": "Search query for symbol names (supports partial matching).",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "scope": {
           "default": "project",
@@ -19721,8 +20054,7 @@
         }
       },
       "required": [
-        "project_id",
-        "query"
+        "project_id"
       ],
       "type": "object"
     },
@@ -20087,6 +20419,103 @@
           ],
           "type": "object"
         },
+        "WorkspaceSymbolBatchEntry": {
+          "description": "One caller-ordered workspace-symbol batch entry.",
+          "properties": {
+            "query": {
+              "description": "Original query at this position.",
+              "type": "string"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkspaceSymbolResult"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Search result for the first occurrence of this query."
+            },
+            "reused_from": {
+              "description": "Earlier entry whose result this exact duplicate reuses.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "skipped_by_budget": {
+              "description": "Whether the global response budget prevented provider work for this query.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "query",
+            "skipped_by_budget"
+          ],
+          "type": "object"
+        },
+        "WorkspaceSymbolBatchResult": {
+          "description": "Bounded results for a caller-ordered batch of workspace-symbol queries.",
+          "properties": {
+            "cache_hit": {
+              "description": "Whether this response reused prior provider work for this exact snapshot.",
+              "type": "boolean"
+            },
+            "entries": {
+              "description": "One entry for every input query, in input order.",
+              "items": {
+                "$ref": "#/$defs/WorkspaceSymbolBatchEntry"
+              },
+              "type": "array"
+            },
+            "max_bytes": {
+              "description": "Serialized-byte budget applied to this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "provider_requests": {
+              "description": "Number of downstream workspace-symbol requests actually issued.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned": {
+              "description": "Number of symbol payloads returned across unique queries.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Stable content-derived identity of the project snapshot queried.",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "Whether an item or byte budget omitted provider work or symbol payloads.",
+              "type": "boolean"
+            },
+            "unique_queries": {
+              "description": "Number of distinct query strings in the request.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "entries",
+            "unique_queries",
+            "provider_requests",
+            "snapshot_identity",
+            "cache_hit",
+            "returned",
+            "truncated",
+            "max_bytes"
+          ],
+          "type": "object"
+        },
         "WorkspaceSymbolMatch": {
           "description": "How a workspace-symbol name matched the query.",
           "oneOf": [
@@ -20126,71 +20555,82 @@
               "type": "string"
             }
           ]
+        },
+        "WorkspaceSymbolResult": {
+          "description": "Result of workspace symbol search.",
+          "properties": {
+            "max_bytes": {
+              "description": "Serialized-byte budget applied to this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "next_cursor": {
+              "description": "Snapshot-owned continuation for the next page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "remaining": {
+              "description": "Number of matching symbols available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned": {
+              "description": "Number of symbols in this response.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Stable identity of the immutable result snapshot.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "symbols": {
+              "description": "List of symbols found on this page.",
+              "items": {
+                "$ref": "#/$defs/WorkspaceSymbol"
+              },
+              "type": "array"
+            },
+            "total": {
+              "description": "Number of matching symbols across every page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether a later page contains matching symbols.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "symbols",
+            "total",
+            "returned",
+            "remaining",
+            "truncated"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "max_bytes": {
-          "description": "Serialized-byte budget applied to this page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkspaceSymbolResult"
         },
-        "next_cursor": {
-          "description": "Snapshot-owned continuation for the next page.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "remaining": {
-          "description": "Number of matching symbols available after this page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "returned": {
-          "description": "Number of symbols in this response.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "snapshot_identity": {
-          "description": "Stable identity of the immutable result snapshot.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "symbols": {
-          "description": "List of symbols found on this page.",
-          "items": {
-            "$ref": "#/$defs/WorkspaceSymbol"
-          },
-          "type": "array"
-        },
-        "total": {
-          "description": "Number of matching symbols across every page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "truncated": {
-          "description": "Whether a later page contains matching symbols.",
-          "type": "boolean"
+        {
+          "$ref": "#/$defs/WorkspaceSymbolBatchResult"
         }
-      },
-      "required": [
-        "symbols",
-        "total",
-        "returned",
-        "remaining",
-        "truncated"
-      ],
-      "type": "object"
+      ]
     }
   },
   {
