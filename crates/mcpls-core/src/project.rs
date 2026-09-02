@@ -23,8 +23,8 @@ use crate::bridge::DeferredResourceReference;
 use crate::bridge::ast_grep::byte_offset_to_position;
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::lexical::{
-    LexicalSearchMatch, LexicalSearchRequest, LexicalSearchScan, collect_project_paths_filtered,
-    find_matches,
+    LexicalSearchBatchRequest, LexicalSearchBatchResult, LexicalSearchMatch, LexicalSearchRequest,
+    LexicalSearchScan, collect_project_paths_filtered, find_matches,
 };
 use crate::bridge::resources::SourceResource;
 use crate::bridge::resources::make_source_uri;
@@ -1753,6 +1753,10 @@ enum ProjectRequest {
         request: LexicalSearchRequest,
         reply: oneshot::Sender<Result<LexicalSearchScan, String>>,
     },
+    LexicalSearchBatch {
+        request: LexicalSearchBatchRequest,
+        reply: oneshot::Sender<Result<LexicalSearchBatchResult, String>>,
+    },
     InspectSymbol {
         request: InspectSymbolRequest,
         reply: oneshot::Sender<Result<InspectSymbolResult, String>>,
@@ -2157,6 +2161,7 @@ impl ProjectRequest {
             Self::WorkspaceSymbol { reply, .. } => reply.is_closed(),
             Self::WorkspaceSymbolBatch { reply, .. } => reply.is_closed(),
             Self::LexicalSearch { reply, .. } => reply.is_closed(),
+            Self::LexicalSearchBatch { reply, .. } => reply.is_closed(),
             Self::InspectSymbol { reply, .. } => reply.is_closed(),
             Self::InspectSymbolBatch { reply, .. } => reply.is_closed(),
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
@@ -2834,6 +2839,22 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::LexicalSearch { request, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Search several lexical queries from one actor-owned source snapshot pass.
+    pub(crate) async fn lexical_search_batch(
+        &self,
+        request: LexicalSearchBatchRequest,
+    ) -> Result<LexicalSearchBatchResult, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::LexicalSearchBatch { request, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3984,6 +4005,62 @@ struct DeferredResultStore {
     entries: HashMap<String, StoredDeferredResult>,
     ttl: Duration,
     max_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LexicalSearchPageState {
+    matches: Vec<LexicalSearchMatch>,
+    total_matches: usize,
+    scanned_files: usize,
+    scanned_bytes: usize,
+    snapshot_identity: String,
+    request_identity: String,
+}
+
+struct LexicalFileSnapshot {
+    path: PathBuf,
+    document_version: Option<i32>,
+    content_hash: String,
+    source: String,
+    project_relative_path: String,
+}
+
+fn lexical_search_request_identity(request: &LexicalSearchRequest) -> String {
+    let value = (
+        &request.query,
+        request.mode,
+        request.case,
+        request.multiline,
+        request.max_files,
+        request.include_generated,
+        &request.include_paths,
+        &request.exclude_paths,
+        request.context_lines,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )
+}
+
+pub(crate) fn lexical_page_cursor(token: &str, offset: usize) -> String {
+    format!("mcpls-deferred:///{token}?offset={offset:020}")
+}
+
+fn parse_lexical_page_cursor(cursor: &str) -> Result<(&str, usize), String> {
+    let cursor = cursor.strip_prefix("mcpls-deferred:///").ok_or_else(|| {
+        "page_token must be the next_cursor returned by lexical_search".to_owned()
+    })?;
+    let (token, offset) = cursor
+        .split_once("?offset=")
+        .ok_or_else(|| "invalid lexical_search page_token".to_owned())?;
+    if token.is_empty() {
+        return Err("invalid lexical_search page_token".to_owned());
+    }
+    let offset = offset
+        .parse::<usize>()
+        .map_err(|_| "invalid lexical_search page_token offset".to_owned())?;
+    Ok((token, offset))
 }
 
 #[derive(Clone)]
@@ -6748,6 +6825,174 @@ impl ProjectRuntime {
         request: LexicalSearchRequest,
     ) -> Result<LexicalSearchScan, String> {
         const LEXICAL_CONTEXT_BYTES: usize = 16 * 1024;
+        let request_identity = lexical_search_request_identity(&request);
+        let scope = self.deferred_scope.as_deref().unwrap_or_default();
+        let (state, token, offset) = if let Some(page_token) = request.page_token.as_deref() {
+            let (token, offset) = parse_lexical_page_cursor(page_token)?;
+            let value = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_scoped(token, scope)?;
+            let state: LexicalSearchPageState = serde_json::from_value(value)
+                .map_err(|error| format!("invalid lexical-search page: {error}"))?;
+            if state.request_identity != request_identity {
+                return Err("page_token belongs to a different lexical_search request".to_owned());
+            }
+            (state, token.to_owned(), offset)
+        } else {
+            let paths = collect_project_paths_filtered(
+                self.translator.workspace_roots(),
+                request.include_generated,
+                request.max_files,
+                &request.include_paths,
+                &request.exclude_paths,
+            )
+            .await?;
+            let mut matches = Vec::new();
+            let mut total_matches: usize = 0;
+            let mut scanned_bytes: usize = 0;
+            let mut scanned_files: usize = 0;
+            let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
+            for path in paths {
+                scanned_files += 1;
+                let (path, document_version, content_hash, source) =
+                    match self.translator.source_snapshot(&path).await {
+                        Ok(snapshot) => snapshot,
+                        Err(crate::error::Error::Io(error))
+                            if error.kind() == std::io::ErrorKind::InvalidData =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                scanned_bytes = scanned_bytes.saturating_add(source.len());
+                let ranges = find_matches(
+                    &source,
+                    &request.query,
+                    request.mode,
+                    request.case,
+                    request.multiline,
+                )?;
+                total_matches = total_matches.saturating_add(ranges.len());
+                let project_relative_path = self
+                    .translator
+                    .workspace_roots()
+                    .iter()
+                    .find_map(|root| path.strip_prefix(root).ok())
+                    .map(|relative| relative.to_string_lossy().into_owned())
+                    .ok_or_else(|| {
+                        "lexical search found a path outside its project roots".to_owned()
+                    })?;
+                for byte_range in ranges {
+                    let start =
+                        byte_offset_to_position(&source, byte_range.start, PositionEncoding::Utf8)
+                            .ok_or_else(|| {
+                                "lexical match start is not a valid text position".to_owned()
+                            })?;
+                    let end =
+                        byte_offset_to_position(&source, byte_range.end, PositionEncoding::Utf8)
+                            .ok_or_else(|| {
+                                "lexical match end is not a valid text position".to_owned()
+                            })?;
+                    let source_uri = make_source_uri(
+                        &path,
+                        start.line.saturating_add(1),
+                        start.character.saturating_add(1),
+                        end.line.saturating_add(1),
+                        end.character.saturating_add(1),
+                        &content_hash,
+                        document_version,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let source = if request.context_lines == 0 {
+                        None
+                    } else {
+                        Some(
+                            self.translator
+                                .lexical_source_context(
+                                    &path,
+                                    crate::bridge::Range {
+                                        start: crate::bridge::Position2D {
+                                            line: start.line.saturating_add(1),
+                                            character: start.character.saturating_add(1),
+                                        },
+                                        end: crate::bridge::Position2D {
+                                            line: end.line.saturating_add(1),
+                                            character: end.character.saturating_add(1),
+                                        },
+                                    },
+                                    &mut source_budget,
+                                    request.context_lines,
+                                )
+                                .await,
+                        )
+                    };
+                    matches.push(LexicalSearchMatch {
+                        project_relative_path: project_relative_path.clone(),
+                        document_version,
+                        content_hash: content_hash.clone(),
+                        source_uri,
+                        source,
+                        byte_range,
+                    });
+                }
+            }
+            let encoded = serde_json::to_vec(&matches)
+                .map_err(|error| format!("failed to identify lexical snapshot: {error}"))?;
+            let snapshot_identity = format!("{:x}", Sha256::digest(encoded));
+            let state = LexicalSearchPageState {
+                matches,
+                total_matches,
+                scanned_files,
+                scanned_bytes,
+                snapshot_identity,
+                request_identity,
+            };
+            let value = serde_json::to_value(&state)
+                .map_err(|error| format!("failed to store lexical page: {error}"))?;
+            let token = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped_kind(
+                    value,
+                    state.snapshot_identity.clone(),
+                    scope,
+                    "lexical_search_page",
+                )
+                .uri
+                .trim_start_matches("mcpls-deferred:///")
+                .to_owned();
+            (state, token, 0)
+        };
+
+        if offset > state.matches.len() {
+            return Err(
+                "lexical_search page_token offset is outside the retained result".to_owned(),
+            );
+        }
+        let end = offset
+            .saturating_add(request.max_matches)
+            .min(state.matches.len());
+        Ok(LexicalSearchScan {
+            matches: state.matches[offset..end].to_vec(),
+            total_matches: state.total_matches,
+            scanned_files: state.scanned_files,
+            scanned_bytes: state.scanned_bytes,
+            offset,
+            page_token: token,
+            snapshot_identity: state.snapshot_identity,
+        })
+    }
+
+    async fn lexical_search_batch(
+        &self,
+        request: LexicalSearchBatchRequest,
+    ) -> Result<LexicalSearchBatchResult, String> {
+        if request.queries.is_empty() {
+            return Err("lexical query batch must not be empty".to_owned());
+        }
         let paths = collect_project_paths_filtered(
             self.translator.workspace_roots(),
             request.include_generated,
@@ -6756,11 +7001,9 @@ impl ProjectRuntime {
             &request.exclude_paths,
         )
         .await?;
-        let mut matches = Vec::new();
-        let mut total_matches: usize = 0;
+        let mut files = Vec::with_capacity(paths.len());
         let mut scanned_bytes: usize = 0;
         let mut scanned_files: usize = 0;
-        let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
         for path in paths {
             scanned_files += 1;
             let (path, document_version, content_hash, source) =
@@ -6773,16 +7016,6 @@ impl ProjectRuntime {
                     }
                     Err(error) => return Err(error.to_string()),
                 };
-            scanned_bytes = scanned_bytes.saturating_add(source.len());
-            let ranges = find_matches(
-                &source,
-                &request.query,
-                request.mode,
-                request.case,
-                request.multiline,
-            )?;
-            total_matches = total_matches.saturating_add(ranges.len());
-            let remaining = request.max_matches.saturating_sub(matches.len());
             let project_relative_path = self
                 .translator
                 .workspace_roots()
@@ -6792,62 +7025,154 @@ impl ProjectRuntime {
                 .ok_or_else(|| {
                     "lexical search found a path outside its project roots".to_owned()
                 })?;
-            for byte_range in ranges.into_iter().take(remaining) {
-                let start =
-                    byte_offset_to_position(&source, byte_range.start, PositionEncoding::Utf8)
-                        .ok_or_else(|| {
-                            "lexical match start is not a valid text position".to_owned()
-                        })?;
-                let end = byte_offset_to_position(&source, byte_range.end, PositionEncoding::Utf8)
-                    .ok_or_else(|| "lexical match end is not a valid text position".to_owned())?;
-                let source_uri = make_source_uri(
-                    &path,
-                    start.line.saturating_add(1),
-                    start.character.saturating_add(1),
-                    end.line.saturating_add(1),
-                    end.character.saturating_add(1),
-                    &content_hash,
-                    document_version,
-                )
-                .map_err(|error| error.to_string())?;
-                let source = if request.context_lines == 0 {
-                    None
-                } else {
-                    Some(
-                        self.translator
-                            .lexical_source_context(
-                                &path,
-                                crate::bridge::Range {
-                                    start: crate::bridge::Position2D {
-                                        line: start.line.saturating_add(1),
-                                        character: start.character.saturating_add(1),
-                                    },
-                                    end: crate::bridge::Position2D {
-                                        line: end.line.saturating_add(1),
-                                        character: end.character.saturating_add(1),
-                                    },
-                                },
-                                &mut source_budget,
-                                request.context_lines,
-                            )
-                            .await,
-                    )
-                };
-                matches.push(LexicalSearchMatch {
-                    project_relative_path: project_relative_path.clone(),
-                    document_version,
-                    content_hash: content_hash.clone(),
-                    source_uri,
-                    source,
-                    byte_range,
-                });
-            }
+            scanned_bytes = scanned_bytes.saturating_add(source.len());
+            files.push(LexicalFileSnapshot {
+                path,
+                document_version,
+                content_hash,
+                source,
+                project_relative_path,
+            });
         }
-        Ok(LexicalSearchScan {
-            matches,
-            total_matches,
+        let mut snapshot_hasher = Sha256::new();
+        for file in &files {
+            snapshot_hasher.update(file.project_relative_path.as_bytes());
+            snapshot_hasher.update(file.content_hash.as_bytes());
+        }
+        let snapshot_identity = format!("{:x}", snapshot_hasher.finalize());
+        let mut seen = HashMap::new();
+        let mut entries = Vec::with_capacity(request.queries.len());
+        let mut returned = 0;
+        let mut truncated = false;
+        let mut source_budget = SourceBudget::new(16 * 1024);
+        for query in request.queries {
+            if let Some(&reused_from) = seen.get(&query) {
+                entries.push(crate::bridge::lexical::LexicalSearchBatchEntry {
+                    query,
+                    result: None,
+                    reused_from: Some(reused_from),
+                    skipped_by_budget: false,
+                });
+                continue;
+            }
+            let entry_index = entries.len();
+            seen.insert(query.clone(), entry_index);
+            let remaining = request.max_matches.saturating_sub(returned);
+            if remaining == 0 {
+                truncated = true;
+                entries.push(crate::bridge::lexical::LexicalSearchBatchEntry {
+                    query,
+                    result: None,
+                    reused_from: None,
+                    skipped_by_budget: true,
+                });
+                continue;
+            }
+            let mut matches = Vec::new();
+            let mut total_matches: usize = 0;
+            for file in &files {
+                let ranges = find_matches(
+                    &file.source,
+                    &query,
+                    request.mode,
+                    request.case,
+                    request.multiline,
+                )?;
+                total_matches = total_matches.saturating_add(ranges.len());
+                for byte_range in ranges
+                    .into_iter()
+                    .take(remaining.saturating_sub(matches.len()))
+                {
+                    let start = byte_offset_to_position(
+                        &file.source,
+                        byte_range.start,
+                        PositionEncoding::Utf8,
+                    )
+                    .ok_or_else(|| "lexical match start is not a valid text position".to_owned())?;
+                    let end = byte_offset_to_position(
+                        &file.source,
+                        byte_range.end,
+                        PositionEncoding::Utf8,
+                    )
+                    .ok_or_else(|| "lexical match end is not a valid text position".to_owned())?;
+                    let source_uri = make_source_uri(
+                        &file.path,
+                        start.line.saturating_add(1),
+                        start.character.saturating_add(1),
+                        end.line.saturating_add(1),
+                        end.character.saturating_add(1),
+                        &file.content_hash,
+                        file.document_version,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let source = if request.context_lines == 0 {
+                        None
+                    } else {
+                        Some(
+                            self.translator
+                                .lexical_source_context(
+                                    &file.path,
+                                    crate::bridge::Range {
+                                        start: crate::bridge::Position2D {
+                                            line: start.line.saturating_add(1),
+                                            character: start.character.saturating_add(1),
+                                        },
+                                        end: crate::bridge::Position2D {
+                                            line: end.line.saturating_add(1),
+                                            character: end.character.saturating_add(1),
+                                        },
+                                    },
+                                    &mut source_budget,
+                                    request.context_lines,
+                                )
+                                .await,
+                        )
+                    };
+                    matches.push(LexicalSearchMatch {
+                        project_relative_path: file.project_relative_path.clone(),
+                        document_version: file.document_version,
+                        content_hash: file.content_hash.clone(),
+                        source_uri,
+                        source,
+                        byte_range,
+                    });
+                }
+            }
+            let query_identity = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&matches).unwrap_or_default())
+            );
+            let query_truncated = total_matches > matches.len();
+            truncated |= query_truncated;
+            returned += matches.len();
+            entries.push(crate::bridge::lexical::LexicalSearchBatchEntry {
+                query,
+                result: Some(crate::bridge::lexical::LexicalSearchResult {
+                    returned: matches.len(),
+                    total: total_matches,
+                    remaining: total_matches.saturating_sub(matches.len()),
+                    scanned_files,
+                    scanned_bytes,
+                    snapshot_identity: format!("{snapshot_identity}:{query_identity}"),
+                    max_bytes: request.max_bytes,
+                    truncated: query_truncated,
+                    next_cursor: None,
+                    matches,
+                }),
+                reused_from: None,
+                skipped_by_budget: false,
+            });
+        }
+        Ok(LexicalSearchBatchResult {
+            unique_queries: seen.len(),
+            entries,
             scanned_files,
             scanned_bytes,
+            returned,
+            truncated,
+            max_matches: request.max_matches,
+            max_bytes: request.max_bytes,
+            snapshot_identity,
         })
     }
 
@@ -8969,6 +9294,16 @@ async fn handle_project_request(
             let result = tokio::select! {
                 () = reply.closed() => return false,
                 result = runtime.lexical_search(request) => result,
+            };
+            let _ = reply.send(result);
+        }
+        ProjectRequest::LexicalSearchBatch { request, mut reply } => {
+            if reply.is_closed() {
+                return false;
+            }
+            let result = tokio::select! {
+                () = reply.closed() => return false,
+                result = runtime.lexical_search_batch(request) => result,
             };
             let _ = reply.send(result);
         }
@@ -11974,6 +12309,7 @@ mod tests {
                 include_paths: Vec::new(),
                 exclude_paths: Vec::new(),
                 context_lines: 0,
+                page_token: None,
             })
             .await
             .unwrap();
@@ -11982,6 +12318,88 @@ mod tests {
         assert_eq!(scan.total_matches, 2);
         assert_eq!(scan.scanned_files, 2);
         assert_eq!(scan.matches[0].project_relative_path, "source.rs");
+    }
+
+    #[tokio::test]
+    async fn lexical_search_pages_replay_one_immutable_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.rs"), "fn marker() {}\n").unwrap();
+        fs::write(root.path().join("b.rs"), "fn marker() {}\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let runtime = ProjectRuntime::new(translator);
+        let request = || LexicalSearchRequest {
+            query: "marker".to_owned(),
+            mode: crate::bridge::LexicalMatchMode::Literal,
+            case: crate::bridge::LexicalCaseMode::Sensitive,
+            multiline: false,
+            max_files: 10,
+            max_matches: 1,
+            include_generated: false,
+            include_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            context_lines: 0,
+            page_token: None,
+        };
+
+        let first = runtime.lexical_search(request()).await.unwrap();
+        assert_eq!(first.total_matches, 2);
+        assert_eq!(first.matches.len(), 1);
+        assert_eq!(first.offset, 0);
+        fs::write(root.path().join("a.rs"), "fn changed() {}\n").unwrap();
+
+        let second = runtime
+            .lexical_search(LexicalSearchRequest {
+                page_token: Some(crate::project::lexical_page_cursor(
+                    &first.page_token,
+                    first.offset + first.matches.len(),
+                )),
+                ..request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.total_matches, 2);
+        assert_eq!(second.matches.len(), 1);
+        assert_eq!(second.offset, 1);
+        assert_eq!(second.snapshot_identity, first.snapshot_identity);
+        assert_ne!(second.matches[0].source_uri, first.matches[0].source_uri);
+    }
+
+    #[tokio::test]
+    async fn lexical_search_batch_shares_snapshot_scan_and_match_budget() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("source.rs"), "marker needle marker\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let runtime = ProjectRuntime::new(translator);
+
+        let batch = runtime
+            .lexical_search_batch(LexicalSearchBatchRequest {
+                queries: vec![
+                    "marker".to_owned(),
+                    "needle".to_owned(),
+                    "marker".to_owned(),
+                ],
+                mode: crate::bridge::LexicalMatchMode::Literal,
+                case: crate::bridge::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 10,
+                max_matches: 2,
+                include_generated: false,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+                context_lines: 0,
+                max_bytes: 16 * 1024,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(batch.unique_queries, 2);
+        assert_eq!(batch.scanned_files, 1);
+        assert_eq!(batch.entries.len(), 3);
+        assert_eq!(batch.entries[0].result.as_ref().unwrap().returned, 2);
+        assert!(batch.entries[1].skipped_by_budget);
+        assert_eq!(batch.entries[2].reused_from, Some(0));
     }
 
     #[tokio::test]

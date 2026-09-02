@@ -60,7 +60,7 @@ use super::tools::{
 };
 #[cfg(test)]
 use crate::bridge::Translator;
-use crate::bridge::lexical::{find_matches, validate_path_globs};
+use crate::bridge::lexical::{LexicalSearchBatchRequest, find_matches, validate_path_globs};
 use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
 #[cfg(test)]
@@ -532,6 +532,8 @@ fn bounded_lexical_page(
         total_matches,
         0,
         0,
+        None,
+        "test-snapshot",
     )
 }
 
@@ -543,6 +545,8 @@ fn bounded_lexical_page_with_accounting(
     total_matches: usize,
     scanned_files: usize,
     scanned_bytes: usize,
+    cursor_token: Option<&str>,
+    snapshot_identity: &str,
 ) -> Result<crate::bridge::lexical::LexicalSearchResult, usize> {
     let candidate_matches = matches.len();
     loop {
@@ -554,7 +558,13 @@ fn bounded_lexical_page_with_accounting(
             scanned_files,
             scanned_bytes,
             max_bytes,
-            next_cursor: truncated.then(|| offset.saturating_add(matches.len()).to_string()),
+            snapshot_identity: snapshot_identity.to_owned(),
+            next_cursor: truncated.then(|| {
+                cursor_token.map_or_else(
+                    || offset.saturating_add(matches.len()).to_string(),
+                    |token| crate::project::lexical_page_cursor(token, offset + matches.len()),
+                )
+            }),
             truncated,
             matches,
         };
@@ -574,6 +584,37 @@ fn bounded_lexical_page_with_accounting(
         } else {
             matches.pop();
         }
+    }
+}
+
+fn bounded_lexical_batch(
+    mut batch: crate::bridge::lexical::LexicalSearchBatchResult,
+    max_bytes: usize,
+) -> Result<crate::bridge::lexical::LexicalSearchBatchResult, usize> {
+    loop {
+        batch.returned = batch
+            .entries
+            .iter()
+            .filter_map(|entry| entry.result.as_ref())
+            .map(|result| result.returned)
+            .sum();
+        let encoded_bytes = serde_json::to_vec(&batch).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_bytes <= max_bytes {
+            return Ok(batch);
+        }
+        let Some(entry) = batch.entries.iter_mut().rev().find(|entry| {
+            entry
+                .result
+                .as_ref()
+                .is_some_and(|result| !result.matches.is_empty())
+        }) else {
+            return Err(encoded_bytes);
+        };
+        let result = entry.result.as_mut().expect("entry was selected above");
+        result.matches.pop();
+        result.returned = result.matches.len();
+        result.truncated = true;
+        batch.truncated = true;
     }
 }
 
@@ -1543,6 +1584,13 @@ enum WorkspaceSymbolSearchResponse {
 enum InspectSymbolResponse {
     One(Box<crate::bridge::InspectSymbolResult>),
     Many(Box<crate::bridge::InspectSymbolBatchResult>),
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum LexicalSearchResponse {
+    One(Box<crate::bridge::lexical::LexicalSearchResult>),
+    Many(Box<crate::bridge::lexical::LexicalSearchBatchResult>),
 }
 
 /// Remove JSON Schema presentation metadata while retaining every invocation contract.
@@ -3662,8 +3710,8 @@ impl McplsServer {
 
     /// Search project snapshots by literal text or Rust regex.
     #[tool(
-        output_schema = rmcp::handler::server::tool::schema_for_output::<crate::bridge::lexical::LexicalSearchResult>(),
-        description = "Bounded project lexical search over current document snapshots. Literal and Rust-regex modes preserve exact byte ranges; ignored and generated paths are excluded unless explicitly requested."
+        output_schema = rmcp::handler::server::tool::schema_for_output::<LexicalSearchResponse>(),
+        description = "Bounded project lexical search over current document snapshots. Use query for one search or queries for caller-ordered searches sharing one source scan and response budget."
     )]
     async fn lexical_search(
         &self,
@@ -3681,24 +3729,34 @@ impl McplsServer {
                 None,
             ));
         }
-        find_matches(
-            "",
-            &params.query,
-            params.mode,
-            params.case,
-            params.multiline,
-        )
-        .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut queries = params.queries;
+        if let Some(query) = params.query {
+            if !queries.is_empty() {
+                return Err(McpError::invalid_params(
+                    "query cannot be combined with queries",
+                    None,
+                ));
+            }
+            queries.push(query);
+        }
+        if queries.is_empty() {
+            return Err(McpError::invalid_params(
+                "query or queries is required",
+                None,
+            ));
+        }
+        if params.page_token.is_some() && queries.len() != 1 {
+            return Err(McpError::invalid_params(
+                "page_token requires one query",
+                None,
+            ));
+        }
+        for query in &queries {
+            find_matches("", query, params.mode, params.case, params.multiline)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+        }
         validate_path_globs(&params.include_paths, &params.exclude_paths)
             .map_err(|error| McpError::invalid_params(error, None))?;
-        let offset = params.page_token.as_deref().map_or(Ok(0), |token| {
-            token.parse::<usize>().map_err(|_| {
-                McpError::invalid_params(
-                    "page_token must be the decimal next_cursor returned by lexical_search",
-                    None,
-                )
-            })
-        })?;
         let limit = params.max_matches;
         let id = parse_project_id(params.project_id)?;
         let actor = self
@@ -3707,33 +3765,37 @@ impl McplsServer {
             .actor_for_project(&id)
             .await
             .map_err(project_routing_error)?;
-        let scan = actor
-            .lexical_search(LexicalSearchRequest {
-                query: params.query,
-                mode: params.mode,
-                case: params.case,
-                multiline: params.multiline,
-                max_files: params.max_files,
-                max_matches: offset.saturating_add(limit).saturating_add(1),
-                include_generated: params.include_generated,
-                include_paths: params.include_paths,
-                exclude_paths: params.exclude_paths,
-                context_lines: params.context_lines,
-            })
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let has_next_page = scan.total_matches > offset.saturating_add(limit);
-        let matches = scan.matches.into_iter().skip(offset).take(limit).collect();
         let max_bytes = effective_lexical_page_bytes(params.max_bytes);
-        let page = bounded_lexical_page_with_accounting(
-            matches,
-            offset,
-            has_next_page,
-            max_bytes,
-            scan.total_matches,
-            scan.scanned_files,
-            scan.scanned_bytes,
-        )
+        let value = if queries.len() == 1 {
+            let scan = actor
+                .lexical_search(LexicalSearchRequest {
+                    query: queries.remove(0),
+                    mode: params.mode,
+                    case: params.case,
+                    multiline: params.multiline,
+                    max_files: params.max_files,
+                    max_matches: limit,
+                    include_generated: params.include_generated,
+                    include_paths: params.include_paths,
+                    exclude_paths: params.exclude_paths,
+                    context_lines: params.context_lines,
+                    page_token: params.page_token,
+                })
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let has_next_page =
+                scan.offset.saturating_add(scan.matches.len()) < scan.total_matches;
+            let page = bounded_lexical_page_with_accounting(
+                scan.matches,
+                scan.offset,
+                has_next_page,
+                max_bytes,
+                scan.total_matches,
+                scan.scanned_files,
+                scan.scanned_bytes,
+                Some(&scan.page_token),
+                &scan.snapshot_identity,
+            )
             .map_err(|required_bytes| {
                 McpError::invalid_params(
                     format!(
@@ -3742,7 +3804,33 @@ impl McplsServer {
                     None,
                 )
             })?;
-        let value = serde_json::to_value(page)
+            serde_json::to_value(LexicalSearchResponse::One(Box::new(page)))
+        } else {
+            let batch = actor
+                .lexical_search_batch(LexicalSearchBatchRequest {
+                    queries,
+                    mode: params.mode,
+                    case: params.case,
+                    multiline: params.multiline,
+                    max_files: params.max_files,
+                    max_matches: limit,
+                    include_generated: params.include_generated,
+                    include_paths: params.include_paths,
+                    exclude_paths: params.exclude_paths,
+                    context_lines: params.context_lines,
+                    max_bytes,
+                })
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            serde_json::to_value(LexicalSearchResponse::Many(Box::new(
+                bounded_lexical_batch(batch, max_bytes).map_err(|required_bytes| {
+                    McpError::invalid_params(
+                        format!("max_bytes must be at least {required_bytes} for lexical batch metadata"),
+                        None,
+                    )
+                })?,
+            )))
+        }
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let legacy = value.to_string();
         Ok(Json::new(value, legacy))
@@ -6975,13 +7063,17 @@ finally:
         assert!(schema.contains("smart"));
         assert!(tool.input_schema["properties"]["max_matches"].is_object());
         assert!(tool.input_schema["properties"]["max_bytes"].is_object());
+        assert!(tool.input_schema["properties"]["query"].is_object());
+        assert!(tool.input_schema["properties"]["queries"].is_object());
         assert_eq!(
             tool.input_schema["properties"]["max_bytes"]["default"],
             16 * 1024
         );
         assert!(tool.output_schema.as_ref().is_some_and(|schema| {
-            schema["properties"]["max_bytes"].is_object()
-                && schema["properties"]["next_cursor"].is_object()
+            schema["anyOf"].is_array()
+                && schema["anyOf"]
+                    .as_array()
+                    .is_some_and(|variants| variants.len() == 2)
         }));
     }
 

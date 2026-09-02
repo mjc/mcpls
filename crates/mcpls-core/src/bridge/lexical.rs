@@ -56,11 +56,29 @@ pub(crate) struct LexicalSearchRequest {
     pub exclude_paths: Vec<String>,
     /// Context lines around each match.
     pub context_lines: usize,
+    /// Opaque continuation token returned by an earlier page.
+    pub page_token: Option<String>,
+}
+
+/// Common options for a caller-ordered lexical query batch.
+#[derive(Debug, Clone)]
+pub(crate) struct LexicalSearchBatchRequest {
+    pub queries: Vec<String>,
+    pub mode: LexicalMatchMode,
+    pub case: LexicalCaseMode,
+    pub multiline: bool,
+    pub max_files: usize,
+    pub max_matches: usize,
+    pub include_generated: bool,
+    pub include_paths: Vec<String>,
+    pub exclude_paths: Vec<String>,
+    pub context_lines: usize,
+    pub max_bytes: usize,
 }
 
 /// One snapshot-bound lexical match, retaining byte offsets until the MCP
 /// boundary chooses its negotiated position encoding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct LexicalSearchMatch {
     /// Canonical project-relative path.
     pub project_relative_path: String,
@@ -89,6 +107,37 @@ pub(crate) struct LexicalSearchScan {
     pub scanned_files: usize,
     /// Total UTF-8 bytes examined across those snapshots.
     pub scanned_bytes: usize,
+    /// Offset of `matches` within the retained snapshot.
+    pub offset: usize,
+    /// Opaque token identifying the retained snapshot.
+    pub page_token: String,
+    /// Hash of the immutable snapshot used for every page.
+    pub snapshot_identity: String,
+}
+
+/// One caller-ordered entry in a shared-budget lexical batch.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct LexicalSearchBatchEntry {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<LexicalSearchResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<usize>,
+    pub skipped_by_budget: bool,
+}
+
+/// Results for several lexical queries scanned from one source snapshot pass.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct LexicalSearchBatchResult {
+    pub entries: Vec<LexicalSearchBatchEntry>,
+    pub unique_queries: usize,
+    pub scanned_files: usize,
+    pub scanned_bytes: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub max_matches: usize,
+    pub max_bytes: usize,
+    pub snapshot_identity: String,
 }
 
 /// One bounded lexical-search page with deterministic continuation metadata.
@@ -106,11 +155,13 @@ pub(crate) struct LexicalSearchResult {
     pub scanned_files: usize,
     /// UTF-8 bytes scanned to produce this page.
     pub scanned_bytes: usize,
+    /// Hash of the immutable snapshot used for every page.
+    pub snapshot_identity: String,
     /// Effective serialized byte ceiling applied to this page.
     pub max_bytes: usize,
     /// Whether another page is available.
     pub truncated: bool,
-    /// Decimal offset for the next page, when `truncated`.
+    /// Opaque snapshot-owned cursor for the next page, when `truncated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }

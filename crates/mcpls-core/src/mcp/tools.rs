@@ -423,7 +423,11 @@ pub struct LexicalSearchParams {
     /// Registered project identifier whose snapshots should be searched.
     pub project_id: String,
     /// Literal text or Rust regex to find.
-    pub query: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Caller-ordered queries sharing one source scan and response budget.
+    #[serde(default)]
+    pub queries: Vec<String>,
     /// Interpret `query` literally or as a Rust regex.
     pub mode: LexicalMatchMode,
     /// Case sensitivity behavior.
@@ -440,7 +444,7 @@ pub struct LexicalSearchParams {
     /// Caller byte ceiling; the server returns at most 16384 bytes per page.
     #[serde(default = "default_lexical_max_bytes")]
     pub max_bytes: usize,
-    /// Decimal offset returned by a prior lexical-search `next_cursor`.
+    /// Opaque snapshot-owned cursor returned by a prior lexical-search response.
     #[serde(default)]
     pub page_token: Option<String>,
     /// Context lines around each match; zero returns references only.

@@ -17343,7 +17343,7 @@
   },
   {
     "name": "lexical_search",
-    "description": "Bounded project lexical search over current document snapshots. Literal and Rust-regex modes preserve exact byte ranges; ignored and generated paths are excluded unless explicitly requested.",
+    "description": "Bounded project lexical search over current document snapshots. Use query for one search or queries for caller-ordered searches sharing one source scan and response budget.",
     "inputSchema": {
       "$defs": {
         "LexicalCaseMode": {
@@ -17458,14 +17458,25 @@
           "description": "Registered project identifier whose snapshots should be searched.",
           "type": "string"
         },
+        "queries": {
+          "default": [],
+          "description": "Caller-ordered queries sharing one source scan and response budget.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "query": {
+          "default": null,
           "description": "Literal text or Rust regex to find.",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "project_id",
-        "query",
         "mode",
         "case"
       ],
@@ -17513,6 +17524,99 @@
           ],
           "type": "object"
         },
+        "LexicalSearchBatchEntry": {
+          "description": "One caller-ordered entry in a shared-budget lexical batch.",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LexicalSearchResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reused_from": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "skipped_by_budget": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "query",
+            "skipped_by_budget"
+          ],
+          "type": "object"
+        },
+        "LexicalSearchBatchResult": {
+          "description": "Results for several lexical queries scanned from one source snapshot pass.",
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/$defs/LexicalSearchBatchEntry"
+              },
+              "type": "array"
+            },
+            "max_bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_matches": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scanned_bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scanned_files": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "unique_queries": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "entries",
+            "unique_queries",
+            "scanned_files",
+            "scanned_bytes",
+            "returned",
+            "truncated",
+            "max_matches",
+            "max_bytes",
+            "snapshot_identity"
+          ],
+          "type": "object"
+        },
         "LexicalSearchMatch": {
           "description": "One snapshot-bound lexical match, retaining byte offsets until the MCP\nboundary chooses its negotiated position encoding.",
           "properties": {
@@ -17557,6 +17661,81 @@
             "content_hash",
             "source_uri",
             "byte_range"
+          ],
+          "type": "object"
+        },
+        "LexicalSearchResult": {
+          "description": "One bounded lexical-search page with deterministic continuation metadata.",
+          "properties": {
+            "matches": {
+              "description": "Compact identities returned on this page.",
+              "items": {
+                "$ref": "#/$defs/LexicalSearchMatch"
+              },
+              "type": "array"
+            },
+            "max_bytes": {
+              "description": "Effective serialized byte ceiling applied to this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "next_cursor": {
+              "description": "Decimal offset for the next page, when `truncated`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "remaining": {
+              "description": "Matches remaining after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned": {
+              "description": "Number of identities in `matches`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scanned_bytes": {
+              "description": "UTF-8 bytes scanned to produce this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scanned_files": {
+              "description": "Number of files scanned to produce this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Hash of the immutable snapshot used for every page.",
+              "type": "string"
+            },
+            "total": {
+              "description": "Total matches found in the scanned snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "Whether another page is available.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "matches",
+            "returned",
+            "total",
+            "remaining",
+            "scanned_files",
+            "scanned_bytes",
+            "snapshot_identity",
+            "max_bytes",
+            "truncated"
           ],
           "type": "object"
         },
@@ -17803,73 +17982,14 @@
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "matches": {
-          "description": "Compact identities returned on this page.",
-          "items": {
-            "$ref": "#/$defs/LexicalSearchMatch"
-          },
-          "type": "array"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LexicalSearchResult"
         },
-        "max_bytes": {
-          "description": "Effective serialized byte ceiling applied to this page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "next_cursor": {
-          "description": "Decimal offset for the next page, when `truncated`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "remaining": {
-          "description": "Matches remaining after this page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "returned": {
-          "description": "Number of identities in `matches`.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "scanned_bytes": {
-          "description": "UTF-8 bytes scanned to produce this page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "scanned_files": {
-          "description": "Number of files scanned to produce this page.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "total": {
-          "description": "Total matches found in the scanned snapshot.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "truncated": {
-          "description": "Whether another page is available.",
-          "type": "boolean"
+        {
+          "$ref": "#/$defs/LexicalSearchBatchResult"
         }
-      },
-      "required": [
-        "matches",
-        "returned",
-        "total",
-        "remaining",
-        "scanned_files",
-        "scanned_bytes",
-        "max_bytes",
-        "truncated"
-      ],
-      "type": "object"
+      ]
     }
   },
   {
