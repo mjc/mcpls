@@ -3410,19 +3410,16 @@ impl McplsServer {
             }
             _ => mode,
         };
-        let result = match mode {
-            DiagnosticsMode::Fresh => actor
+        let result = if mode == DiagnosticsMode::Fresh {
+            actor
                 .diagnostics_with_options(file_path, options)
                 .await
-                .map_err(|error| error.to_string()),
-            DiagnosticsMode::CacheOnly => actor
+                .map_err(|error| error.to_string())
+        } else {
+            actor
                 .cached_diagnostics_with_options(file_path, options)
                 .await
-                .map_err(|error| error.to_string()),
-            DiagnosticsMode::CachedPreferred => actor
-                .cached_diagnostics_with_options(file_path, options)
-                .await
-                .map_err(|error| error.to_string()),
+                .map_err(|error| error.to_string())
         };
 
         encode_tool_result(result)
