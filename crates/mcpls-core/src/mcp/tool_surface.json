@@ -17448,7 +17448,7 @@
         },
         "page_token": {
           "default": null,
-          "description": "Decimal offset returned by a prior lexical-search `next_cursor`.",
+          "description": "Opaque snapshot-owned cursor returned by a prior lexical-search response.",
           "type": [
             "string",
             "null"
@@ -17681,7 +17681,7 @@
               "type": "integer"
             },
             "next_cursor": {
-              "description": "Decimal offset for the next page, when `truncated`.",
+              "description": "Opaque snapshot-owned cursor for the next page, when `truncated`.",
               "type": [
                 "string",
                 "null"

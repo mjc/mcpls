@@ -4190,6 +4190,18 @@ fn update_inspect_symbol_batch_page_metadata(
     }
 }
 
+fn update_inspect_symbol_byte_count(result: &mut InspectSymbolResult) {
+    // `returned_bytes` is part of the serialized result, so assigning it
+    // once under-reports whenever its digit count changes the payload.
+    for _ in 0..4 {
+        let serialized_bytes = serde_json::to_vec(result).map_or(0, |json| json.len());
+        if result.returned_bytes == serialized_bytes {
+            break;
+        }
+        result.returned_bytes = serialized_bytes;
+    }
+}
+
 fn bounded_inspect_symbol_batch_page(
     snapshot: &InspectSymbolBatchSnapshot,
     token: &str,
@@ -7391,7 +7403,7 @@ impl ProjectRuntime {
                 }
                 result.truncated = true;
             }
-            result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+            update_inspect_symbol_byte_count(&mut result);
             return Ok(result);
         };
         let limits = SemanticResultLimits {
@@ -7725,7 +7737,7 @@ impl ProjectRuntime {
             *symbol = None;
             result.truncated = true;
         }
-        result.returned_bytes = serde_json::to_vec(&result).map_or(0, |json| json.len());
+        update_inspect_symbol_byte_count(&mut result);
         Ok(result)
     }
 
@@ -14192,7 +14204,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.budget.max_bytes, PAGE_LIMIT);
-        assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
+        let serialized = serde_json::to_vec(&result).unwrap();
+        assert!(serialized.len() <= PAGE_LIMIT);
+        assert_eq!(result.returned_bytes, serialized.len());
         assert!(result.truncated);
     }
 

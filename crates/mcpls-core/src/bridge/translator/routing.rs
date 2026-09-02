@@ -117,15 +117,16 @@ impl Translator {
             let resolved = lock_std(&self.router).resolve(lang, tool).cloned();
             let Some(id) = resolved else { continue };
 
+            // A successful initialize handshake registers the client before
+            // the server's initial semantic index is authoritative. Check
+            // this state before returning that client so semantic callers
+            // cannot observe a successful but incomplete result.
+            if lock_std(&self.expected_servers).contains(&id) {
+                return Err(Error::ServerInitializing { server_id: id });
+            }
             let found = lock_std(&self.lsp_clients).get(&id).cloned();
             if let Some(client) = found {
                 return Ok((id, client));
-            }
-            // A route naming a server that is still initializing (e.g. a
-            // large Unity solution loading via OmniSharp) -- tell the caller
-            // to wait and retry rather than implying no server is configured.
-            if lock_std(&self.expected_servers).contains(&id) {
-                return Err(Error::ServerInitializing { server_id: id });
             }
             // Unreachable once registration has rebound the router
             // (`Translator::rebind_router`) -- a route can only name a
@@ -390,6 +391,29 @@ mod tests {
         let mut expected = HashSet::new();
         expected.insert(id.clone());
         translator.set_expected_servers(expected);
+
+        let err = translator
+            .get_client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
+        assert!(matches!(err, Error::ServerInitializing { server_id } if server_id == id));
+    }
+
+    #[test]
+    fn test_get_client_for_file_rejects_registered_server_while_expected() {
+        // A completed initialize handshake registers the client before the
+        // server's initial semantic index is authoritative. Semantic callers
+        // must still wait instead of receiving an incomplete/empty result.
+        let path = PathBuf::from("/ws/src/lib.rs");
+        let lang = "rust".to_owned();
+        let id = ServerId::from(lang.clone());
+        let config = LspServerConfig::rust_analyzer();
+        let client = LspClient::new(config);
+
+        let translator = Translator::new()
+            .with_extensions(HashMap::from([("rs".to_owned(), lang.clone())]))
+            .with_router(ToolRouter::catch_all([(id.clone(), lang)]));
+        translator.register_client(id.clone(), client);
+        translator.set_expected_servers(HashSet::from([id.clone()]));
 
         let err = translator
             .get_client_for_file(&path, ToolKind::Hover)
