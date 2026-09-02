@@ -77,6 +77,20 @@ pub(crate) struct LexicalSearchMatch {
     pub byte_range: Range<usize>,
 }
 
+/// Results of a bounded scan, including accounting for matches that were not
+/// retained for the requested page.
+#[derive(Debug, Clone)]
+pub(crate) struct LexicalSearchScan {
+    /// Matches retained for the caller's requested window.
+    pub matches: Vec<LexicalSearchMatch>,
+    /// Total matches found in the scanned snapshot.
+    pub total_matches: usize,
+    /// Number of files whose snapshots were read.
+    pub scanned_files: usize,
+    /// Total UTF-8 bytes examined across those snapshots.
+    pub scanned_bytes: usize,
+}
+
 /// One bounded lexical-search page with deterministic continuation metadata.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(crate) struct LexicalSearchResult {
@@ -84,6 +98,14 @@ pub(crate) struct LexicalSearchResult {
     pub matches: Vec<LexicalSearchMatch>,
     /// Number of identities in `matches`.
     pub returned: usize,
+    /// Total matches found in the scanned snapshot.
+    pub total: usize,
+    /// Matches remaining after this page.
+    pub remaining: usize,
+    /// Number of files scanned to produce this page.
+    pub scanned_files: usize,
+    /// UTF-8 bytes scanned to produce this page.
+    pub scanned_bytes: usize,
     /// Effective serialized byte ceiling applied to this page.
     pub max_bytes: usize,
     /// Whether another page is available.

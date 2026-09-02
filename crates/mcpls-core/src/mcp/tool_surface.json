@@ -17824,8 +17824,32 @@
             "null"
           ]
         },
+        "remaining": {
+          "description": "Matches remaining after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "returned": {
           "description": "Number of identities in `matches`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scanned_bytes": {
+          "description": "UTF-8 bytes scanned to produce this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scanned_files": {
+          "description": "Number of files scanned to produce this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "description": "Total matches found in the scanned snapshot.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -17838,6 +17862,10 @@
       "required": [
         "matches",
         "returned",
+        "total",
+        "remaining",
+        "scanned_files",
+        "scanned_bytes",
         "max_bytes",
         "truncated"
       ],

@@ -514,17 +514,45 @@ fn validate_inspect_symbol_batch(params: &InspectSymbolBatchParams) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn bounded_lexical_page(
-    mut matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
+    matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
     offset: usize,
     has_next_page: bool,
     max_bytes: usize,
 ) -> Result<crate::bridge::lexical::LexicalSearchResult, usize> {
-    let total_matches = matches.len();
+    let total_matches = offset
+        .saturating_add(matches.len())
+        .saturating_add(usize::from(has_next_page));
+    bounded_lexical_page_with_accounting(
+        matches,
+        offset,
+        has_next_page,
+        max_bytes,
+        total_matches,
+        0,
+        0,
+    )
+}
+
+fn bounded_lexical_page_with_accounting(
+    mut matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
+    offset: usize,
+    has_next_page: bool,
+    max_bytes: usize,
+    total_matches: usize,
+    scanned_files: usize,
+    scanned_bytes: usize,
+) -> Result<crate::bridge::lexical::LexicalSearchResult, usize> {
+    let candidate_matches = matches.len();
     loop {
-        let truncated = has_next_page || matches.len() < total_matches;
+        let truncated = has_next_page || matches.len() < candidate_matches;
         let page = crate::bridge::lexical::LexicalSearchResult {
             returned: matches.len(),
+            total: total_matches,
+            remaining: total_matches.saturating_sub(offset.saturating_add(matches.len())),
+            scanned_files,
+            scanned_bytes,
             max_bytes,
             next_cursor: truncated.then(|| offset.saturating_add(matches.len()).to_string()),
             truncated,
@@ -3679,7 +3707,7 @@ impl McplsServer {
             .actor_for_project(&id)
             .await
             .map_err(project_routing_error)?;
-        let mut matches = actor
+        let scan = actor
             .lexical_search(LexicalSearchRequest {
                 query: params.query,
                 mode: params.mode,
@@ -3694,13 +3722,18 @@ impl McplsServer {
             })
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let has_next_page = matches.len() > offset.saturating_add(limit);
-        let end = offset.saturating_add(limit).min(matches.len());
-        let matches = matches
-            .drain(offset.min(matches.len())..end)
-            .collect::<Vec<_>>();
+        let has_next_page = scan.total_matches > offset.saturating_add(limit);
+        let matches = scan.matches.into_iter().skip(offset).take(limit).collect();
         let max_bytes = effective_lexical_page_bytes(params.max_bytes);
-        let page = bounded_lexical_page(matches, offset, has_next_page, max_bytes)
+        let page = bounded_lexical_page_with_accounting(
+            matches,
+            offset,
+            has_next_page,
+            max_bytes,
+            scan.total_matches,
+            scan.scanned_files,
+            scan.scanned_bytes,
+        )
             .map_err(|required_bytes| {
                 McpError::invalid_params(
                     format!(

@@ -23,7 +23,8 @@ use crate::bridge::DeferredResourceReference;
 use crate::bridge::ast_grep::byte_offset_to_position;
 use crate::bridge::convert_code_action_or_command;
 use crate::bridge::lexical::{
-    LexicalSearchMatch, LexicalSearchRequest, collect_project_paths_filtered, find_matches,
+    LexicalSearchMatch, LexicalSearchRequest, LexicalSearchScan, collect_project_paths_filtered,
+    find_matches,
 };
 use crate::bridge::resources::SourceResource;
 use crate::bridge::resources::make_source_uri;
@@ -1750,7 +1751,7 @@ enum ProjectRequest {
     },
     LexicalSearch {
         request: LexicalSearchRequest,
-        reply: oneshot::Sender<Result<Vec<LexicalSearchMatch>, String>>,
+        reply: oneshot::Sender<Result<LexicalSearchScan, String>>,
     },
     InspectSymbol {
         request: InspectSymbolRequest,
@@ -2829,7 +2830,7 @@ impl ProjectHandle {
     pub(crate) async fn lexical_search(
         &self,
         request: LexicalSearchRequest,
-    ) -> Result<Vec<LexicalSearchMatch>, ProjectActorError> {
+    ) -> Result<LexicalSearchScan, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::LexicalSearch { request, reply })
@@ -6745,7 +6746,7 @@ impl ProjectRuntime {
     async fn lexical_search(
         &self,
         request: LexicalSearchRequest,
-    ) -> Result<Vec<LexicalSearchMatch>, String> {
+    ) -> Result<LexicalSearchScan, String> {
         const LEXICAL_CONTEXT_BYTES: usize = 16 * 1024;
         let paths = collect_project_paths_filtered(
             self.translator.workspace_roots(),
@@ -6756,11 +6757,12 @@ impl ProjectRuntime {
         )
         .await?;
         let mut matches = Vec::new();
+        let mut total_matches: usize = 0;
+        let mut scanned_bytes: usize = 0;
+        let mut scanned_files: usize = 0;
         let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
         for path in paths {
-            if matches.len() >= request.max_matches {
-                break;
-            }
+            scanned_files += 1;
             let (path, document_version, content_hash, source) =
                 match self.translator.source_snapshot(&path).await {
                     Ok(snapshot) => snapshot,
@@ -6771,6 +6773,7 @@ impl ProjectRuntime {
                     }
                     Err(error) => return Err(error.to_string()),
                 };
+            scanned_bytes = scanned_bytes.saturating_add(source.len());
             let ranges = find_matches(
                 &source,
                 &request.query,
@@ -6778,6 +6781,7 @@ impl ProjectRuntime {
                 request.case,
                 request.multiline,
             )?;
+            total_matches = total_matches.saturating_add(ranges.len());
             let remaining = request.max_matches.saturating_sub(matches.len());
             let project_relative_path = self
                 .translator
@@ -6839,7 +6843,12 @@ impl ProjectRuntime {
                 });
             }
         }
-        Ok(matches)
+        Ok(LexicalSearchScan {
+            matches,
+            total_matches,
+            scanned_files,
+            scanned_bytes,
+        })
     }
 
     async fn workspace_snapshot_identity(&self) -> Result<String, String> {
@@ -11944,19 +11953,23 @@ mod tests {
     async fn lexical_search_skips_non_utf8_files() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("binary.dat"), [0xff]).unwrap();
-        fs::write(root.path().join("source.rs"), "fn status_chip() {}\n").unwrap();
+        fs::write(
+            root.path().join("source.rs"),
+            "fn status_chip() {}\nfn status_chip_again() {}\n",
+        )
+        .unwrap();
         let mut translator = Translator::new();
         translator.set_workspace_roots(vec![root.path().to_path_buf()]);
         let runtime = ProjectRuntime::new(translator);
 
-        let matches = runtime
+        let scan = runtime
             .lexical_search(LexicalSearchRequest {
                 query: "status_chip".to_owned(),
                 mode: crate::bridge::LexicalMatchMode::Literal,
                 case: crate::bridge::LexicalCaseMode::Sensitive,
                 multiline: false,
                 max_files: 10,
-                max_matches: 10,
+                max_matches: 1,
                 include_generated: false,
                 include_paths: Vec::new(),
                 exclude_paths: Vec::new(),
@@ -11965,8 +11978,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].project_relative_path, "source.rs");
+        assert_eq!(scan.matches.len(), 1);
+        assert_eq!(scan.total_matches, 2);
+        assert_eq!(scan.scanned_files, 2);
+        assert_eq!(scan.matches[0].project_relative_path, "source.rs");
     }
 
     #[tokio::test]
