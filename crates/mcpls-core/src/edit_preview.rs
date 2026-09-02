@@ -126,6 +126,14 @@ pub enum PreviewError {
         #[source]
         source: std::io::Error,
     },
+    /// A tracked document could not be refreshed before planning.
+    #[error("failed to refresh workspace edit target {path}: {error}")]
+    Refresh {
+        /// Target path.
+        path: PathBuf,
+        /// Refresh failure.
+        error: String,
+    },
     /// A preview exceeded one configured bound.
     #[error("workspace edit preview exceeds {kind} limit: {actual} > {limit}")]
     Limit {
@@ -136,6 +144,50 @@ pub enum PreviewError {
         /// Configured maximum.
         limit: usize,
     },
+}
+
+/// Refresh every tracked document touched by a workspace edit before planning.
+///
+/// The tracker remains authoritative for clean open documents after external
+/// rewrites, while dirty documents retain their in-memory text and conflict
+/// state. Untracked files stay disk-owned and are read by the planner itself.
+pub(crate) async fn refresh_workspace_edit_documents(
+    edit: &WorkspaceEdit,
+    documents: &DocumentTracker,
+    limits: PreviewLimits,
+) -> Result<(), PreviewError> {
+    let normalized = normalize(edit.clone()).expect("workspace edit normalization is infallible");
+    let mut paths = BTreeSet::new();
+    for operation in normalized.operations {
+        match operation {
+            EditOperation::Text { uri, .. }
+            | EditOperation::Create { uri, .. }
+            | EditOperation::Delete { uri, .. } => {
+                paths.insert(path_for_uri(&uri.to_string())?);
+            }
+            EditOperation::Rename {
+                old_uri, new_uri, ..
+            } => {
+                paths.insert(path_for_uri(&old_uri.to_string())?);
+                paths.insert(path_for_uri(&new_uri.to_string())?);
+            }
+        }
+        if paths.len() > limits.max_files {
+            return Err(PreviewError::Limit {
+                kind: "file",
+                actual: paths.len(),
+                limit: limits.max_files,
+            });
+        }
+    }
+    documents
+        .refresh_paths(paths)
+        .await
+        .map_err(|(path, error)| PreviewError::Refresh {
+            path,
+            error: error.to_string(),
+        })?;
+    Ok(())
 }
 
 struct PlannedFile {

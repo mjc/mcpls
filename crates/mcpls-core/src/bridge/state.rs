@@ -480,6 +480,29 @@ impl DocumentTracker {
         self.refresh_from_disk_status(path).await.map(|_| ())
     }
 
+    /// Refresh the tracked documents in an explicit freshness boundary.
+    ///
+    /// Paths are refreshed serially under their existing per-path locks. An
+    /// untracked path remains disk-owned and is skipped. The failing path is
+    /// returned with the underlying error so callers can report a precise
+    /// boundary failure without reimplementing this policy.
+    pub(crate) async fn refresh_paths<I>(
+        &self,
+        paths: I,
+    ) -> std::result::Result<(), (PathBuf, Error)>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        for path in paths {
+            if self.is_open(&path) {
+                self.refresh_from_disk(&path)
+                    .await
+                    .map_err(|error| (path, error))?;
+            }
+        }
+        Ok(())
+    }
+
     async fn refresh_from_disk_status(&self, path: &Path) -> Result<ExternalChange> {
         let _path_guard = self.lock_path(path).await;
         let Some((current, local_edit, external_conflict)) =

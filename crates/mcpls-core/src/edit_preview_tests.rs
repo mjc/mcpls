@@ -87,6 +87,58 @@ fn open_document_that_differs_from_disk_makes_preview_unsafe() {
     assert_eq!(fs::read_to_string(file).unwrap(), "newer disk content\n");
 }
 
+#[tokio::test]
+async fn freshness_preflight_is_bounded_by_file_limit() {
+    let root = TempDir::new().unwrap();
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    let edit = WorkspaceEdit {
+        changes: Some(HashMap::from([
+            (
+                path_to_uri(&first).unwrap(),
+                vec![lsp_types::TextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 0),
+                    ),
+                    new_text: "first".to_string(),
+                }],
+            ),
+            (
+                path_to_uri(&second).unwrap(),
+                vec![lsp_types::TextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 0),
+                    ),
+                    new_text: "second".to_string(),
+                }],
+            ),
+        ])),
+        document_changes: None,
+        change_annotations: None,
+    };
+
+    let result = refresh_workspace_edit_documents(
+        &edit,
+        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
+        PreviewLimits {
+            max_files: 1,
+            ..PreviewLimits::default()
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(PreviewError::Limit {
+            kind: "file",
+            actual: 2,
+            limit: 1,
+        })
+    ));
+}
+
 #[test]
 fn preview_and_apply_preserve_rust_literal_bytes_across_workspace_edit_transport() {
     let root = TempDir::new().unwrap();

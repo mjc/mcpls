@@ -57,6 +57,7 @@ use crate::edit_paths::{FileOperation, OperationValidationError, WorkspaceBounda
 use crate::edit_plan::{AuditLogPolicy, EditAuditRecord, EditPlan, EditPlanStore, PlanId};
 use crate::edit_preview::{
     EditProducer, PreviewArtifact, PreviewLimits, VerificationStatus, preview_workspace_edit,
+    refresh_workspace_edit_documents,
 };
 use crate::lsp::{LspNotification, load_project_environment, resolve_command};
 use crate::project_persistence::{PersistedProject, ProjectRegistrationStore};
@@ -5173,7 +5174,7 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn preview_edit(
+    async fn preview_edit(
         &mut self,
         project_id: &str,
         edit: WorkspaceEdit,
@@ -5181,13 +5182,17 @@ impl ProjectRuntime {
         root: &Path,
     ) -> Result<PreviewArtifact, String> {
         let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
+        let limits = PreviewLimits::default();
+        refresh_workspace_edit_documents(&edit, self.translator.document_tracker(), limits)
+            .await
+            .map_err(|error| error.to_string())?;
         let artifact = preview_workspace_edit(
             &boundary,
             project_id,
             edit,
             encoding,
             self.translator.document_tracker(),
-            PreviewLimits::default(),
+            limits,
         )
         .map_err(|error| error.to_string())?;
         self.edit_plans
@@ -5259,10 +5264,10 @@ impl ProjectRuntime {
                 (result.supported, result.edit, false)
             }
         };
-        let artifact = edit
-            .or_else(|| create_empty_plan.then(WorkspaceEdit::default))
-            .map(|edit| self.preview_edit(project_id, edit, encoding, root))
-            .transpose()?;
+        let artifact = match edit.or_else(|| create_empty_plan.then(WorkspaceEdit::default)) {
+            Some(edit) => Some(self.preview_edit(project_id, edit, encoding, root).await?),
+            None => None,
+        };
         Ok(GeneratedEditPreview {
             supported,
             artifact,
@@ -5343,14 +5348,15 @@ impl ProjectRuntime {
             }
         };
         let scanned_files = self.validate_structural_snapshots(&snapshots).await?;
-        let artifact = edit
-            .map(|edit| {
-                let mut artifact = self.preview_edit(project_id, edit, encoding, root)?;
+        let artifact = match edit {
+            Some(edit) => {
+                let mut artifact = self.preview_edit(project_id, edit, encoding, root).await?;
                 artifact.verification = Some(verification);
                 artifact.producer = Some(producer);
-                Ok::<_, String>(artifact)
-            })
-            .transpose()?;
+                Some(artifact)
+            }
+            None => None,
+        };
         let matched_files = artifact.as_ref().map_or(scanned_files, |artifact| {
             let matched_paths = matches
                 .iter()
@@ -5445,7 +5451,9 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         let (edit, providers, semantic_edit_count) =
             compose_path_rename_edit(result, &old_path, &new_path)?;
-        let mut artifact = self.preview_edit(project_id, edit, request.encoding, root)?;
+        let mut artifact = self
+            .preview_edit(project_id, edit, request.encoding, root)
+            .await?;
         artifact.verification = Some(if semantic_edit_count > 0 {
             VerificationStatus::SemanticVerified
         } else {
@@ -5558,7 +5566,7 @@ impl ProjectRuntime {
             .map_or((structural_edit, EditProducer::StructuralAstGrep), |edit| {
                 (edit, EditProducer::RustAnalyzer)
             });
-        let mut artifact = self.preview_edit(project_id, edit, encoding, root)?;
+        let mut artifact = self.preview_edit(project_id, edit, encoding, root).await?;
         artifact.verification = Some(verification);
         artifact.producer = Some(producer);
         if let Some(destination_path) = artifact
@@ -7620,7 +7628,7 @@ impl ProjectRuntime {
         let edit = action
             .edit
             .ok_or_else(|| "resolved code action has no workspace edit".to_string())?;
-        self.preview_edit(project_id, edit, encoding, root)
+        self.preview_edit(project_id, edit, encoding, root).await
     }
 
     async fn prepare_call_hierarchy(
@@ -9173,7 +9181,11 @@ async fn handle_project_request(
             root,
             reply,
         } => {
-            let _ = reply.send(runtime.preview_edit(&project_id, edit, encoding, &root));
+            let _ = reply.send(
+                runtime
+                    .preview_edit(&project_id, edit, encoding, &root)
+                    .await,
+            );
         }
         ProjectRequest::MoveInlineModulePreview {
             project_id,
@@ -16168,8 +16180,8 @@ while True:
         assert_eq!(dormancy.idle_for(), Some(idle_for));
     }
 
-    #[test]
-    fn path_rename_composition_uses_authoritative_open_document_content() {
+    #[tokio::test]
+    async fn path_rename_composition_uses_authoritative_open_document_content() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("old.rs");
         let destination = root.path().join("renamed.rs");
@@ -16210,6 +16222,7 @@ while True:
         let mut runtime = ProjectRuntime::new(translator);
         let artifact = runtime
             .preview_edit("project", edit, PositionEncoding::Utf8, root.path())
+            .await
             .unwrap();
 
         assert_eq!(providers, ["rust"]);
@@ -16235,6 +16248,93 @@ while True:
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn preview_edit_refreshes_clean_tracked_document_after_external_rewrite() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("source.rs");
+        fs::write(&file, "before\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let tracker = translator.document_tracker();
+        tracker.open(file.clone(), "before\n".to_owned()).unwrap();
+        tracker.refresh_from_disk(&file).await.unwrap();
+
+        fs::write(&file, "after!\n").unwrap();
+        let edit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                path_to_uri(&file).unwrap().to_string(): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 5}
+                    },
+                    "newText": "fresh"
+                }]
+            }
+        }))
+        .unwrap();
+
+        let mut runtime = ProjectRuntime::new(translator);
+        let artifact = runtime
+            .preview_edit("project", edit, PositionEncoding::Utf8, root.path())
+            .await
+            .unwrap();
+
+        assert!(artifact.plan.safe_to_apply(), "{:?}", artifact.conflicts);
+        assert_eq!(artifact.plan.files()[0].original_content(), "after!\n");
+        assert_eq!(artifact.plan.files()[0].planned_content(), "fresh!\n");
+    }
+
+    #[tokio::test]
+    async fn preview_edit_preserves_dirty_document_on_external_rewrite() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("source.rs");
+        fs::write(&file, "external\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        translator
+            .document_tracker_mut()
+            .open(file.clone(), "local\n".to_owned())
+            .unwrap();
+
+        fs::write(&file, "external rewrite\n").unwrap();
+        let edit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                path_to_uri(&file).unwrap().to_string(): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 5}
+                    },
+                    "newText": "fresh"
+                }]
+            }
+        }))
+        .unwrap();
+
+        let mut runtime = ProjectRuntime::new(translator);
+        let artifact = runtime
+            .preview_edit("project", edit, PositionEncoding::Utf8, root.path())
+            .await
+            .unwrap();
+
+        assert!(!artifact.plan.safe_to_apply());
+        assert!(
+            artifact
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("open document differs from disk"))
+        );
+        assert_eq!(
+            runtime
+                .translator
+                .document_tracker()
+                .get(&file)
+                .unwrap()
+                .content(),
+            "local\n"
+        );
+        assert_eq!(fs::read_to_string(file).unwrap(), "external rewrite\n");
     }
 
     #[test]
