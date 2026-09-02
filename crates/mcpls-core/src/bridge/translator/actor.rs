@@ -22,7 +22,7 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::lsp::{
-    LspNotification, LspServer, ServerInitConfig, apply_project_environment,
+    LspNotification, LspServer, ServerInitConfig, WatchInvalidation, apply_project_environment,
     load_project_environment, resolve_command,
 };
 
@@ -38,26 +38,42 @@ pub enum ActivationHealth {
 }
 
 fn spawn_external_change_forwarder(
-    mut receiver: mpsc::UnboundedReceiver<PathBuf>,
+    mut receiver: mpsc::UnboundedReceiver<WatchInvalidation>,
     tracker: Arc<DocumentTracker>,
 ) {
     tokio::spawn(async move {
         while let Some(first) = receiver.recv().await {
-            let paths = coalesce_external_changes(first, &mut receiver);
-            tracker.mark_external_changes(paths);
+            tracker.invalidate_external(coalesce_external_changes(first, &mut receiver));
         }
     });
 }
 
 fn coalesce_external_changes(
-    first: PathBuf,
-    receiver: &mut mpsc::UnboundedReceiver<PathBuf>,
-) -> BTreeSet<PathBuf> {
-    let mut paths = BTreeSet::from([first]);
-    while let Ok(path) = receiver.try_recv() {
-        paths.insert(path);
+    first: WatchInvalidation,
+    receiver: &mut mpsc::UnboundedReceiver<WatchInvalidation>,
+) -> WatchInvalidation {
+    let mut paths = BTreeSet::new();
+    let mut roots = false;
+    let mut all = false;
+    let mut next = Some(first);
+    while let Some(invalidation) = next {
+        match invalidation {
+            WatchInvalidation::Paths(changed_paths) => paths.extend(changed_paths),
+            WatchInvalidation::Roots(changed_roots) => {
+                roots = true;
+                paths.extend(changed_roots);
+            }
+            WatchInvalidation::All => all = true,
+        }
+        next = receiver.try_recv().ok();
     }
-    paths
+    if all {
+        WatchInvalidation::All
+    } else if roots {
+        WatchInvalidation::Roots(paths.into_iter().collect())
+    } else {
+        WatchInvalidation::Paths(paths.into_iter().collect())
+    }
 }
 
 /// Language-server handles produced by one project activation.
@@ -1262,14 +1278,53 @@ mod tests {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let first = PathBuf::from("first.rs");
         let second = PathBuf::from("second.rs");
-        sender.send(first.clone()).unwrap();
-        sender.send(second.clone()).unwrap();
-        sender.send(first.clone()).unwrap();
+        sender
+            .send(WatchInvalidation::Paths(vec![first.clone()]))
+            .unwrap();
+        sender
+            .send(WatchInvalidation::Paths(vec![second.clone()]))
+            .unwrap();
+        sender
+            .send(WatchInvalidation::Paths(vec![first.clone()]))
+            .unwrap();
 
         let received = receiver.try_recv().unwrap();
         assert_eq!(
             coalesce_external_changes(received, &mut receiver),
-            BTreeSet::from([first, second])
+            WatchInvalidation::Paths(vec![first, second])
+        );
+    }
+
+    #[test]
+    fn coalesces_a_rescan_with_paths_as_global_invalidation() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender
+            .send(WatchInvalidation::Paths(vec![PathBuf::from("first.rs")]))
+            .unwrap();
+        sender.send(WatchInvalidation::All).unwrap();
+
+        let received = receiver.try_recv().unwrap();
+        assert_eq!(
+            coalesce_external_changes(received, &mut receiver),
+            WatchInvalidation::All
+        );
+    }
+
+    #[test]
+    fn coalesces_paths_into_directory_roots() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let directory = PathBuf::from("src");
+        sender
+            .send(WatchInvalidation::Roots(vec![directory.clone()]))
+            .unwrap();
+        sender
+            .send(WatchInvalidation::Paths(vec![PathBuf::from("Cargo.toml")]))
+            .unwrap();
+
+        let received = receiver.try_recv().unwrap();
+        assert_eq!(
+            coalesce_external_changes(received, &mut receiver),
+            WatchInvalidation::Roots(vec![PathBuf::from("Cargo.toml"), directory])
         );
     }
 

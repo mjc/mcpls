@@ -15,6 +15,7 @@ use tracing::{debug, debug_span, error, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
+use crate::lsp::WatchInvalidation;
 use crate::lsp::notification::NonBlockingNotificationSink;
 #[cfg(test)]
 use crate::lsp::notification::non_blocking_notification_channel;
@@ -22,7 +23,7 @@ use crate::lsp::transport::{LspReader, LspTransport, LspWriter};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LspNotification, RequestId,
 };
-use crate::lsp::watcher::{WATCH_EVENT_CHANNEL_CAPACITY, WatchRegistry, WatchSignal, signal_paths};
+use crate::lsp::watcher::{WATCH_EVENT_CHANNEL_CAPACITY, WatchRegistry, WatchSignal};
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -142,10 +143,10 @@ pub struct LspClient {
     /// that only when its own timeout elapses.
     pending_requests: Arc<Mutex<PendingRequests>>,
 
-    /// Filesystem paths reported by the native watcher. The owning project
-    /// consumes this stream to invalidate its shared document tracker; the
-    /// LSP `didChangeWatchedFiles` notification remains a separate concern.
-    watch_change_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
+    /// Invalidation scopes reported by the native watcher. The owning project
+    /// consumes this stream to refresh its shared document tracker; LSP
+    /// `didChangeWatchedFiles` notifications remain a separate concern.
+    watch_change_rx: Option<mpsc::UnboundedReceiver<WatchInvalidation>>,
 
     /// Background receiver task handle.
     receiver_task: Option<JoinHandle<Result<()>>>,
@@ -374,7 +375,7 @@ impl LspClient {
     }
 
     /// Take the filesystem watcher stream out of the owning client.
-    pub(super) fn take_watch_change_rx(&mut self) -> mpsc::UnboundedReceiver<PathBuf> {
+    pub(super) fn take_watch_change_rx(&mut self) -> mpsc::UnboundedReceiver<WatchInvalidation> {
         self.watch_change_rx.take().unwrap_or_else(|| {
             let (_, receiver) = mpsc::unbounded_channel();
             receiver
@@ -713,7 +714,7 @@ impl LspClient {
         pending_requests: Arc<Mutex<PendingRequests>>,
         notification_sink: Option<NonBlockingNotificationSink>,
         workspace_roots: Vec<std::path::PathBuf>,
-        watch_change_tx: mpsc::UnboundedSender<PathBuf>,
+        watch_change_tx: mpsc::UnboundedSender<WatchInvalidation>,
     ) -> Result<()> {
         debug!("Message loop started");
         let (writer, mut reader) = transport.split();
@@ -772,7 +773,7 @@ impl LspClient {
         watch_registry: &mut WatchRegistry,
         watch_signal_rx: &mut mpsc::Receiver<WatchSignal>,
         outbound_tx: &mpsc::Sender<OutboundBatch>,
-        watch_change_tx: &mpsc::UnboundedSender<PathBuf>,
+        watch_change_tx: &mpsc::UnboundedSender<WatchInvalidation>,
     ) -> Result<()> {
         loop {
             tokio::select! {
@@ -883,17 +884,16 @@ impl LspClient {
                 }
 
                 Some(signal) = watch_signal_rx.recv() => {
-                    for path in signal_paths(&signal) {
-                        let _ = watch_change_tx.send(path);
-                    }
-                    let events = match watch_registry.handle_signal(signal) {
-                        Ok(events) => events,
+                    let update = match watch_registry.handle_signal(signal) {
+                        Ok(update) => update,
                         Err(error) => {
+                            let _ = watch_change_tx.send(WatchInvalidation::All);
                             warn!("Watched-file runtime degraded: {}", error.message);
                             continue;
                         }
                     };
-                    let messages = events
+                    let _ = watch_change_tx.send(update.invalidation);
+                    let messages = update.events
                         .into_iter()
                         .filter(|event| watch_registry.accepts(event))
                         .map(|event| serde_json::json!({

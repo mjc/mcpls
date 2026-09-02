@@ -428,8 +428,10 @@ impl LspServer {
     /// Take the native filesystem-watcher stream out of this server.
     ///
     /// The project owns the shared document tracker, so it consumes these
-    /// paths and invalidates tracked snapshots before the next semantic call.
-    pub fn take_watch_change_rx(&mut self) -> mpsc::UnboundedReceiver<PathBuf> {
+    /// invalidation scopes before the next semantic call.
+    pub(crate) fn take_watch_change_rx(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<super::WatchInvalidation> {
         self.client.take_watch_change_rx()
     }
 

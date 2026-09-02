@@ -20,7 +20,7 @@ use url::Url;
 use super::lock_std;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::LspClient;
+use crate::lsp::{LspClient, WatchInvalidation};
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
 /// [`mtime_settled`]. The stat itself is never debounced -- only this
@@ -522,15 +522,33 @@ impl DocumentTracker {
             .map(|state| state.apply_local_edit(content))
     }
 
-    /// Invalidate a coalesced watcher batch under one short map lock.
-    pub(crate) fn mark_external_changes<I>(&self, paths: I)
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
+    /// Invalidate tracked snapshots affected by a coalesced watcher batch.
+    ///
+    /// Directory roots invalidate only their tracked descendants. A watcher
+    /// overflow cannot name reliable paths, so `All` deliberately fails
+    /// closed and makes every tracked document revalidate on its next
+    /// semantic read or edit.
+    pub(crate) fn invalidate_external(&self, invalidation: WatchInvalidation) {
         let mut documents = lock_std(&self.documents);
-        for path in paths {
-            if let Some(state) = documents.get_mut(&path) {
-                state.invalidate_external();
+        match invalidation {
+            WatchInvalidation::Paths(paths) => {
+                for path in paths {
+                    if let Some(state) = documents.get_mut(&path) {
+                        state.invalidate_external();
+                    }
+                }
+            }
+            WatchInvalidation::Roots(roots) => {
+                for (path, state) in &mut *documents {
+                    if roots.iter().any(|root| path.starts_with(root)) {
+                        state.invalidate_external();
+                    }
+                }
+            }
+            WatchInvalidation::All => {
+                for state in documents.values_mut() {
+                    state.invalidate_external();
+                }
             }
         }
     }
@@ -2340,6 +2358,19 @@ mod tests {
         SystemTime::now() - Duration::from_secs(10)
     }
 
+    async fn open_settled_document(
+        tracker: &DocumentTracker,
+        path: &Path,
+        client: &LspClient,
+    ) -> SystemTime {
+        set_mtime(path, settled_past());
+        tracker
+            .ensure_open(path, &ServerId::from("rust"), client)
+            .await
+            .unwrap();
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
     /// Reads one `Content-Length`-framed JSON-RPC message off `reader`.
     ///
     /// `reader` must be reused across calls (not recreated per message):
@@ -2502,36 +2533,78 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_ensure_open_resyncs_after_watcher_invalidation() {
+    async fn test_directory_watcher_invalidation_leaves_unrelated_document_cached() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("a.rs");
-        std::fs::write(&path, "AAAA").unwrap();
-        set_mtime(&path, settled_past());
+        let changed_root = dir.path().join("changed");
+        let untouched_root = dir.path().join("untouched");
+        std::fs::create_dir(&changed_root).unwrap();
+        std::fs::create_dir(&untouched_root).unwrap();
+        let changed = changed_root.join("changed.rs");
+        let untouched = untouched_root.join("untouched.rs");
+        std::fs::write(&changed, "AAAA").unwrap();
+        std::fs::write(&untouched, "CCCC").unwrap();
 
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
-            .await
-            .unwrap();
-        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let changed_mtime = open_settled_document(&tracker, &changed, &client).await;
+        let untouched_mtime = open_settled_document(&tracker, &untouched, &client).await;
 
-        // Simulate cargo fmt's atomic replacement while preserving the
-        // settled stat tuple. The watcher event is the missing invalidation
-        // signal that makes this rewrite observable without hashing every
-        // unchanged file.
-        std::fs::write(&path, "BBBB").unwrap();
-        set_mtime(&path, original_mtime);
-        tracker.mark_external_changes([path.clone()]);
+        // Same-size rewrites preserving settled metadata are visible only
+        // through the native watcher invalidation; an unrelated path remains
+        // on the cheap cached path.
+        std::fs::write(&changed, "BBBB").unwrap();
+        set_mtime(&changed, changed_mtime);
+        std::fs::write(&untouched, "DDDD").unwrap();
+        set_mtime(&untouched, untouched_mtime);
+        tracker.invalidate_external(WatchInvalidation::Roots(vec![changed_root]));
 
         let outcome = tracker
-            .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
+            .ensure_open_with_status(&changed, &ServerId::from("rust"), &client)
             .await
             .unwrap();
         assert_eq!(outcome.external_change, ExternalChange::Reloaded);
-        let state = tracker.get(&path).unwrap();
+        let state = tracker.get(&changed).unwrap();
         assert_eq!(state.version(), 2);
         assert_eq!(state.content(), "BBBB");
+
+        tracker
+            .ensure_open(&untouched, &ServerId::from("rust"), &client)
+            .await
+            .unwrap();
+        let state = tracker.get(&untouched).unwrap();
+        assert_eq!(state.version(), 1);
+        assert_eq!(state.content(), "CCCC");
+    }
+
+    #[tokio::test]
+    async fn test_global_watcher_invalidation_reloads_every_tracked_document() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first.rs");
+        let second = dir.path().join("second.rs");
+        std::fs::write(&first, "AAAA").unwrap();
+        std::fs::write(&second, "CCCC").unwrap();
+
+        let (client, _server) = fake_lsp_client();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let first_mtime = open_settled_document(&tracker, &first, &client).await;
+        let second_mtime = open_settled_document(&tracker, &second, &client).await;
+
+        std::fs::write(&first, "BBBB").unwrap();
+        set_mtime(&first, first_mtime);
+        std::fs::write(&second, "DDDD").unwrap();
+        set_mtime(&second, second_mtime);
+        tracker.invalidate_external(WatchInvalidation::All);
+
+        for (path, expected) in [(&first, "BBBB"), (&second, "DDDD")] {
+            let outcome = tracker
+                .ensure_open_with_status(path, &ServerId::from("rust"), &client)
+                .await
+                .unwrap();
+            assert_eq!(outcome.external_change, ExternalChange::Reloaded);
+            let state = tracker.get(path).unwrap();
+            assert_eq!(state.version(), 2);
+            assert_eq!(state.content(), expected);
+        }
     }
 
     #[tokio::test]
@@ -2551,7 +2624,7 @@ mod tests {
 
         std::fs::write(&replacement, "BBBB").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        tracker.mark_external_changes([path.clone()]);
+        tracker.invalidate_external(WatchInvalidation::Paths(vec![path.clone()]));
 
         let outcome = tracker
             .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
@@ -2577,7 +2650,7 @@ mod tests {
         tracker.update(&path, "LOCAL".to_owned()).unwrap();
 
         std::fs::write(&path, "BBBB").unwrap();
-        tracker.mark_external_changes([path.clone()]);
+        tracker.invalidate_external(WatchInvalidation::Paths(vec![path.clone()]));
 
         let outcome = tracker
             .ensure_open_with_status(&path, &ServerId::from("rust"), &client)

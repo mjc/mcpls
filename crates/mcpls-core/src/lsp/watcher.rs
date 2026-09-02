@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use url::Url;
 
+use super::WatchInvalidation;
 use super::types::JsonRpcError;
 
 const MAX_REGISTRATIONS: usize = 64;
@@ -141,17 +142,12 @@ pub(super) enum WatchSignal {
     Error(String),
 }
 
-/// Return the concrete filesystem paths represented by an OS watcher signal.
-/// Rescans have no bounded path list; callers should rely on their own
-/// snapshot reconciliation for those signals.
-pub(super) fn signal_paths(signal: &WatchSignal) -> Vec<PathBuf> {
-    match signal {
-        WatchSignal::Event(event) => event_changes(event)
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect(),
-        WatchSignal::Rescan | WatchSignal::Error(_) => Vec::new(),
-    }
+/// One watcher update, coupling LSP notifications to the source-of-truth
+/// invalidation scope that produced them.
+#[derive(Debug)]
+pub(super) struct WatchUpdate {
+    pub(super) invalidation: WatchInvalidation,
+    pub(super) events: Vec<WatchedFileEvent>,
 }
 
 pub(super) struct WatchRegistry {
@@ -364,7 +360,7 @@ impl WatchRegistry {
     pub(super) fn handle_signal(
         &mut self,
         signal: WatchSignal,
-    ) -> Result<Vec<WatchedFileEvent>, JsonRpcError> {
+    ) -> Result<WatchUpdate, JsonRpcError> {
         let pending_error = self
             .pending_error
             .lock()
@@ -383,12 +379,18 @@ impl WatchRegistry {
             }
             WatchSignal::Rescan => {
                 self.overflowed.store(false, Ordering::Release);
-                return self.rescan();
+                return self.rescan().map(|events| WatchUpdate {
+                    invalidation: WatchInvalidation::All,
+                    events,
+                });
             }
             WatchSignal::Event(event) => event,
         };
         if self.overflowed.swap(false, Ordering::AcqRel) || event.need_rescan() {
-            return self.rescan();
+            return self.rescan().map(|events| WatchUpdate {
+                invalidation: WatchInvalidation::All,
+                events,
+            });
         }
 
         let raw_changes = event_changes(&event);
@@ -396,9 +398,22 @@ impl WatchRegistry {
             .iter()
             .any(|(path, _)| path.is_dir() || self.watched_directories.contains(path))
         {
-            return self.rescan();
+            return self.rescan().map(|events| WatchUpdate {
+                invalidation: WatchInvalidation::Roots(
+                    raw_changes.into_iter().map(|(path, _)| path).collect(),
+                ),
+                events,
+            });
         }
-        self.apply_changes(&raw_changes)
+        let invalidation = if raw_changes.is_empty() {
+            WatchInvalidation::All
+        } else {
+            WatchInvalidation::Paths(raw_changes.iter().map(|(path, _)| path.clone()).collect())
+        };
+        self.apply_changes(&raw_changes).map(|events| WatchUpdate {
+            invalidation,
+            events,
+        })
     }
 
     fn apply_changes(
@@ -1148,6 +1163,41 @@ mod tests {
     }
 
     #[test]
+    fn rescan_invalidates_every_tracked_document() {
+        let temp = TempDir::new().unwrap();
+        let (signal_tx, _signal_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
+        let mut registry = WatchRegistry::new(vec![temp.path().to_path_buf()], signal_tx).unwrap();
+
+        assert_eq!(
+            registry
+                .handle_signal(WatchSignal::Rescan)
+                .unwrap()
+                .invalidation,
+            WatchInvalidation::All
+        );
+    }
+
+    #[test]
+    fn directory_event_invalidates_tracked_descendants() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("src");
+        fs::create_dir(&directory).unwrap();
+        let signal = WatchSignal::Event(
+            Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )))
+            .add_path(directory.clone()),
+        );
+        let (signal_tx, _signal_rx) = mpsc::channel(WATCH_EVENT_CHANNEL_CAPACITY);
+        let mut registry = WatchRegistry::new(vec![temp.path().to_path_buf()], signal_tx).unwrap();
+
+        assert_eq!(
+            registry.handle_signal(signal).unwrap().invalidation,
+            WatchInvalidation::Roots(vec![directory])
+        );
+    }
+
+    #[test]
     fn registration_supports_workspace_and_relative_patterns() {
         let temp = TempDir::new().unwrap();
         let watchers = vec![
@@ -1382,7 +1432,7 @@ mod tests {
         fs::write(&created, "").unwrap();
         registry.overflowed.store(true, Ordering::Release);
 
-        let rescanned = changes(registry.handle_signal(other_event()).unwrap());
+        let rescanned = changes(registry.handle_signal(other_event()).unwrap().events);
         assert_eq!(rescanned.len(), 1);
         assert_eq!(
             rescanned[0]["uri"],
@@ -1415,13 +1465,13 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
         registry.overflowed.store(true, Ordering::Release);
-        let deleted = changes(registry.handle_signal(other_event()).unwrap());
+        let deleted = changes(registry.handle_signal(other_event()).unwrap().events);
         assert!(deleted.iter().any(|change| change["type"] == 3));
 
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("after.rs"), "").unwrap();
         registry.overflowed.store(true, Ordering::Release);
-        let created = changes(registry.handle_signal(other_event()).unwrap());
+        let created = changes(registry.handle_signal(other_event()).unwrap().events);
         assert!(created.iter().any(|change| change["type"] == 1));
     }
 
@@ -1516,8 +1566,8 @@ mod tests {
         timeout(Duration::from_secs(5), async {
             loop {
                 let signal = signal_rx.recv().await.unwrap();
-                let events = registry.handle_signal(signal).unwrap();
-                if events.iter().any(|event| {
+                let update = registry.handle_signal(signal).unwrap();
+                if update.events.iter().any(|event| {
                     event.params["changes"].as_array().is_some_and(|changes| {
                         changes
                             .iter()
@@ -1535,8 +1585,8 @@ mod tests {
         timeout(Duration::from_secs(5), async {
             loop {
                 let signal = signal_rx.recv().await.unwrap();
-                let events = registry.handle_signal(signal).unwrap();
-                if events.iter().any(|event| {
+                let update = registry.handle_signal(signal).unwrap();
+                if update.events.iter().any(|event| {
                     event.params["changes"].as_array().is_some_and(|changes| {
                         changes
                             .iter()

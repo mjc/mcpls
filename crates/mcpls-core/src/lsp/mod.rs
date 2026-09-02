@@ -10,6 +10,17 @@ mod transport;
 pub(crate) mod types;
 pub(crate) mod watcher;
 
+/// The tracked-document scope affected by a native filesystem watcher signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WatchInvalidation {
+    /// Concrete file paths whose snapshots are no longer current.
+    Paths(Vec<std::path::PathBuf>),
+    /// Directory roots whose tracked descendants may have changed.
+    Roots(Vec<std::path::PathBuf>),
+    /// A watcher overflow or error lost the affected path set.
+    All,
+}
+
 pub use client::LspClient;
 #[cfg(test)]
 pub(crate) use lifecycle::fake_lsp_server;
