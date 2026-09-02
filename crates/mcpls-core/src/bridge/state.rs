@@ -256,6 +256,10 @@ impl DocumentState {
         self.external_conflict = true;
     }
 
+    const fn mark_missing_external_conflict(&mut self) {
+        self.external_conflict = true;
+    }
+
     /// Records that `server` has synced up to `version`.
     fn mark_synced(&mut self, server: ServerId, version: i32) {
         self.synced.insert(server, version);
@@ -264,6 +268,50 @@ impl DocumentState {
     /// Forgets `server`'s sync history for this document.
     fn forget_server(&mut self, server: &ServerId) {
         self.synced.remove(server);
+    }
+}
+
+/// Immutable content selected from a tracked document.
+///
+/// Callers that need current source text must obtain this through
+/// [`DocumentTracker::reconciled_snapshot`], which serializes the disk check
+/// with all other reconciliation for this path before exposing the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentSnapshot {
+    uri: Uri,
+    language_id: String,
+    version: i32,
+    content: String,
+}
+
+impl DocumentSnapshot {
+    fn from_state(state: &DocumentState) -> Self {
+        Self {
+            uri: state.uri.clone(),
+            language_id: state.language_id.clone(),
+            version: state.version,
+            content: state.content.clone(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    #[must_use]
+    pub(crate) fn language_id(&self) -> &str {
+        &self.language_id
+    }
+
+    #[must_use]
+    pub(crate) const fn version(&self) -> i32 {
+        self.version
+    }
+
+    #[must_use]
+    pub(crate) fn content(&self) -> &str {
+        &self.content
     }
 }
 
@@ -342,10 +390,23 @@ impl DocumentTracker {
         lock_std(&self.documents).contains_key(path)
     }
 
-    /// Get a clone of the state of an open document.
+    /// Get a clone of the state of an open document for assertions.
     #[must_use]
-    pub fn get(&self, path: &Path) -> Option<DocumentState> {
+    #[cfg(test)]
+    pub(crate) fn get(&self, path: &Path) -> Option<DocumentState> {
         lock_std(&self.documents).get(path).cloned()
+    }
+
+    /// Return the current tracked snapshot without reading disk.
+    ///
+    /// This is suitable only for read-free decisions such as authorizing a
+    /// dirty snapshot whose path has been removed. Consumers of source text
+    /// must use [`Self::reconciled_snapshot`] instead.
+    #[must_use]
+    pub(crate) fn tracked_snapshot(&self, path: &Path) -> Option<DocumentSnapshot> {
+        lock_std(&self.documents)
+            .get(path)
+            .map(DocumentSnapshot::from_state)
     }
 
     /// Snapshot all currently open documents.
@@ -461,85 +522,37 @@ impl DocumentTracker {
             .map(|state| state.apply_local_edit(content))
     }
 
-    /// Invalidate a tracked document's disk provenance after a filesystem
-    /// watcher reports an external change. No bytes are read or overwritten
-    /// here; the next path synchronization performs the authoritative read.
-    pub(crate) fn mark_external_change(&self, path: &Path) {
-        if let Some(state) = lock_std(&self.documents).get_mut(path) {
-            state.invalidate_external();
-        }
-    }
-
-    /// Refresh a tracked document from disk for source-resource reads.
-    ///
-    /// Unlike [`Self::ensure_open`], this deliberately reads the file even
-    /// when its stat appears unchanged. A source resource is an explicit
-    /// request for current text, and this closes the settled-mtime hole that
-    /// a formatter or atomic replacement can otherwise leave behind.
-    pub(crate) async fn refresh_from_disk(&self, path: &Path) -> Result<()> {
-        self.refresh_from_disk_status(path).await.map(|_| ())
-    }
-
-    /// Refresh the tracked documents in an explicit freshness boundary.
-    ///
-    /// Paths are refreshed serially under their existing per-path locks. An
-    /// untracked path remains disk-owned and is skipped. The failing path is
-    /// returned with the underlying error so callers can report a precise
-    /// boundary failure without reimplementing this policy.
-    pub(crate) async fn refresh_paths<I>(
-        &self,
-        paths: I,
-    ) -> std::result::Result<(), (PathBuf, Error)>
+    /// Invalidate a coalesced watcher batch under one short map lock.
+    pub(crate) fn mark_external_changes<I>(&self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,
     {
+        let mut documents = lock_std(&self.documents);
         for path in paths {
-            if self.is_open(&path) {
-                self.refresh_from_disk(&path)
-                    .await
-                    .map_err(|error| (path, error))?;
+            if let Some(state) = documents.get_mut(&path) {
+                state.invalidate_external();
             }
         }
-        Ok(())
     }
 
-    async fn refresh_from_disk_status(&self, path: &Path) -> Result<ExternalChange> {
+    /// Reconcile one tracked path with disk and return the immutable result.
+    ///
+    /// An untracked path remains disk-owned and returns `None`. The disk read
+    /// is forced even when metadata matches, because source and edit
+    /// boundaries require the bytes they expose to be current.
+    pub(crate) async fn reconciled_snapshot(
+        &self,
+        path: &Path,
+    ) -> Result<Option<DocumentSnapshot>> {
         let _path_guard = self.lock_path(path).await;
-        let Some((current, local_edit, external_conflict)) =
-            lock_std(&self.documents).get(path).map(|state| {
-                (
-                    state.content.clone(),
-                    state.local_edit,
-                    state.external_conflict,
-                )
-            })
+        let Some(decision) = self
+            .reconcile_tracked(path, ReconcileMode::Required)
+            .await?
         else {
-            return Err(Error::DocumentNotFound(path.to_path_buf()));
+            return Ok(None);
         };
-        let (fresh, snap) = match self.read_disk_snapshot(path).await {
-            Ok(read) => read,
-            Err(Error::FileIo { .. }) if local_edit || external_conflict => {
-                return Ok(ExternalChange::Conflict);
-            }
-            Err(error) => return Err(error),
-        };
-        if fresh == current {
-            if let Some(state) = lock_std(&self.documents).get_mut(path) {
-                state.set_disk(snap);
-            }
-            return Ok(ExternalChange::Unchanged);
-        }
-        if local_edit {
-            if let Some(state) = lock_std(&self.documents).get_mut(path) {
-                state.mark_external_conflict(snap);
-            }
-            return Ok(ExternalChange::Conflict);
-        }
-        if let Some(state) = lock_std(&self.documents).get_mut(path) {
-            let version = state.version.saturating_add(1);
-            state.commit_reload(version, fresh, Some(snap));
-        }
-        Ok(ExternalChange::Reloaded)
+        self.commit_reconciliation(path, &decision);
+        Ok(self.tracked_snapshot(path))
     }
 
     /// Returns an error if `size` exceeds the configured file size limit.
@@ -801,87 +814,113 @@ impl DocumentTracker {
     /// LSP notification and never returns early in a way that would skip the
     /// per-server sync phase -- see `ensure_open`'s docs.
     async fn disk_phase(&self, path: &Path) -> Result<Decision> {
-        if !lock_std(&self.documents).contains_key(path) {
+        let Some(decision) = self
+            .reconcile_tracked(path, ReconcileMode::Observed)
+            .await?
+        else {
             return self.disk_phase_new(path).await;
+        };
+        if decision.external_change != ExternalChange::Reloaded {
+            self.commit_reconciliation(path, &decision);
         }
+        Ok(decision)
+    }
 
-        let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let mtime = meta.modified().ok();
-        let size = meta.len();
-
-        // `.map(...)` extracts an owned tuple from the lookup in a single
-        // statement, so the lock releases immediately rather than staying
-        // held while `fast_path` is computed.
-        let Some((uri, current_version, fast_path)) =
-            lock_std(&self.documents).get(path).map(|st| {
-                let stat_matches = st
-                    .disk()
-                    .is_some_and(|d| d.mtime == mtime && d.size == size);
-                let fast_path = match st.disk() {
-                    Some(d) if stat_matches && d.mtime_settled => true,
-                    Some(d)
-                        if stat_matches && d.content_checked_at.elapsed() < DISK_CHECK_DEBOUNCE =>
-                    {
-                        true
-                    }
-                    _ => false,
-                };
+    /// Decide how a tracked document relates to disk without talking to an
+    /// LSP server. All tracked-disk freshness paths route through this one
+    /// operation while the caller owns the per-path lock.
+    async fn reconcile_tracked(
+        &self,
+        path: &Path,
+        mode: ReconcileMode,
+    ) -> Result<Option<Decision>> {
+        let Some((uri, current_version, current, local_edit, external_conflict, disk)) =
+            lock_std(&self.documents).get(path).map(|state| {
                 (
-                    st.uri.clone(),
-                    st.version,
-                    fast_path && !st.external_conflict,
+                    state.uri.clone(),
+                    state.version,
+                    state.content.clone(),
+                    state.local_edit,
+                    state.external_conflict,
+                    state.disk(),
                 )
             })
         else {
-            return Err(Error::DocumentNotFound(path.to_path_buf()));
-        };
-        if fast_path {
-            return Ok(Decision::unchanged(uri, current_version));
-        }
-
-        let (fresh, snap) = self.read_disk_snapshot(path).await?;
-
-        let Some((unchanged, local_edit)) = lock_std(&self.documents)
-            .get(path)
-            .map(|st| (fresh == st.content, st.local_edit))
-        else {
-            return Err(Error::DocumentNotFound(path.to_path_buf()));
+            return Ok(None);
         };
 
-        if unchanged {
-            self.set_disk(path, snap);
-            return Ok(Decision {
-                uri,
-                target_version: current_version,
-                fresh_content: None,
-                snap: None,
-                external_change: ExternalChange::Unchanged,
-            });
-        }
-
-        if local_edit {
-            if let Some(state) = lock_std(&self.documents).get_mut(path) {
-                state.mark_external_conflict(snap);
+        if mode == ReconcileMode::Observed {
+            let meta = fs::metadata(path).await.map_err(|source| Error::FileIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let mtime = meta.modified().ok();
+            let size = meta.len();
+            let stat_matches =
+                disk.is_some_and(|snapshot| snapshot.mtime == mtime && snapshot.size == size);
+            let fast_path = match disk {
+                Some(snapshot) if stat_matches && snapshot.mtime_settled => true,
+                Some(snapshot)
+                    if stat_matches
+                        && snapshot.content_checked_at.elapsed() < DISK_CHECK_DEBOUNCE =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if fast_path && !external_conflict {
+                return Ok(Some(Decision::unchanged(uri, current_version)));
             }
-            return Ok(Decision {
-                uri,
-                target_version: current_version,
-                fresh_content: None,
-                snap: None,
-                external_change: ExternalChange::Conflict,
-            });
         }
 
-        Ok(Decision {
+        let (fresh, snap) = match self.read_disk_snapshot(path).await {
+            Ok(snapshot) => snapshot,
+            Err(Error::FileIo { .. }) if local_edit || external_conflict => {
+                return Ok(Some(Decision::conflict(uri, current_version, None)));
+            }
+            Err(error) => return Err(error),
+        };
+        if fresh == current {
+            return Ok(Some(Decision::unchanged_with_snapshot(
+                uri,
+                current_version,
+                snap,
+            )));
+        }
+        if local_edit {
+            return Ok(Some(Decision::conflict(uri, current_version, Some(snap))));
+        }
+        Ok(Some(Decision {
             uri,
             target_version: current_version.saturating_add(1),
             fresh_content: Some(fresh),
             snap: Some(snap),
             external_change: ExternalChange::Reloaded,
-        })
+        }))
+    }
+
+    /// Commit a reconciliation result that does not require an LSP
+    /// notification. Reloads discovered by `ensure_open` remain pending until
+    /// its `sync_phase` reports that the target server accepted the change.
+    fn commit_reconciliation(&self, path: &Path, decision: &Decision) {
+        let mut documents = lock_std(&self.documents);
+        let Some(state) = documents.get_mut(path) else {
+            return;
+        };
+        match (&decision.fresh_content, decision.snap) {
+            (Some(content), Some(snapshot)) => {
+                state.commit_reload(decision.target_version, content.clone(), Some(snapshot));
+            }
+            (None, Some(snapshot)) if decision.external_change == ExternalChange::Conflict => {
+                state.mark_external_conflict(snapshot);
+            }
+            (None, Some(snapshot)) => state.set_disk(snapshot),
+            (None, None) if decision.external_change == ExternalChange::Conflict => {
+                state.mark_missing_external_conflict();
+            }
+            _ => {}
+        }
+        drop(documents);
     }
 
     /// Reads a not-yet-tracked file from disk and opens it in the tracker at
@@ -1122,6 +1161,14 @@ impl Drop for PathLockGuard<'_> {
     }
 }
 
+/// Whether reconciliation may trust an unchanged settled stat or must read
+/// the path's bytes for an explicit source/edit boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileMode {
+    Observed,
+    Required,
+}
+
 /// Outcome of `DocumentTracker::disk_phase`: the version `ensure_open`'s
 /// caller should end up synced to, and -- only when this call detected an
 /// as-yet-uncommitted content change -- the content and disk snapshot to
@@ -1144,6 +1191,26 @@ impl Decision {
             fresh_content: None,
             snap: None,
             external_change: ExternalChange::Unchanged,
+        }
+    }
+
+    const fn unchanged_with_snapshot(uri: Uri, target_version: i32, snap: DiskSync) -> Self {
+        Self {
+            uri,
+            target_version,
+            fresh_content: None,
+            snap: Some(snap),
+            external_change: ExternalChange::Unchanged,
+        }
+    }
+
+    const fn conflict(uri: Uri, target_version: i32, snap: Option<DiskSync>) -> Self {
+        Self {
+            uri,
+            target_version,
+            fresh_content: None,
+            snap,
+            external_change: ExternalChange::Conflict,
         }
     }
 }
@@ -2455,7 +2522,7 @@ mod tests {
         // unchanged file.
         std::fs::write(&path, "BBBB").unwrap();
         set_mtime(&path, original_mtime);
-        tracker.mark_external_change(&path);
+        tracker.mark_external_changes([path.clone()]);
 
         let outcome = tracker
             .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
@@ -2484,7 +2551,7 @@ mod tests {
 
         std::fs::write(&replacement, "BBBB").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        tracker.mark_external_change(&path);
+        tracker.mark_external_changes([path.clone()]);
 
         let outcome = tracker
             .ensure_open_with_status(&path, &ServerId::from("rust"), &client)
@@ -2510,7 +2577,7 @@ mod tests {
         tracker.update(&path, "LOCAL".to_owned()).unwrap();
 
         std::fs::write(&path, "BBBB").unwrap();
-        tracker.mark_external_change(&path);
+        tracker.mark_external_changes([path.clone()]);
 
         let outcome = tracker
             .ensure_open_with_status(&path, &ServerId::from("rust"), &client)

@@ -77,15 +77,22 @@ pub(super) async fn resolve_source_context_with_max_lines(
     let Some(path) = uri_to_path(uri) else {
         return unavailable(SourceUnavailableReason::NonFileUri);
     };
-    let document = tracker.get(&path);
-    let canonical_path = if document.is_some() {
+    let tracked_document = tracker.tracked_snapshot(&path);
+    let canonical_path = if tracked_document.is_some() {
         snapshot_authorized_path(&path, workspace_roots, approved_source_roots)
     } else {
         canonical_authorized_path(&path, workspace_roots, approved_source_roots)
     };
     let Some(canonical_path) = canonical_path else {
-        return unavailable(if path.exists() || document.is_some() {
+        return unavailable(if path.exists() || tracked_document.is_some() {
             SourceUnavailableReason::OutsideApprovedRoots
+        } else {
+            SourceUnavailableReason::NotFound
+        });
+    };
+    let Ok(document) = tracker.reconciled_snapshot(&path).await else {
+        return unavailable(if path.exists() {
+            SourceUnavailableReason::Unreadable
         } else {
             SourceUnavailableReason::NotFound
         });
@@ -625,10 +632,7 @@ impl super::Translator {
         &self,
         path: PathBuf,
     ) -> crate::error::Result<(PathBuf, Option<i32>, String, String)> {
-        if self.document_tracker.is_open(&path) {
-            self.document_tracker.refresh_from_disk(&path).await?;
-        }
-        if let Some(document) = self.document_tracker.get(&path) {
+        if let Some(document) = self.document_tracker.reconciled_snapshot(&path).await? {
             let content = document.content().to_owned();
             return Ok((
                 path,
@@ -1182,6 +1186,38 @@ mod tests {
         };
         assert!(frame.text.contains("dirty λ"));
         assert!(!frame.text.contains("disk"));
+        assert_eq!(frame.document_version, Some(2));
+        assert!(tracker.get(&path).unwrap().has_external_conflict());
+    }
+
+    #[tokio::test]
+    async fn source_context_refreshes_a_clean_tracked_document() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("clean.rs");
+        tokio::fs::write(&path, "fn before() {}\n").await.unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let uri = tracker
+            .open(path.clone(), "fn before() {}\n".to_owned())
+            .unwrap();
+        tracker.reconciled_snapshot(&path).await.unwrap();
+
+        tokio::fs::write(&path, "fn after() {}\n").await.unwrap();
+
+        let source = resolve_source_context(
+            &tracker,
+            &[root.path().to_path_buf()],
+            &[],
+            &uri,
+            range(1),
+            &mut SourceBudget::default(),
+        )
+        .await;
+
+        let SourceContext::Available(frame) = source else {
+            panic!("source unavailable");
+        };
+        assert!(frame.text.contains("after"), "{}", frame.text);
+        assert!(!frame.text.contains("before"), "{}", frame.text);
         assert_eq!(frame.document_version, Some(2));
     }
 

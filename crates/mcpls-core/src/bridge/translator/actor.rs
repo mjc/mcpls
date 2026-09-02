@@ -1,6 +1,6 @@
 //! Project-actor lifecycle and configuration support.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,10 +42,22 @@ fn spawn_external_change_forwarder(
     tracker: Arc<DocumentTracker>,
 ) {
     tokio::spawn(async move {
-        while let Some(path) = receiver.recv().await {
-            tracker.mark_external_change(&path);
+        while let Some(first) = receiver.recv().await {
+            let paths = coalesce_external_changes(first, &mut receiver);
+            tracker.mark_external_changes(paths);
         }
     });
+}
+
+fn coalesce_external_changes(
+    first: PathBuf,
+    receiver: &mut mpsc::UnboundedReceiver<PathBuf>,
+) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::from([first]);
+    while let Ok(path) = receiver.try_recv() {
+        paths.insert(path);
+    }
+    paths
 }
 
 /// Language-server handles produced by one project activation.
@@ -957,7 +969,7 @@ impl Translator {
     ) -> Result<Vec<(ServerId, String)>> {
         let document = self
             .document_tracker
-            .get(path)
+            .tracked_snapshot(path)
             .ok_or_else(|| Error::DocumentNotFound(path.to_path_buf()))?;
         if document.version() != expected_version {
             return Err(Error::InvalidToolParams(format!(
@@ -1244,6 +1256,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn coalesces_duplicate_watcher_paths_without_losing_distinct_paths() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let first = PathBuf::from("first.rs");
+        let second = PathBuf::from("second.rs");
+        sender.send(first.clone()).unwrap();
+        sender.send(second.clone()).unwrap();
+        sender.send(first.clone()).unwrap();
+
+        let received = receiver.try_recv().unwrap();
+        assert_eq!(
+            coalesce_external_changes(received, &mut receiver),
+            BTreeSet::from([first, second])
+        );
+    }
 
     #[test]
     fn open_document_change_is_incremental_and_encoding_safe() {

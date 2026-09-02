@@ -317,12 +317,9 @@ fn position_to_byte_offset(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::bridge::{DocumentTracker, ResourceLimits};
     use crate::edit_apply::apply_plan;
-    use crate::edit_preview::{PreviewLimits, preview_workspace_edit};
+    use crate::edit_preview::{PreviewDocuments, PreviewLimits, preview_workspace_edit};
 
     #[test]
     fn builds_top_level_module_move_edit() {
@@ -623,7 +620,7 @@ mod tests {
             "project",
             edit,
             PositionEncoding::Utf8,
-            &DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
+            &PreviewDocuments::default(),
             PreviewLimits::default(),
         )
         .unwrap_err();
@@ -665,7 +662,7 @@ mod tests {
             "project",
             edit,
             PositionEncoding::Utf8,
-            &DocumentTracker::new(ResourceLimits::default(), HashMap::new()),
+            &PreviewDocuments::default(),
             PreviewLimits::default(),
         )
         .unwrap();

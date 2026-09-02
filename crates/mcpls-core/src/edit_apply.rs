@@ -542,7 +542,7 @@ fn validate_open_document_snapshot(
     let Some(documents) = documents else {
         return Err(ApplyError::UnsupportedSource(snapshot.path().clone()));
     };
-    let Some(document) = documents.get(snapshot.path()) else {
+    let Some(document) = documents.tracked_snapshot(snapshot.path()) else {
         return Err(ApplyError::Stale(SnapshotValidationError::VersionChanged {
             path: snapshot.path().clone(),
             expected: snapshot.version().unwrap_or_default(),

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use lsp_types::WorkspaceEdit;
 
-use crate::bridge::{DocumentTracker, PositionEncoding, uri_to_path};
+use crate::bridge::{DocumentSnapshot, DocumentTracker, PositionEncoding, uri_to_path};
 use crate::edit_paths::{
     FileOperation, OperationValidationError, PathSafetyError, WorkspaceBoundary,
 };
@@ -57,6 +57,11 @@ pub struct PreviewArtifact {
     /// Optional implementation that produced a specialized edit.
     pub producer: Option<EditProducer>,
 }
+
+/// Immutable tracked-document state captured at the preview freshness
+/// boundary. The synchronous planner never reads mutable tracker state.
+#[derive(Debug, Default)]
+pub(crate) struct PreviewDocuments(BTreeMap<PathBuf, DocumentSnapshot>);
 
 /// Producer selected for a specialized edit preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +160,7 @@ pub(crate) async fn refresh_workspace_edit_documents(
     edit: &WorkspaceEdit,
     documents: &DocumentTracker,
     limits: PreviewLimits,
-) -> Result<(), PreviewError> {
+) -> Result<PreviewDocuments, PreviewError> {
     let normalized = normalize(edit.clone()).expect("workspace edit normalization is infallible");
     let mut paths = BTreeSet::new();
     for operation in normalized.operations {
@@ -180,14 +185,20 @@ pub(crate) async fn refresh_workspace_edit_documents(
             });
         }
     }
-    documents
-        .refresh_paths(paths)
-        .await
-        .map_err(|(path, error)| PreviewError::Refresh {
-            path,
-            error: error.to_string(),
-        })?;
-    Ok(())
+    let mut snapshots = BTreeMap::new();
+    for path in paths {
+        if let Some(snapshot) = documents
+            .reconciled_snapshot(&path)
+            .await
+            .map_err(|error| PreviewError::Refresh {
+                path: path.clone(),
+                error: error.to_string(),
+            })?
+        {
+            snapshots.insert(path, snapshot);
+        }
+    }
+    Ok(PreviewDocuments(snapshots))
 }
 
 struct PlannedFile {
@@ -215,12 +226,12 @@ struct PlannedFile {
 ///
 /// Panics only if the internal normalization enum gains a variant without a
 /// corresponding preview representation.
-pub fn preview_workspace_edit(
+pub(crate) fn preview_workspace_edit(
     boundary: &WorkspaceBoundary,
     project_id: &str,
     edit: WorkspaceEdit,
     encoding: PositionEncoding,
-    documents: &DocumentTracker,
+    documents: &PreviewDocuments,
     limits: PreviewLimits,
 ) -> Result<PreviewArtifact, PreviewError> {
     let normalized = normalize(edit).expect("workspace edit normalization is infallible");
@@ -234,7 +245,7 @@ fn preview_normalized(
     project_id: &str,
     normalized: NormalizedWorkspaceEdit,
     encoding: PositionEncoding,
-    documents: &DocumentTracker,
+    documents: &PreviewDocuments,
     limits: PreviewLimits,
 ) -> Result<PreviewArtifact, PreviewError> {
     PreviewBuilder::new(boundary, project_id, encoding, documents, limits).finish(normalized)
@@ -244,7 +255,7 @@ struct PreviewBuilder<'a> {
     boundary: &'a WorkspaceBoundary,
     project_id: &'a str,
     encoding: PositionEncoding,
-    documents: &'a DocumentTracker,
+    documents: &'a PreviewDocuments,
     limits: PreviewLimits,
     files: BTreeMap<PathBuf, PlannedFile>,
     created_paths: BTreeSet<PathBuf>,
@@ -264,7 +275,7 @@ impl<'a> PreviewBuilder<'a> {
         boundary: &'a WorkspaceBoundary,
         project_id: &'a str,
         encoding: PositionEncoding,
-        documents: &'a DocumentTracker,
+        documents: &'a PreviewDocuments,
         limits: PreviewLimits,
     ) -> Self {
         Self {
@@ -603,8 +614,8 @@ fn path_for_uri(uri: &str) -> Result<PathBuf, PreviewError> {
     uri_to_path(&parsed).ok_or_else(|| PreviewError::InvalidUri(uri.to_string()))
 }
 
-fn initial_file(path: &PathBuf, documents: &DocumentTracker) -> Result<PlannedFile, PreviewError> {
-    if let Some(document) = documents.get(path) {
+fn initial_file(path: &PathBuf, documents: &PreviewDocuments) -> Result<PlannedFile, PreviewError> {
+    if let Some(document) = documents.0.get(path) {
         let disk = fs::read_to_string(path).map_err(|source| PreviewError::Read {
             path: path.clone(),
             source,

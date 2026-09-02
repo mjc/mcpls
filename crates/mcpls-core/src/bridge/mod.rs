@@ -20,11 +20,11 @@ pub use notifications::{
     DiagnosticInfo, LogEntry, LogLevel, MessageType, NotificationCache, ServerMessage,
 };
 pub use resources::ResourceSubscriptions;
-pub(crate) use state::try_path_to_uri;
 pub use state::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, DocumentState, DocumentTracker, ResourceLimits,
     path_to_uri, uri_to_path,
 };
+pub(crate) use state::{DocumentSnapshot, try_path_to_uri};
 pub use translator::{
     ActivationHealth, CallHierarchyPrepareResult, CodeActionsResult, Completion, CompletionsResult,
     DeferredResourceReference, DefinitionResult, Diagnostic, DiagnosticSeverity,

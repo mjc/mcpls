@@ -5183,18 +5183,13 @@ impl ProjectRuntime {
     ) -> Result<PreviewArtifact, String> {
         let boundary = WorkspaceBoundary::new(root).map_err(|error| error.to_string())?;
         let limits = PreviewLimits::default();
-        refresh_workspace_edit_documents(&edit, self.translator.document_tracker(), limits)
-            .await
-            .map_err(|error| error.to_string())?;
-        let artifact = preview_workspace_edit(
-            &boundary,
-            project_id,
-            edit,
-            encoding,
-            self.translator.document_tracker(),
-            limits,
-        )
-        .map_err(|error| error.to_string())?;
+        let documents =
+            refresh_workspace_edit_documents(&edit, self.translator.document_tracker(), limits)
+                .await
+                .map_err(|error| error.to_string())?;
+        let artifact =
+            preview_workspace_edit(&boundary, project_id, edit, encoding, &documents, limits)
+                .map_err(|error| error.to_string())?;
         self.edit_plans
             .insert(artifact.plan.clone())
             .map_err(|error| error.to_string())?;
@@ -5538,7 +5533,9 @@ impl ProjectRuntime {
         let source_override = self
             .translator
             .document_tracker()
-            .get(&source_path)
+            .reconciled_snapshot(&source_path)
+            .await
+            .map_err(|error| error.to_string())?
             .map(|document| document.content().to_string());
         let (verification, verified_position) = self
             .verify_inline_module_before_preview(&source_path, module_name, module_position)
@@ -16259,7 +16256,7 @@ while True:
         translator.set_workspace_roots(vec![root.path().to_path_buf()]);
         let tracker = translator.document_tracker();
         tracker.open(file.clone(), "before\n".to_owned()).unwrap();
-        tracker.refresh_from_disk(&file).await.unwrap();
+        tracker.reconciled_snapshot(&file).await.unwrap();
 
         fs::write(&file, "after!\n").unwrap();
         let edit = serde_json::from_value(serde_json::json!({

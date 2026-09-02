@@ -7,6 +7,35 @@ use super::*;
 use crate::bridge::path_to_uri;
 use crate::workspace_edit::NormalizedTextEdit;
 
+fn preview_with_empty_documents(
+    boundary: &WorkspaceBoundary,
+    edit: WorkspaceEdit,
+) -> Result<PreviewArtifact, PreviewError> {
+    preview_workspace_edit(
+        boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &PreviewDocuments::default(),
+        PreviewLimits::default(),
+    )
+}
+
+fn preview_normalized_with_empty_documents(
+    boundary: &WorkspaceBoundary,
+    edit: NormalizedWorkspaceEdit,
+    limits: PreviewLimits,
+) -> Result<PreviewArtifact, PreviewError> {
+    preview_normalized(
+        boundary,
+        "project",
+        edit,
+        PositionEncoding::Utf8,
+        &PreviewDocuments::default(),
+        limits,
+    )
+}
+
 #[test]
 fn previews_disk_text_edit_without_writing() {
     let root = TempDir::new().unwrap();
@@ -28,22 +57,14 @@ fn previews_disk_text_edit_without_writing() {
         change_annotations: None,
     };
 
-    let artifact = preview_workspace_edit(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact = preview_with_empty_documents(&boundary, edit).unwrap();
     assert!(artifact.plan.safe_to_apply());
     assert!(artifact.plan.unified_diff().contains("+after"));
     assert_eq!(fs::read_to_string(file).unwrap(), "before\n");
 }
 
-#[test]
-fn open_document_that_differs_from_disk_makes_preview_unsafe() {
+#[tokio::test]
+async fn open_document_that_differs_from_disk_makes_preview_unsafe() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("src.rs");
     fs::write(&file, "newer disk content\n").unwrap();
@@ -67,12 +88,15 @@ fn open_document_that_differs_from_disk_makes_preview_unsafe() {
         change_annotations: None,
     };
 
+    let snapshots = refresh_workspace_edit_documents(&edit, &documents, PreviewLimits::default())
+        .await
+        .unwrap();
     let artifact = preview_workspace_edit(
         &boundary,
         "project",
         edit,
         PositionEncoding::Utf8,
-        &documents,
+        &snapshots,
         PreviewLimits::default(),
     )
     .unwrap();
@@ -168,15 +192,7 @@ second";
     };
     let edit: WorkspaceEdit = serde_json::from_value(serde_json::to_value(edit).unwrap()).unwrap();
 
-    let artifact = preview_workspace_edit(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact = preview_with_empty_documents(&boundary, edit).unwrap();
     assert!(artifact.plan.safe_to_apply());
     assert_eq!(artifact.plan.files()[0].planned_content(), expected);
 
@@ -209,15 +225,8 @@ fn previews_text_edit_after_ordered_create() {
         change_annotations: None,
     };
 
-    let artifact = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact =
+        preview_normalized_with_empty_documents(&boundary, edit, PreviewLimits::default()).unwrap();
 
     assert!(artifact.plan.safe_to_apply());
     assert_eq!(artifact.plan.files()[0].original_content(), "");
@@ -259,15 +268,8 @@ fn rejects_text_before_create_in_the_same_transaction() {
         change_annotations: None,
     };
 
-    let artifact = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact =
+        preview_normalized_with_empty_documents(&boundary, edit, PreviewLimits::default()).unwrap();
 
     assert!(!artifact.plan.safe_to_apply());
     assert!(
@@ -307,15 +309,8 @@ fn create_overwrite_then_text_retains_existing_preimage() {
         change_annotations: None,
     };
 
-    let artifact = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact =
+        preview_normalized_with_empty_documents(&boundary, edit, PreviewLimits::default()).unwrap();
 
     assert!(artifact.plan.safe_to_apply());
     assert_eq!(artifact.plan.files()[0].original_content(), "before\n");
@@ -341,14 +336,7 @@ fn rejects_resource_operation_limit() {
         ..PreviewLimits::default()
     };
 
-    let result = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        limits,
-    );
+    let result = preview_normalized_with_empty_documents(&boundary, edit, limits);
 
     assert!(matches!(
         result,
@@ -393,15 +381,8 @@ fn permits_text_edits_followed_by_one_rename() {
         change_annotations: None,
     };
 
-    let artifact = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact =
+        preview_normalized_with_empty_documents(&boundary, edit, PreviewLimits::default()).unwrap();
 
     assert!(artifact.plan.safe_to_apply(), "{:?}", artifact.conflicts);
     assert_eq!(artifact.plan.files()[0].planned_content(), "mod renamed;\n");
@@ -437,15 +418,8 @@ fn rejects_text_edits_that_follow_a_rename() {
         change_annotations: None,
     };
 
-    let artifact = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        PreviewLimits::default(),
-    )
-    .unwrap();
+    let artifact =
+        preview_normalized_with_empty_documents(&boundary, edit, PreviewLimits::default()).unwrap();
 
     assert!(!artifact.plan.safe_to_apply());
     assert!(
@@ -482,14 +456,7 @@ fn rejects_per_file_byte_limit() {
         ..PreviewLimits::default()
     };
 
-    let result = preview_normalized(
-        &boundary,
-        "project",
-        edit,
-        PositionEncoding::Utf8,
-        &DocumentTracker::new(crate::bridge::ResourceLimits::default(), HashMap::new()),
-        limits,
-    );
+    let result = preview_normalized_with_empty_documents(&boundary, edit, limits);
 
     assert!(matches!(
         result,
