@@ -516,19 +516,12 @@ impl DocumentTracker {
         else {
             return Err(Error::DocumentNotFound(path.to_path_buf()));
         };
-        let read_at = SystemTime::now();
-        let (fresh, mtime, size) = match self.read_to_string_checked(path).await {
+        let (fresh, snap) = match self.read_disk_snapshot(path).await {
             Ok(read) => read,
             Err(Error::FileIo { .. }) if local_edit || external_conflict => {
                 return Ok(ExternalChange::Conflict);
             }
             Err(error) => return Err(error),
-        };
-        let snap = DiskSync {
-            mtime,
-            size,
-            mtime_settled: mtime_settled(mtime, read_at),
-            content_checked_at: Instant::now(),
         };
         if fresh == current {
             if let Some(state) = lock_std(&self.documents).get_mut(path) {
@@ -812,7 +805,6 @@ impl DocumentTracker {
             return self.disk_phase_new(path).await;
         }
 
-        let read_at = SystemTime::now();
         let meta = fs::metadata(path).await.map_err(|e| Error::FileIo {
             path: path.to_path_buf(),
             source: e,
@@ -850,13 +842,7 @@ impl DocumentTracker {
             return Ok(Decision::unchanged(uri, current_version));
         }
 
-        let (fresh, ..) = self.read_to_string_checked(path).await?;
-        let snap = DiskSync {
-            mtime,
-            size,
-            mtime_settled: mtime_settled(mtime, read_at),
-            content_checked_at: Instant::now(),
-        };
+        let (fresh, snap) = self.read_disk_snapshot(path).await?;
 
         let Some((unchanged, local_edit)) = lock_std(&self.documents)
             .get(path)
@@ -902,21 +888,31 @@ impl DocumentTracker {
     /// version 1. No server has synced it yet, so the sync phase always
     /// sends `didOpen` regardless of which server calls next.
     async fn disk_phase_new(&self, path: &Path) -> Result<Decision> {
-        let read_at = SystemTime::now();
-        let (content, mtime, size) = self.read_to_string_checked(path).await?;
+        let (content, snap) = self.read_disk_snapshot(path).await?;
 
         let uri = self.open(path.to_path_buf(), content)?;
-        self.set_disk(
-            path,
+        self.set_disk(path, snap);
+
+        Ok(Decision::unchanged(uri, 1))
+    }
+
+    /// Read one authoritative disk snapshot through a single file handle.
+    ///
+    /// Keeping content, size, and modification time together prevents the
+    /// refresh, lazy-open, and normal synchronization paths from drifting in
+    /// their TOCTOU and mtime-settling behavior.
+    async fn read_disk_snapshot(&self, path: &Path) -> Result<(String, DiskSync)> {
+        let read_at = SystemTime::now();
+        let (content, mtime, size) = self.read_to_string_checked(path).await?;
+        Ok((
+            content,
             DiskSync {
                 mtime,
                 size,
                 mtime_settled: mtime_settled(mtime, read_at),
                 content_checked_at: Instant::now(),
             },
-        );
-
-        Ok(Decision::unchanged(uri, 1))
+        ))
     }
 
     /// Reads `path` through a single open file handle, checking its size
