@@ -51,6 +51,10 @@ struct Args {
     query: String,
     #[arg(long, default_value_t = 45.0)]
     settle_timeout: f64,
+    #[arg(long)]
+    skip_initial_load_wait: bool,
+    #[arg(long)]
+    wait_for_crate_def_maps: bool,
     #[arg(long, default_value_t = 60.0)]
     request_timeout: f64,
     #[arg(long)]
@@ -209,6 +213,38 @@ fn wait_for_initial_load(
     Ok(())
 }
 
+fn completes_crate_def_maps(message: &Value) -> bool {
+    message["method"] == "$/progress"
+        && message["params"]["token"] == "rustAnalyzer/cachePriming"
+        && message["params"]["value"]["kind"] == "report"
+        && message["params"]["value"]["percentage"].as_f64() == Some(100.0)
+}
+
+fn wait_for_crate_def_maps(
+    client: &mut LspClient,
+    timeout: Duration,
+    complete: &mut bool,
+    quiescent: &mut bool,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = match client
+            .messages
+            .recv_timeout(remaining.min(Duration::from_millis(250)))
+        {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => bail!("rust-analyzer output closed"),
+        };
+        handle_message(client, &message, complete, quiescent)?;
+        if completes_crate_def_maps(&message) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 fn initialization_options(profile: &Profile, roots: &[PathBuf]) -> Value {
     let mut options = json!({
         "files": {"watcher": "client", "exclude": [".git", ".direnv", ".serena", "target"]},
@@ -339,12 +375,21 @@ fn run(args: &Args) -> Result<Value> {
         &mut client.stdin,
         &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
     )?;
-    wait_for_initial_load(
-        &mut client,
-        Duration::from_secs_f64(args.settle_timeout),
-        &mut initial_load_complete,
-        &mut quiescent,
-    )?;
+    if args.wait_for_crate_def_maps {
+        wait_for_crate_def_maps(
+            &mut client,
+            Duration::from_secs_f64(args.settle_timeout),
+            &mut initial_load_complete,
+            &mut quiescent,
+        )?;
+    } else if !args.skip_initial_load_wait {
+        wait_for_initial_load(
+            &mut client,
+            Duration::from_secs_f64(args.settle_timeout),
+            &mut initial_load_complete,
+            &mut quiescent,
+        )?;
+    }
     let pre_query_wait_ms = started.elapsed().as_secs_f64() * 1000.0;
     let before_ids = descendants(child.0.id());
     let before_kib = pss_kib(&before_ids);
@@ -473,5 +518,19 @@ mod tests {
         });
 
         assert!(completes_initial_load(&progress));
+    }
+
+    #[test]
+    fn completed_crate_def_maps_are_detected_before_priming_ends() {
+        let progress = serde_json::json!({
+            "method": "$/progress",
+            "params": {
+                "token": "rustAnalyzer/cachePriming",
+                "value": {"kind": "report", "percentage": 100}
+            }
+        });
+
+        assert!(super::completes_crate_def_maps(&progress));
+        assert!(!super::completes_initial_load(&progress));
     }
 }
