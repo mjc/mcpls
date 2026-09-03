@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -57,6 +58,10 @@ const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 /// Bound project-environment discovery so a stuck `.envrc` cannot hold an
 /// activation mailbox indefinitely.
 const PROJECT_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
@@ -464,6 +469,7 @@ impl LspServer {
         config: ServerInitConfig,
         cancellation: CancellationToken,
     ) -> Result<Self> {
+        let started = Instant::now();
         info!(
             "Spawning LSP server: {} {:?}",
             config.server_config.command, config.server_config.args
@@ -547,7 +553,10 @@ impl LspServer {
             }
         };
 
-        info!("LSP server initialized successfully");
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            "LSP server initialized successfully"
+        );
 
         Ok(Self {
             client,
@@ -1046,13 +1055,13 @@ fn workspace_folder(root: &Path) -> Result<WorkspaceFolder> {
 
 /// Load the effective process environment for one project root.
 pub async fn load_project_environment(root: &Path) -> Option<HashMap<String, Option<String>>> {
-    if root.join(".envrc").is_file()
-        && let Some(root_string) = root.to_str()
-        && let Some(environment) =
-            command_environment("direnv", ["exec", root_string, "env"], root).await
-    {
-        info!("Loaded LSP environment from direnv: {}", root.display());
-        return Some(environment);
+    if root.join(".envrc").is_file() {
+        let root_string = root.to_str()?;
+        let environment = command_environment("direnv", ["exec", root_string, "env"], root).await;
+        if environment.is_some() {
+            info!("Loaded LSP environment from direnv: {}", root.display());
+        }
+        return environment;
     }
 
     let root_string = root.to_str()?;
@@ -1092,6 +1101,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    let started = Instant::now();
     let output = tokio::time::timeout(
         timeout,
         Command::new(command)
@@ -1102,24 +1112,42 @@ where
     )
     .await
     .map_err(|_| {
-        warn!(command, ?timeout, root = %root.display(), "project environment command timed out");
+        warn!(
+            command,
+            ?timeout,
+            root = %root.display(),
+            elapsed_ms = elapsed_ms(started),
+            "project environment command timed out"
+        );
     })
     .ok()?
     .ok()?;
     if !output.status.success() {
+        debug!(
+            command,
+            root = %root.display(),
+            status = ?output.status,
+            elapsed_ms = elapsed_ms(started),
+            "project environment command failed"
+        );
         return None;
     }
 
     let stdout = String::from_utf8(output.stdout).ok()?;
-    Some(
-        stdout
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                Some((key.to_string(), Some(value.to_string())))
-            })
-            .collect(),
-    )
+    let environment = stdout
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.to_string(), Some(value.to_string())))
+        })
+        .collect();
+    debug!(
+        command,
+        root = %root.display(),
+        elapsed_ms = elapsed_ms(started),
+        "project environment command complete"
+    );
+    Some(environment)
 }
 
 /// Resolve a configured command against the daemon and project environments.

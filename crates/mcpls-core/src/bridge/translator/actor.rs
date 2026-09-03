@@ -1,6 +1,7 @@
 //! Project-actor lifecycle and configuration support.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -358,6 +359,30 @@ fn builtin_command_available(
         || resolve_command(&config.command, project_environment).is_file()
 }
 
+async fn load_project_environments<F, Fut>(
+    roots: impl IntoIterator<Item = PathBuf>,
+    loader: F,
+) -> HashMap<PathBuf, Option<HashMap<String, Option<String>>>>
+where
+    F: Fn(PathBuf) -> Fut + Clone,
+    Fut: Future<Output = Option<HashMap<String, Option<String>>>>,
+{
+    let roots = roots.into_iter().collect::<BTreeSet<_>>();
+    let results = futures::future::join_all(roots.into_iter().map(|root| {
+        let loader = loader.clone();
+        async move {
+            let environment = loader(root.clone()).await;
+            (root, environment)
+        }
+    }))
+    .await;
+    results.into_iter().collect()
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn incremental_content_change(
     original: &str,
     updated: &str,
@@ -601,6 +626,7 @@ impl Translator {
         roots: Vec<PathBuf>,
         cancellation: CancellationToken,
     ) -> Result<ProjectActivation> {
+        let activation_started = std::time::Instant::now();
         if roots.is_empty() {
             return Err(Error::NoServerConfigured);
         }
@@ -611,6 +637,14 @@ impl Translator {
         *lock_std(&self.evaluated_lsp_roots) = planned_server_roots(&servers);
         let router = ToolRouter::from_configs(servers.iter().map(|server| &server.config))?;
         *lock_std(&self.router) = router;
+        tracing::debug!(
+            stage = "plan",
+            root_count = roots.len(),
+            server_count = servers.len(),
+            stage_ms = elapsed_ms(activation_started),
+            total_ms = elapsed_ms(activation_started),
+            "project activation stage complete"
+        );
 
         let configured_ids = servers
             .iter()
@@ -675,18 +709,30 @@ impl Translator {
                 .map(|server| server.config.id())
                 .collect(),
         );
-        let mut project_environments = HashMap::new();
+        let environment_roots = pending
+            .iter()
+            .filter_map(|server| server.workspace_roots.first().cloned())
+            .collect::<BTreeSet<_>>();
+        let environment_started = std::time::Instant::now();
+        let project_environments =
+            load_project_environments(environment_roots, |root| async move {
+                load_project_environment(&root).await
+            })
+            .await;
+        tracing::debug!(
+            stage = "project_environment",
+            stage_ms = elapsed_ms(environment_started),
+            total_ms = elapsed_ms(activation_started),
+            "project activation stage complete"
+        );
         let mut init_configs = Vec::with_capacity(pending.len());
         for server in pending {
             let server_roots = server.workspace_roots.clone();
             let mut server_config = server.config.clone();
-            if let Some(root) = server_roots.first() {
-                if !project_environments.contains_key(root) {
-                    project_environments.insert(root.clone(), load_project_environment(root).await);
-                }
-                if let Some(Some(project_environment)) = project_environments.get(root) {
-                    apply_project_environment(&mut server_config, project_environment);
-                }
+            if let Some(root) = server_roots.first()
+                && let Some(Some(project_environment)) = project_environments.get(root)
+            {
+                apply_project_environment(&mut server_config, project_environment);
             }
             let project_environment = server_roots
                 .first()
@@ -721,7 +767,16 @@ impl Translator {
                 ProjectActivation::ready()
             });
         }
+        let lsp_started = std::time::Instant::now();
         let result = LspServer::spawn_batch_with_cancellation(&init_configs, cancellation).await;
+        tracing::debug!(
+            stage = "lsp_spawn_batch",
+            stage_ms = elapsed_ms(lsp_started),
+            total_ms = elapsed_ms(activation_started),
+            server_count = result.server_count(),
+            failure_count = result.failure_count(),
+            "project activation stage complete"
+        );
         if result.all_failed() {
             self.clear_expected_servers();
             lock_std(&self.active_language_aliases).clear();
@@ -743,6 +798,7 @@ impl Translator {
         let successful: HashSet<_> = result.servers.keys().cloned().collect();
         lock_std(&self.expected_servers).retain(|id| successful.contains(id));
         self.rebind_router(&successful);
+        let registration_started = std::time::Instant::now();
         let init_by_id: HashMap<_, _> = init_configs
             .into_iter()
             .map(|config| (config.server_config.id(), config))
@@ -796,6 +852,12 @@ impl Translator {
             .count();
         self.actor_notification_cache
             .set_diagnostics_route_count(diagnostics_routes);
+        tracing::debug!(
+            stage = "register",
+            stage_ms = elapsed_ms(registration_started),
+            total_ms = elapsed_ms(activation_started),
+            "project activation complete"
+        );
         Ok(ProjectActivation::new(receivers, health))
     }
 
@@ -1326,6 +1388,45 @@ mod tests {
             coalesce_external_changes(received, &mut receiver),
             WatchInvalidation::Roots(vec![PathBuf::from("Cargo.toml"), directory])
         );
+    }
+
+    #[tokio::test]
+    async fn project_environment_loads_run_concurrently() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = {
+            let barrier = Arc::clone(&barrier);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move |root: PathBuf| {
+                let barrier = Arc::clone(&barrier);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                    barrier.wait().await;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(HashMap::from([(
+                        root.display().to_string(),
+                        Some("loaded".to_string()),
+                    )]))
+                }
+            }
+        };
+
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        let environments = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            load_project_environments([first.clone(), second.clone(), first.clone()], loader),
+        )
+        .await
+        .expect("environment loads should not serialize");
+
+        assert_eq!(environments.len(), 2);
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
