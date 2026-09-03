@@ -6108,7 +6108,7 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn workspace_symbol_search_lazily_activates_the_requested_project() {
+    async fn workspace_symbol_search_lazily_activates_and_waits_for_requested_project() {
         let root = TempDir::new().unwrap();
         write_rust_fixture(root.path());
         let counter = root.path().join("spawn-count");
@@ -6124,23 +6124,6 @@ finally:
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
-        let initial = server
-            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
-                project_id: "dormant".to_string(),
-                query: Some("fixture".to_string()),
-                queries: Vec::new(),
-                kind_filter: None,
-                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
-                scope: crate::bridge::WorkspaceSymbolScope::default(),
-                limit: 20,
-                max_bytes: 16 * 1024,
-                page_token: None,
-                include_generated: false,
-            }))
-            .await;
-        assert!(initial.is_err());
-        let project_id = ProjectId::new("dormant").unwrap();
-        wait_for_project_ready(&server.context.project_registry, &project_id).await;
         let result = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "dormant".to_string(),
@@ -6155,7 +6138,7 @@ finally:
                 include_generated: false,
             }))
             .await
-            .unwrap();
+            .expect("first semantic request should wait for rust-analyzer readiness");
         let result: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
@@ -6205,8 +6188,11 @@ finally:
                 include_generated: false,
             })),
         );
-        assert!(first.is_err());
-        assert!(second.is_err());
+        for result in [first, second] {
+            let result = result.expect("cold semantic request should wait for readiness");
+            let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
+        }
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
@@ -6327,7 +6313,10 @@ finally:
                 .await
                 .expect("second semantic request should resume after the first request completes")
                 .unwrap();
-        assert!(second_result.is_err());
+        let second_result =
+            second_result.expect("second semantic request should wait for readiness");
+        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
+        assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),

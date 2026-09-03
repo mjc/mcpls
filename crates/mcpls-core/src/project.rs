@@ -2096,6 +2096,25 @@ impl ProjectRequest {
         )
     }
 
+    const fn must_run_while_semantics_load(&self) -> bool {
+        match self {
+            Self::Timed { request, .. } | Self::Resident { request, .. } => {
+                request.must_run_while_semantics_load()
+            }
+            Self::Activate { .. }
+            | Self::ActivateWorkspaceRoots { .. }
+            | Self::AddWorkspaceRoot { .. }
+            | Self::Notification { .. }
+            | Self::ServerExited { .. }
+            | Self::SetStatus { .. }
+            | Self::Restart { .. }
+            | Self::Suspend { .. }
+            | Self::Shutdown { .. }
+            | Self::Fail { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Fail LSP work that was queued while this actor exhausted recovery.
     ///
     /// Inspection and lifecycle requests still pass through so callers can
@@ -8776,7 +8795,16 @@ async fn run_project_actor(
     mut runtime: ProjectRuntime,
     residency: Option<ProjectResidency>,
 ) {
-    while let Some(request) = next_project_request(&mut receiver).await {
+    let mut deferred_requests = VecDeque::new();
+    loop {
+        let request = if let Some(request) = deferred_requests.pop_front() {
+            request
+        } else {
+            let Some(request) = next_project_request(&mut receiver).await else {
+                break;
+            };
+            request
+        };
         let (request, _residency_guard) = request.into_resident();
         let (request, timing) = request.into_timed();
         if matches!(&request, ProjectRequest::Shutdown { .. }) {
@@ -8809,6 +8837,35 @@ async fn run_project_actor(
             && !runtime.activation_is_reusable(state.status, runtime.translator.workspace_roots())
         {
             resume_project_runtime(&actor_sender, &channels, &mut state, &mut runtime).await;
+        }
+        while resumes_runtime && runtime.translator.is_initializing() {
+            let Some(next) = next_project_request(&mut receiver).await else {
+                break;
+            };
+            if !next.must_run_while_semantics_load() {
+                deferred_requests.push_back(next);
+                continue;
+            }
+            let (next, _residency_guard) = next.into_resident();
+            let (next, timing) = next.into_timed();
+            let stop = handle_timed_project_request(
+                next,
+                timing,
+                &actor_sender,
+                &channels,
+                &mut state,
+                &mut runtime,
+                residency.as_ref(),
+            )
+            .await;
+            state.sync_runtime(&runtime);
+            channels.publish_state(&state);
+            if stop {
+                return;
+            }
+        }
+        if request.is_cancelled() {
+            continue;
         }
         let stop = handle_timed_project_request(
             request,
