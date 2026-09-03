@@ -1141,7 +1141,7 @@ where
             Some((key.to_string(), Some(value.to_string())))
         })
         .collect();
-    debug!(
+    info!(
         command,
         root = %root.display(),
         elapsed_ms = elapsed_ms(started),

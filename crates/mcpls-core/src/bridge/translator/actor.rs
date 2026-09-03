@@ -637,7 +637,7 @@ impl Translator {
         *lock_std(&self.evaluated_lsp_roots) = planned_server_roots(&servers);
         let router = ToolRouter::from_configs(servers.iter().map(|server| &server.config))?;
         *lock_std(&self.router) = router;
-        tracing::debug!(
+        tracing::info!(
             stage = "plan",
             root_count = roots.len(),
             server_count = servers.len(),
@@ -719,7 +719,7 @@ impl Translator {
                 load_project_environment(&root).await
             })
             .await;
-        tracing::debug!(
+        tracing::info!(
             stage = "project_environment",
             stage_ms = elapsed_ms(environment_started),
             total_ms = elapsed_ms(activation_started),
@@ -769,7 +769,7 @@ impl Translator {
         }
         let lsp_started = std::time::Instant::now();
         let result = LspServer::spawn_batch_with_cancellation(&init_configs, cancellation).await;
-        tracing::debug!(
+        tracing::info!(
             stage = "lsp_spawn_batch",
             stage_ms = elapsed_ms(lsp_started),
             total_ms = elapsed_ms(activation_started),
@@ -852,7 +852,7 @@ impl Translator {
             .count();
         self.actor_notification_cache
             .set_diagnostics_route_count(diagnostics_routes);
-        tracing::debug!(
+        tracing::info!(
             stage = "register",
             stage_ms = elapsed_ms(registration_started),
             total_ms = elapsed_ms(activation_started),
