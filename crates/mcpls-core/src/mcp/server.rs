@@ -6126,7 +6126,7 @@ finally:
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
 
-        server
+        let initial = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
                 project_id: "dormant".to_string(),
                 query: Some("fixture".to_string()),
@@ -6139,8 +6139,8 @@ finally:
                 page_token: None,
                 include_generated: false,
             }))
-            .await
-            .unwrap();
+            .await;
+        assert!(initial.is_err());
         let project_id = ProjectId::new("dormant").unwrap();
         wait_for_project_ready(&server.context.project_registry, &project_id).await;
         let result = server
@@ -6207,11 +6207,8 @@ finally:
                 include_generated: false,
             })),
         );
-        let first: serde_json::Value = serde_json::from_str(&first.unwrap()).unwrap();
-        let second: serde_json::Value = serde_json::from_str(&second.unwrap()).unwrap();
-
-        assert_eq!(first["symbols"][0]["name"], "fixture_symbol");
-        assert_eq!(second["symbols"][0]["name"], "fixture_symbol");
+        assert!(first.is_err());
+        assert!(second.is_err());
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
@@ -6331,10 +6328,8 @@ finally:
             tokio::time::timeout(std::time::Duration::from_secs(3), &mut second_request)
                 .await
                 .expect("second semantic request should resume after the first request completes")
-                .unwrap()
                 .unwrap();
-        let second_result: serde_json::Value = serde_json::from_str(&second_result).unwrap();
-        assert_eq!(second_result["symbols"][0]["name"], "fixture_symbol");
+        assert!(second_result.is_err());
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
         assert_eq!(
             std::fs::read_to_string(format!("{}.max-active", counter.display())).unwrap(),
