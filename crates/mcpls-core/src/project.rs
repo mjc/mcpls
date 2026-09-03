@@ -3754,6 +3754,7 @@ struct ProjectRuntime {
     edit_conflicts: VecDeque<EditConflict>,
     active_edit_workers: usize,
     activation_health: ActivationHealth,
+    activation_started_at: Option<Instant>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
 }
@@ -5025,6 +5026,7 @@ impl ProjectRuntime {
             edit_conflicts: VecDeque::new(),
             active_edit_workers: 0,
             activation_health: ActivationHealth::Ready,
+            activation_started_at: None,
             generation: 0,
             automatic_restart: AutomaticRestartPolicy::default(),
         }
@@ -5040,6 +5042,11 @@ impl ProjectRuntime {
 
     const fn begin_transition(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn begin_activation(&mut self) {
+        self.begin_transition();
+        self.activation_started_at = Some(Instant::now());
     }
 
     const fn generation(&self) -> u64 {
@@ -5250,7 +5257,7 @@ impl ProjectRuntime {
 
     fn begin_automatic_restart(&mut self) -> Option<AutomaticRestartAttempt> {
         let attempt = self.automatic_restart.next()?;
-        self.begin_transition();
+        self.begin_activation();
         Some(attempt)
     }
 
@@ -8831,7 +8838,7 @@ async fn resume_project_runtime(
     runtime: &mut ProjectRuntime,
 ) {
     let roots = runtime.translator.workspace_roots().to_vec();
-    runtime.begin_transition();
+    runtime.begin_activation();
     state.last_error = None;
     channels.publish_status(state, ProjectStatus::Starting);
     let cancellation = CancellationToken::new();
@@ -8930,6 +8937,19 @@ fn mark_project_started(
         &channels.gate,
         runtime.generation(),
     );
+    let status = runtime.readiness_status();
+    if !runtime.translator.is_initializing() {
+        let elapsed_ms = runtime
+            .activation_started_at
+            .take()
+            .map_or(0, |started| started.elapsed().as_millis() as u64);
+        tracing::info!(
+            stage = "readiness",
+            ?status,
+            stage_ms = elapsed_ms,
+            "project activation readiness reached"
+        );
+    }
     publish_project_readiness(channels, state, runtime);
 }
 
@@ -9061,7 +9081,7 @@ async fn handle_project_request(
                 let _ = reply.send(Ok(state.clone()));
                 return false;
             }
-            runtime.begin_transition();
+            runtime.begin_activation();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
             let cancellation = CancellationToken::new();
@@ -9098,7 +9118,7 @@ async fn handle_project_request(
                 let _ = reply.send(Ok(state.clone()));
                 return false;
             }
-            runtime.begin_transition();
+            runtime.begin_activation();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
             let cancellation = CancellationToken::new();
@@ -9496,7 +9516,7 @@ async fn handle_project_request(
         }
         ProjectRequest::AddWorkspaceRoot { root, reply } => {
             let previous_status = state.status;
-            runtime.begin_transition();
+            runtime.begin_activation();
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Restarting);
             let cancellation = CancellationToken::new();
@@ -9730,6 +9750,17 @@ async fn handle_project_request(
             let was_initializing = runtime.translator.is_initializing();
             channels.publish_notification(runtime, generation, &server_id, notification);
             if was_initializing && !runtime.translator.is_initializing() {
+                let status = runtime.readiness_status();
+                let elapsed_ms = runtime
+                    .activation_started_at
+                    .take()
+                    .map_or(0, |started| started.elapsed().as_millis() as u64);
+                tracing::info!(
+                    stage = "readiness",
+                    ?status,
+                    stage_ms = elapsed_ms,
+                    "project activation readiness reached"
+                );
                 publish_project_readiness(channels, state, runtime);
             }
         }
@@ -9751,7 +9782,7 @@ async fn handle_project_request(
             let _ = reply.send(());
         }
         ProjectRequest::Restart { reply } => {
-            runtime.begin_transition();
+            runtime.begin_activation();
             state.sync_runtime(runtime);
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Restarting);
