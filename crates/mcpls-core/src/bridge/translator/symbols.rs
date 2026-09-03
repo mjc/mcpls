@@ -696,8 +696,9 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error when the request parameters are invalid. Missing,
-    /// initializing, unsupported, or failed LSP servers use the bounded
-    /// in-process AST fallback.
+    /// unsupported, or failed LSP servers use the bounded in-process AST
+    /// fallback; an initializing server remains pending until its semantic
+    /// index is authoritative.
     #[allow(clippy::too_many_lines)]
     pub async fn handle_workspace_symbol(
         &self,
@@ -861,8 +862,8 @@ impl Translator {
             }
         };
         if lock_std(&self.expected_servers).contains(&server_id) {
-            tracing::debug!(%server_id, "workspace-symbol server still initializing; using AST fallback");
-            return fallback().await;
+            tracing::debug!(%server_id, "workspace-symbol server still initializing");
+            return Err(Error::ServerInitializing { server_id });
         }
         if let Err(error) = self.respawn_if_dead(&server_id).await {
             tracing::debug!(%error, "workspace-symbol server unavailable; using AST fallback");
@@ -1373,7 +1374,6 @@ mod tests {
         assert_eq!(WorkspaceSymbolMatch::Exact.score(), 100);
     }
     use std::fs;
-    use std::time::Duration;
 
     use super::*;
     use crate::bridge::translator::testing::{
@@ -1382,7 +1382,6 @@ mod tests {
     use crate::config::{ServerId, ToolRouter};
     use tempfile::TempDir;
     use tokio::io::BufReader;
-    use tokio::time::timeout;
 
     fn fallback_translator(dir: &TempDir) -> Translator {
         let mut translator = Translator::new()
@@ -1408,6 +1407,30 @@ mod tests {
             .unwrap();
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(result.symbols[0].name, "fallback_target");
+    }
+
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_rejects_initializing_server() {
+        let dir = TempDir::new().unwrap();
+        let translator = fallback_translator(&dir).with_router(ToolRouter::catch_all([(
+            ServerId::from("rust"),
+            "rust".to_owned(),
+        )]));
+        let server_id = ServerId::from("rust");
+        translator.set_expected_servers(std::collections::HashSet::from([server_id.clone()]));
+
+        let error = translator
+            .handle_workspace_symbol(
+                "fallback_target".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::ServerInitializing { server_id: id } if id == server_id));
     }
 
     #[tokio::test]
@@ -1623,49 +1646,32 @@ mod tests {
         assert_eq!(result.symbols[0].name, "fallback_target");
     }
 
-    /// MCPLS-43 regression: rust-analyzer accepts requests before its first
-    /// indexing pass is authoritative. An empty response from that interval
-    /// must not masquerade as a successful semantic result.
+    /// MCPLS-36 regression: rust-analyzer accepts requests before its first
+    /// indexing pass is authoritative. The request must remain pending rather
+    /// than falling back to a non-authoritative AST result.
     #[tokio::test]
-    async fn test_handle_workspace_symbol_falls_back_while_registered_server_initializes() {
+    async fn test_handle_workspace_symbol_rejects_registered_server_while_initializing() {
         let dir = TempDir::new().unwrap();
         let server_id = ServerId::from("rust");
         let capabilities = lsp_types::ServerCapabilities {
             workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
             ..lsp_types::ServerCapabilities::default()
         };
-        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, capabilities);
-        translator.set_expected_servers(HashSet::from([server_id]));
-        fs::write(dir.path().join("main.rs"), "fn fallback_target() {}\n").unwrap();
+        let (translator, server) = translator_with_capabilities(&dir, &server_id, capabilities);
+        translator.set_expected_servers(HashSet::from([server_id.clone()]));
 
-        let responder = tokio::spawn(async move {
-            let mut wire = BufReader::new(&mut server.write_stdout);
-            let request = read_framed_message(&mut wire).await;
-            assert_eq!(request["method"], "workspace/symbol");
-            write_response(
-                &mut server.read_half_stdin,
-                &request["id"],
-                serde_json::json!([]),
-            )
-            .await;
-        });
-
-        let result = timeout(
-            Duration::from_secs(2),
-            translator.handle_workspace_symbol(
+        let error = translator
+            .handle_workspace_symbol(
                 "fallback_target".to_string(),
                 None,
                 100,
                 WorkspaceSymbolMatchMode::default(),
                 WorkspaceSymbolScope::default(),
-            ),
-        )
-        .await
-        .expect("handler call should not hang")
-        .unwrap();
-        responder.abort();
-        assert_eq!(result.symbols.len(), 1);
-        assert_eq!(result.symbols[0].name, "fallback_target");
+            )
+            .await
+            .unwrap_err();
+        drop(server);
+        assert!(matches!(error, Error::ServerInitializing { server_id: id } if id == server_id));
     }
 
     /// #242 regression: a server *is* configured and running, it just
