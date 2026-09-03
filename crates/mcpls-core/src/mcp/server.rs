@@ -3659,8 +3659,7 @@ impl McplsServer {
         let id = parse_project_id(params.project_id)?;
         let actor = self
             .context
-            .project_registry
-            .actor_for_project(&id)
+            .required_actor_for_project(&id)
             .await
             .map_err(project_routing_error)?;
         let result = actor
@@ -3689,8 +3688,7 @@ impl McplsServer {
         let id = parse_project_id(params.project_id).map_err(|error| error.to_string())?;
         let actor = self
             .context
-            .project_registry
-            .actor_for_project(&id)
+            .required_actor_for_project(&id)
             .await
             .map_err(project_routing_error)
             .map_err(|error| error.to_string())?;
@@ -6420,7 +6418,7 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rust_residency_evicts_before_spawn_and_resumes_on_semantic_request() {
+    async fn rust_residency_first_semantic_request_waits_for_ready_after_resume() {
         let first_root = TempDir::new().unwrap();
         let second_root = TempDir::new().unwrap();
         let first_file = write_rust_fixture(first_root.path());
@@ -6459,20 +6457,10 @@ finally:
             "1"
         );
 
-        let result = match server
+        let result = server
             .get_document_symbols(document_symbols_params(&first_file))
             .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                assert!(error.message.contains("still initializing"));
-                wait_for_project_ready(&server.context.project_registry, &first_id).await;
-                server
-                    .get_document_symbols(document_symbols_params(&first_file))
-                    .await
-                    .unwrap()
-            }
-        };
+            .expect("first semantic request should wait for rust-analyzer readiness");
         let result: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["symbols"], serde_json::json!([]));
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "3");

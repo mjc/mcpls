@@ -306,7 +306,9 @@ impl HandlerContext {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.project_registry.active_actor_for_path(path).await
+        let actor = self.project_registry.active_actor_for_path(path).await?;
+        actor.wait_until_routable().await?;
+        Ok(actor)
     }
 
     /// Resolve a handle through every actor group owned by an explicit project.
@@ -325,7 +327,9 @@ impl HandlerContext {
         &self,
         id: &crate::project::ProjectId,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.project_registry.actor(id).await
+        let actor = self.project_registry.actor(id).await?;
+        actor.wait_until_routable().await?;
+        Ok(actor)
     }
 
     /// Return the owning project identity and actor for a path.

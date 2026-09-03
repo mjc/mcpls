@@ -1147,12 +1147,20 @@ const fn project_status_priority(status: ProjectStatus) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SemanticReadiness {
+    Loading,
+    #[default]
+    Ready,
+}
+
 /// Project-local state counts and roots owned by an actor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectRuntimeSummary {
     workspace_roots: Vec<PathBuf>,
     configured_language_ids: Vec<String>,
     active_language_ids: Vec<String>,
+    semantic_readiness: SemanticReadiness,
     open_document_count: usize,
     generation: u64,
 }
@@ -1163,6 +1171,11 @@ impl ProjectRuntimeSummary {
             workspace_roots: translator.workspace_roots().to_vec(),
             configured_language_ids: translator.configured_language_ids(),
             active_language_ids: translator.active_language_ids(),
+            semantic_readiness: if translator.is_initializing() {
+                SemanticReadiness::Loading
+            } else {
+                SemanticReadiness::Ready
+            },
             open_document_count: translator.open_document_count(),
             generation,
         }
@@ -1203,6 +1216,9 @@ impl ProjectRuntimeSummary {
         self.configured_language_ids
             .extend(other.configured_language_ids);
         self.active_language_ids.extend(other.active_language_ids);
+        if other.semantic_readiness == SemanticReadiness::Loading {
+            self.semantic_readiness = SemanticReadiness::Loading;
+        }
         self.open_document_count += other.open_document_count;
         self.generation = self.generation.max(other.generation);
         self.workspace_roots.sort();
@@ -2226,6 +2242,17 @@ impl ProjectHandle {
     #[must_use]
     pub fn status(&self) -> watch::Receiver<ProjectStatus> {
         self.status.clone()
+    }
+    /// Wait while an expected language server is completing its initial load.
+    pub(crate) async fn wait_until_routable(&self) -> Result<(), ProjectActorError> {
+        let mut state = self.state.clone();
+        while state.borrow_and_update().runtime.semantic_readiness == SemanticReadiness::Loading {
+            state
+                .changed()
+                .await
+                .map_err(|_| ProjectActorError::Closed)?;
+        }
+        Ok(())
     }
 
     fn state_snapshot(&self) -> ProjectState {
