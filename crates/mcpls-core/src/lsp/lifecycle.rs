@@ -703,6 +703,10 @@ impl LspServer {
                     ),
                     ..Default::default()
                 }),
+                window: Some(lsp_types::WindowClientCapabilities {
+                    work_done_progress: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             client_info: Some(ClientInfo {
@@ -2485,7 +2489,7 @@ fn main() {
         }
 
         #[tokio::test]
-        async fn test_initialize_sends_configured_position_encodings() {
+        async fn test_initialize_sends_required_client_capabilities() {
             let (client, mut server) = fake_lsp_client();
 
             let config = ServerInitConfig {
@@ -2508,6 +2512,11 @@ fn main() {
                 serde_json::json!(["utf-32", "utf-8"]),
                 "initialize request must carry the configured encoding order, not the \
                  hardcoded [UTF8, UTF16] default"
+            );
+            assert_eq!(
+                request["params"]["capabilities"]["window"]["workDoneProgress"], true,
+                "rust-analyzer suppresses its indexing-complete notification unless the client \
+                 advertises work-done progress support"
             );
 
             write_success_response(

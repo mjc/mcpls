@@ -132,7 +132,10 @@ impl LspNotification {
         matches!(
             self,
             Self::Progress { token, value }
-                if token.as_str() == Some("rustAnalyzer/Indexing")
+                if matches!(
+                    token.as_str(),
+                    Some("rustAnalyzer/Indexing" | "rustAnalyzer/cachePriming")
+                )
                     && value.get("kind").and_then(serde_json::Value::as_str) == Some("end")
         )
     }

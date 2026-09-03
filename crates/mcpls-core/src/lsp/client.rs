@@ -1066,6 +1066,7 @@ impl LspClient {
             | "workspace/semanticTokens/refresh"
             | "workspace/inlayHint/refresh"
             | "workspace/codeLens/refresh"
+            | "window/workDoneProgress/create"
             | "window/showMessageRequest" => Ok(Value::Null),
             "workspace/configuration" => Ok(Self::workspace_configuration_result(params)),
             "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
@@ -1888,7 +1889,7 @@ mod tests {
                 &mut server.read_half_stdin,
                 "$/progress",
                 serde_json::json!({
-                    "token": "rustAnalyzer/Indexing",
+                    "token": "rustAnalyzer/cachePriming",
                     "value": { "kind": "end" },
                 }),
             )

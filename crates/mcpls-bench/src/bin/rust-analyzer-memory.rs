@@ -136,7 +136,10 @@ fn respond_to_server_request(client: &mut LspClient, message: &Value) -> Result<
 
 fn completes_initial_load(message: &Value) -> bool {
     message["method"] == "$/progress"
-        && message["params"]["token"] == "rustAnalyzer/Indexing"
+        && matches!(
+            message["params"]["token"].as_str(),
+            Some("rustAnalyzer/Indexing" | "rustAnalyzer/cachePriming")
+        )
         && message["params"]["value"]["kind"] == "end"
 }
 
@@ -460,11 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn indexing_end_completes_initial_load() {
+    fn cache_priming_end_completes_initial_load() {
         let progress = serde_json::json!({
             "method": "$/progress",
             "params": {
-                "token": "rustAnalyzer/Indexing",
+                "token": "rustAnalyzer/cachePriming",
                 "value": {"kind": "end"}
             }
         });
