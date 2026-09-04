@@ -459,15 +459,37 @@ pub(crate) async fn run_stdio(
 /// predates this function's own `TcpListener::bind` call — a signal between
 /// bind and the graceful-shutdown future's first poll is still caught.
 #[cfg(feature = "transport-http")]
+pub(crate) async fn bind_http_listener(
+    cfg: &HttpConfig,
+) -> Result<tokio::net::TcpListener, crate::Error> {
+    cfg.validate()?;
+    tokio::net::TcpListener::bind(cfg.bind)
+        .await
+        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))
+}
+
+/// Run the HTTP service using a listener reserved before project startup.
+#[cfg(feature = "transport-http")]
+pub(crate) async fn run_http(
+    mcp_server: crate::mcp::McplsServer,
+    cfg: HttpConfig,
+    shutdown_signal: ShutdownSignal,
+) -> Result<(), crate::Error> {
+    let listener = bind_http_listener(&cfg).await?;
+    run_http_with_listener(mcp_server, cfg, shutdown_signal, listener).await
+}
+
+#[cfg(feature = "transport-http")]
 // `session_manager` and `service` are moved into `app`, which is served until
 // shutdown — clippy's drop-tightening heuristic misreads that as an
 // early-droppable temporary because both types embed `tokio::sync` lock types
 // (`CappedSessionManager`'s `Mutex`, `StreamableHttpService`'s `RwLock`s).
 #[allow(clippy::significant_drop_tightening)]
-pub(crate) async fn run_http(
+pub(crate) async fn run_http_with_listener(
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,
     mut shutdown_signal: ShutdownSignal,
+    listener: tokio::net::TcpListener,
 ) -> Result<(), crate::Error> {
     use std::sync::Arc;
 
@@ -475,8 +497,6 @@ pub(crate) async fn run_http(
         StreamableHttpServerConfig, StreamableHttpService,
     };
     use tokio_util::sync::CancellationToken;
-
-    cfg.validate()?;
 
     let session_manager = Arc::new(CappedSessionManager::new(cfg.max_concurrent_sessions));
     let request_limit = Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_sessions));
@@ -503,10 +523,6 @@ pub(crate) async fn run_http(
             enforce_request_cap,
         ))
         .layer(axum::middleware::from_fn(enforce_session_cap));
-
-    let listener = tokio::net::TcpListener::bind(cfg.bind)
-        .await
-        .map_err(|e| crate::Error::McpServer(format!("bind {}: {e}", cfg.bind)))?;
 
     tracing::info!(addr = %cfg.bind, path = %cfg.path, "MCP HTTP transport listening");
 

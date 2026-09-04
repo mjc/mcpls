@@ -67,9 +67,9 @@ use tracing::{info, warn};
 #[cfg(feature = "transport-http")]
 pub use transport::HttpConfig;
 pub use transport::Transport;
-#[cfg(feature = "transport-http")]
-use transport::run_http;
 use transport::run_stdio;
+#[cfg(feature = "transport-http")]
+use transport::{bind_http_listener, run_http_with_listener};
 
 const PROJECT_MANIFESTS: &[&str] = &[
     "Cargo.toml",
@@ -246,6 +246,12 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
 pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<(), Error> {
     info!("Starting MCPLS server...");
 
+    #[cfg(feature = "transport-http")]
+    let http_listener = match &transport {
+        Transport::Http(cfg) => Some(bind_http_listener(cfg).await?),
+        Transport::Stdio => None,
+    };
+
     let workspace_roots = resolve_workspace_roots(&config.workspace.roots);
     let translator_template = TranslatorTemplate::from_server_config(&config);
     let subscriptions = Arc::new(ResourceSubscriptions::new());
@@ -289,7 +295,15 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             .await
         }
         #[cfg(feature = "transport-http")]
-        Transport::Http(cfg) => run_http(mcp_server, cfg, transport::ShutdownSignal::new()).await,
+        Transport::Http(cfg) => {
+            run_http_with_listener(
+                mcp_server,
+                cfg,
+                transport::ShutdownSignal::new(),
+                http_listener.expect("HTTP listener is bound before server startup"),
+            )
+            .await
+        }
     };
 
     let shutdown = project_registry.shutdown_all().await;

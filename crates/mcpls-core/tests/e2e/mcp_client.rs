@@ -2,8 +2,21 @@
 //!
 //! This module provides a synchronous MCP client that spawns the mcpls binary
 //! and communicates via stdio using the JSON-RPC 2.0 protocol.
+//!
+//! The authoritative command for the `mcpls-core` rust-analyzer E2E suite is:
+//!
+//! ```text
+//! cargo build -p mcpls && MCPLS_E2E_BINARY="$PWD/target/debug/mcpls" \
+//!   cargo nextest run -p mcpls-core --test ra_e2e --run-ignored ignored-only ra_e2e_suite
+//! ```
+//!
+//! The explicit binary path is required because this test belongs to
+//! `mcpls-core`, so Cargo does not provide `CARGO_BIN_EXE_mcpls` for it. This
+//! keeps the suite tied to the binary built from the current workspace rather
+//! than an arbitrary pre-existing `target/debug/mcpls`.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -65,23 +78,10 @@ impl McpClient {
     /// - The mcpls binary cannot be found or spawned
     /// - stdin or stdout cannot be captured
     pub fn spawn_with_args(args: &[&str]) -> Result<Self> {
-        // Get binary path from cargo test environment
-        // CARGO_BIN_EXE_mcpls is only set for tests in the mcpls-cli crate.
-        // For tests in mcpls-core, compute workspace root from CARGO_MANIFEST_DIR.
-        let binary_path = std::env::var("CARGO_BIN_EXE_mcpls")
-            .ok()
-            .or_else(|| {
-                let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-                manifest_dir
-                    .ancestors()
-                    .nth(2) // mcpls-core -> crates -> workspace
-                    .map(|root| {
-                        root.join("target/debug/mcpls")
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-            })
-            .unwrap_or_else(|| "target/debug/mcpls".to_string());
+        let binary_path = configured_binary_path(
+            std::env::var_os("CARGO_BIN_EXE_mcpls").as_deref(),
+            std::env::var_os("MCPLS_E2E_BINARY").as_deref(),
+        )?;
 
         let mut process = Command::new(binary_path)
             .args(args)
@@ -393,6 +393,25 @@ impl McpClient {
     }
 }
 
+fn configured_binary_path(
+    cargo_binary: Option<&std::ffi::OsStr>,
+    explicit_binary: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let configured = cargo_binary.or(explicit_binary).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCPLS E2E binary is not configured; run `cargo build -p mcpls` and set MCPLS_E2E_BINARY to the resulting binary"
+        )
+    })?;
+    let path = Path::new(configured);
+    if !path.is_file() {
+        anyhow::bail!(
+            "configured MCPLS E2E binary does not exist: {}",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
 #[allow(dead_code)]
 fn inline_request(id: i64, method: &str, params: &Value) -> Value {
     let mut params = params.as_object().cloned().unwrap_or_default();
@@ -421,6 +440,31 @@ impl Drop for McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_selection_requires_cargo_or_explicit_binary() {
+        let error = configured_binary_path(None, None).unwrap_err();
+        assert!(error.to_string().contains("MCPLS_E2E_BINARY"));
+        assert!(!error.to_string().contains("target/debug/mcpls"));
+    }
+
+    #[test]
+    fn binary_selection_prefers_cargo_binary_and_validates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_binary = dir.path().join("cargo-mcpls");
+        let explicit_binary = dir.path().join("explicit-mcpls");
+        std::fs::write(&cargo_binary, b"cargo").unwrap();
+        std::fs::write(&explicit_binary, b"explicit").unwrap();
+
+        assert_eq!(
+            configured_binary_path(
+                Some(cargo_binary.as_os_str()),
+                Some(explicit_binary.as_os_str())
+            )
+            .unwrap(),
+            cargo_binary
+        );
+    }
 
     #[test]
     #[ignore = "Requires mcpls binary built"]

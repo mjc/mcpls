@@ -865,13 +865,12 @@ impl Translator {
             tracing::debug!(%server_id, "workspace-symbol server still initializing");
             return Err(Error::ServerInitializing { server_id });
         }
-        if let Err(error) = self.respawn_if_dead(&server_id).await {
-            tracing::debug!(%error, "workspace-symbol server unavailable; using AST fallback");
-            return fallback().await;
-        }
+        self.respawn_if_dead(&server_id).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let Some(client) = client else {
-            return fallback().await;
+            return Err(Error::NoServerForWorkspaceTool {
+                tool: ToolKind::WorkspaceSymbols,
+            });
         };
         if self
             .require_capability(&server_id, "workspaceSymbolProvider", |caps| {
@@ -882,6 +881,10 @@ impl Translator {
             })
             .is_err()
         {
+            tracing::debug!(
+                %server_id,
+                "workspace-symbol provider does not advertise the capability; using AST fallback"
+            );
             return fallback().await;
         }
 
@@ -896,10 +899,7 @@ impl Translator {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
-                tracing::debug!(%error, "workspace-symbol request failed; using AST fallback");
-                return fallback().await;
-            }
+            Err(error) => return Err(error),
         };
 
         let ctx = self.encoding_ctx(&server_id);
@@ -938,10 +938,6 @@ impl Translator {
                 project_relative_path,
                 is_generated,
             });
-        }
-
-        if candidates.is_empty() {
-            return fallback().await;
         }
 
         Ok(finish_workspace_symbols(
@@ -1377,7 +1373,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::translator::testing::{
-        read_framed_message, translator_with_capabilities, write_response,
+        read_framed_message, translator_with_capabilities, write_error_response, write_response,
     };
     use crate::config::{ServerId, ToolRouter};
     use tempfile::TempDir;
@@ -1407,6 +1403,52 @@ mod tests {
             .unwrap();
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(result.symbols[0].name, "fallback_target");
+    }
+
+    #[tokio::test]
+    async fn lsp_workspace_symbol_failure_is_not_silently_replaced_by_ast_results() {
+        let dir = TempDir::new().unwrap();
+        let fallback_path = dir.path().join("main.rs");
+        fs::write(&fallback_path, "fn fallback_target() {}\n").unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, capabilities);
+        let responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut wire).await;
+            write_error_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                -32000,
+                "provider unavailable",
+            )
+            .await;
+            (server._write_half, server._read_half)
+        });
+
+        let error = translator
+            .handle_workspace_symbol(
+                "fallback_target".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::LspServerError {
+                code: -32000,
+                message,
+                ..
+            } if message == "provider unavailable"
+        ));
+        let _ = responder.await.unwrap();
     }
 
     #[tokio::test]
