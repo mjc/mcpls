@@ -7516,6 +7516,62 @@ finally:
         );
     }
 
+    #[tokio::test]
+    async fn resources_read_deferred_completion_details_reassemble_losslessly() {
+        let server = create_test_server_with_project().await;
+        let items = (0..80)
+            .map(|index| {
+                serde_json::json!({
+                    "completion_id": format!("completion-{index}"),
+                    "label": format!("item-{index}"),
+                    "detail": "λ".repeat(500),
+                    "documentation": "documentation"
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = serde_json::to_string(&items).unwrap();
+        let reference = server
+            .context
+            .project_registry
+            .store_deferred_resource(
+                &ProjectId::new("project").unwrap(),
+                "completions",
+                serde_json::Value::Array(items),
+            )
+            .unwrap();
+
+        let mut uri = reference.uri.clone();
+        let mut recovered = String::new();
+        loop {
+            let resource = parse_session_resource_uri(&uri).unwrap();
+            let SessionResource::Deferred(deferred) = resource else {
+                panic!("expected deferred completion resource");
+            };
+            let response = server
+                .read_deferred_resource(deferred, uri.clone(), false)
+                .unwrap();
+            let ReadResourceResponse::Complete(response) = response else {
+                panic!("deferred completion resource unexpectedly requested input");
+            };
+            let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+                panic!("deferred completion resource was not text");
+            };
+            let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            recovered.push_str(&page.text);
+            let Some(next) = page.next_uri else {
+                break;
+            };
+            uri = next;
+        }
+
+        assert_eq!(recovered, expected);
+        assert_eq!(
+            reference.snapshot_hash,
+            format!("{:x}", Sha256::digest(expected.as_bytes()))
+        );
+    }
+
     #[test]
     fn project_list_tool_schema_exposes_cursor_pagination() {
         let tools = McplsServer::tool_router().list_all();
