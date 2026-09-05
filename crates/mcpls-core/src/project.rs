@@ -20991,5 +20991,12 @@ while True:
             .read_scoped(token, "project")
             .unwrap();
         assert_eq!(value["contents"], contents);
+        assert!(
+            deferred_results
+                .lock()
+                .unwrap()
+                .read_scoped(token, "different-project")
+                .is_err()
+        );
     }
 }
