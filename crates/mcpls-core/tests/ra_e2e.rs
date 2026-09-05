@@ -856,6 +856,20 @@ fn sc_rename_symbol_deferred(client: &mut McpClient, workspace: &Path) -> Result
         return Err(format!("rename fallback omitted edits: {semantic}"));
     }
 
+    let mut other =
+        McpClient::spawn().map_err(|error| format!("spawn second MCP session: {error}"))?;
+    other
+        .initialize()
+        .map_err(|error| format!("initialize second MCP session: {error}"))?;
+    let cross_session = other
+        .call_tool("read_semantic_resource", &json!({"uri": resource_uri}))
+        .expect_err("rename resource must not be readable from another session");
+    if !cross_session.to_string().contains("stale_resource") {
+        return Err(format!(
+            "cross-session rename resource failure was not explicit: {cross_session}"
+        ));
+    }
+
     let mut uri = resource_uri;
     let mut resource_json = String::new();
     loop {
