@@ -286,21 +286,31 @@ impl Translator {
         let mut hints = Vec::new();
         for hint in response.unwrap_or_default() {
             let position = ctx.to_mcp(&response_uri, hint.position).await;
-            let label = match hint.label {
-                InlayHintLabel::String(s) => s,
-                InlayHintLabel::LabelParts(parts) => parts
-                    .into_iter()
-                    .map(|p| p.value)
-                    .collect::<Vec<_>>()
-                    .concat(),
+            let (label, label_parts) = match hint.label {
+                InlayHintLabel::String(s) => (s, None),
+                InlayHintLabel::LabelParts(parts) => {
+                    let label = parts
+                        .iter()
+                        .map(|p| p.value.as_str())
+                        .collect::<Vec<_>>()
+                        .concat();
+                    let label_parts = parts
+                        .into_iter()
+                        .filter_map(|part| serde_json::to_value(part).ok())
+                        .collect::<Vec<_>>();
+                    (label, Some(label_parts))
+                }
             };
             let tooltip = hint.tooltip.map(|t| match t {
                 lsp_types::InlayHintTooltip::String(s) => s,
                 lsp_types::InlayHintTooltip::MarkupContent(m) => m.value,
             });
             hints.push(InlayHintEntry {
+                hint_id: None,
+                resolve_handle: None,
                 position,
                 label,
+                label_parts,
                 kind: hint.kind.and_then(|k| {
                     serde_json::to_value(k)
                         .ok()
@@ -310,10 +320,24 @@ impl Translator {
                 padding_left: hint.padding_left,
                 padding_right: hint.padding_right,
                 tooltip,
+                text_edit: hint
+                    .text_edits
+                    .and_then(|edits| serde_json::to_value(edits).ok()),
+                data: hint.data,
             });
         }
 
-        Ok(InlayHintsResult { hints })
+        Ok(InlayHintsResult {
+            hints,
+            provider_incomplete: false,
+            total_hints: 0,
+            returned_hints: 0,
+            remaining_hints: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+            hints_resource: None,
+            truncated: false,
+        })
     }
 }
 

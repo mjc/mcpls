@@ -870,6 +870,9 @@ pub struct InlayHintsParams {
     /// End character (1-based).
     #[schemars(description = "End character (1-based).")]
     pub end_character: u32,
+    /// Snapshot-bound continuation returned by a prior inlay-hints response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for registering a project with the long-lived daemon.

@@ -9555,6 +9555,14 @@
           "description": "Absolute path to the file.",
           "type": "string"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior inlay-hints response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "start_character": {
           "description": "Start character (1-based).",
           "format": "uint32",
@@ -9579,9 +9587,59 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "InlayHintEntry": {
           "description": "A single inlay hint entry.",
           "properties": {
+            "data": {
+              "description": "Opaque provider data used to resolve the hint."
+            },
+            "hint_id": {
+              "description": "Stable identity for this provider hint within its snapshot.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "description": "Hint kind (1 = Type, 2 = Parameter).",
               "format": "uint8",
@@ -9595,6 +9653,14 @@
             "label": {
               "description": "Label text for the hint.",
               "type": "string"
+            },
+            "label_parts": {
+              "description": "Provider label parts, including per-part tooltip/location/command data.",
+              "items": true,
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "padding_left": {
               "description": "Whether to add a space before the hint.",
@@ -9613,6 +9679,16 @@
             "position": {
               "$ref": "#/$defs/Position2D",
               "description": "Position of the hint (1-based MCP)."
+            },
+            "resolve_handle": {
+              "description": "Stable handle for provider-side hint resolution or editing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text_edit": {
+              "description": "Provider text edit used to resolve or replace the hint."
             },
             "tooltip": {
               "description": "Tooltip text.",
@@ -9659,6 +9735,60 @@
             "$ref": "#/$defs/InlayHintEntry"
           },
           "type": "array"
+        },
+        "hints_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete hint payloads when expensive fields are deferred."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_incomplete": {
+          "default": false,
+          "description": "Whether the provider reported an incomplete result. LSP inlay-hint\nresponses have no incompleteness bit, so this is always false today.",
+          "type": "boolean"
+        },
+        "remaining_hints": {
+          "default": 0,
+          "description": "Number of hints after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_hints": {
+          "default": 0,
+          "description": "Number of hints returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the received provider hint snapshot.",
+          "type": "string"
+        },
+        "total_hints": {
+          "default": 0,
+          "description": "Number of hints received from the provider in this snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "default": false,
+          "description": "Whether the response budget caused fields to move behind the resource.",
+          "type": "boolean"
         }
       },
       "required": [

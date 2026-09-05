@@ -1843,6 +1843,7 @@ enum ProjectRequest {
         start_character: u32,
         end_line: u32,
         end_character: u32,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<InlayHintsResult, String>>,
     },
     GoToImplementation {
@@ -3213,6 +3214,7 @@ impl ProjectHandle {
         start_character: u32,
         end_line: u32,
         end_character: u32,
+        page_token: Option<String>,
     ) -> Result<InlayHintsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -3222,6 +3224,7 @@ impl ProjectHandle {
                 start_character,
                 end_line,
                 end_character,
+                page_token,
                 reply,
             })
             .await
@@ -4141,6 +4144,84 @@ struct CodeActionStore {
 const CODE_ACTION_PAGE_SIZE: usize = 64;
 const COMPLETION_PAGE_SIZE: usize = 64;
 const SIGNATURE_PAGE_SIZE: usize = 32;
+const INLAY_HINT_PAGE_SIZE: usize = 64;
+
+fn inlay_hint_page_bounds(
+    hints: &[crate::bridge::translator::InlayHintEntry],
+    page_token: Option<&str>,
+) -> Result<(std::ops::Range<usize>, String, Option<String>), String> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(hints).map_err(|error| error.to_string())?)
+    );
+    let offset = page_token
+        .map(|token| {
+            let (identity, offset) = token
+                .split_once(':')
+                .ok_or_else(|| "invalid inlay hint page_token".to_owned())?;
+            if identity != snapshot_identity {
+                return Err("inlay hint page_token belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| "invalid inlay hint page_token".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if offset > hints.len() {
+        return Err("inlay hint page_token is outside the provider snapshot".to_owned());
+    }
+    let end = offset.saturating_add(INLAY_HINT_PAGE_SIZE).min(hints.len());
+    let next = (end < hints.len()).then(|| format!("{snapshot_identity}:{end}"));
+    Ok((offset..end, snapshot_identity, next))
+}
+
+fn inlay_hint_identity(hint: &crate::bridge::translator::InlayHintEntry, ordinal: usize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(ordinal, hint)).unwrap_or_default())
+    )
+}
+
+fn defer_oversized_inlay_hint_payloads(
+    result: &mut InlayHintsResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        <= MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Ok(());
+    }
+    let complete = serde_json::to_value(&result.hints)
+        .map_err(|error| format!("failed to store inlay hints: {error}"))?;
+    result.hints_resource = Some(store_diagnostic_payload(
+        complete,
+        "inlay_hints",
+        deferred_results,
+        scope,
+    )?);
+    result.truncated = true;
+    for hint in &mut result.hints {
+        hint.label_parts = None;
+        hint.tooltip = None;
+        hint.text_edit = None;
+        hint.data = None;
+    }
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        > MAX_NOTIFICATION_RESULT_BYTES
+    {
+        for hint in &mut result.hints {
+            hint.label.clear();
+        }
+    }
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        > MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Err("inlay hint result exceeds the response page budget".to_owned());
+    }
+    Ok(())
+}
 
 fn signature_page_bounds(
     signatures: &[crate::bridge::translator::SignatureInfo],
@@ -8974,8 +9055,10 @@ impl ProjectRuntime {
         start_character: u32,
         end_line: u32,
         end_character: u32,
+        page_token: Option<String>,
     ) -> Result<InlayHintsResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_inlay_hints(
                 file_path,
                 start_line,
@@ -8984,7 +9067,29 @@ impl ProjectRuntime {
                 end_character,
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let (page, snapshot_identity, next_cursor) =
+            inlay_hint_page_bounds(&result.hints, page_token.as_deref())?;
+        let total_hints = result.hints.len();
+        let page_start = page.start;
+        let mut hints = result.hints[page].to_vec();
+        for (index, hint) in hints.iter_mut().enumerate() {
+            let identity = inlay_hint_identity(hint, page_start + index);
+            hint.hint_id = Some(identity.clone());
+            hint.resolve_handle = Some(identity);
+        }
+        result.hints = hints;
+        result.total_hints = total_hints;
+        result.returned_hints = result.hints.len();
+        result.remaining_hints = total_hints.saturating_sub(page_start + result.hints.len());
+        result.next_cursor = next_cursor;
+        result.snapshot_identity = snapshot_identity;
+        defer_oversized_inlay_hint_payloads(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn go_to_implementation(
@@ -10359,6 +10464,7 @@ async fn handle_project_request(
             start_character,
             end_line,
             end_character,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
@@ -10369,6 +10475,7 @@ async fn handle_project_request(
                         start_character,
                         end_line,
                         end_character,
+                        page_token,
                     )
                     .await,
             );
@@ -13874,6 +13981,92 @@ mod tests {
     }
 
     #[test]
+    fn inlay_hint_pages_are_snapshot_bound_and_gap_free() {
+        let hints = (0..130)
+            .map(|index| crate::bridge::translator::InlayHintEntry {
+                hint_id: None,
+                resolve_handle: None,
+                position: crate::bridge::translator::Position2D {
+                    line: u32::try_from(index + 1).unwrap(),
+                    character: 1,
+                },
+                label: format!("hint-{index}"),
+                label_parts: None,
+                kind: Some(1),
+                padding_left: None,
+                padding_right: None,
+                tooltip: None,
+                text_edit: None,
+                data: None,
+            })
+            .collect::<Vec<_>>();
+        let (first, snapshot, next) = inlay_hint_page_bounds(&hints, None).unwrap();
+        assert_eq!(first, 0..64);
+        let token = next.unwrap();
+        let (second, same_snapshot, next) = inlay_hint_page_bounds(&hints, Some(&token)).unwrap();
+        assert_eq!(same_snapshot, snapshot);
+        assert_eq!(second, 64..128);
+        let (last, _, next) = inlay_hint_page_bounds(&hints, next.as_deref()).unwrap();
+        assert_eq!(last, 128..130);
+        assert!(next.is_none());
+        assert!(inlay_hint_page_bounds(&hints, Some("stale:64")).is_err());
+    }
+
+    #[test]
+    fn oversized_inlay_hint_details_are_deferred_losslessly() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let hint = crate::bridge::translator::InlayHintEntry {
+            hint_id: Some("hint-1".to_owned()),
+            resolve_handle: Some("hint-1".to_owned()),
+            position: crate::bridge::translator::Position2D {
+                line: 1,
+                character: 1,
+            },
+            label: "type".to_owned(),
+            label_parts: Some(vec![serde_json::json!({
+                "value": "type",
+                "command": {"command": "resolve"}
+            })]),
+            kind: Some(1),
+            padding_left: Some(true),
+            padding_right: Some(false),
+            tooltip: Some("λ".repeat(MAX_NOTIFICATION_RESULT_BYTES)),
+            text_edit: Some(serde_json::json!({"newText": "replacement"})),
+            data: Some(serde_json::json!({"opaque": "provider"})),
+        };
+        let complete = serde_json::to_value(vec![hint.clone()]).unwrap();
+        let mut result = InlayHintsResult {
+            hints: vec![hint],
+            provider_incomplete: false,
+            total_hints: 1,
+            returned_hints: 1,
+            remaining_hints: 0,
+            next_cursor: None,
+            snapshot_identity: "snapshot".to_owned(),
+            hints_resource: None,
+            truncated: false,
+        };
+
+        defer_oversized_inlay_hint_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_NOTIFICATION_RESULT_BYTES);
+        assert!(result.truncated);
+        assert!(result.hints[0].tooltip.is_none());
+        assert!(result.hints[0].text_edit.is_none());
+        assert!(result.hints[0].data.is_none());
+        let reference = result.hints_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[test]
     fn completion_pages_are_snapshot_bound_and_gap_free() {
         let items = (0..130)
             .map(|index| serde_json::json!({"label": index}))
@@ -16770,7 +16963,7 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle
-            .inlay_hints(file.display().to_string(), 1, 5, 1, 15)
+            .inlay_hints(file.display().to_string(), 1, 5, 1, 15, None)
             .await;
 
         assert!(matches!(

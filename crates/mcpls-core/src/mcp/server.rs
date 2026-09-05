@@ -4413,6 +4413,7 @@ impl McplsServer {
             start_character,
             end_line,
             end_character,
+            page_token,
         }): Parameters<InlayHintsParams>,
     ) -> Result<Json<crate::bridge::InlayHintsResult>, McpError> {
         let actor = self
@@ -4427,6 +4428,7 @@ impl McplsServer {
                 start_character,
                 end_line,
                 end_character,
+                page_token,
             )
             .await
             .map_err(|error| error.to_string());
@@ -10540,6 +10542,7 @@ while True:
                 start_character: 5,
                 end_line: 1,
                 end_character: 15,
+                page_token: None,
             }))
             .await;
 
@@ -11206,6 +11209,7 @@ while True:
             start_character: 1,
             end_line: 10,
             end_character: 1,
+            page_token: None,
         });
 
         let result = server.get_inlay_hints(params).await;

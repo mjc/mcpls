@@ -1869,10 +1869,19 @@ pub struct LocationsResult {
 /// A single inlay hint entry.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct InlayHintEntry {
+    /// Stable identity for this provider hint within its snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint_id: Option<String>,
+    /// Stable handle for provider-side hint resolution or editing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_handle: Option<String>,
     /// Position of the hint (1-based MCP).
     pub position: Position2D,
     /// Label text for the hint.
     pub label: String,
+    /// Provider label parts, including per-part tooltip/location/command data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_parts: Option<Vec<serde_json::Value>>,
     /// Hint kind (1 = Type, 2 = Parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<u8>,
@@ -1885,6 +1894,12 @@ pub struct InlayHintEntry {
     /// Tooltip text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tooltip: Option<String>,
+    /// Provider text edit used to resolve or replace the hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_edit: Option<serde_json::Value>,
+    /// Opaque provider data used to resolve the hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Result of an inlay hints request.
@@ -1892,6 +1907,31 @@ pub struct InlayHintEntry {
 pub struct InlayHintsResult {
     /// List of inlay hints.
     pub hints: Vec<InlayHintEntry>,
+    /// Whether the provider reported an incomplete result. LSP inlay-hint
+    /// responses have no incompleteness bit, so this is always false today.
+    #[serde(default)]
+    pub provider_incomplete: bool,
+    /// Number of hints received from the provider in this snapshot.
+    #[serde(default)]
+    pub total_hints: usize,
+    /// Number of hints returned on this page.
+    #[serde(default)]
+    pub returned_hints: usize,
+    /// Number of hints after this page.
+    #[serde(default)]
+    pub remaining_hints: usize,
+    /// Snapshot-bound continuation for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the received provider hint snapshot.
+    #[serde(default)]
+    pub snapshot_identity: String,
+    /// Complete hint payloads when expensive fields are deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hints_resource: Option<DeferredResourceReference>,
+    /// Whether the response budget caused fields to move behind the resource.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[cfg(test)]
