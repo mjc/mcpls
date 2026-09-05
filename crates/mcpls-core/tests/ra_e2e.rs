@@ -748,14 +748,15 @@ fn sc_get_document_symbols(client: &mut McpClient, workspace: &Path) -> Result<(
             return Err(format!("symbol '{expected}' not found in document symbols"));
         }
     }
-    if inner["filters"]["max_depth"] != 1
+    if !inner["filters"]["max_depth"].is_null()
         || inner["returned"].as_u64().is_none()
         || inner["total"].as_u64().is_none()
+        || inner["source_resource"]["uri"].as_str().is_none()
         || !inner["truncated"].is_boolean()
         || syms.iter().any(|symbol| symbol["children"].is_array())
-        || syms.iter().any(|symbol| {
-            symbol["source"]["status"] != "available" || !symbol["symbol_handle"].is_string()
-        })
+        || syms
+            .iter()
+            .any(|symbol| symbol["source"].is_object() || !symbol["symbol_handle"].is_string())
     {
         return Err(format!("compact outline contract is incomplete: {inner}"));
     }
@@ -1050,10 +1051,8 @@ fn sc_no_reread_corpus(client: &mut McpClient, workspace: &Path) -> Result<(), S
                     || structured["returned"] != 12
                     || structured["truncated"] != true
                     || first["name"] != "fixture_item_00"
-                    || first["source"]["status"] != "available"
-                    || first["source"]["text"]
-                        .as_str()
-                        .is_none_or(|text| !text.contains("pub fn fixture_item_00()"))
+                    || structured["source_resource"]["uri"].as_str().is_none()
+                    || first["source"].is_object()
                     || first["range"]["start"]["line"].as_u64().is_none()
                     || response.to_string().len() > 65_536
                     || started.elapsed() > Duration::from_secs(15)

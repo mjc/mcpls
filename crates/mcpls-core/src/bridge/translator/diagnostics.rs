@@ -24,6 +24,40 @@ use crate::bridge::{DiagnosticInfo, DocumentTracker, NotificationCache, path_to_
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 
+fn notification_page_bounds(
+    item_count: usize,
+    cursor: Option<&str>,
+    snapshot_identity: &str,
+    kind: &str,
+    page_size: usize,
+) -> Result<(std::ops::Range<usize>, Option<String>)> {
+    let start = match cursor {
+        Some(cursor) => {
+            let (identity, offset) = cursor.split_once(':').ok_or_else(|| {
+                Error::InvalidToolParams(format!("invalid {kind} cursor: {cursor}"))
+            })?;
+            if identity != snapshot_identity {
+                return Err(Error::InvalidToolParams(format!(
+                    "{kind} cursor belongs to a different snapshot"
+                )));
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidToolParams(format!("invalid {kind} cursor: {cursor}")))?
+        }
+        None => 0,
+    };
+    if cursor.is_some() && start >= item_count {
+        return Err(Error::InvalidToolParams(format!(
+            "{kind} cursor is outside the retained snapshot: {start}"
+        )));
+    }
+    let end = start.saturating_add(page_size).min(item_count);
+    let next_cursor =
+        (page_size > 0 && end < item_count).then(|| format!("{snapshot_identity}:{end}"));
+    Ok((start..end, next_cursor))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DiagnosticRequestParams {
@@ -619,6 +653,16 @@ impl Translator {
         limit: usize,
         min_level: Option<String>,
     ) -> Result<ServerLogsResult> {
+        Self::handle_server_logs_page(cache, limit, min_level, None)
+    }
+
+    /// Return one snapshot-bound page of server logs.
+    pub fn handle_server_logs_page(
+        cache: &NotificationCache,
+        limit: usize,
+        min_level: Option<String>,
+        cursor: Option<&str>,
+    ) -> Result<ServerLogsResult> {
         use crate::bridge::notifications::LogLevel;
 
         let min_level_filter = if let Some(level_str) = min_level {
@@ -640,7 +684,7 @@ impl Translator {
 
         let all_logs = cache.logs();
 
-        let logs: Vec<_> = all_logs
+        let filtered_logs: Vec<_> = all_logs
             .iter()
             .filter(|log| {
                 min_level_filter.is_none_or(|min| match min {
@@ -650,11 +694,32 @@ impl Translator {
                     LogLevel::Debug => true,
                 })
             })
-            .take(limit)
             .cloned()
             .collect();
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&filtered_logs).unwrap_or_default())
+        );
+        let (page, next_cursor) = notification_page_bounds(
+            filtered_logs.len(),
+            cursor,
+            &snapshot_identity,
+            "server_logs",
+            limit,
+        )?;
+        let page_end = page.end;
+        let logs = (limit > 0)
+            .then(|| filtered_logs[page].to_vec())
+            .unwrap_or_default();
 
-        Ok(ServerLogsResult { logs })
+        Ok(ServerLogsResult {
+            returned: logs.len(),
+            remaining: filtered_logs.len().saturating_sub(page_end),
+            total: filtered_logs.len(),
+            snapshot_identity,
+            next_cursor,
+            logs,
+        })
     }
 
     /// Handle server messages request.
@@ -666,9 +731,46 @@ impl Translator {
         cache: &NotificationCache,
         limit: usize,
     ) -> Result<ServerMessagesResult> {
+        Self::handle_server_messages_page(cache, limit, None)
+    }
+
+    /// Return one snapshot-bound page of server messages.
+    pub fn handle_server_messages_page(
+        cache: &NotificationCache,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ServerMessagesResult> {
         let all_messages = cache.messages();
-        let messages: Vec<_> = all_messages.iter().take(limit).cloned().collect();
-        Ok(ServerMessagesResult { messages })
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&all_messages).unwrap_or_default())
+        );
+        let (page, next_cursor) = notification_page_bounds(
+            all_messages.len(),
+            cursor,
+            &snapshot_identity,
+            "server_messages",
+            limit,
+        )?;
+        let page_end = page.end;
+        let messages: Vec<_> = (limit > 0)
+            .then(|| {
+                all_messages
+                    .iter()
+                    .skip(page.start)
+                    .take(page.end - page.start)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ServerMessagesResult {
+            returned: messages.len(),
+            remaining: all_messages.len().saturating_sub(page_end),
+            total: all_messages.len(),
+            snapshot_identity,
+            next_cursor,
+            messages,
+        })
     }
 }
 
@@ -1674,6 +1776,39 @@ mod tests {
     }
 
     #[test]
+    fn notification_pages_are_complete_and_reject_mutated_cursors() {
+        use crate::bridge::notifications::{LogLevel, MessageType};
+
+        let mut cache = NotificationCache::new();
+        for index in 0..101 {
+            cache.store_log(LogLevel::Info, format!("log {index}"));
+            cache.store_message(MessageType::Info, format!("message {index}"));
+        }
+
+        let first = Translator::handle_server_logs_page(&cache, 50, None, None).unwrap();
+        assert_eq!(
+            (first.total, first.returned, first.remaining),
+            (100, 50, 50)
+        );
+        let cursor = first.next_cursor.clone().unwrap();
+        let second = Translator::handle_server_logs_page(&cache, 50, None, Some(&cursor)).unwrap();
+        assert_eq!(
+            (second.total, second.returned, second.remaining),
+            (100, 50, 0)
+        );
+        assert!(second.next_cursor.is_none());
+        assert_eq!(first.logs[0].message, "log 1");
+        assert_eq!(second.logs[0].message, "log 51");
+
+        let first = Translator::handle_server_messages_page(&cache, 50, None).unwrap();
+        assert_eq!((first.total, first.returned, first.remaining), (50, 50, 0));
+        assert!(first.next_cursor.is_none());
+
+        cache.store_log(LogLevel::Info, "new log".to_owned());
+        assert!(Translator::handle_server_logs_page(&cache, 50, None, Some(&cursor)).is_err());
+    }
+
+    #[test]
     fn test_handle_server_messages_zero_limit() {
         use crate::bridge::notifications::MessageType;
 
@@ -1685,6 +1820,9 @@ mod tests {
         assert!(result.is_ok());
         let messages = result.unwrap();
         assert_eq!(messages.messages.len(), 0);
+        assert_eq!(messages.total, 1);
+        assert_eq!(messages.remaining, 1);
+        assert!(messages.next_cursor.is_none());
     }
 
     #[test]

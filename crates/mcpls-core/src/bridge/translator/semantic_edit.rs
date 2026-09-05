@@ -10,6 +10,7 @@ use lsp_types::{
     WorkDoneProgressParams, WorkspaceEdit,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::Translator;
 use super::dto::{
@@ -23,9 +24,8 @@ use crate::config::ToolKind;
 use crate::edit_paths::FileOperation;
 use crate::error::{Error, Result};
 
-const MAX_DISCOVERY_ITEMS: usize = 100;
-const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 const PROVIDER_SYNC_STABILITY_WINDOW: Duration = Duration::from_millis(100);
+const MAX_DISCOVERY_PAGE_ITEMS: usize = 64;
 
 #[derive(Debug, Clone)]
 /// Edits returned by language servers participating in a file rename.
@@ -97,15 +97,51 @@ pub struct SemanticDiscoveryResult {
     /// Locations returned by declaration or module discovery.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
+    /// Total declaration or module locations returned by the provider.
+    pub locations_total: usize,
+    /// Number of declaration or module locations retained inline.
+    pub locations_returned: usize,
+    /// Number of declaration or module locations after this page.
+    pub remaining_locations: usize,
+    /// Complete declaration or module locations when the inline result is bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locations_resource: Option<crate::bridge::DeferredResourceReference>,
     /// Inner-to-outer ranges returned by selection discovery.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub selection_ranges: Vec<Range>,
+    /// Total selection ranges returned by the provider.
+    pub selection_ranges_total: usize,
+    /// Number of selection ranges retained inline.
+    pub selection_ranges_returned: usize,
+    /// Number of selection ranges after this page.
+    pub remaining_selection_ranges: usize,
+    /// Snapshot-bound continuation for the compact result page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the provider result snapshot.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub snapshot_identity: String,
+    /// Complete selection ranges when the inline result is bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_ranges_resource: Option<crate::bridge::DeferredResourceReference>,
     /// Expansion returned by macro discovery.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub macro_expansion: Option<MacroExpansion>,
+    /// Complete macro expansion when the inline result is bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macro_expansion_resource: Option<crate::bridge::DeferredResourceReference>,
     /// Raw, redacted runnable or related-test payloads.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runnables: Vec<serde_json::Value>,
+    /// Total runnable or related-test payloads returned by the provider.
+    pub runnables_total: usize,
+    /// Number of runnable or related-test payloads retained inline.
+    pub runnables_returned: usize,
+    /// Number of runnable or related-test payloads after this page.
+    pub remaining_runnables: usize,
+    /// Complete runnable or related-test payloads when the inline result is bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runnables_resource: Option<crate::bridge::DeferredResourceReference>,
     /// Whether configured item or byte bounds truncated the response.
     pub truncated: bool,
 }
@@ -117,9 +153,24 @@ impl SemanticDiscoveryResult {
             provider: provider.to_string(),
             kind,
             locations: Vec::new(),
+            locations_total: 0,
+            locations_returned: 0,
+            remaining_locations: 0,
+            locations_resource: None,
             selection_ranges: Vec::new(),
+            selection_ranges_total: 0,
+            selection_ranges_returned: 0,
+            remaining_selection_ranges: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+            selection_ranges_resource: None,
             macro_expansion: None,
+            macro_expansion_resource: None,
             runnables: Vec::new(),
+            runnables_total: 0,
+            runnables_returned: 0,
+            remaining_runnables: 0,
+            runnables_resource: None,
             truncated: false,
         }
     }
@@ -977,6 +1028,7 @@ impl Translator {
         line: u32,
         character: u32,
         kind: SemanticDiscoveryKind,
+        page_token: Option<&str>,
     ) -> Result<SemanticDiscoveryResult> {
         let (id, client, uri) = self
             .prepare_document(&file_path, ToolKind::Definition)
@@ -1045,13 +1097,23 @@ impl Translator {
                         timeout,
                     )
                     .await?;
-                (result.locations, result.truncated) = super::navigation::bounded_locations(
-                    response,
-                    &ctx,
-                    &self.workspace_roots,
-                    MAX_DISCOVERY_ITEMS,
-                )
-                .await;
+                let (locations, total, remaining, next_cursor, snapshot_identity, truncated) =
+                    super::navigation::bounded_location_page(
+                        response,
+                        &ctx,
+                        &self.workspace_roots,
+                        page_token,
+                        "semantic discovery",
+                    )
+                    .await?;
+                result.locations = locations;
+                result.locations_total = total;
+                result.locations_returned = result.locations.len();
+                result.locations_resource = None;
+                result.next_cursor = next_cursor;
+                result.snapshot_identity = snapshot_identity;
+                result.remaining_locations = remaining;
+                result.truncated |= truncated;
             }
             SemanticDiscoveryKind::ParentModule | SemanticDiscoveryKind::ChildModules => {
                 let method = if matches!(kind, SemanticDiscoveryKind::ParentModule) {
@@ -1061,16 +1123,26 @@ impl Translator {
                 };
                 let response: Option<lsp_types::GotoDefinitionResponse> =
                     client.request(method, position_params, timeout).await?;
-                (result.locations, result.truncated) = super::navigation::bounded_locations(
-                    response,
-                    &ctx,
-                    &self.workspace_roots,
-                    MAX_DISCOVERY_ITEMS,
-                )
-                .await;
+                let (locations, total, remaining, next_cursor, snapshot_identity, truncated) =
+                    super::navigation::bounded_location_page(
+                        response,
+                        &ctx,
+                        &self.workspace_roots,
+                        page_token,
+                        "semantic discovery",
+                    )
+                    .await?;
+                result.locations = locations;
+                result.locations_total = total;
+                result.locations_returned = result.locations.len();
+                result.locations_resource = None;
+                result.next_cursor = next_cursor;
+                result.snapshot_identity = snapshot_identity;
+                result.remaining_locations = remaining;
+                result.truncated |= truncated;
             }
             SemanticDiscoveryKind::MacroExpansion => {
-                if let Some(mut expansion) = client
+                if let Some(expansion) = client
                     .request::<_, Option<MacroExpansion>>(
                         "rust-analyzer/expandMacro",
                         position_params,
@@ -1078,9 +1150,6 @@ impl Translator {
                     )
                     .await?
                 {
-                    result.truncated = truncate_utf8(&mut expansion.name, MAX_DISCOVERY_BYTES);
-                    let remaining = MAX_DISCOVERY_BYTES.saturating_sub(expansion.name.len());
-                    result.truncated |= truncate_utf8(&mut expansion.expansion, remaining);
                     result.macro_expansion = Some(expansion);
                 }
             }
@@ -1099,15 +1168,39 @@ impl Translator {
                     .await?;
                 let mut current = response.and_then(|ranges| ranges.into_iter().next());
                 while let Some(selection) = current {
-                    if result.selection_ranges.len() == MAX_DISCOVERY_ITEMS {
-                        result.truncated = true;
-                        break;
-                    }
                     result
                         .selection_ranges
                         .push(normalize_range(selection.range));
                     current = selection.parent.map(|parent| *parent);
                 }
+                let all_ranges = std::mem::take(&mut result.selection_ranges);
+                let snapshot_identity = format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&all_ranges).unwrap_or_default())
+                );
+                let offset = semantic_page_offset(page_token, &snapshot_identity)?;
+                if offset > all_ranges.len() {
+                    return Err(Error::InvalidToolParams(
+                        "semantic discovery page_token is outside the provider snapshot".to_owned(),
+                    ));
+                }
+                result.selection_ranges_total = all_ranges.len();
+                result.selection_ranges = all_ranges
+                    .into_iter()
+                    .skip(offset)
+                    .take(MAX_DISCOVERY_PAGE_ITEMS)
+                    .collect();
+                result.selection_ranges_returned = result.selection_ranges.len();
+                result.remaining_selection_ranges = result
+                    .selection_ranges_total
+                    .saturating_sub(offset + result.selection_ranges_returned);
+                result.next_cursor = (result.remaining_selection_ranges > 0).then(|| {
+                    format!(
+                        "{snapshot_identity}:{}",
+                        offset + result.selection_ranges_returned
+                    )
+                });
+                result.snapshot_identity = snapshot_identity;
             }
             SemanticDiscoveryKind::Runnables => {
                 let mut values: Vec<serde_json::Value> = client
@@ -1120,7 +1213,14 @@ impl Translator {
                 for value in &mut values {
                     self.redaction_policy.redact_json(value);
                 }
-                (result.runnables, result.truncated) = bounded_json_values(values);
+                let (page, total, remaining, next_cursor, snapshot_identity) =
+                    paged_json_values(&values, page_token)?;
+                result.runnables = page;
+                result.runnables_total = total;
+                result.runnables_returned = result.runnables.len();
+                result.remaining_runnables = remaining;
+                result.next_cursor = next_cursor;
+                result.snapshot_identity = snapshot_identity;
             }
             SemanticDiscoveryKind::RelatedTests => {
                 let mut values: Vec<serde_json::Value> = client
@@ -1129,7 +1229,14 @@ impl Translator {
                 for value in &mut values {
                     self.redaction_policy.redact_json(value);
                 }
-                (result.runnables, result.truncated) = bounded_json_values(values);
+                let (page, total, remaining, next_cursor, snapshot_identity) =
+                    paged_json_values(&values, page_token)?;
+                result.runnables = page;
+                result.runnables_total = total;
+                result.runnables_returned = result.runnables.len();
+                result.remaining_runnables = remaining;
+                result.next_cursor = next_cursor;
+                result.snapshot_identity = snapshot_identity;
             }
         }
         Ok(result)
@@ -1206,6 +1313,50 @@ fn plain_text_move_item_edit(edit: SnippetTextEdit) -> Result<lsp_types::TextEdi
     })
 }
 
+fn semantic_page_offset(page_token: Option<&str>, snapshot_identity: &str) -> Result<usize> {
+    let Some(page_token) = page_token else {
+        return Ok(0);
+    };
+    let (identity, offset) = page_token.split_once(':').ok_or_else(|| {
+        Error::InvalidToolParams("invalid semantic discovery page_token".to_owned())
+    })?;
+    if identity != snapshot_identity {
+        return Err(Error::InvalidToolParams(
+            "semantic discovery page_token belongs to a different snapshot".to_owned(),
+        ));
+    }
+    offset
+        .parse()
+        .map_err(|_| Error::InvalidToolParams("invalid semantic discovery page_token".to_owned()))
+}
+
+fn paged_json_values(
+    values: &[serde_json::Value],
+    page_token: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, usize, usize, Option<String>, String)> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(values).unwrap_or_default())
+    );
+    let offset = semantic_page_offset(page_token, &snapshot_identity)?;
+    let total = values.len();
+    if offset > total {
+        return Err(Error::InvalidToolParams(
+            "semantic discovery page_token is outside the provider snapshot".to_owned(),
+        ));
+    }
+    let page = values
+        .iter()
+        .skip(offset)
+        .take(MAX_DISCOVERY_PAGE_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = total.saturating_sub(offset + page.len());
+    let next_cursor =
+        (remaining > 0).then(|| format!("{snapshot_identity}:{}", offset + page.len()));
+    Ok((page, total, remaining, next_cursor, snapshot_identity))
+}
+
 fn validate_code_action_params(
     start_line: u32,
     start_character: u32,
@@ -1233,34 +1384,6 @@ fn experimental_enabled(capabilities: &lsp_types::ServerCapabilities, key: &str)
             .and_then(|value| value.get(key)),
         None | Some(serde_json::Value::Null | serde_json::Value::Bool(false))
     )
-}
-
-fn bounded_json_values(values: Vec<serde_json::Value>) -> (Vec<serde_json::Value>, bool) {
-    let mut retained = Vec::new();
-    let mut bytes = 0usize;
-    let mut truncated = values.len() > MAX_DISCOVERY_ITEMS;
-    for value in values.into_iter().take(MAX_DISCOVERY_ITEMS) {
-        let size = serde_json::to_vec(&value).map_or(MAX_DISCOVERY_BYTES + 1, |value| value.len());
-        if bytes.saturating_add(size) > MAX_DISCOVERY_BYTES {
-            truncated = true;
-            break;
-        }
-        bytes += size;
-        retained.push(value);
-    }
-    (retained, truncated)
-}
-
-fn truncate_utf8(value: &mut String, max_bytes: usize) -> bool {
-    if value.len() <= max_bytes {
-        return false;
-    }
-    let mut boundary = max_bytes.min(value.len());
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
-    true
 }
 
 const fn normalize_range(range: lsp_types::Range) -> Range {
@@ -1516,7 +1639,7 @@ fn error_indicates_missing_document(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_indicates_missing_document, plain_text_snippet};
+    use super::{error_indicates_missing_document, paged_json_values, plain_text_snippet};
     use crate::Error;
 
     #[test]
@@ -1561,5 +1684,21 @@ mod tests {
         assert!(error_indicates_missing_document(&missing));
         assert!(!error_indicates_missing_document(&unrelated));
         assert!(!error_indicates_missing_document(&Error::ServerTerminated));
+    }
+
+    #[test]
+    fn runnable_pages_are_snapshot_bound_and_gap_free() {
+        let values = (0..130)
+            .map(|index| serde_json::json!({"index": index}))
+            .collect::<Vec<_>>();
+        let (first, total, remaining, cursor, snapshot) = paged_json_values(&values, None).unwrap();
+        assert_eq!((first.len(), total, remaining), (64, 130, 66));
+        let cursor = cursor.unwrap();
+        let (second, _, remaining, cursor, _) = paged_json_values(&values, Some(&cursor)).unwrap();
+        assert_eq!((second.len(), remaining), (64, 2));
+        let (last, _, remaining, cursor, _) =
+            paged_json_values(&values, cursor.as_deref()).unwrap();
+        assert_eq!((last.len(), remaining, cursor), (2, 0, None));
+        assert!(paged_json_values(&values, Some(&format!("different:{snapshot}"))).is_err());
     }
 }

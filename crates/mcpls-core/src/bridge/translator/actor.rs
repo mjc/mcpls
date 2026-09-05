@@ -1009,8 +1009,22 @@ impl Translator {
         limit: usize,
         min_level: Option<String>,
     ) -> Result<super::ServerLogsResult> {
-        let mut result =
-            Self::handle_server_logs(&self.actor_notification_cache, limit, min_level)?;
+        self.actor_server_logs_page(limit, min_level, None)
+    }
+
+    /// Return one snapshot-bound page of redacted server logs owned by this actor.
+    pub fn actor_server_logs_page(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+        cursor: Option<&str>,
+    ) -> Result<super::ServerLogsResult> {
+        let mut result = Self::handle_server_logs_page(
+            &self.actor_notification_cache,
+            limit,
+            min_level,
+            cursor,
+        )?;
         for log in &mut result.logs {
             log.message = self.redaction_policy.redact(&log.message);
         }
@@ -1023,7 +1037,17 @@ impl Translator {
     ///
     /// Returns an error when the requested limit is invalid.
     pub fn actor_server_messages(&self, limit: usize) -> Result<super::ServerMessagesResult> {
-        let mut result = Self::handle_server_messages(&self.actor_notification_cache, limit)?;
+        self.actor_server_messages_page(limit, None)
+    }
+
+    /// Return one snapshot-bound page of redacted server messages owned by this actor.
+    pub fn actor_server_messages_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<super::ServerMessagesResult> {
+        let mut result =
+            Self::handle_server_messages_page(&self.actor_notification_cache, limit, cursor)?;
         for message in &mut result.messages {
             message.message = self.redaction_policy.redact(&message.message);
         }

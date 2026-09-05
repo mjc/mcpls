@@ -52,6 +52,9 @@ pub struct DefinitionParams {
     pub project_id: Option<String>,
     /// Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.
     pub symbol_handle: Option<SymbolHandle>,
+    /// Snapshot-bound continuation returned by a prior definition response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Project-scoped position for read-only semantic discovery.
@@ -70,6 +73,9 @@ pub struct SemanticPositionParams {
     pub character: u32,
     /// Snapshot-bound handle returned by a source-bearing result; refresh discovery if stale.
     pub symbol_handle: Option<SymbolHandle>,
+    /// Snapshot-bound continuation returned by a prior discovery response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `get_references` tool.
@@ -189,6 +195,9 @@ pub struct CompletionsParams {
     /// Optional trigger character (e.g., '.', ':', '->').
     #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
     pub trigger: Option<String>,
+    /// Snapshot-bound continuation returned by a prior response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `get_document_symbols` tool.
@@ -599,6 +608,9 @@ pub struct CodeActionsParams {
     #[schemars(description = "Optional filter by action kind (quickfix, refactor, source, etc.).")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_filter: Option<String>,
+    /// Snapshot-bound continuation returned by a prior response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for listing project-scoped code actions with reusable references.
@@ -620,6 +632,9 @@ pub struct CodeActionListParams {
     /// Optional filter by action kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_filter: Option<String>,
+    /// Snapshot-bound continuation returned by a prior response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for previewing one project-scoped code action.
@@ -688,6 +703,9 @@ pub struct CallHierarchyCallsParams {
     /// Bounds applied to call groups and call sites.
     #[serde(default)]
     pub limits: SemanticResultLimits,
+    /// Snapshot-bound continuation cursor returned by a prior page.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `get_cached_diagnostics` tool.
@@ -721,6 +739,9 @@ pub struct ServerLogsParams {
     #[schemars(description = "Minimum log level to include: error, warning, info, debug.")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_level: Option<String>,
+    /// Snapshot-bound continuation cursor returned by a prior page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 const fn default_log_limit() -> usize {
@@ -742,6 +763,9 @@ pub struct ServerMessagesParams {
     #[schemars(description = "Maximum number of messages to return (default: 20).")]
     #[serde(default = "default_message_limit")]
     pub limit: usize,
+    /// Snapshot-bound continuation cursor returned by a prior page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// Parameters for inspecting negotiated language-server capabilities.
@@ -772,6 +796,9 @@ pub struct SignatureHelpParams {
     /// Character/column number (1-based).
     #[schemars(description = "Character/column number (1-based).")]
     pub character: u32,
+    /// Snapshot-bound continuation returned by a prior response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `go_to_implementation` tool.
@@ -794,6 +821,9 @@ pub struct GoToImplementationParams {
     pub project_id: Option<String>,
     /// Snapshot-bound handle returned by a prior semantic result.
     pub symbol_handle: Option<SymbolHandle>,
+    /// Snapshot-bound continuation returned by a prior implementation response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `go_to_type_definition` tool.
@@ -816,6 +846,9 @@ pub struct GoToTypeDefinitionParams {
     pub project_id: Option<String>,
     /// Snapshot-bound handle returned by a prior semantic result.
     pub symbol_handle: Option<SymbolHandle>,
+    /// Snapshot-bound continuation returned by a prior type-definition response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// Parameters for the `get_inlay_hints` tool.
@@ -1038,7 +1071,7 @@ pub enum WorkspaceEditContentionScope {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List all registered projects.")]
 pub struct ProjectListParams {
-    /// Decimal cursor returned by a prior `project_list` response.
+    /// Snapshot-bound cursor returned by a prior `project_list` response.
     #[serde(default)]
     pub cursor: Option<String>,
 }
@@ -1048,10 +1081,14 @@ pub struct ProjectListParams {
 #[schemars(description = "Return a daemon health or status snapshot.")]
 pub struct DaemonStatusParams {}
 
-/// Empty parameters for listing this MCP session's resource subscriptions.
+/// Parameters for listing this MCP session's resource subscriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "List resource subscriptions owned by this MCP session.")]
-pub struct SubscriptionListParams {}
+pub struct SubscriptionListParams {
+    /// Snapshot-bound continuation cursor returned by a prior page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
 
 /// Parameters for reading source or deferred semantic context through a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

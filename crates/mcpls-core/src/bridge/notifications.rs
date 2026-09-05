@@ -578,6 +578,9 @@ pub struct LogEntry {
     pub level: LogLevel,
     /// Log message.
     pub message: String,
+    /// Lossless message payload when the inline text is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_resource: Option<crate::bridge::DeferredResourceReference>,
     /// Timestamp when the log was received.
     pub timestamp: DateTime<Utc>,
 }
@@ -617,6 +620,9 @@ pub struct ServerMessage {
     pub message_type: MessageType,
     /// Message content.
     pub message: String,
+    /// Lossless message payload when the inline text is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_resource: Option<crate::bridge::DeferredResourceReference>,
     /// Timestamp when the message was received.
     pub timestamp: DateTime<Utc>,
 }
@@ -914,6 +920,7 @@ impl NotificationCache {
             generation,
             level,
             message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
+            message_resource: None,
             timestamp: Utc::now(),
         };
 
@@ -939,6 +946,7 @@ impl NotificationCache {
             generation,
             message_type,
             message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
+            message_resource: None,
             timestamp: Utc::now(),
         };
 

@@ -791,6 +791,43 @@ const fn health_status(snapshot: &DaemonSnapshot) -> DaemonHealth {
 #[derive(Serialize, schemars::JsonSchema)]
 struct SubscriptionListResult {
     subscriptions: Vec<String>,
+    total: usize,
+    returned: usize,
+    remaining: usize,
+    snapshot_identity: String,
+    next_cursor: Option<String>,
+}
+
+const SUBSCRIPTION_LIST_PAGE_SIZE: usize = 64;
+
+fn subscription_list_page(
+    subscription_count: usize,
+    cursor: Option<&str>,
+    snapshot_identity: &str,
+) -> Result<std::ops::Range<usize>, String> {
+    let start = match cursor {
+        Some(cursor) => {
+            let (identity, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| format!("invalid subscription_list cursor: {cursor}"))?;
+            if identity != snapshot_identity {
+                return Err("subscription_list cursor belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| format!("invalid subscription_list cursor: {cursor}"))?
+        }
+        None => 0,
+    };
+    if cursor.is_some() && start >= subscription_count {
+        return Err(format!(
+            "subscription_list cursor is outside the subscription list: {start}"
+        ));
+    }
+    let end = start
+        .saturating_add(SUBSCRIPTION_LIST_PAGE_SIZE)
+        .min(subscription_count);
+    Ok(start..end)
 }
 
 fn project_events_json(
@@ -1732,11 +1769,20 @@ fn resource_page(
 fn project_list_page(
     project_count: usize,
     cursor: Option<&str>,
+    snapshot_identity: &str,
 ) -> Result<(std::ops::Range<usize>, Option<String>), String> {
     let start = match cursor {
-        Some(cursor) => cursor
-            .parse::<usize>()
-            .map_err(|_| format!("invalid project_list cursor: {cursor}"))?,
+        Some(cursor) => {
+            let (identity, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| format!("invalid project_list cursor: {cursor}"))?;
+            if identity != snapshot_identity {
+                return Err("project_list cursor belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| format!("invalid project_list cursor: {cursor}"))?
+        }
         None => 0,
     };
     if cursor.is_some() && start >= project_count {
@@ -1748,7 +1794,7 @@ fn project_list_page(
     let end = start
         .saturating_add(PROJECT_LIST_PAGE_SIZE)
         .min(project_count);
-    let next_cursor = (end < project_count).then(|| end.to_string());
+    let next_cursor = (end < project_count).then(|| format!("{snapshot_identity}:{end}"));
     Ok((start..end, next_cursor))
 }
 
@@ -2233,6 +2279,7 @@ impl McplsServer {
         params: SemanticPositionParams,
         kind: SemanticDiscoveryKind,
     ) -> Result<Json<crate::bridge::SemanticDiscoveryResult>, McpError> {
+        let page_token = params.page_token.clone();
         let (actor, file_path, line, character) = self
             .semantic_target(
                 Some(params.project_id),
@@ -2243,7 +2290,7 @@ impl McplsServer {
             )
             .await?;
         let result = actor
-            .semantic_discovery(file_path, line, character, kind)
+            .semantic_discovery(file_path, line, character, kind, page_token)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         encode_tool_result::<_, std::convert::Infallible>(Ok(result))
@@ -2708,9 +2755,7 @@ impl McplsServer {
         Parameters(ProjectListParams { cursor }): Parameters<ProjectListParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let projects = self.context.project_registry.list().await;
-        let (page, next_cursor) = project_list_page(projects.len(), cursor.as_deref())
-            .map_err(|error| McpError::invalid_params(error, None))?;
-        let result: Vec<_> = projects[page]
+        let project_values: Vec<_> = projects
             .iter()
             .map(|project| {
                 serde_json::json!({
@@ -2721,9 +2766,21 @@ impl McplsServer {
                 })
             })
             .collect();
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&project_values).unwrap_or_default())
+        );
+        let (page, next_cursor) =
+            project_list_page(project_values.len(), cursor.as_deref(), &snapshot_identity)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+        let page_end = page.end;
+        let result = project_values[page].to_vec();
         encode_json(&serde_json::json!({
             "projects": result,
             "returned": result.len(),
+            "total": project_values.len(),
+            "remaining": project_values.len().saturating_sub(page_end),
+            "snapshot_identity": snapshot_identity,
             "truncated": next_cursor.is_some(),
             "next_cursor": next_cursor,
         }))
@@ -2733,10 +2790,26 @@ impl McplsServer {
     #[tool(description = "List resource URIs subscribed by this MCP session.")]
     async fn subscription_list(
         &self,
-        Parameters(_params): Parameters<SubscriptionListParams>,
+        Parameters(SubscriptionListParams { cursor }): Parameters<SubscriptionListParams>,
     ) -> Result<Json<SubscriptionListResult>, McpError> {
         let subscriptions = self.context.subscriptions.sorted_snapshot().await;
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&subscriptions).unwrap_or_default())
+        );
+        let page =
+            subscription_list_page(subscriptions.len(), cursor.as_deref(), &snapshot_identity)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+        let total = subscriptions.len();
+        let page_end = page.end;
+        let subscriptions = subscriptions[page].to_vec();
+        let next_cursor = (page_end < total).then(|| format!("{snapshot_identity}:{page_end}"));
         encode_tool_result::<_, std::convert::Infallible>(Ok(SubscriptionListResult {
+            returned: subscriptions.len(),
+            remaining: total.saturating_sub(page_end),
+            total,
+            snapshot_identity,
+            next_cursor,
             subscriptions,
         }))
     }
@@ -3313,13 +3386,14 @@ impl McplsServer {
             character,
             project_id,
             symbol_handle,
+            page_token,
         }): Parameters<DefinitionParams>,
     ) -> Result<Json<crate::bridge::DefinitionResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
         let result = actor
-            .definition(file_path, line, character)
+            .definition_page(file_path, line, character, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -3538,6 +3612,7 @@ impl McplsServer {
             line,
             character,
             trigger,
+            page_token,
         }): Parameters<CompletionsParams>,
     ) -> Result<Json<crate::bridge::CompletionsResult>, McpError> {
         let actor = self
@@ -3546,7 +3621,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .completions(file_path, line, character, trigger)
+            .completions(file_path, line, character, trigger, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -3965,6 +4040,7 @@ impl McplsServer {
             end_line,
             end_character,
             kind_filter,
+            page_token,
         }): Parameters<CodeActionsParams>,
     ) -> Result<Json<crate::bridge::CodeActionsResult>, McpError> {
         let actor = self
@@ -3980,6 +4056,7 @@ impl McplsServer {
                 end_line,
                 end_character,
                 kind_filter,
+                page_token,
             )
             .await
             .map_err(|error| error.to_string());
@@ -3999,6 +4076,7 @@ impl McplsServer {
             end_line,
             end_character,
             kind_filter,
+            page_token,
         }): Parameters<CodeActionListParams>,
     ) -> Result<Json<crate::bridge::CodeActionsResult>, McpError> {
         let id = parse_project_id(project_id)?;
@@ -4013,6 +4091,7 @@ impl McplsServer {
                 end_line,
                 end_character,
                 kind_filter,
+                page_token,
             )
             .await;
         encode_tool_result(result)
@@ -4130,9 +4209,10 @@ impl McplsServer {
         &self,
         Parameters(params): Parameters<CallHierarchyCallsParams>,
     ) -> Result<Json<crate::bridge::IncomingCallsResult>, McpError> {
+        let page_token = params.page_token.clone();
         let (actor, item, limits) = self.call_hierarchy_target(params).await?;
         let result = actor
-            .incoming_calls(item, limits)
+            .incoming_calls(item, limits, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -4147,9 +4227,10 @@ impl McplsServer {
         &self,
         Parameters(params): Parameters<CallHierarchyCallsParams>,
     ) -> Result<Json<crate::bridge::OutgoingCallsResult>, McpError> {
+        let page_token = params.page_token.clone();
         let (actor, item, limits) = self.call_hierarchy_target(params).await?;
         let result = actor
-            .outgoing_calls(item, limits)
+            .outgoing_calls(item, limits, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -4185,13 +4266,14 @@ impl McplsServer {
             project_id,
             limit,
             min_level,
+            cursor,
         }): Parameters<ServerLogsParams>,
     ) -> Result<Json<crate::bridge::ServerLogsResult>, McpError> {
         let id = parse_project_id(project_id)?;
         encode_tool_result(
             self.context
                 .project_registry
-                .server_logs(&id, limit, min_level)
+                .server_logs_page(&id, limit, min_level, cursor)
                 .await,
         )
     }
@@ -4202,13 +4284,17 @@ impl McplsServer {
     )]
     async fn get_server_messages(
         &self,
-        Parameters(ServerMessagesParams { project_id, limit }): Parameters<ServerMessagesParams>,
+        Parameters(ServerMessagesParams {
+            project_id,
+            limit,
+            cursor,
+        }): Parameters<ServerMessagesParams>,
     ) -> Result<Json<crate::bridge::ServerMessagesResult>, McpError> {
         let id = parse_project_id(project_id)?;
         encode_tool_result(
             self.context
                 .project_registry
-                .server_messages(&id, limit)
+                .server_messages_page(&id, limit, cursor)
                 .await,
         )
     }
@@ -4247,6 +4333,7 @@ impl McplsServer {
             file_path,
             line,
             character,
+            page_token,
         }): Parameters<SignatureHelpParams>,
     ) -> Result<Json<crate::bridge::SignatureHelpResult>, McpError> {
         let actor = self
@@ -4255,7 +4342,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let result = actor
-            .signature_help(file_path, line, character)
+            .signature_help(file_path, line, character, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -4274,13 +4361,14 @@ impl McplsServer {
             character,
             project_id,
             symbol_handle,
+            page_token,
         }): Parameters<GoToImplementationParams>,
     ) -> Result<Json<crate::bridge::LocationsResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
         let result = actor
-            .go_to_implementation(file_path, line, character)
+            .go_to_implementation_page(file_path, line, character, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -4299,13 +4387,14 @@ impl McplsServer {
             character,
             project_id,
             symbol_handle,
+            page_token,
         }): Parameters<GoToTypeDefinitionParams>,
     ) -> Result<Json<crate::bridge::LocationsResult>, McpError> {
         let (actor, file_path, line, character) = self
             .semantic_target(project_id, symbol_handle, file_path, line, character)
             .await?;
         let result = actor
-            .go_to_type_definition(file_path, line, character)
+            .go_to_type_definition_page(file_path, line, character, page_token)
             .await
             .map_err(|error| error.to_string());
 
@@ -5770,25 +5859,81 @@ mod tests {
             .unwrap();
 
         let result = server
-            .subscription_list(Parameters(SubscriptionListParams {}))
+            .subscription_list(Parameters(SubscriptionListParams { cursor: None }))
             .await
             .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result).unwrap(),
-            serde_json::json!({
-                "subscriptions": [
-                    "lsp-diagnostics:///a.rs",
-                    "lsp-diagnostics:///z.rs"
-                ]
-            })
+            result["subscriptions"],
+            serde_json::json!(["lsp-diagnostics:///a.rs", "lsp-diagnostics:///z.rs"])
         );
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["returned"], 2);
+        assert_eq!(result["remaining"], 0);
+        assert!(result["snapshot_identity"].as_str().is_some());
+        assert!(result["next_cursor"].is_null());
         let session_result = session
-            .subscription_list(Parameters(SubscriptionListParams {}))
+            .subscription_list(Parameters(SubscriptionListParams { cursor: None }))
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&session_result).unwrap(),
-            serde_json::json!({"subscriptions": []})
+        let session_result: serde_json::Value = serde_json::from_str(&session_result).unwrap();
+        assert_eq!(session_result["subscriptions"], serde_json::json!([]));
+        assert_eq!(session_result["total"], 0);
+        assert_eq!(session_result["returned"], 0);
+        assert_eq!(session_result["remaining"], 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_list_pages_and_rejects_mutated_snapshot() {
+        let server = create_test_server();
+        for index in 0..65 {
+            server
+                .context
+                .subscriptions
+                .subscribe(format!("lsp-diagnostics:///{index:03}.rs"))
+                .await
+                .unwrap();
+        }
+
+        let first: serde_json::Value = serde_json::from_str(
+            &server
+                .subscription_list(Parameters(SubscriptionListParams { cursor: None }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["total"], 65);
+        assert_eq!(first["returned"], 64);
+        assert_eq!(first["remaining"], 1);
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+
+        let second: serde_json::Value = serde_json::from_str(
+            &server
+                .subscription_list(Parameters(SubscriptionListParams {
+                    cursor: Some(cursor.clone()),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["total"], 65);
+        assert_eq!(second["returned"], 1);
+        assert_eq!(second["remaining"], 0);
+        assert!(second["next_cursor"].is_null());
+
+        server
+            .context
+            .subscriptions
+            .subscribe("lsp-diagnostics:///new.rs".to_string())
+            .await
+            .unwrap();
+        assert!(
+            server
+                .subscription_list(Parameters(SubscriptionListParams {
+                    cursor: Some(cursor),
+                }))
+                .await
+                .is_err()
         );
     }
 
@@ -7147,6 +7292,140 @@ finally:
         assert!(read.output_schema.as_ref().is_some());
     }
 
+    #[tokio::test]
+    async fn hover_deferred_contents_are_readable_through_the_mcp_fallback() {
+        let server = create_test_server_with_project().await;
+        let reference = server
+            .context
+            .project_registry
+            .store_deferred_resource(
+                &ProjectId::new("project").unwrap(),
+                "hover_contents",
+                serde_json::json!({"contents": "hover tail"}),
+            )
+            .unwrap();
+
+        let page = server
+            .read_semantic_resource(Parameters(SemanticResourceReadParams {
+                uri: reference.uri,
+            }))
+            .await
+            .unwrap();
+        let page: SemanticResourceReadResult = serde_json::from_value(page.value).unwrap();
+
+        assert_eq!(page.text, "{\"contents\":\"hover tail\"}");
+        assert_eq!(page.snapshot_hash, Some(reference.snapshot_hash));
+        assert_eq!(page.remaining_bytes, Some(0));
+    }
+
+    #[tokio::test]
+    async fn server_notification_deferred_bodies_are_readable_through_mcp_fallback() {
+        let server = create_test_server_with_project().await;
+        for (kind, body) in [
+            ("diagnostic_log_message", "log body"),
+            ("server_message", "message body"),
+        ] {
+            let reference = server
+                .context
+                .project_registry
+                .store_deferred_resource(
+                    &ProjectId::new("project").unwrap(),
+                    kind,
+                    serde_json::Value::String(body.to_owned()),
+                )
+                .unwrap();
+            let page = server
+                .read_semantic_resource(Parameters(SemanticResourceReadParams {
+                    uri: reference.uri,
+                }))
+                .await
+                .unwrap();
+            let page: SemanticResourceReadResult = serde_json::from_value(page.value).unwrap();
+
+            assert_eq!(page.text, format!("\"{body}\""));
+            assert_eq!(page.snapshot_hash, Some(reference.snapshot_hash));
+            assert_eq!(page.remaining_bytes, Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_discovery_deferred_payloads_are_readable_through_mcp_fallback() {
+        let server = create_test_server_with_project().await;
+        for (kind, value) in [
+            (
+                "semantic_locations",
+                serde_json::json!([{"uri":"file:///workspace/lib.rs"}]),
+            ),
+            (
+                "semantic_selection_ranges",
+                serde_json::json!([{"start":{"line":1,"character":1}}]),
+            ),
+            (
+                "semantic_runnables",
+                serde_json::json!([{"label":"test fixture"}]),
+            ),
+        ] {
+            let reference = server
+                .context
+                .project_registry
+                .store_deferred_resource(&ProjectId::new("project").unwrap(), kind, value.clone())
+                .unwrap();
+            let page = server
+                .read_semantic_resource(Parameters(SemanticResourceReadParams {
+                    uri: reference.uri,
+                }))
+                .await
+                .unwrap();
+            let page: SemanticResourceReadResult = serde_json::from_value(page.value).unwrap();
+
+            assert_eq!(page.text, serde_json::to_string(&value).unwrap());
+            assert_eq!(page.snapshot_hash, Some(reference.snapshot_hash));
+            assert_eq!(page.remaining_bytes, Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn resources_read_deferred_semantic_payloads_through_handler_path() {
+        let server = create_test_server_with_project().await;
+        let reference = server
+            .context
+            .project_registry
+            .store_deferred_resource(
+                &ProjectId::new("project").unwrap(),
+                "semantic_runnables",
+                serde_json::json!([{"label":"test fixture"}]),
+            )
+            .unwrap();
+        let resource = parse_session_resource_uri(&reference.uri).unwrap();
+        let SessionResource::Deferred(deferred) = resource else {
+            panic!("expected deferred resource");
+        };
+
+        let response = server
+            .read_deferred_resource(deferred, reference.uri.clone(), false)
+            .unwrap();
+        let ReadResourceResponse::Complete(response) = response else {
+            panic!("deferred resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, uri, .. } = &response.contents[0] else {
+            panic!("deferred resource was not text");
+        };
+        assert_eq!(uri, &reference.uri);
+        let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+        assert_eq!(page.text, "[{\"label\":\"test fixture\"}]");
+        assert_eq!(page.snapshot_hash, Some(reference.snapshot_hash));
+
+        let stale = server.read_deferred_resource(
+            DeferredResource {
+                token: "missing".to_owned(),
+                offset_bytes: 0,
+            },
+            "mcpls-deferred:///missing".to_owned(),
+            false,
+        );
+        assert!(stale.is_err());
+    }
+
     #[test]
     fn project_list_tool_schema_exposes_cursor_pagination() {
         let tools = McplsServer::tool_router().list_all();
@@ -7160,7 +7439,7 @@ finally:
             "properties": {
                 "cursor": {
                     "default": null,
-                    "description": "Decimal cursor returned by a prior `project_list` response.",
+                    "description": "Snapshot-bound cursor returned by a prior `project_list` response.",
                     "type": ["string", "null"]
                 }
             },
@@ -7447,6 +7726,54 @@ finally:
         assert_eq!(second["returned"], 1);
         assert!(!second["truncated"].as_bool().unwrap());
         assert!(second["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn project_list_rejects_cursor_after_registry_mutation() {
+        let parent = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        for index in 0..33 {
+            let root = parent.path().join(index.to_string());
+            std::fs::create_dir(&root).unwrap();
+            registry
+                .add(ProjectIdentity::new(
+                    ProjectId::new(format!("project-{index:02}")).unwrap(),
+                    CanonicalRoot::new(root).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let server = McplsServer::new_with_registry(
+            Arc::new(ResourceSubscriptions::new()),
+            registry.clone(),
+        );
+        let first: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams::default()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+
+        let added_root = parent.path().join("33");
+        std::fs::create_dir(&added_root).unwrap();
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project-33").unwrap(),
+                CanonicalRoot::new(added_root).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            server
+                .project_list(Parameters(ProjectListParams {
+                    cursor: Some(cursor),
+                }))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9119,6 +9446,7 @@ while True:
             line: 1,
             character: 1,
             symbol_handle: None,
+            page_token: None,
         };
         let declaration: serde_json::Value = serde_json::from_str(
             &server
@@ -9366,6 +9694,7 @@ while True:
             line: 1,
             character: 1,
             symbol_handle: None,
+            page_token: None,
         };
         for response in [
             server
@@ -9408,6 +9737,7 @@ while True:
                 line: 1,
                 character: 1,
                 symbol_handle: None,
+                page_token: None,
             }))
             .await
             .unwrap_err()
@@ -9897,6 +10227,7 @@ while True:
                 character: 0,
                 project_id: None,
                 symbol_handle: None,
+                page_token: None,
             }))
             .await;
 
@@ -10023,6 +10354,7 @@ while True:
                 line: 0,
                 character: 0,
                 trigger: None,
+                page_token: None,
             }))
             .await;
 
@@ -10114,6 +10446,7 @@ while True:
                 end_line: 1,
                 end_character: 15,
                 kind_filter: None,
+                page_token: None,
             }))
             .await;
 
@@ -10175,6 +10508,7 @@ while True:
                 file_path: file_path.display().to_string(),
                 line: 1,
                 character: 5,
+                page_token: None,
             }))
             .await;
 
@@ -10236,6 +10570,7 @@ while True:
                 character: 5,
                 project_id: None,
                 symbol_handle: None,
+                page_token: None,
             }))
             .await;
 
@@ -10266,6 +10601,7 @@ while True:
                 character: 5,
                 project_id: None,
                 symbol_handle: None,
+                page_token: None,
             }))
             .await;
 
@@ -10313,6 +10649,7 @@ while True:
             character: 5,
             project_id: None,
             symbol_handle: None,
+            page_token: None,
         });
 
         let result = server.get_definition(params).await;
@@ -10373,6 +10710,7 @@ while True:
             line: 10,
             character: 5,
             trigger: None,
+            page_token: None,
         });
 
         let result = server.get_completions(params).await;
@@ -10435,6 +10773,7 @@ while True:
             end_line: 10,
             end_character: 15,
             kind_filter: None,
+            page_token: None,
         });
         let result = server.get_code_actions(params).await;
         assert!(result.is_err());
@@ -10493,6 +10832,7 @@ while True:
             project_id: None,
             symbol_handle: None,
             limits: crate::bridge::SemanticResultLimits::default(),
+            page_token: None,
         });
         let result = server.get_incoming_calls(params).await;
         assert!(result.is_err());
@@ -10519,6 +10859,7 @@ while True:
             project_id: None,
             symbol_handle: None,
             limits: crate::bridge::SemanticResultLimits::default(),
+            page_token: None,
         });
         let result = server.get_outgoing_calls(params).await;
         assert!(result.is_err());
@@ -10554,6 +10895,7 @@ while True:
                 project_id: None,
                 symbol_handle: None,
                 limits: crate::bridge::SemanticResultLimits::default(),
+                page_token: None,
             }))
             .await;
         let error = result.unwrap_err().to_string();
@@ -10590,6 +10932,7 @@ while True:
                 project_id: None,
                 symbol_handle: None,
                 limits: crate::bridge::SemanticResultLimits::default(),
+                page_token: None,
             }))
             .await;
         let error = result.unwrap_err().to_string();
@@ -10637,6 +10980,7 @@ while True:
             project_id: "project".to_string(),
             limit: 50,
             min_level: None,
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10654,6 +10998,7 @@ while True:
             project_id: "project".to_string(),
             limit: 10,
             min_level: Some("error".to_string()),
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10672,6 +11017,7 @@ while True:
             project_id: "project".to_string(),
             limit: 100,
             min_level: Some("warning".to_string()),
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10685,6 +11031,7 @@ while True:
             project_id: "project".to_string(),
             limit: 50,
             min_level: Some("info".to_string()),
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10698,6 +11045,7 @@ while True:
             project_id: "project".to_string(),
             limit: 20,
             min_level: Some("debug".to_string()),
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10711,6 +11059,7 @@ while True:
             project_id: "project".to_string(),
             limit: 10,
             min_level: Some("invalid_level".to_string()),
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10724,6 +11073,7 @@ while True:
             project_id: "project".to_string(),
             limit: 0,
             min_level: None,
+            cursor: None,
         });
 
         let result = server.get_server_logs(params).await;
@@ -10741,6 +11091,7 @@ while True:
         let params = Parameters(ServerMessagesParams {
             project_id: "project".to_string(),
             limit: 20,
+            cursor: None,
         });
 
         let result = server.get_server_messages(params).await;
@@ -10757,6 +11108,7 @@ while True:
         let params = Parameters(ServerMessagesParams {
             project_id: "project".to_string(),
             limit: 5,
+            cursor: None,
         });
 
         let result = server.get_server_messages(params).await;
@@ -10774,6 +11126,7 @@ while True:
         let params = Parameters(ServerMessagesParams {
             project_id: "project".to_string(),
             limit: 0,
+            cursor: None,
         });
 
         let result = server.get_server_messages(params).await;
@@ -10791,6 +11144,7 @@ while True:
         let params = Parameters(ServerMessagesParams {
             project_id: "project".to_string(),
             limit: 1000,
+            cursor: None,
         });
 
         let result = server.get_server_messages(params).await;
@@ -10804,6 +11158,7 @@ while True:
             file_path: "/test/file.rs".to_string(),
             line: 10,
             character: 5,
+            page_token: None,
         });
 
         let result = server.get_signature_help(params).await;
@@ -10819,6 +11174,7 @@ while True:
             character: 5,
             project_id: None,
             symbol_handle: None,
+            page_token: None,
         });
 
         let result = server.go_to_implementation(params).await;
@@ -10834,6 +11190,7 @@ while True:
             character: 5,
             project_id: None,
             symbol_handle: None,
+            page_token: None,
         });
 
         let result = server.go_to_type_definition(params).await;

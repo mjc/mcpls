@@ -1180,7 +1180,7 @@ mod tests {
         });
 
         let result = translator
-            .handle_incoming_calls(item, crate::bridge::SemanticResultLimits::default())
+            .handle_incoming_calls(item, crate::bridge::SemanticResultLimits::default(), None)
             .await;
 
         assert!(matches!(
@@ -1221,7 +1221,7 @@ mod tests {
         });
 
         let result = translator
-            .handle_outgoing_calls(item, crate::bridge::SemanticResultLimits::default())
+            .handle_outgoing_calls(item, crate::bridge::SemanticResultLimits::default(), None)
             .await;
 
         assert!(matches!(

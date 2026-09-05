@@ -376,6 +376,14 @@
             "null"
           ]
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
@@ -562,12 +570,34 @@
             "data": {
               "description": "Language-server-specific payload after secret redaction."
             },
+            "data_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless diagnostic payload when inline data is deferred."
+            },
             "fix_handles": {
               "description": "Actor-owned code-action handles accepted by the preview flow.",
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "fix_handles_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless fix handles when the inline list is deferred."
             },
             "group_id": {
               "description": "Stable identity shared by every page of this diagnostic group.",
@@ -579,6 +609,17 @@
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless rendered message when the inline message is deferred."
             },
             "occurrence_count": {
               "description": "Number of identical diagnostics represented by this group.",
@@ -623,6 +664,17 @@
                 "$ref": "#/$defs/DiagnosticRelatedInformation"
               },
               "type": "array"
+            },
+            "related_information_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless related diagnostics when inline context would exceed a page."
             },
             "severity": {
               "$ref": "#/$defs/DiagnosticSeverity",
@@ -1053,6 +1105,50 @@
             "$ref": "#/$defs/CodeAction"
           },
           "type": "array"
+        },
+        "actions_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete action payloads when edits, commands, or other details are deferred."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_actions": {
+          "default": 0,
+          "description": "Number of actions after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_actions": {
+          "default": 0,
+          "description": "Number of actions returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the provider action snapshot.",
+          "type": "string"
+        },
+        "total_actions": {
+          "default": 0,
+          "description": "Number of provider actions in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -1120,6 +1216,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
@@ -1507,6 +1611,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -1518,14 +1645,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -1533,6 +1719,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -1548,8 +1761,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -1580,6 +1803,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
@@ -1967,6 +2198,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -1978,14 +2232,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -1993,6 +2306,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -2008,8 +2348,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -2040,6 +2390,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
@@ -2427,6 +2785,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -2438,14 +2819,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -2453,6 +2893,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -2468,8 +2935,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -3190,12 +3667,34 @@
             "data": {
               "description": "Language-server-specific payload after secret redaction."
             },
+            "data_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless diagnostic payload when inline data is deferred."
+            },
             "fix_handles": {
               "description": "Actor-owned code-action handles accepted by the preview flow.",
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "fix_handles_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless fix handles when the inline list is deferred."
             },
             "group_id": {
               "description": "Stable identity shared by every page of this diagnostic group.",
@@ -3207,6 +3706,17 @@
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless rendered message when the inline message is deferred."
             },
             "occurrence_count": {
               "description": "Number of identical diagnostics represented by this group.",
@@ -3251,6 +3761,17 @@
                 "$ref": "#/$defs/DiagnosticRelatedInformation"
               },
               "type": "array"
+            },
+            "related_information_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless related diagnostics when inline context would exceed a page."
             },
             "severity": {
               "$ref": "#/$defs/DiagnosticSeverity",
@@ -3864,6 +4385,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
@@ -4251,6 +4780,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -4262,14 +4814,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -4277,6 +4888,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -4292,8 +4930,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -4323,6 +4971,14 @@
         },
         "kind_filter": {
           "description": "Optional filter by action kind (quickfix, refactor, source, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior response.",
           "type": [
             "string",
             "null"
@@ -4509,12 +5165,34 @@
             "data": {
               "description": "Language-server-specific payload after secret redaction."
             },
+            "data_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless diagnostic payload when inline data is deferred."
+            },
             "fix_handles": {
               "description": "Actor-owned code-action handles accepted by the preview flow.",
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "fix_handles_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless fix handles when the inline list is deferred."
             },
             "group_id": {
               "description": "Stable identity shared by every page of this diagnostic group.",
@@ -4526,6 +5204,17 @@
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless rendered message when the inline message is deferred."
             },
             "occurrence_count": {
               "description": "Number of identical diagnostics represented by this group.",
@@ -4570,6 +5259,17 @@
                 "$ref": "#/$defs/DiagnosticRelatedInformation"
               },
               "type": "array"
+            },
+            "related_information_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless related diagnostics when inline context would exceed a page."
             },
             "severity": {
               "$ref": "#/$defs/DiagnosticSeverity",
@@ -5000,6 +5700,50 @@
             "$ref": "#/$defs/CodeAction"
           },
           "type": "array"
+        },
+        "actions_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete action payloads when edits, commands, or other details are deferred."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_actions": {
+          "default": 0,
+          "description": "Number of actions after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_actions": {
+          "default": 0,
+          "description": "Number of actions returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the provider action snapshot.",
+          "type": "string"
+        },
+        "total_actions": {
+          "default": 0,
+          "description": "Number of provider actions in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -5030,6 +5774,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "trigger": {
           "description": "Optional trigger character (e.g., '.', ':', '->').",
           "type": [
@@ -5050,6 +5802,13 @@
         "Completion": {
           "description": "A completion item.",
           "properties": {
+            "completion_id": {
+              "description": "Stable identity for this provider completion item.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "detail": {
               "description": "Detail information.",
               "type": [
@@ -5059,6 +5818,27 @@
             },
             "documentation": {
               "description": "Documentation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "filter_text": {
+              "description": "Provider filter key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "insert_text": {
+              "description": "Text inserted when this item is selected.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "insertion_handle": {
+              "description": "Stable handle for insertion-specific follow-up operations.",
               "type": [
                 "string",
                 "null"
@@ -5074,10 +5854,60 @@
             "label": {
               "description": "Label of the completion.",
               "type": "string"
+            },
+            "sort_text": {
+              "description": "Provider sort key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text_edit": {
+              "description": "Provider text edit used for insertion."
             }
           },
           "required": [
             "label"
+          ],
+          "type": "object"
+        },
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
           ],
           "type": "object"
         }
@@ -5090,6 +5920,55 @@
             "$ref": "#/$defs/Completion"
           },
           "type": "array"
+        },
+        "items_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete completion payloads when details are deferred."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_incomplete": {
+          "default": false,
+          "description": "Whether the provider says more completions may be available.",
+          "type": "boolean"
+        },
+        "remaining_items": {
+          "default": 0,
+          "description": "Number of completions after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_items": {
+          "default": 0,
+          "description": "Number of completions returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the received provider snapshot.",
+          "type": "string"
+        },
+        "total_items": {
+          "default": 0,
+          "description": "Number of completions received from the provider in this snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -5122,6 +6001,14 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Registered project that owns the file.",
@@ -5510,6 +6397,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -5521,14 +6431,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -5536,6 +6505,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -5551,8 +6547,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -5582,6 +6588,14 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior definition response.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Project owning `symbol_handle` when coordinates are omitted.",
@@ -5960,9 +6974,42 @@
           },
           "type": "array"
         },
+        "next_cursor": {
+          "description": "Snapshot-bound cursor for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable protocol provider identity.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "default": 0,
+          "description": "Number of definition targets after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_locations": {
+          "default": 0,
+          "description": "Number of definition targets returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the provider target snapshot.",
+          "type": "string"
+        },
+        "total_locations": {
+          "default": 0,
+          "description": "Number of definition targets in the provider snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "truncated": {
           "description": "Whether item or response budgets omitted target data.",
@@ -6168,12 +7215,34 @@
             "data": {
               "description": "Language-server-specific payload after secret redaction."
             },
+            "data_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless diagnostic payload when inline data is deferred."
+            },
             "fix_handles": {
               "description": "Actor-owned code-action handles accepted by the preview flow.",
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "fix_handles_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless fix handles when the inline list is deferred."
             },
             "group_id": {
               "description": "Stable identity shared by every page of this diagnostic group.",
@@ -6185,6 +7254,17 @@
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless rendered message when the inline message is deferred."
             },
             "occurrence_count": {
               "description": "Number of identical diagnostics represented by this group.",
@@ -6229,6 +7309,17 @@
                 "$ref": "#/$defs/DiagnosticRelatedInformation"
               },
               "type": "array"
+            },
+            "related_information_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless related diagnostics when inline context would exceed a page."
             },
             "severity": {
               "$ref": "#/$defs/DiagnosticSeverity",
@@ -7821,6 +8912,17 @@
           "description": "Hover contents as markdown string.",
           "type": "string"
         },
+        "contents_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete hover contents when the inline markdown was bounded."
+        },
         "kind": {
           "$ref": "#/$defs/NavigationKind",
           "description": "Relationship represented by this result."
@@ -7912,6 +9014,14 @@
             "total": 200
           },
           "description": "Bounds applied to call groups and call sites."
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation cursor returned by a prior page.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Project owning `symbol_handle` when `item` is omitted.",
@@ -8344,6 +9454,13 @@
           "$ref": "#/$defs/SemanticResultLimits",
           "description": "Limits applied to this result."
         },
+        "next_cursor": {
+          "description": "Cursor for the next caller or call-site page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "omitted_groups": {
           "description": "Groups omitted by limits.",
           "format": "uint",
@@ -8353,6 +9470,18 @@
         "provider": {
           "description": "Stable protocol provider identity.",
           "type": "string"
+        },
+        "remaining_call_sites": {
+          "description": "Call sites still available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_calls": {
+          "description": "Call groups still available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "returned_call_sites": {
           "description": "Returned call-site count.",
@@ -8365,6 +9494,10 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Snapshot identity used by the continuation cursor.",
+          "type": "string"
         },
         "total_call_sites": {
           "description": "Complete call-site count before limits.",
@@ -8388,8 +9521,11 @@
         "calls",
         "total_calls",
         "returned_calls",
+        "remaining_calls",
         "total_call_sites",
         "returned_call_sites",
+        "remaining_call_sites",
+        "snapshot_identity",
         "omitted_groups",
         "truncated",
         "limits"
@@ -8577,6 +9713,14 @@
             "total": 200
           },
           "description": "Bounds applied to call groups and call sites."
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation cursor returned by a prior page.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Project owning `symbol_handle` when `item` is omitted.",
@@ -9009,6 +10153,13 @@
           "$ref": "#/$defs/SemanticResultLimits",
           "description": "Limits applied to this result."
         },
+        "next_cursor": {
+          "description": "Cursor for the next callee or call-site page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "omitted_groups": {
           "description": "Groups omitted by limits.",
           "format": "uint",
@@ -9018,6 +10169,18 @@
         "provider": {
           "description": "Stable protocol provider identity.",
           "type": "string"
+        },
+        "remaining_call_sites": {
+          "description": "Call sites still available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_calls": {
+          "description": "Call groups still available after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "returned_call_sites": {
           "description": "Returned call-site count.",
@@ -9030,6 +10193,10 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Snapshot identity used by the continuation cursor.",
+          "type": "string"
         },
         "total_call_sites": {
           "description": "Complete call-site count before limits.",
@@ -9053,8 +10220,11 @@
         "calls",
         "total_calls",
         "returned_calls",
+        "remaining_calls",
         "total_call_sites",
         "returned_call_sites",
+        "remaining_call_sites",
+        "snapshot_identity",
         "omitted_groups",
         "truncated",
         "limits"
@@ -9086,6 +10256,14 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Registered project that owns the file.",
@@ -9474,6 +10652,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -9485,14 +10686,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -9500,6 +10760,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -9515,8 +10802,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -10220,6 +11517,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior discovery response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project that owns the file.",
           "type": "string"
@@ -10607,6 +11912,29 @@
           },
           "type": "array"
         },
+        "locations_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete declaration or module locations when the inline result is bounded."
+        },
+        "locations_returned": {
+          "description": "Number of declaration or module locations retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locations_total": {
+          "description": "Total declaration or module locations returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "macro_expansion": {
           "anyOf": [
             {
@@ -10618,14 +11946,73 @@
           ],
           "description": "Expansion returned by macro discovery."
         },
+        "macro_expansion_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete macro expansion when the inline result is bounded."
+        },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the compact result page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable name of the protocol provider.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "description": "Number of declaration or module locations after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_runnables": {
+          "description": "Number of runnable or related-test payloads after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_selection_ranges": {
+          "description": "Number of selection ranges after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "runnables": {
           "description": "Raw, redacted runnable or related-test payloads.",
           "items": true,
           "type": "array"
+        },
+        "runnables_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete runnable or related-test payloads when the inline result is bounded."
+        },
+        "runnables_returned": {
+          "description": "Number of runnable or related-test payloads retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runnables_total": {
+          "description": "Total runnable or related-test payloads returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "selection_ranges": {
           "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -10633,6 +12020,33 @@
             "$ref": "#/$defs/Range"
           },
           "type": "array"
+        },
+        "selection_ranges_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete selection ranges when the inline result is bounded."
+        },
+        "selection_ranges_returned": {
+          "description": "Number of selection ranges retained inline.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selection_ranges_total": {
+          "description": "Total selection ranges returned by the provider.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the provider result snapshot.",
+          "type": "string"
         },
         "supported": {
           "description": "Whether the active server supports the operation.",
@@ -10648,8 +12062,18 @@
         "provider",
         "kind",
         "locations",
+        "locations_total",
+        "locations_returned",
+        "remaining_locations",
         "selection_ranges",
+        "selection_ranges_total",
+        "selection_ranges_returned",
+        "remaining_selection_ranges",
+        "snapshot_identity",
         "runnables",
+        "runnables_total",
+        "runnables_returned",
+        "remaining_runnables",
         "truncated"
       ],
       "type": "object"
@@ -10661,6 +12085,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound continuation cursor returned by a prior page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "limit": {
           "default": 50,
           "description": "Maximum number of log entries to return (default: 50).",
@@ -10687,6 +12119,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "LogEntry": {
           "description": "A log entry from the LSP server.",
           "properties": {
@@ -10703,6 +12175,17 @@
             "message": {
               "description": "Log message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless message payload when the inline text is deferred."
             },
             "timestamp": {
               "description": "Timestamp when the log was received.",
@@ -10752,10 +12235,43 @@
             "$ref": "#/$defs/LogEntry"
           },
           "type": "array"
+        },
+        "next_cursor": {
+          "description": "Cursor for the next page, when entries remain.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining": {
+          "description": "Number of matching entries after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned": {
+          "description": "Number of entries returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the retained log snapshot and filter.",
+          "type": "string"
+        },
+        "total": {
+          "description": "Exact number of entries matching the filter in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "logs"
+        "logs",
+        "total",
+        "returned",
+        "remaining",
+        "snapshot_identity"
       ],
       "type": "object"
     }
@@ -10766,6 +12282,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound continuation cursor returned by a prior page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "limit": {
           "default": 20,
           "description": "Maximum number of messages to return (default: 20).",
@@ -10785,6 +12309,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "MessageType": {
           "description": "Server message type.",
           "oneOf": [
@@ -10823,6 +12387,17 @@
               "description": "Message content.",
               "type": "string"
             },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless message payload when the inline text is deferred."
+            },
             "message_type": {
               "$ref": "#/$defs/MessageType",
               "description": "Message type."
@@ -10850,10 +12425,43 @@
             "$ref": "#/$defs/ServerMessage"
           },
           "type": "array"
+        },
+        "next_cursor": {
+          "description": "Cursor for the next page, when messages remain.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining": {
+          "description": "Number of messages after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned": {
+          "description": "Number of messages returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "description": "Identity of the retained message snapshot.",
+          "type": "string"
+        },
+        "total": {
+          "description": "Exact number of messages in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "messages"
+        "messages",
+        "total",
+        "returned",
+        "remaining",
+        "snapshot_identity"
       ],
       "type": "object"
     }
@@ -10879,6 +12487,14 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior response.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -10890,6 +12506,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "SignatureInfo": {
           "description": "A single signature overload.",
           "properties": {
@@ -10910,6 +12566,13 @@
                 "$ref": "#/$defs/SignatureParameter"
               },
               "type": "array"
+            },
+            "signature_id": {
+              "description": "Stable identity of this signature in the provider snapshot.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -10959,12 +12622,56 @@
             "null"
           ]
         },
+        "next_cursor": {
+          "description": "Snapshot-bound continuation for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_signatures": {
+          "default": 0,
+          "description": "Number of signatures after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_signatures": {
+          "default": 0,
+          "description": "Number of signatures returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "signatures": {
           "description": "Available signatures.",
           "items": {
             "$ref": "#/$defs/SignatureInfo"
           },
           "type": "array"
+        },
+        "signatures_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete signatures when documentation is deferred."
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the provider signature snapshot.",
+          "type": "string"
+        },
+        "total_signatures": {
+          "default": 0,
+          "description": "Number of provider signatures in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -10997,6 +12704,14 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior implementation response.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Project owning `symbol_handle` when coordinates are omitted.",
@@ -11375,9 +13090,42 @@
           },
           "type": "array"
         },
+        "next_cursor": {
+          "description": "Snapshot-bound cursor for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable protocol provider identity.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "default": 0,
+          "description": "Number of targets after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_locations": {
+          "default": 0,
+          "description": "Number of targets returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the provider target snapshot.",
+          "type": "string"
+        },
+        "total_locations": {
+          "default": 0,
+          "description": "Number of provider targets in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "truncated": {
           "description": "Whether item or response budgets omitted target data.",
@@ -11418,6 +13166,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound continuation returned by a prior type-definition response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Project owning `symbol_handle` when coordinates are omitted.",
           "type": [
@@ -11795,9 +13551,42 @@
           },
           "type": "array"
         },
+        "next_cursor": {
+          "description": "Snapshot-bound cursor for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider": {
           "description": "Stable protocol provider identity.",
           "type": "string"
+        },
+        "remaining_locations": {
+          "default": 0,
+          "description": "Number of targets after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_locations": {
+          "default": 0,
+          "description": "Number of targets returned on this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "default": "",
+          "description": "Identity of the provider target snapshot.",
+          "type": "string"
+        },
+        "total_locations": {
+          "default": 0,
+          "description": "Number of provider targets in the snapshot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "truncated": {
           "description": "Whether item or response budgets omitted target data.",
@@ -12169,9 +13958,42 @@
               },
               "type": "array"
             },
+            "next_cursor": {
+              "description": "Snapshot-bound cursor for the next page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_locations": {
+              "default": 0,
+              "description": "Number of definition targets after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_locations": {
+              "default": 0,
+              "description": "Number of definition targets returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "default": "",
+              "description": "Identity of the provider target snapshot.",
+              "type": "string"
+            },
+            "total_locations": {
+              "default": 0,
+              "description": "Number of definition targets in the provider snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "truncated": {
               "description": "Whether item or response budgets omitted target data.",
@@ -12206,12 +14028,34 @@
             "data": {
               "description": "Language-server-specific payload after secret redaction."
             },
+            "data_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless diagnostic payload when inline data is deferred."
+            },
             "fix_handles": {
               "description": "Actor-owned code-action handles accepted by the preview flow.",
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "fix_handles_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless fix handles when the inline list is deferred."
             },
             "group_id": {
               "description": "Stable identity shared by every page of this diagnostic group.",
@@ -12223,6 +14067,17 @@
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless rendered message when the inline message is deferred."
             },
             "occurrence_count": {
               "description": "Number of identical diagnostics represented by this group.",
@@ -12267,6 +14122,17 @@
                 "$ref": "#/$defs/DiagnosticRelatedInformation"
               },
               "type": "array"
+            },
+            "related_information_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless related diagnostics when inline context would exceed a page."
             },
             "severity": {
               "$ref": "#/$defs/DiagnosticSeverity",
@@ -12602,6 +14468,17 @@
               "description": "Hover contents as markdown string.",
               "type": "string"
             },
+            "contents_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete hover contents when the inline markdown was bounded."
+            },
             "kind": {
               "$ref": "#/$defs/NavigationKind",
               "description": "Relationship represented by this result."
@@ -12681,6 +14558,13 @@
               "$ref": "#/$defs/SemanticResultLimits",
               "description": "Limits applied to this result."
             },
+            "next_cursor": {
+              "description": "Cursor for the next caller or call-site page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Groups omitted by limits.",
               "format": "uint",
@@ -12690,6 +14574,18 @@
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_call_sites": {
+              "description": "Call sites still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_calls": {
+              "description": "Call groups still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "returned_call_sites": {
               "description": "Returned call-site count.",
@@ -12702,6 +14598,10 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Snapshot identity used by the continuation cursor.",
+              "type": "string"
             },
             "total_call_sites": {
               "description": "Complete call-site count before limits.",
@@ -12725,8 +14625,11 @@
             "calls",
             "total_calls",
             "returned_calls",
+            "remaining_calls",
             "total_call_sites",
             "returned_call_sites",
+            "remaining_call_sites",
+            "snapshot_identity",
             "omitted_groups",
             "truncated",
             "limits"
@@ -13730,9 +15633,42 @@
               },
               "type": "array"
             },
+            "next_cursor": {
+              "description": "Snapshot-bound cursor for the next page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_locations": {
+              "default": 0,
+              "description": "Number of targets after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_locations": {
+              "default": 0,
+              "description": "Number of targets returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "default": "",
+              "description": "Identity of the provider target snapshot.",
+              "type": "string"
+            },
+            "total_locations": {
+              "default": 0,
+              "description": "Number of provider targets in the snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "truncated": {
               "description": "Whether item or response budgets omitted target data.",
@@ -13842,6 +15778,13 @@
               "$ref": "#/$defs/SemanticResultLimits",
               "description": "Limits applied to this result."
             },
+            "next_cursor": {
+              "description": "Cursor for the next callee or call-site page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Groups omitted by limits.",
               "format": "uint",
@@ -13851,6 +15794,18 @@
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_call_sites": {
+              "description": "Call sites still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_calls": {
+              "description": "Call groups still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "returned_call_sites": {
               "description": "Returned call-site count.",
@@ -13863,6 +15818,10 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Snapshot identity used by the continuation cursor.",
+              "type": "string"
             },
             "total_call_sites": {
               "description": "Complete call-site count before limits.",
@@ -13886,8 +15845,11 @@
             "calls",
             "total_calls",
             "returned_calls",
+            "remaining_calls",
             "total_call_sites",
             "returned_call_sites",
+            "remaining_call_sites",
+            "snapshot_identity",
             "omitted_groups",
             "truncated",
             "limits"
@@ -14239,6 +16201,29 @@
               },
               "type": "array"
             },
+            "locations_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete declaration or module locations when the inline result is bounded."
+            },
+            "locations_returned": {
+              "description": "Number of declaration or module locations retained inline.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "locations_total": {
+              "description": "Total declaration or module locations returned by the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "macro_expansion": {
               "anyOf": [
                 {
@@ -14250,14 +16235,73 @@
               ],
               "description": "Expansion returned by macro discovery."
             },
+            "macro_expansion_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete macro expansion when the inline result is bounded."
+            },
+            "next_cursor": {
+              "description": "Snapshot-bound continuation for the compact result page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider": {
               "description": "Stable name of the protocol provider.",
               "type": "string"
+            },
+            "remaining_locations": {
+              "description": "Number of declaration or module locations after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_runnables": {
+              "description": "Number of runnable or related-test payloads after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_selection_ranges": {
+              "description": "Number of selection ranges after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "runnables": {
               "description": "Raw, redacted runnable or related-test payloads.",
               "items": true,
               "type": "array"
+            },
+            "runnables_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete runnable or related-test payloads when the inline result is bounded."
+            },
+            "runnables_returned": {
+              "description": "Number of runnable or related-test payloads retained inline.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runnables_total": {
+              "description": "Total runnable or related-test payloads returned by the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "selection_ranges": {
               "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -14265,6 +16309,33 @@
                 "$ref": "#/$defs/Range"
               },
               "type": "array"
+            },
+            "selection_ranges_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete selection ranges when the inline result is bounded."
+            },
+            "selection_ranges_returned": {
+              "description": "Number of selection ranges retained inline.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "selection_ranges_total": {
+              "description": "Total selection ranges returned by the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Identity of the provider result snapshot.",
+              "type": "string"
             },
             "supported": {
               "description": "Whether the active server supports the operation.",
@@ -14280,8 +16351,18 @@
             "provider",
             "kind",
             "locations",
+            "locations_total",
+            "locations_returned",
+            "remaining_locations",
             "selection_ranges",
+            "selection_ranges_total",
+            "selection_ranges_returned",
+            "remaining_selection_ranges",
+            "snapshot_identity",
             "runnables",
+            "runnables_total",
+            "runnables_returned",
+            "remaining_runnables",
             "truncated"
           ],
           "type": "object"
@@ -14914,9 +16995,42 @@
               },
               "type": "array"
             },
+            "next_cursor": {
+              "description": "Snapshot-bound cursor for the next page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_locations": {
+              "default": 0,
+              "description": "Number of definition targets after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_locations": {
+              "default": 0,
+              "description": "Number of definition targets returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "default": "",
+              "description": "Identity of the provider target snapshot.",
+              "type": "string"
+            },
+            "total_locations": {
+              "default": 0,
+              "description": "Number of definition targets in the provider snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "truncated": {
               "description": "Whether item or response budgets omitted target data.",
@@ -14951,12 +17065,34 @@
             "data": {
               "description": "Language-server-specific payload after secret redaction."
             },
+            "data_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless diagnostic payload when inline data is deferred."
+            },
             "fix_handles": {
               "description": "Actor-owned code-action handles accepted by the preview flow.",
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "fix_handles_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless fix handles when the inline list is deferred."
             },
             "group_id": {
               "description": "Stable identity shared by every page of this diagnostic group.",
@@ -14968,6 +17104,17 @@
             "message": {
               "description": "Diagnostic message.",
               "type": "string"
+            },
+            "message_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless rendered message when the inline message is deferred."
             },
             "occurrence_count": {
               "description": "Number of identical diagnostics represented by this group.",
@@ -15012,6 +17159,17 @@
                 "$ref": "#/$defs/DiagnosticRelatedInformation"
               },
               "type": "array"
+            },
+            "related_information_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lossless related diagnostics when inline context would exceed a page."
             },
             "severity": {
               "$ref": "#/$defs/DiagnosticSeverity",
@@ -15347,6 +17505,17 @@
               "description": "Hover contents as markdown string.",
               "type": "string"
             },
+            "contents_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete hover contents when the inline markdown was bounded."
+            },
             "kind": {
               "$ref": "#/$defs/NavigationKind",
               "description": "Relationship represented by this result."
@@ -15426,6 +17595,13 @@
               "$ref": "#/$defs/SemanticResultLimits",
               "description": "Limits applied to this result."
             },
+            "next_cursor": {
+              "description": "Cursor for the next caller or call-site page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Groups omitted by limits.",
               "format": "uint",
@@ -15435,6 +17611,18 @@
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_call_sites": {
+              "description": "Call sites still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_calls": {
+              "description": "Call groups still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "returned_call_sites": {
               "description": "Returned call-site count.",
@@ -15447,6 +17635,10 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Snapshot identity used by the continuation cursor.",
+              "type": "string"
             },
             "total_call_sites": {
               "description": "Complete call-site count before limits.",
@@ -15470,8 +17662,11 @@
             "calls",
             "total_calls",
             "returned_calls",
+            "remaining_calls",
             "total_call_sites",
             "returned_call_sites",
+            "remaining_call_sites",
+            "snapshot_identity",
             "omitted_groups",
             "truncated",
             "limits"
@@ -16378,9 +18573,42 @@
               },
               "type": "array"
             },
+            "next_cursor": {
+              "description": "Snapshot-bound cursor for the next page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_locations": {
+              "default": 0,
+              "description": "Number of targets after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_locations": {
+              "default": 0,
+              "description": "Number of targets returned on this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "default": "",
+              "description": "Identity of the provider target snapshot.",
+              "type": "string"
+            },
+            "total_locations": {
+              "default": 0,
+              "description": "Number of provider targets in the snapshot.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "truncated": {
               "description": "Whether item or response budgets omitted target data.",
@@ -16490,6 +18718,13 @@
               "$ref": "#/$defs/SemanticResultLimits",
               "description": "Limits applied to this result."
             },
+            "next_cursor": {
+              "description": "Cursor for the next callee or call-site page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "omitted_groups": {
               "description": "Groups omitted by limits.",
               "format": "uint",
@@ -16499,6 +18734,18 @@
             "provider": {
               "description": "Stable protocol provider identity.",
               "type": "string"
+            },
+            "remaining_call_sites": {
+              "description": "Call sites still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_calls": {
+              "description": "Call groups still available after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "returned_call_sites": {
               "description": "Returned call-site count.",
@@ -16511,6 +18758,10 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Snapshot identity used by the continuation cursor.",
+              "type": "string"
             },
             "total_call_sites": {
               "description": "Complete call-site count before limits.",
@@ -16534,8 +18785,11 @@
             "calls",
             "total_calls",
             "returned_calls",
+            "remaining_calls",
             "total_call_sites",
             "returned_call_sites",
+            "remaining_call_sites",
+            "snapshot_identity",
             "omitted_groups",
             "truncated",
             "limits"
@@ -16887,6 +19141,29 @@
               },
               "type": "array"
             },
+            "locations_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete declaration or module locations when the inline result is bounded."
+            },
+            "locations_returned": {
+              "description": "Number of declaration or module locations retained inline.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "locations_total": {
+              "description": "Total declaration or module locations returned by the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "macro_expansion": {
               "anyOf": [
                 {
@@ -16898,14 +19175,73 @@
               ],
               "description": "Expansion returned by macro discovery."
             },
+            "macro_expansion_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete macro expansion when the inline result is bounded."
+            },
+            "next_cursor": {
+              "description": "Snapshot-bound continuation for the compact result page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider": {
               "description": "Stable name of the protocol provider.",
               "type": "string"
+            },
+            "remaining_locations": {
+              "description": "Number of declaration or module locations after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_runnables": {
+              "description": "Number of runnable or related-test payloads after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining_selection_ranges": {
+              "description": "Number of selection ranges after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "runnables": {
               "description": "Raw, redacted runnable or related-test payloads.",
               "items": true,
               "type": "array"
+            },
+            "runnables_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete runnable or related-test payloads when the inline result is bounded."
+            },
+            "runnables_returned": {
+              "description": "Number of runnable or related-test payloads retained inline.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runnables_total": {
+              "description": "Total runnable or related-test payloads returned by the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
             },
             "selection_ranges": {
               "description": "Inner-to-outer ranges returned by selection discovery.",
@@ -16913,6 +19249,33 @@
                 "$ref": "#/$defs/Range"
               },
               "type": "array"
+            },
+            "selection_ranges_resource": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DeferredResourceReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Complete selection ranges when the inline result is bounded."
+            },
+            "selection_ranges_returned": {
+              "description": "Number of selection ranges retained inline.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "selection_ranges_total": {
+              "description": "Total selection ranges returned by the provider.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "snapshot_identity": {
+              "description": "Identity of the provider result snapshot.",
+              "type": "string"
             },
             "supported": {
               "description": "Whether the active server supports the operation.",
@@ -16928,8 +19291,18 @@
             "provider",
             "kind",
             "locations",
+            "locations_total",
+            "locations_returned",
+            "remaining_locations",
             "selection_ranges",
+            "selection_ranges_total",
+            "selection_ranges_returned",
+            "remaining_selection_ranges",
+            "snapshot_identity",
             "runnables",
+            "runnables_total",
+            "runnables_returned",
+            "remaining_runnables",
             "truncated"
           ],
           "type": "object"
@@ -18742,7 +21115,7 @@
       "properties": {
         "cursor": {
           "default": null,
-          "description": "Decimal cursor returned by a prior `project_list` response.",
+          "description": "Snapshot-bound cursor returned by a prior `project_list` response.",
           "type": [
             "string",
             "null"
@@ -19704,20 +22077,58 @@
     "description": "List resource URIs subscribed by this MCP session.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound continuation cursor returned by a prior page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "outputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot_identity": {
+          "type": "string"
+        },
         "subscriptions": {
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "subscriptions"
+        "subscriptions",
+        "total",
+        "returned",
+        "remaining",
+        "snapshot_identity"
       ],
       "type": "object"
     }

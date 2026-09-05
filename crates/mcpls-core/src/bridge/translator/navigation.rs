@@ -6,6 +6,7 @@ use lsp_types::{
     PartialResultParams, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
     TextDocumentPositionParams, WorkDoneProgressParams,
 };
+use sha2::{Digest, Sha256};
 
 use super::Translator;
 use super::dto::{
@@ -21,29 +22,78 @@ use crate::error::Result;
 
 const MAX_NAVIGATION_TARGETS: usize = 64;
 
-/// Normalize a `GotoDefinitionResponse` into bounded MCP `Location` values.
-pub(super) async fn bounded_locations(
+fn definition_page_bounds(
+    locations: &[lsp_types::Location],
+    page_token: Option<&str>,
+) -> Result<(usize, String)> {
+    location_page_bounds(locations, page_token, "definition")
+}
+
+fn location_page_bounds(
+    locations: &[lsp_types::Location],
+    page_token: Option<&str>,
+    kind: &str,
+) -> Result<(usize, String)> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(locations).unwrap_or_default())
+    );
+    let offset = match page_token {
+        Some(token) => {
+            let (identity, offset) = token.split_once(':').ok_or_else(|| {
+                crate::error::Error::InvalidToolParams(format!("invalid {kind} page_token"))
+            })?;
+            if identity != snapshot_identity {
+                return Err(crate::error::Error::InvalidToolParams(format!(
+                    "{kind} page_token belongs to a different snapshot"
+                )));
+            }
+            offset.parse::<usize>().map_err(|_| {
+                crate::error::Error::InvalidToolParams(format!("invalid {kind} page_token"))
+            })?
+        }
+        None => 0,
+    };
+    if offset > locations.len() {
+        return Err(crate::error::Error::InvalidToolParams(format!(
+            "{kind} page_token is outside the provider snapshot"
+        )));
+    }
+    Ok((offset, snapshot_identity))
+}
+
+pub(super) async fn bounded_location_page(
     response: Option<lsp_types::GotoDefinitionResponse>,
     ctx: &EncodingCtx,
     workspace_roots: &[std::path::PathBuf],
-    max_targets: usize,
-) -> (Vec<Location>, bool) {
-    let (lsp_locs, truncated_items) = bounded_targets(flatten_goto_response(response), max_targets);
-    let mut locations = Vec::with_capacity(lsp_locs.len());
+    page_token: Option<&str>,
+    kind: &str,
+) -> Result<(Vec<Location>, usize, usize, Option<String>, String, bool)> {
+    let raw_locations = flatten_goto_response(response);
+    let (offset, snapshot_identity) = location_page_bounds(&raw_locations, page_token, kind)?;
+    let total_locations = raw_locations.len();
+    let page_locations: Vec<_> = raw_locations
+        .into_iter()
+        .skip(offset)
+        .take(MAX_NAVIGATION_TARGETS)
+        .collect();
+    let mut locations = Vec::with_capacity(page_locations.len());
     let mut budget = SourceBudget::default();
-    for loc in lsp_locs {
-        locations.push(ctx.location(workspace_roots, loc, &mut budget).await);
+    for location in page_locations {
+        locations.push(ctx.location(workspace_roots, location, &mut budget).await);
     }
-    (locations, truncated_items || budget.truncated())
-}
-
-fn bounded_targets(
-    mut locations: Vec<lsp_types::Location>,
-    max_targets: usize,
-) -> (Vec<lsp_types::Location>, bool) {
-    let truncated = locations.len() > max_targets;
-    locations.truncate(max_targets);
-    (locations, truncated)
+    let returned_locations = locations.len();
+    let remaining_locations = total_locations.saturating_sub(offset + returned_locations);
+    let next_cursor = (remaining_locations > 0)
+        .then(|| format!("{snapshot_identity}:{}", offset + returned_locations));
+    Ok((
+        locations,
+        total_locations,
+        remaining_locations,
+        next_cursor,
+        snapshot_identity,
+        budget.truncated(),
+    ))
 }
 
 fn flatten_goto_response(
@@ -61,6 +111,16 @@ fn flatten_goto_response(
             .collect(),
         None => vec![],
     }
+}
+
+#[cfg(test)]
+fn bounded_targets(
+    mut locations: Vec<lsp_types::Location>,
+    max_targets: usize,
+) -> (Vec<lsp_types::Location>, bool) {
+    let truncated = locations.len() > max_targets;
+    locations.truncate(max_targets);
+    (locations, truncated)
 }
 
 fn extract_hover_contents(contents: HoverContents) -> String {
@@ -151,6 +211,7 @@ impl Translator {
             provider: "standard_lsp".to_owned(),
             kind: NavigationKind::Hover,
             contents,
+            contents_resource: None,
             range,
             source,
             truncated: budget.truncated(),
@@ -171,6 +232,18 @@ impl Translator {
         file_path: String,
         line: u32,
         character: u32,
+    ) -> Result<DefinitionResult> {
+        self.handle_definition_page(file_path, line, character, None)
+            .await
+    }
+
+    /// Handle one snapshot-bound page of definition targets.
+    pub async fn handle_definition_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        page_token: Option<&str>,
     ) -> Result<DefinitionResult> {
         let (server_id, client, uri) = self
             .prepare_gated_document(
@@ -201,18 +274,36 @@ impl Translator {
             .request("textDocument/definition", params, client.request_timeout())
             .await?;
 
-        let (locations, truncated) = bounded_locations(
-            response,
-            &ctx,
-            &self.workspace_roots,
-            MAX_NAVIGATION_TARGETS,
-        )
-        .await;
+        let raw_locations = flatten_goto_response(response);
+        let (offset, snapshot_identity) = definition_page_bounds(&raw_locations, page_token)?;
+        let total_locations = raw_locations.len();
+        let page_locations: Vec<_> = raw_locations
+            .into_iter()
+            .skip(offset)
+            .take(MAX_NAVIGATION_TARGETS)
+            .collect();
+        let mut locations = Vec::with_capacity(page_locations.len());
+        let mut budget = SourceBudget::default();
+        for location in page_locations {
+            locations.push(
+                ctx.location(&self.workspace_roots, location, &mut budget)
+                    .await,
+            );
+        }
+        let returned_locations = locations.len();
+        let remaining_locations = total_locations.saturating_sub(offset + locations.len());
+        let next_cursor = (remaining_locations > 0)
+            .then(|| format!("{snapshot_identity}:{}", offset + locations.len()));
         let result = DefinitionResult {
             provider: "standard_lsp".to_owned(),
             kind: NavigationKind::Definition,
             locations,
-            truncated,
+            total_locations,
+            returned_locations,
+            remaining_locations,
+            next_cursor,
+            snapshot_identity,
+            truncated: budget.truncated() || remaining_locations > 0,
         };
 
         Ok(result)
@@ -377,6 +468,18 @@ impl Translator {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult> {
+        self.handle_implementation_page(file_path, line, character, None)
+            .await
+    }
+
+    /// Handle one snapshot-bound page of implementation targets.
+    pub async fn handle_implementation_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        page_token: Option<&str>,
+    ) -> Result<LocationsResult> {
         let (server_id, client, uri) = self
             .prepare_gated_document(
                 &file_path,
@@ -413,18 +516,31 @@ impl Translator {
             )
             .await?;
 
-        let (locations, truncated) = bounded_locations(
+        let (
+            locations,
+            total_locations,
+            remaining_locations,
+            next_cursor,
+            snapshot_identity,
+            source_truncated,
+        ) = bounded_location_page(
             response,
             &ctx,
             &self.workspace_roots,
-            MAX_NAVIGATION_TARGETS,
+            page_token,
+            "implementation",
         )
-        .await;
+        .await?;
         Ok(LocationsResult {
             provider: "standard_lsp".to_owned(),
             kind: NavigationKind::Implementation,
+            returned_locations: locations.len(),
             locations,
-            truncated,
+            total_locations,
+            remaining_locations,
+            next_cursor,
+            snapshot_identity,
+            truncated: source_truncated || remaining_locations > 0,
         })
     }
 
@@ -442,6 +558,18 @@ impl Translator {
         file_path: String,
         line: u32,
         character: u32,
+    ) -> Result<LocationsResult> {
+        self.handle_type_definition_page(file_path, line, character, None)
+            .await
+    }
+
+    /// Handle one snapshot-bound page of type-definition targets.
+    pub async fn handle_type_definition_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        page_token: Option<&str>,
     ) -> Result<LocationsResult> {
         let (server_id, client, uri) = self
             .prepare_gated_document(
@@ -479,18 +607,31 @@ impl Translator {
             )
             .await?;
 
-        let (locations, truncated) = bounded_locations(
+        let (
+            locations,
+            total_locations,
+            remaining_locations,
+            next_cursor,
+            snapshot_identity,
+            source_truncated,
+        ) = bounded_location_page(
             response,
             &ctx,
             &self.workspace_roots,
-            MAX_NAVIGATION_TARGETS,
+            page_token,
+            "type_definition",
         )
-        .await;
+        .await?;
         Ok(LocationsResult {
             provider: "standard_lsp".to_owned(),
             kind: NavigationKind::TypeDefinition,
+            returned_locations: locations.len(),
             locations,
-            truncated,
+            total_locations,
+            remaining_locations,
+            next_cursor,
+            snapshot_identity,
+            truncated: source_truncated || remaining_locations > 0,
         })
     }
 }
@@ -942,6 +1083,25 @@ mod tests {
         let contents = lsp_types::HoverContents::Markup(markup);
         let result = extract_hover_contents(contents);
         assert_eq!(result, "# Documentation");
+    }
+
+    #[test]
+    fn definition_pages_are_snapshot_bound_and_gap_free() {
+        let locations = (0..2)
+            .map(|index| lsp_types::Location {
+                uri: format!("file:///workspace/{index}.rs").parse().unwrap(),
+                range: lsp_types::Range::default(),
+            })
+            .collect::<Vec<_>>();
+        let (offset, identity) = definition_page_bounds(&locations, None).unwrap();
+        assert_eq!(offset, 0);
+        let cursor = format!("{identity}:1");
+        let (offset, _) = definition_page_bounds(&locations, Some(&cursor)).unwrap();
+        assert_eq!(offset, 1);
+
+        let mut changed = locations.clone();
+        changed.reverse();
+        assert!(definition_page_bounds(&changed, Some(&cursor)).is_err());
     }
 
     #[test]

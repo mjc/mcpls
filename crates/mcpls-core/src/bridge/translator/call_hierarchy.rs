@@ -6,6 +6,7 @@ use lsp_types::{
     CallHierarchyPrepareParams as LspCallHierarchyPrepareParams, PartialResultParams,
     TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
 };
+use sha2::{Digest, Sha256};
 
 use super::Translator;
 use super::dto::{
@@ -16,6 +17,46 @@ use super::encoding_ctx::EncodingCtx;
 use super::routing::MAX_POSITION_VALUE;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
+
+const CALL_PAGE_GROUPS: usize = 64;
+
+fn call_page_bounds<T: serde::Serialize>(
+    calls: &[T],
+    page_token: Option<&str>,
+    kind: &str,
+) -> Result<(usize, usize, String)> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(calls).unwrap_or_default())
+    );
+    let (group, site) = match page_token {
+        Some(token) => {
+            let mut parts = token.split(':');
+            let identity = parts.next();
+            let group = parts.next();
+            let site = parts.next();
+            if identity != Some(snapshot_identity.as_str()) || parts.next().is_some() {
+                return Err(Error::InvalidToolParams(format!(
+                    "{kind} page_token belongs to a different snapshot"
+                )));
+            }
+            let group = group
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| Error::InvalidToolParams(format!("invalid {kind} page_token")))?;
+            let site = site
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| Error::InvalidToolParams(format!("invalid {kind} page_token")))?;
+            (group, site)
+        }
+        None => (0, 0),
+    };
+    if group > calls.len() {
+        return Err(Error::InvalidToolParams(format!(
+            "{kind} page_token is outside the provider snapshot"
+        )));
+    }
+    Ok((group, site, snapshot_identity))
+}
 
 /// Split a prepared item snapshot into a deterministic page and remainder.
 pub fn page_items<T>(mut items: Vec<T>, page_size: usize) -> (Vec<T>, Option<Vec<T>>) {
@@ -209,6 +250,7 @@ impl Translator {
         &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
     ) -> Result<IncomingCallsResult> {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
@@ -249,26 +291,48 @@ impl Translator {
         stable_sort_incoming_calls(&mut lsp_calls, &self.workspace_roots);
         let total_calls = lsp_calls.len();
         let total_call_sites = lsp_calls.iter().map(|call| call.from_ranges.len()).sum();
+        let (group_offset, site_offset, snapshot_identity) =
+            call_page_bounds(&lsp_calls, page_token.as_deref(), "incoming_calls")?;
+        let prior_call_sites: usize = lsp_calls
+            .iter()
+            .take(group_offset)
+            .map(|call| call.from_ranges.len())
+            .sum();
         let mut calls = Vec::with_capacity(total_calls.min(limits.total));
         let mut source_budget = super::source_context::SourceBudget::default();
-        let mut per_file = std::collections::HashMap::<String, usize>::new();
+        let mut next_cursor = None;
+        let mut consumed_calls = group_offset;
+        let mut consumed_call_sites = prior_call_sites + site_offset;
 
-        for call in lsp_calls {
-            if calls.len() >= limits.total {
+        for (group_index, call) in lsp_calls.into_iter().enumerate().skip(group_offset) {
+            if calls.len() >= limits.total.min(CALL_PAGE_GROUPS) {
+                next_cursor = Some(format!("{snapshot_identity}:{group_index}:0"));
                 break;
             }
             // Per the LSP spec, `fromRanges` are ranges within the *caller's*
             // document (`call.from.uri`), not the queried item's document.
             let from_uri = call.from.uri.clone();
-            let file_key = from_uri.to_string();
-            let count = per_file.entry(file_key).or_default();
-            if *count >= limits.per_file {
-                continue;
+            let start_site = if group_index == group_offset {
+                site_offset
+            } else {
+                0
+            };
+            let available_sites = call.from_ranges.len();
+            if start_site > available_sites {
+                return Err(Error::InvalidToolParams(
+                    "incoming_calls page_token is outside the provider snapshot".to_owned(),
+                ));
             }
-            *count += 1;
+            let site_limit = limits.per_symbol.max(1);
             let call_sites = {
-                let mut sites = Vec::with_capacity(call.from_ranges.len().min(limits.per_symbol));
-                for range in call.from_ranges.into_iter().take(limits.per_symbol) {
+                let mut sites =
+                    Vec::with_capacity(available_sites.saturating_sub(start_site).min(site_limit));
+                for range in call
+                    .from_ranges
+                    .into_iter()
+                    .skip(start_site)
+                    .take(site_limit)
+                {
                     let range = ctx.normalize_range(&from_uri, range).await;
                     let source = ctx
                         .source_context(
@@ -293,6 +357,16 @@ impl Translator {
                 .await,
                 call_sites,
             });
+            let returned_sites = calls.last().map_or(0, |call| call.call_sites.len());
+            consumed_call_sites += returned_sites;
+            if start_site + returned_sites < available_sites {
+                next_cursor = Some(format!(
+                    "{snapshot_identity}:{group_index}:{}",
+                    start_site + returned_sites
+                ));
+                break;
+            }
+            consumed_calls = group_index + 1;
         }
 
         let returned_calls = calls.len();
@@ -302,8 +376,12 @@ impl Translator {
             calls,
             total_calls,
             returned_calls,
+            remaining_calls: total_calls.saturating_sub(consumed_calls),
             total_call_sites,
             returned_call_sites,
+            remaining_call_sites: total_call_sites.saturating_sub(consumed_call_sites),
+            snapshot_identity,
+            next_cursor,
             omitted_groups: total_calls.saturating_sub(returned_calls),
             truncated: source_budget.truncated()
                 || returned_calls < total_calls
@@ -322,6 +400,7 @@ impl Translator {
         &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
     ) -> Result<OutgoingCallsResult> {
         // Deserialize as our own type (1-based coords).
         let parsed = parse_mcp_call_hierarchy_item(item)?;
@@ -362,23 +441,45 @@ impl Translator {
         stable_sort_outgoing_calls(&mut lsp_calls, &self.workspace_roots);
         let total_calls = lsp_calls.len();
         let total_call_sites = lsp_calls.iter().map(|call| call.from_ranges.len()).sum();
+        let (group_offset, site_offset, snapshot_identity) =
+            call_page_bounds(&lsp_calls, page_token.as_deref(), "outgoing_calls")?;
+        let prior_call_sites: usize = lsp_calls
+            .iter()
+            .take(group_offset)
+            .map(|call| call.from_ranges.len())
+            .sum();
         let mut calls = Vec::with_capacity(total_calls.min(limits.total));
         let mut source_budget = super::source_context::SourceBudget::default();
-        let mut per_file = std::collections::HashMap::<String, usize>::new();
+        let mut next_cursor = None;
+        let mut consumed_calls = group_offset;
+        let mut consumed_call_sites = prior_call_sites + site_offset;
 
-        for call in lsp_calls {
-            if calls.len() >= limits.total {
+        for (group_index, call) in lsp_calls.into_iter().enumerate().skip(group_offset) {
+            if calls.len() >= limits.total.min(CALL_PAGE_GROUPS) {
+                next_cursor = Some(format!("{snapshot_identity}:{group_index}:0"));
                 break;
             }
-            let file_key = call.to.uri.to_string();
-            let count = per_file.entry(file_key).or_default();
-            if *count >= limits.per_file {
-                continue;
+            let start_site = if group_index == group_offset {
+                site_offset
+            } else {
+                0
+            };
+            let available_sites = call.from_ranges.len();
+            if start_site > available_sites {
+                return Err(Error::InvalidToolParams(
+                    "outgoing_calls page_token is outside the provider snapshot".to_owned(),
+                ));
             }
-            *count += 1;
+            let site_limit = limits.per_symbol.max(1);
             let call_sites = {
-                let mut sites = Vec::with_capacity(call.from_ranges.len().min(limits.per_symbol));
-                for range in call.from_ranges.into_iter().take(limits.per_symbol) {
+                let mut sites =
+                    Vec::with_capacity(available_sites.saturating_sub(start_site).min(site_limit));
+                for range in call
+                    .from_ranges
+                    .into_iter()
+                    .skip(start_site)
+                    .take(site_limit)
+                {
                     let range = ctx.normalize_range(&source_uri, range).await;
                     let source = ctx
                         .source_context(
@@ -403,6 +504,16 @@ impl Translator {
                 .await,
                 call_sites,
             });
+            let returned_sites = calls.last().map_or(0, |call| call.call_sites.len());
+            consumed_call_sites += returned_sites;
+            if start_site + returned_sites < available_sites {
+                next_cursor = Some(format!(
+                    "{snapshot_identity}:{group_index}:{}",
+                    start_site + returned_sites
+                ));
+                break;
+            }
+            consumed_calls = group_index + 1;
         }
 
         let returned_calls = calls.len();
@@ -412,8 +523,12 @@ impl Translator {
             calls,
             total_calls,
             returned_calls,
+            remaining_calls: total_calls.saturating_sub(consumed_calls),
             total_call_sites,
             returned_call_sites,
+            remaining_call_sites: total_call_sites.saturating_sub(consumed_call_sites),
+            snapshot_identity,
+            next_cursor,
             omitted_groups: total_calls.saturating_sub(returned_calls),
             truncated: source_budget.truncated()
                 || returned_calls < total_calls
@@ -572,7 +687,7 @@ mod tests {
         let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator
-            .handle_incoming_calls(invalid_item, SemanticResultLimits::default())
+            .handle_incoming_calls(invalid_item, SemanticResultLimits::default(), None)
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
@@ -582,7 +697,7 @@ mod tests {
         let translator = Translator::new();
         let invalid_item = serde_json::json!({"invalid": "structure"});
         let result = translator
-            .handle_outgoing_calls(invalid_item, SemanticResultLimits::default())
+            .handle_outgoing_calls(invalid_item, SemanticResultLimits::default(), None)
             .await;
         assert!(matches!(result, Err(Error::InvalidToolParams(_))));
     }
@@ -669,7 +784,7 @@ mod tests {
             let item = serde_json::to_value(item).unwrap();
             tokio::spawn(async move {
                 translator
-                    .handle_incoming_calls(item, SemanticResultLimits::default())
+                    .handle_incoming_calls(item, SemanticResultLimits::default(), None)
                     .await
             })
         };
@@ -685,7 +800,7 @@ mod tests {
                 "from": {
                     "name": "caller_fn",
                     "kind": 12,
-                    "uri": caller_uri,
+                    "uri": caller_uri.clone(),
                     "range": {
                         "start": {"line": 0, "character": 0},
                         "end": {"line": 0, "character": 1}
@@ -724,6 +839,179 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn incoming_call_pages_reconstruct_call_sites_and_reject_mutation() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let queried_path = dir.path().join("queried.rs");
+        let caller_path = dir.path().join("caller.rs");
+        fs::write(&queried_path, "fn queried() {}\n").unwrap();
+        fs::write(
+            &caller_path,
+            "fn caller() { queried(); queried(); queried(); }\n",
+        )
+        .unwrap();
+        let item = call_item(
+            "queried_fn",
+            Url::from_file_path(&queried_path).unwrap().to_string(),
+        );
+        let caller_uri = Url::from_file_path(&caller_path).unwrap().to_string();
+        let response = |end: u32| {
+            serde_json::json!([{
+                "from": {
+                    "name": "caller_fn",
+                    "kind": 12,
+                    "uri": caller_uri,
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 6}},
+                    "selectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}}
+                },
+                "fromRanges": [
+                    {"start": {"line": 0, "character": 14}, "end": {"line": 0, "character": end}},
+                    {"start": {"line": 0, "character": 25}, "end": {"line": 0, "character": 31}},
+                    {"start": {"line": 0, "character": 36}, "end": {"line": 0, "character": 42}}
+                ]
+            }])
+        };
+        let limits = SemanticResultLimits {
+            total: 1,
+            per_file: 1,
+            per_symbol: 1,
+        };
+        let translator = Arc::new(translator);
+        let item = serde_json::to_value(item).unwrap();
+        let mut wire = BufReader::new(&mut server.write_stdout);
+
+        let first_task = {
+            let translator = Arc::clone(&translator);
+            let item = item.clone();
+            tokio::spawn(async move { translator.handle_incoming_calls(item, limits, None).await })
+        };
+        let request = read_framed_message(&mut wire).await;
+        write_response(&mut server.read_half_stdin, &request["id"], response(20)).await;
+        let first = first_task.await.unwrap().unwrap();
+        assert_eq!(first.total_calls, 1);
+        assert_eq!(first.total_call_sites, 3);
+        assert_eq!(first.returned_call_sites, 1);
+        assert_eq!(first.remaining_calls, 1);
+        assert_eq!(first.remaining_call_sites, 2);
+        let cursor = first.next_cursor.clone().unwrap();
+
+        let second_task = {
+            let translator = Arc::clone(&translator);
+            let item = item.clone();
+            let cursor = cursor.clone();
+            tokio::spawn(async move {
+                translator
+                    .handle_incoming_calls(item, limits, Some(cursor))
+                    .await
+            })
+        };
+        let request = read_framed_message(&mut wire).await;
+        write_response(&mut server.read_half_stdin, &request["id"], response(20)).await;
+        let second = second_task.await.unwrap().unwrap();
+        assert_eq!(second.returned_call_sites, 1);
+        assert_eq!(second.remaining_calls, 1);
+        assert_eq!(second.remaining_call_sites, 1);
+        let cursor = second.next_cursor.clone().unwrap();
+
+        let third_task = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_incoming_calls(item, limits, Some(cursor))
+                    .await
+            })
+        };
+        let request = read_framed_message(&mut wire).await;
+        write_response(&mut server.read_half_stdin, &request["id"], response(21)).await;
+        let error = third_task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidToolParams(message) if message.contains("different snapshot"))
+        );
+    }
+
+    #[tokio::test]
+    async fn outgoing_call_pages_reconstruct_call_sites() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let caps = lsp_types::ServerCapabilities {
+            call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let queried_path = dir.path().join("queried.rs");
+        let callee_path = dir.path().join("callee.rs");
+        fs::write(&queried_path, "fn queried() { callee(); callee(); }\n").unwrap();
+        fs::write(&callee_path, "fn callee() {}\n").unwrap();
+        let item = call_item(
+            "queried_fn",
+            Url::from_file_path(&queried_path).unwrap().to_string(),
+        );
+        let callee_uri = Url::from_file_path(&callee_path).unwrap().to_string();
+        let response = serde_json::json!([{
+            "to": {
+                "name": "callee_fn",
+                "kind": 12,
+                "uri": callee_uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 13}},
+                "selectionRange": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 8}}
+            },
+            "fromRanges": [
+                {"start": {"line": 0, "character": 15}, "end": {"line": 0, "character": 21}},
+                {"start": {"line": 0, "character": 24}, "end": {"line": 0, "character": 30}}
+            ]
+        }]);
+        let limits = SemanticResultLimits {
+            total: 1,
+            per_file: 1,
+            per_symbol: 1,
+        };
+        let translator = Arc::new(translator);
+        let item = serde_json::to_value(item).unwrap();
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let first_task = {
+            let translator = Arc::clone(&translator);
+            let item = item.clone();
+            tokio::spawn(async move { translator.handle_outgoing_calls(item, limits, None).await })
+        };
+        let request = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            response.clone(),
+        )
+        .await;
+        let first = first_task.await.unwrap().unwrap();
+        assert_eq!(first.total_calls, 1);
+        assert_eq!(first.total_call_sites, 2);
+        assert_eq!(first.returned_call_sites, 1);
+        assert_eq!(first.remaining_calls, 1);
+        assert_eq!(first.remaining_call_sites, 1);
+        let cursor = first.next_cursor.unwrap();
+
+        let second_task = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_outgoing_calls(item, limits, Some(cursor))
+                    .await
+            })
+        };
+        let request = read_framed_message(&mut wire).await;
+        write_response(&mut server.read_half_stdin, &request["id"], response).await;
+        let second = second_task.await.unwrap().unwrap();
+        assert_eq!(second.total_call_sites, 2);
+        assert_eq!(second.returned_call_sites, 1);
+        assert_eq!(second.remaining_calls, 0);
+        assert_eq!(second.remaining_call_sites, 0);
+        assert!(second.next_cursor.is_none());
+    }
+
     /// Per the LSP spec, an outgoing call's `fromRanges` are ranges within
     /// the *queried* item's own document, not the callee's (`call.to.uri`) --
     /// the inverse directional convention from incoming calls, tested above.
@@ -758,7 +1046,7 @@ mod tests {
             let item = serde_json::to_value(item).unwrap();
             tokio::spawn(async move {
                 translator
-                    .handle_outgoing_calls(item, SemanticResultLimits::default())
+                    .handle_outgoing_calls(item, SemanticResultLimits::default(), None)
                     .await
             })
         };

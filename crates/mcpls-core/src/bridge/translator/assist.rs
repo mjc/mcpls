@@ -100,16 +100,17 @@ impl Translator {
             )
             .await?;
 
-        let items = match response {
-            Some(lsp_types::CompletionResponse::Array(items)) => items,
-            Some(lsp_types::CompletionResponse::List(list)) => list.items,
-            None => vec![],
+        let (items, provider_incomplete) = match response {
+            Some(lsp_types::CompletionResponse::Array(items)) => (items, false),
+            Some(lsp_types::CompletionResponse::List(list)) => (list.items, list.is_incomplete),
+            None => (vec![], false),
         };
 
         let result = CompletionsResult {
             items: items
                 .into_iter()
                 .map(|item| Completion {
+                    completion_id: None,
                     label: item.label,
                     kind: item.kind.map(|k| format!("{k:?}")),
                     detail: item.detail,
@@ -117,8 +118,22 @@ impl Translator {
                         lsp_types::Documentation::String(s) => s,
                         lsp_types::Documentation::MarkupContent(m) => m.value,
                     }),
+                    sort_text: item.sort_text,
+                    filter_text: item.filter_text,
+                    insert_text: item.insert_text,
+                    text_edit: item
+                        .text_edit
+                        .and_then(|edit| serde_json::to_value(edit).ok()),
+                    insertion_handle: None,
                 })
                 .collect(),
+            provider_incomplete,
+            total_items: 0,
+            returned_items: 0,
+            remaining_items: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+            items_resource: None,
         };
 
         Ok(result)
@@ -175,6 +190,7 @@ impl Translator {
                     .signatures
                     .into_iter()
                     .map(|sig| SignatureInfo {
+                        signature_id: None,
                         label: sig.label,
                         documentation: sig.documentation.map(extract_documentation),
                         parameters: sig
@@ -195,11 +211,23 @@ impl Translator {
                     .collect(),
                 active_signature: sig_help.active_signature,
                 active_parameter: sig_help.active_parameter,
+                total_signatures: 0,
+                returned_signatures: 0,
+                remaining_signatures: 0,
+                next_cursor: None,
+                snapshot_identity: String::new(),
+                signatures_resource: None,
             },
             None => SignatureHelpResult {
                 signatures: vec![],
                 active_signature: None,
                 active_parameter: None,
+                total_signatures: 0,
+                returned_signatures: 0,
+                remaining_signatures: 0,
+                next_cursor: None,
+                snapshot_identity: String::new(),
+                signatures_resource: None,
             },
         };
 

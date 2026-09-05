@@ -448,7 +448,15 @@ impl Translator {
             actions.push(action);
         }
 
-        Ok(CodeActionsResult { actions })
+        Ok(CodeActionsResult {
+            actions,
+            actions_resource: None,
+            total_actions: 0,
+            returned_actions: 0,
+            remaining_actions: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+        })
     }
 }
 

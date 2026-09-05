@@ -1681,6 +1681,7 @@ enum ProjectRequest {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<DefinitionResult, String>>,
     },
     References {
@@ -1725,6 +1726,7 @@ enum ProjectRequest {
         line: u32,
         character: u32,
         trigger: Option<String>,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<CompletionsResult, String>>,
     },
     DocumentSymbols {
@@ -1755,6 +1757,7 @@ enum ProjectRequest {
         line: u32,
         character: u32,
         kind: SemanticDiscoveryKind,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<SemanticDiscoveryResult, String>>,
     },
     WorkspaceSymbol {
@@ -1788,6 +1791,7 @@ enum ProjectRequest {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<CodeActionsResult, String>>,
     },
     CodeActionList {
@@ -1797,6 +1801,7 @@ enum ProjectRequest {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<CodeActionsResult, String>>,
     },
     CodeActionPreview {
@@ -1816,17 +1821,20 @@ enum ProjectRequest {
     IncomingCalls {
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<IncomingCallsResult, String>>,
     },
     OutgoingCalls {
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<OutgoingCallsResult, String>>,
     },
     SignatureHelp {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<SignatureHelpResult, String>>,
     },
     InlayHints {
@@ -1841,12 +1849,14 @@ enum ProjectRequest {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<LocationsResult, String>>,
     },
     GoToTypeDefinition {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
         reply: oneshot::Sender<Result<LocationsResult, String>>,
     },
     CachedDiagnostics {
@@ -1946,10 +1956,12 @@ enum ProjectRequest {
     ServerLogs {
         limit: usize,
         min_level: Option<String>,
+        cursor: Option<String>,
         reply: oneshot::Sender<Result<ServerLogsResult, String>>,
     },
     ServerMessages {
         limit: usize,
+        cursor: Option<String>,
         reply: oneshot::Sender<Result<ServerMessagesResult, String>>,
     },
     ServerCapabilities {
@@ -2440,12 +2452,24 @@ impl ProjectHandle {
         line: u32,
         character: u32,
     ) -> Result<DefinitionResult, ProjectActorError> {
+        self.definition_page(file_path, line, character, None).await
+    }
+
+    /// Route one snapshot-bound definition page through the actor.
+    pub async fn definition_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        page_token: Option<String>,
+    ) -> Result<DefinitionResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::Definition {
                 file_path,
                 line,
                 character,
+                page_token,
                 reply,
             })
             .await
@@ -2671,6 +2695,7 @@ impl ProjectHandle {
         line: u32,
         character: u32,
         trigger: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CompletionsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2679,6 +2704,7 @@ impl ProjectHandle {
                 line,
                 character,
                 trigger,
+                page_token,
                 reply,
             })
             .await
@@ -2817,6 +2843,7 @@ impl ProjectHandle {
         line: u32,
         character: u32,
         kind: SemanticDiscoveryKind,
+        page_token: Option<String>,
     ) -> Result<SemanticDiscoveryResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2825,6 +2852,7 @@ impl ProjectHandle {
                 line,
                 character,
                 kind,
+                page_token,
                 reply,
             })
             .await
@@ -2968,6 +2996,7 @@ impl ProjectHandle {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CodeActionsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -2978,6 +3007,7 @@ impl ProjectHandle {
                 end_line,
                 end_character,
                 kind_filter,
+                page_token,
                 reply,
             })
             .await
@@ -3002,6 +3032,7 @@ impl ProjectHandle {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CodeActionsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -3012,6 +3043,7 @@ impl ProjectHandle {
                 end_line,
                 end_character,
                 kind_filter,
+                page_token,
                 reply,
             })
             .await
@@ -3092,12 +3124,14 @@ impl ProjectHandle {
         &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
     ) -> Result<IncomingCallsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::IncomingCalls {
                 item,
                 limits,
+                page_token,
                 reply,
             })
             .await
@@ -3118,12 +3152,14 @@ impl ProjectHandle {
         &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
     ) -> Result<OutgoingCallsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::OutgoingCalls {
                 item,
                 limits,
+                page_token,
                 reply,
             })
             .await
@@ -3145,6 +3181,7 @@ impl ProjectHandle {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<SignatureHelpResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -3152,6 +3189,7 @@ impl ProjectHandle {
                 file_path,
                 line,
                 character,
+                page_token,
                 reply,
             })
             .await
@@ -3206,12 +3244,25 @@ impl ProjectHandle {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult, ProjectActorError> {
+        self.go_to_implementation_page(file_path, line, character, None)
+            .await
+    }
+
+    /// Route one snapshot-bound implementation page through the actor.
+    pub async fn go_to_implementation_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        page_token: Option<String>,
+    ) -> Result<LocationsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::GoToImplementation {
                 file_path,
                 line,
                 character,
+                page_token,
                 reply,
             })
             .await
@@ -3234,12 +3285,25 @@ impl ProjectHandle {
         line: u32,
         character: u32,
     ) -> Result<LocationsResult, ProjectActorError> {
+        self.go_to_type_definition_page(file_path, line, character, None)
+            .await
+    }
+
+    /// Route one snapshot-bound type-definition page through the actor.
+    pub async fn go_to_type_definition_page(
+        &self,
+        file_path: String,
+        line: u32,
+        character: u32,
+        page_token: Option<String>,
+    ) -> Result<LocationsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::GoToTypeDefinition {
                 file_path,
                 line,
                 character,
+                page_token,
                 reply,
             })
             .await
@@ -3632,11 +3696,22 @@ impl ProjectHandle {
         limit: usize,
         min_level: Option<String>,
     ) -> Result<ServerLogsResult, ProjectActorError> {
+        self.server_logs_page(limit, min_level, None).await
+    }
+
+    /// Return one snapshot-bound page of recent logs.
+    pub async fn server_logs_page(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+        cursor: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::ServerLogs {
                 limit,
                 min_level,
+                cursor,
                 reply,
             })
             .await
@@ -3656,9 +3731,22 @@ impl ProjectHandle {
         &self,
         limit: usize,
     ) -> Result<ServerMessagesResult, ProjectActorError> {
+        self.server_messages_page(limit, None).await
+    }
+
+    /// Return one snapshot-bound page of recent messages.
+    pub async fn server_messages_page(
+        &self,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(ProjectRequest::ServerMessages { limit, reply })
+            .send(ProjectRequest::ServerMessages {
+                limit,
+                cursor,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3672,11 +3760,22 @@ impl ProjectHandle {
         limit: usize,
         min_level: Option<String>,
     ) -> Result<ServerLogsResult, ProjectActorError> {
+        self.server_logs_page_unchecked(limit, min_level, None)
+            .await
+    }
+
+    async fn server_logs_page_unchecked(
+        &self,
+        limit: usize,
+        min_level: Option<String>,
+        cursor: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send_unchecked(ProjectRequest::ServerLogs {
                 limit,
                 min_level,
+                cursor,
                 reply,
             })
             .await
@@ -3691,9 +3790,21 @@ impl ProjectHandle {
         &self,
         limit: usize,
     ) -> Result<ServerMessagesResult, ProjectActorError> {
+        self.server_messages_page_unchecked(limit, None).await
+    }
+
+    async fn server_messages_page_unchecked(
+        &self,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send_unchecked(ProjectRequest::ServerMessages { limit, reply })
+            .send_unchecked(ProjectRequest::ServerMessages {
+                limit,
+                cursor,
+                reply,
+            })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3836,6 +3947,7 @@ enum PreparedEditResult {
 const LANGUAGE_SERVER_EXITED: &str = "language server exited";
 const MAX_AUTOMATIC_RESTART_ATTEMPTS: usize = 3;
 const MAX_INLINE_MODULE_CHECKS: usize = 256;
+const MAX_INLINE_HOVER_CONTENT_BYTES: usize = 4 * 1024;
 const MAX_EDIT_ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const MAX_APPLIED_EDIT_RECEIPTS: usize = 256;
 const MAX_APPLIED_EDIT_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
@@ -3845,6 +3957,31 @@ const AUTOMATIC_RESTART_BACKOFF: [Duration; MAX_AUTOMATIC_RESTART_ATTEMPTS] = [
     Duration::from_millis(500),
     Duration::from_secs(2),
 ];
+
+fn defer_oversized_hover_contents(
+    result: &mut HoverResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    if result.contents.len() <= MAX_INLINE_HOVER_CONTENT_BYTES {
+        return Ok(());
+    }
+
+    let contents = std::mem::take(&mut result.contents);
+    let inline_contents =
+        crate::util::truncate_string(contents.clone(), MAX_INLINE_HOVER_CONTENT_BYTES);
+    let encoded = serde_json::json!({"contents": contents});
+    let encoded_bytes = serde_json::to_vec(&encoded).map_err(|error| error.to_string())?;
+    let snapshot_hash = format!("{:x}", Sha256::digest(&encoded_bytes));
+    let reference = deferred_results
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert_scoped_kind(encoded, snapshot_hash, scope, "hover_contents");
+    result.contents = inline_contents;
+    result.contents_resource = Some(reference);
+    result.truncated = true;
+    Ok(())
+}
 
 const fn position_in_mcp_range(line: u32, character: u32, range: &crate::bridge::Range) -> bool {
     let after_start =
@@ -3999,6 +4136,175 @@ struct CodeActionStore {
     entries: HashMap<PlanId, StoredCodeAction>,
     ttl: Duration,
     max_entries: usize,
+}
+
+const CODE_ACTION_PAGE_SIZE: usize = 64;
+const COMPLETION_PAGE_SIZE: usize = 64;
+const SIGNATURE_PAGE_SIZE: usize = 32;
+
+fn signature_page_bounds(
+    signatures: &[crate::bridge::translator::SignatureInfo],
+    page_token: Option<&str>,
+) -> Result<(std::ops::Range<usize>, String, Option<String>), String> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(signatures).map_err(|error| error.to_string())?)
+    );
+    let offset = page_token
+        .map(|token| {
+            let (identity, offset) = token
+                .split_once(':')
+                .ok_or_else(|| "invalid signature page_token".to_owned())?;
+            if identity != snapshot_identity {
+                return Err("signature page_token belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| "invalid signature page_token".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if offset > signatures.len() {
+        return Err("signature page_token is outside the provider snapshot".to_owned());
+    }
+    let end = offset
+        .saturating_add(SIGNATURE_PAGE_SIZE)
+        .min(signatures.len());
+    let next = (end < signatures.len()).then(|| format!("{snapshot_identity}:{end}"));
+    Ok((offset..end, snapshot_identity, next))
+}
+
+fn signature_identity(
+    signature: &crate::bridge::translator::SignatureInfo,
+    ordinal: usize,
+) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(ordinal, signature)).unwrap_or_default())
+    )
+}
+
+fn defer_oversized_signature_payloads(
+    result: &mut SignatureHelpResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        <= MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Ok(());
+    }
+    let complete = serde_json::to_value(&result.signatures)
+        .map_err(|error| format!("failed to store signatures: {error}"))?;
+    result.signatures_resource = Some(store_diagnostic_payload(
+        complete,
+        "signature_help",
+        deferred_results,
+        scope,
+    )?);
+    for signature in &mut result.signatures {
+        signature.documentation = None;
+        for parameter in &mut signature.parameters {
+            parameter.documentation = None;
+        }
+    }
+    Ok(())
+}
+
+fn completion_page_bounds<T: serde::Serialize>(
+    items: &[T],
+    page_token: Option<&str>,
+) -> Result<(std::ops::Range<usize>, String, Option<String>), String> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(items).map_err(|error| error.to_string())?)
+    );
+    let offset = page_token
+        .map(|token| {
+            let (identity, offset) = token
+                .split_once(':')
+                .ok_or_else(|| "invalid completion page_token".to_owned())?;
+            if identity != snapshot_identity {
+                return Err("completion page_token belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| "invalid completion page_token".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if offset > items.len() {
+        return Err("completion page_token is outside the provider snapshot".to_owned());
+    }
+    let end = offset.saturating_add(COMPLETION_PAGE_SIZE).min(items.len());
+    let next = (end < items.len()).then(|| format!("{snapshot_identity}:{end}"));
+    Ok((offset..end, snapshot_identity, next))
+}
+
+fn completion_identity(item: &crate::bridge::Completion, ordinal: usize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(ordinal, item)).unwrap_or_default())
+    )
+}
+
+fn defer_oversized_completion_payloads(
+    result: &mut CompletionsResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        <= MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Ok(());
+    }
+    let complete = serde_json::to_value(&result.items)
+        .map_err(|error| format!("failed to store completions: {error}"))?;
+    result.items_resource = Some(store_diagnostic_payload(
+        complete,
+        "completions",
+        deferred_results,
+        scope,
+    )?);
+    for item in &mut result.items {
+        item.documentation = None;
+        item.detail = None;
+        item.insert_text = None;
+        item.text_edit = None;
+    }
+    Ok(())
+}
+
+fn code_action_page_bounds<T: serde::Serialize>(
+    actions: &[T],
+    page_token: Option<&str>,
+) -> Result<(std::ops::Range<usize>, String, Option<String>), String> {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(actions).map_err(|error| error.to_string())?)
+    );
+    let offset = page_token
+        .map(|token| {
+            let (identity, offset) = token
+                .split_once(':')
+                .ok_or_else(|| "invalid code action page_token".to_owned())?;
+            if identity != snapshot_identity {
+                return Err("code action page_token belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| "invalid code action page_token".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if offset > actions.len() {
+        return Err("code action page_token is outside the provider snapshot".to_owned());
+    }
+    let end = offset
+        .saturating_add(CODE_ACTION_PAGE_SIZE)
+        .min(actions.len());
+    let next = (end < actions.len()).then(|| format!("{snapshot_identity}:{end}"));
+    Ok((offset..end, snapshot_identity, next))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4748,6 +5054,357 @@ fn finish_diagnostics_page_metadata(
         remaining.len(),
         source_truncated,
     );
+}
+
+fn defer_oversized_diagnostic_related_information(
+    result: &mut DiagnosticsResult,
+    max_bytes: usize,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    if serde_json::to_vec(result).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+        return Ok(());
+    }
+    for diagnostic in &mut result.diagnostics {
+        let related = std::mem::take(&mut diagnostic.context.related_information);
+        if related.is_empty() {
+            continue;
+        }
+        let encoded = serde_json::to_vec(&related)
+            .map_err(|error| format!("failed to store related diagnostics: {error}"))?;
+        let value = serde_json::to_value(&related)
+            .map_err(|error| format!("failed to store related diagnostics: {error}"))?;
+        let snapshot_hash = format!("{:x}", Sha256::digest(&encoded));
+        let reference = deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert_scoped_kind(
+                value,
+                snapshot_hash,
+                scope,
+                "diagnostic_related_information",
+            );
+        diagnostic.context.related_information_resource = Some(reference);
+    }
+    Ok(())
+}
+
+fn store_diagnostic_payload(
+    value: serde_json::Value,
+    kind: &str,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<DeferredResourceReference, String> {
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|error| format!("failed to store diagnostic payload: {error}"))?;
+    let snapshot_hash = format!("{:x}", Sha256::digest(&encoded));
+    Ok(deferred_results
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert_scoped_kind(value, snapshot_hash, scope, kind))
+}
+
+trait NotificationMessageEntry {
+    fn message(&self) -> &str;
+    fn take_message(&mut self) -> String;
+    fn set_message(&mut self, message: String, resource: DeferredResourceReference);
+}
+
+const MAX_NOTIFICATION_RESULT_BYTES: usize = 16 * 1024;
+
+fn bound_notification_page<T>(
+    entries: &mut Vec<T>,
+    total: usize,
+    snapshot_identity: &str,
+    cursor: Option<&str>,
+    mut serialize_with_metadata: impl FnMut(&[T], usize, usize, Option<String>) -> usize,
+) -> Result<(), String> {
+    let start = cursor
+        .map(|cursor| {
+            cursor
+                .rsplit_once(':')
+                .and_then(|(_, offset)| offset.parse::<usize>().ok())
+                .ok_or_else(|| format!("invalid notification cursor: {cursor}"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+
+    loop {
+        let page_end = start.saturating_add(entries.len());
+        let remaining = total.saturating_sub(page_end);
+        let next_cursor = (remaining > 0).then(|| format!("{snapshot_identity}:{page_end}"));
+        let serialized_bytes =
+            serialize_with_metadata(entries, entries.len(), remaining, next_cursor);
+        if serialized_bytes <= MAX_NOTIFICATION_RESULT_BYTES || entries.len() <= 1 {
+            if serialized_bytes > MAX_NOTIFICATION_RESULT_BYTES {
+                return Err("notification result exceeds the response page budget".to_owned());
+            }
+            return Ok(());
+        }
+        entries.pop();
+    }
+}
+
+fn defer_notification_messages_for_scope<T>(
+    entries: &mut [T],
+    kind: &str,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String>
+where
+    T: NotificationMessageEntry,
+{
+    for entry in entries {
+        if entry.message().len() <= 4 * 1024 {
+            continue;
+        }
+        let message = entry.take_message();
+        let reference = store_diagnostic_payload(
+            serde_json::Value::String(message),
+            kind,
+            deferred_results,
+            scope,
+        )?;
+        entry.set_message("[server message deferred]".to_owned(), reference);
+    }
+    Ok(())
+}
+
+fn bound_server_logs_result(
+    result: &mut ServerLogsResult,
+    cursor: Option<&str>,
+) -> Result<(), String> {
+    let mut logs = std::mem::take(&mut result.logs);
+    bound_notification_page(
+        &mut logs,
+        result.total,
+        &result.snapshot_identity,
+        cursor,
+        |entries, returned, remaining, next_cursor| {
+            result.returned = returned;
+            result.remaining = remaining;
+            result.next_cursor = next_cursor;
+            serde_json::to_vec(&ServerLogsResult {
+                returned: result.returned,
+                remaining: result.remaining,
+                total: result.total,
+                snapshot_identity: result.snapshot_identity.clone(),
+                next_cursor: result.next_cursor.clone(),
+                logs: entries.to_vec(),
+            })
+            .map_or(usize::MAX, |json| json.len())
+        },
+    )?;
+    result.logs = logs;
+    Ok(())
+}
+
+fn bound_server_messages_result(
+    result: &mut ServerMessagesResult,
+    cursor: Option<&str>,
+) -> Result<(), String> {
+    let mut messages = std::mem::take(&mut result.messages);
+    bound_notification_page(
+        &mut messages,
+        result.total,
+        &result.snapshot_identity,
+        cursor,
+        |entries, returned, remaining, next_cursor| {
+            result.returned = returned;
+            result.remaining = remaining;
+            result.next_cursor = next_cursor;
+            serde_json::to_vec(&ServerMessagesResult {
+                returned: result.returned,
+                remaining: result.remaining,
+                total: result.total,
+                snapshot_identity: result.snapshot_identity.clone(),
+                next_cursor: result.next_cursor.clone(),
+                messages: entries.to_vec(),
+            })
+            .map_or(usize::MAX, |json| json.len())
+        },
+    )?;
+    result.messages = messages;
+    Ok(())
+}
+
+fn defer_semantic_discovery_payloads(
+    result: &mut crate::bridge::SemanticDiscoveryResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    loop {
+        if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+            <= MAX_NOTIFICATION_RESULT_BYTES
+        {
+            return Ok(());
+        }
+        if !result.locations.is_empty() {
+            let locations = std::mem::take(&mut result.locations);
+            result.locations_returned = 0;
+            result.locations_resource = Some(store_diagnostic_payload(
+                serde_json::to_value(locations)
+                    .map_err(|error| format!("failed to store discovery locations: {error}"))?,
+                "semantic_locations",
+                deferred_results,
+                scope,
+            )?);
+            continue;
+        }
+        if !result.selection_ranges.is_empty() {
+            let selection_ranges = std::mem::take(&mut result.selection_ranges);
+            result.selection_ranges_returned = 0;
+            result.selection_ranges_resource = Some(store_diagnostic_payload(
+                serde_json::to_value(selection_ranges)
+                    .map_err(|error| format!("failed to store selection ranges: {error}"))?,
+                "semantic_selection_ranges",
+                deferred_results,
+                scope,
+            )?);
+            continue;
+        }
+        if let Some(expansion) = result.macro_expansion.take() {
+            let value = serde_json::to_value(expansion)
+                .map_err(|error| format!("failed to store macro expansion: {error}"))?;
+            result.macro_expansion_resource = Some(store_diagnostic_payload(
+                value,
+                "macro_expansion",
+                deferred_results,
+                scope,
+            )?);
+            continue;
+        }
+        if !result.runnables.is_empty() {
+            let runnables = std::mem::take(&mut result.runnables);
+            result.runnables_returned = 0;
+            result.runnables_resource = Some(store_diagnostic_payload(
+                serde_json::Value::Array(runnables),
+                "semantic_runnables",
+                deferred_results,
+                scope,
+            )?);
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+fn defer_oversized_code_action_payloads(
+    result: &mut CodeActionsResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        <= MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Ok(());
+    }
+    let complete = serde_json::to_value(&result.actions)
+        .map_err(|error| format!("failed to store code actions: {error}"))?;
+    result.actions_resource = Some(store_diagnostic_payload(
+        complete,
+        "code_actions",
+        deferred_results,
+        scope,
+    )?);
+    for action in &mut result.actions {
+        action.edit = None;
+        action.workspace_edit = None;
+        action.command = None;
+        action.data = None;
+    }
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        > MAX_NOTIFICATION_RESULT_BYTES
+    {
+        for action in &mut result.actions {
+            action.diagnostics.clear();
+        }
+    }
+    Ok(())
+}
+
+impl NotificationMessageEntry for LogEntry {
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn take_message(&mut self) -> String {
+        std::mem::take(&mut self.message)
+    }
+
+    fn set_message(&mut self, message: String, resource: DeferredResourceReference) {
+        self.message = message;
+        self.message_resource = Some(resource);
+    }
+}
+
+impl NotificationMessageEntry for ServerMessage {
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn take_message(&mut self) -> String {
+        std::mem::take(&mut self.message)
+    }
+
+    fn set_message(&mut self, message: String, resource: DeferredResourceReference) {
+        self.message = message;
+        self.message_resource = Some(resource);
+    }
+}
+
+fn defer_oversized_diagnostic_payloads(
+    result: &mut DiagnosticsResult,
+    max_bytes: usize,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    defer_oversized_diagnostic_related_information(result, max_bytes, deferred_results, scope)?;
+    if serde_json::to_vec(result).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+        return Ok(());
+    }
+    for diagnostic in &mut result.diagnostics {
+        if diagnostic.message.len() > 1_024 {
+            let message = std::mem::take(&mut diagnostic.message);
+            diagnostic.context.message_resource = Some(store_diagnostic_payload(
+                serde_json::Value::String(message),
+                "diagnostic_message",
+                deferred_results,
+                scope,
+            )?);
+            diagnostic.message = "[diagnostic message deferred]".to_owned();
+        }
+        if diagnostic
+            .context
+            .data
+            .as_ref()
+            .and_then(|data| serde_json::to_vec(data).ok())
+            .is_some_and(|encoded| encoded.len() > 1_024)
+        {
+            let Some(data) = diagnostic.context.data.take() else {
+                continue;
+            };
+            diagnostic.context.data_resource = Some(store_diagnostic_payload(
+                data,
+                "diagnostic_data",
+                deferred_results,
+                scope,
+            )?);
+        }
+        if serde_json::to_vec(&diagnostic.context.fix_handles)
+            .is_ok_and(|encoded| encoded.len() > 1_024)
+        {
+            let fix_handles = std::mem::take(&mut diagnostic.context.fix_handles);
+            diagnostic.context.fix_handles_resource = Some(store_diagnostic_payload(
+                serde_json::to_value(fix_handles)
+                    .map_err(|error| format!("failed to store diagnostic fix handles: {error}"))?,
+                "diagnostic_fix_handles",
+                deferred_results,
+                scope,
+            )?);
+        }
+    }
+    Ok(())
 }
 
 fn bounded_diagnostics_page(
@@ -6249,6 +6906,11 @@ impl ProjectRuntime {
             .handle_hover(file_path.clone(), line, character)
             .await
             .map_err(|error| error.to_string())?;
+        defer_oversized_hover_contents(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
         let target = result.range.as_ref().map_or((line, character), |range| {
             (range.start.line, range.start.character)
         });
@@ -6261,10 +6923,11 @@ impl ProjectRuntime {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<DefinitionResult, String> {
         let mut result = self
             .translator
-            .handle_definition(file_path, line, character)
+            .handle_definition_page(file_path, line, character, page_token.as_deref())
             .await
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(&mut result.locations);
@@ -6438,6 +7101,18 @@ impl ProjectRuntime {
                     total_bytes: Some(content.len()),
                 });
             }
+            if serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len())
+                > result.filters.byte_limit
+            {
+                let scope = self.deferred_scope.as_deref().unwrap_or_default();
+                let max_bytes = result.filters.byte_limit;
+                defer_oversized_diagnostic_payloads(
+                    &mut result,
+                    max_bytes,
+                    &self.deferred_results,
+                    scope,
+                )?;
+            }
             let encoded = serde_json::to_vec(&result.diagnostics)
                 .map_err(|error| format!("failed to identify diagnostics snapshot: {error}"))?;
             result.snapshot_identity = Some(format!("{:x}", Sha256::digest(encoded)));
@@ -6537,11 +7212,35 @@ impl ProjectRuntime {
         line: u32,
         character: u32,
         trigger: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CompletionsResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_completions(file_path, line, character, trigger)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let (page, snapshot_identity, next_cursor) =
+            completion_page_bounds(&result.items, page_token.as_deref())?;
+        let total_items = result.items.len();
+        let page_start = page.start;
+        let mut items = result.items[page].to_vec();
+        for (index, item) in items.iter_mut().enumerate() {
+            let identity = completion_identity(item, page_start + index);
+            item.completion_id = Some(identity.clone());
+            item.insertion_handle = Some(identity);
+        }
+        result.items = items;
+        result.total_items = total_items;
+        result.returned_items = result.items.len();
+        result.remaining_items = total_items.saturating_sub(page_start + result.items.len());
+        result.next_cursor = next_cursor;
+        result.snapshot_identity = snapshot_identity;
+        defer_oversized_completion_payloads(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn document_symbols(
@@ -6682,13 +7381,19 @@ impl ProjectRuntime {
         line: u32,
         character: u32,
         kind: SemanticDiscoveryKind,
+        page_token: Option<String>,
     ) -> Result<SemanticDiscoveryResult, String> {
         let mut result = self
             .translator
-            .request_semantic_discovery(file_path, line, character, kind)
+            .request_semantic_discovery(file_path, line, character, kind, page_token.as_deref())
             .await
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(&mut result.locations);
+        defer_semantic_discovery_payloads(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
         Ok(result)
     }
 
@@ -7515,8 +8220,9 @@ impl ProjectRuntime {
             let provider = prepared.provider;
             let item = serde_json::to_value(first).map_err(|error| error.to_string())?;
             let (incoming, outgoing) = tokio::join!(
-                self.translator.handle_incoming_calls(item.clone(), limits),
-                self.translator.handle_outgoing_calls(item, limits),
+                self.translator
+                    .handle_incoming_calls(item.clone(), limits, None),
+                self.translator.handle_outgoing_calls(item, limits, None),
             );
             let incoming = incoming.map_err(|error| error.to_string())?;
             let outgoing = outgoing.map_err(|error| error.to_string())?;
@@ -7538,6 +8244,7 @@ impl ProjectRuntime {
                     line,
                     character,
                     SemanticDiscoveryKind::RelatedTests,
+                    None,
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -7549,6 +8256,7 @@ impl ProjectRuntime {
                     line,
                     character,
                     SemanticDiscoveryKind::Runnables,
+                    None,
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -7928,8 +8636,10 @@ impl ProjectRuntime {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CodeActionsResult, String> {
-        self.translator
+        let actions = self
+            .translator
             .handle_code_actions(
                 file_path,
                 start_line,
@@ -7939,7 +8649,27 @@ impl ProjectRuntime {
                 kind_filter,
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let (page, snapshot_identity, next_cursor) =
+            code_action_page_bounds(&actions.actions, page_token.as_deref())?;
+        let total_actions = actions.actions.len();
+        let page_start = page.start;
+        let actions = actions.actions[page].to_vec();
+        let mut result = CodeActionsResult {
+            returned_actions: actions.len(),
+            remaining_actions: total_actions.saturating_sub(page_start + actions.len()),
+            total_actions,
+            next_cursor,
+            snapshot_identity,
+            actions,
+            actions_resource: None,
+        };
+        defer_oversized_code_action_payloads(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn code_action_list(
@@ -7950,6 +8680,7 @@ impl ProjectRuntime {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CodeActionsResult, String> {
         let actions = self
             .translator
@@ -7963,8 +8694,11 @@ impl ProjectRuntime {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let mut result = Vec::with_capacity(actions.len());
-        for action in actions {
+        let (page, snapshot_identity, next_cursor) =
+            code_action_page_bounds(&actions, page_token.as_deref())?;
+        let total_actions = actions.len();
+        let mut result = Vec::with_capacity(page.len());
+        for action in actions[page.clone()].iter().cloned() {
             let id = self.code_actions.insert(StoredCodeAction {
                 file_path: file_path.clone(),
                 action: action.clone(),
@@ -7972,7 +8706,21 @@ impl ProjectRuntime {
             });
             result.push(convert_code_action_or_command(action, Some(id.to_string())));
         }
-        Ok(CodeActionsResult { actions: result })
+        let mut result = CodeActionsResult {
+            returned_actions: result.len(),
+            remaining_actions: total_actions.saturating_sub(page.start + result.len()),
+            total_actions,
+            next_cursor,
+            snapshot_identity,
+            actions: result,
+            actions_resource: None,
+        };
+        defer_oversized_code_action_payloads(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn preview_code_action(
@@ -8140,10 +8888,11 @@ impl ProjectRuntime {
         &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
     ) -> Result<IncomingCallsResult, String> {
         let mut result = self
             .translator
-            .handle_incoming_calls(item, limits)
+            .handle_incoming_calls(item, limits, page_token)
             .await
             .map_err(|error| error.to_string())?;
         for call in &mut result.calls {
@@ -8163,10 +8912,11 @@ impl ProjectRuntime {
         &self,
         item: serde_json::Value,
         limits: SemanticResultLimits,
+        page_token: Option<String>,
     ) -> Result<OutgoingCallsResult, String> {
         let mut result = self
             .translator
-            .handle_outgoing_calls(item, limits)
+            .handle_outgoing_calls(item, limits, page_token)
             .await
             .map_err(|error| error.to_string())?;
         for call in &mut result.calls {
@@ -8187,11 +8937,34 @@ impl ProjectRuntime {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<SignatureHelpResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_signature_help(file_path, line, character)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let (page, snapshot_identity, next_cursor) =
+            signature_page_bounds(&result.signatures, page_token.as_deref())?;
+        let total_signatures = result.signatures.len();
+        let page_start = page.start;
+        let mut signatures = result.signatures[page].to_vec();
+        for (index, signature) in signatures.iter_mut().enumerate() {
+            signature.signature_id = Some(signature_identity(signature, page_start + index));
+        }
+        result.signatures = signatures;
+        result.total_signatures = total_signatures;
+        result.returned_signatures = result.signatures.len();
+        result.remaining_signatures =
+            total_signatures.saturating_sub(page_start + result.signatures.len());
+        result.next_cursor = next_cursor;
+        result.snapshot_identity = snapshot_identity;
+        defer_oversized_signature_payloads(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn inlay_hints(
@@ -8219,10 +8992,11 @@ impl ProjectRuntime {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<LocationsResult, String> {
         let mut result = self
             .translator
-            .handle_implementation(file_path, line, character)
+            .handle_implementation_page(file_path, line, character, page_token.as_deref())
             .await
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(&mut result.locations);
@@ -8234,10 +9008,11 @@ impl ProjectRuntime {
         file_path: String,
         line: u32,
         character: u32,
+        page_token: Option<String>,
     ) -> Result<LocationsResult, String> {
         let mut result = self
             .translator
-            .handle_type_definition(file_path, line, character)
+            .handle_type_definition_page(file_path, line, character, page_token.as_deref())
             .await
             .map_err(|error| error.to_string())?;
         self.attach_location_handles(&mut result.locations);
@@ -8270,20 +9045,45 @@ impl ProjectRuntime {
         self.translator.source_path_is_authorized(path)
     }
 
-    fn server_logs(
+    fn server_logs_page(
         &self,
         limit: usize,
         min_level: Option<String>,
+        cursor: Option<&str>,
     ) -> Result<ServerLogsResult, String> {
-        self.translator
-            .actor_server_logs(limit, min_level)
-            .map_err(|error| error.to_string())
+        let mut result = self
+            .translator
+            .actor_server_logs_page(limit, min_level, cursor)
+            .map_err(|error| error.to_string())?;
+        self.defer_notification_messages(&mut result.logs, "diagnostic_log_message")?;
+        bound_server_logs_result(&mut result, cursor)?;
+        Ok(result)
     }
 
-    fn server_messages(&self, limit: usize) -> Result<ServerMessagesResult, String> {
-        self.translator
-            .actor_server_messages(limit)
-            .map_err(|error| error.to_string())
+    fn server_messages_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ServerMessagesResult, String> {
+        let mut result = self
+            .translator
+            .actor_server_messages_page(limit, cursor)
+            .map_err(|error| error.to_string())?;
+        self.defer_notification_messages(&mut result.messages, "server_message")?;
+        bound_server_messages_result(&mut result, cursor)?;
+        Ok(result)
+    }
+
+    fn defer_notification_messages<T>(&self, entries: &mut [T], kind: &str) -> Result<(), String>
+    where
+        T: NotificationMessageEntry,
+    {
+        defer_notification_messages_for_scope(
+            entries,
+            kind,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )
     }
 
     fn server_capabilities(
@@ -9245,9 +10045,14 @@ async fn handle_project_request(
             file_path,
             line,
             character,
+            page_token,
             reply,
         } => {
-            let _ = reply.send(runtime.definition(file_path, line, character).await);
+            let _ = reply.send(
+                runtime
+                    .definition(file_path, line, character, page_token)
+                    .await,
+            );
         }
         ProjectRequest::References {
             file_path,
@@ -9322,11 +10127,12 @@ async fn handle_project_request(
             line,
             character,
             trigger,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .completions(file_path, line, character, trigger)
+                    .completions(file_path, line, character, trigger, page_token)
                     .await,
             );
         }
@@ -9375,11 +10181,12 @@ async fn handle_project_request(
             line,
             character,
             kind,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .semantic_discovery(file_path, line, character, kind)
+                    .semantic_discovery(file_path, line, character, kind, page_token)
                     .await,
             );
         }
@@ -9450,6 +10257,7 @@ async fn handle_project_request(
             end_line,
             end_character,
             kind_filter,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
@@ -9461,6 +10269,7 @@ async fn handle_project_request(
                         end_line,
                         end_character,
                         kind_filter,
+                        page_token,
                     )
                     .await,
             );
@@ -9472,6 +10281,7 @@ async fn handle_project_request(
             end_line,
             end_character,
             kind_filter,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
@@ -9483,6 +10293,7 @@ async fn handle_project_request(
                         end_line,
                         end_character,
                         kind_filter,
+                        page_token,
                     )
                     .await,
             );
@@ -9516,24 +10327,31 @@ async fn handle_project_request(
         ProjectRequest::IncomingCalls {
             item,
             limits,
+            page_token,
             reply,
         } => {
-            let _ = reply.send(runtime.incoming_calls(item, limits).await);
+            let _ = reply.send(runtime.incoming_calls(item, limits, page_token).await);
         }
         ProjectRequest::OutgoingCalls {
             item,
             limits,
+            page_token,
             reply,
         } => {
-            let _ = reply.send(runtime.outgoing_calls(item, limits).await);
+            let _ = reply.send(runtime.outgoing_calls(item, limits, page_token).await);
         }
         ProjectRequest::SignatureHelp {
             file_path,
             line,
             character,
+            page_token,
             reply,
         } => {
-            let _ = reply.send(runtime.signature_help(file_path, line, character).await);
+            let _ = reply.send(
+                runtime
+                    .signature_help(file_path, line, character, page_token)
+                    .await,
+            );
         }
         ProjectRequest::InlayHints {
             file_path,
@@ -9559,11 +10377,12 @@ async fn handle_project_request(
             file_path,
             line,
             character,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .go_to_implementation(file_path, line, character)
+                    .go_to_implementation(file_path, line, character, page_token)
                     .await,
             );
         }
@@ -9571,11 +10390,12 @@ async fn handle_project_request(
             file_path,
             line,
             character,
+            page_token,
             reply,
         } => {
             let _ = reply.send(
                 runtime
-                    .go_to_type_definition(file_path, line, character)
+                    .go_to_type_definition(file_path, line, character, page_token)
                     .await,
             );
         }
@@ -9816,12 +10636,17 @@ async fn handle_project_request(
         ProjectRequest::ServerLogs {
             limit,
             min_level,
+            cursor,
             reply,
         } => {
-            let _ = reply.send(runtime.server_logs(limit, min_level));
+            let _ = reply.send(runtime.server_logs_page(limit, min_level, cursor.as_deref()));
         }
-        ProjectRequest::ServerMessages { limit, reply } => {
-            let _ = reply.send(runtime.server_messages(limit));
+        ProjectRequest::ServerMessages {
+            limit,
+            cursor,
+            reply,
+        } => {
+            let _ = reply.send(runtime.server_messages_page(limit, cursor.as_deref()));
         }
         ProjectRequest::ServerCapabilities { language_id, reply } => {
             let _ = reply.send(runtime.server_capabilities(language_id.as_deref()));
@@ -10029,10 +10854,48 @@ struct RetainedProjectHistory {
 }
 
 impl RetainedProjectHistory {
-    fn server_logs(
+    fn page_bounds<T: Serialize>(
+        items: &[T],
+        limit: usize,
+        cursor: Option<&str>,
+        kind: &str,
+    ) -> Result<(std::ops::Range<usize>, String, Option<String>), ProjectActorError> {
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(items).unwrap_or_default())
+        );
+        let start = match cursor {
+            Some(cursor) => {
+                let (identity, offset) = cursor.split_once(':').ok_or_else(|| {
+                    ProjectActorError::Operation(format!("invalid {kind} cursor: {cursor}"))
+                })?;
+                if identity != snapshot_identity {
+                    return Err(ProjectActorError::Operation(format!(
+                        "{kind} cursor belongs to a different snapshot"
+                    )));
+                }
+                offset.parse::<usize>().map_err(|_| {
+                    ProjectActorError::Operation(format!("invalid {kind} cursor: {cursor}"))
+                })?
+            }
+            None => 0,
+        };
+        if cursor.is_some() && start >= items.len() {
+            return Err(ProjectActorError::Operation(format!(
+                "{kind} cursor is outside the retained snapshot: {start}"
+            )));
+        }
+        let end = start.saturating_add(limit).min(items.len());
+        let next_cursor =
+            (limit > 0 && end < items.len()).then(|| format!("{snapshot_identity}:{end}"));
+        Ok((start..end, snapshot_identity, next_cursor))
+    }
+
+    fn server_logs_page(
         &self,
         limit: usize,
         min_level: Option<&str>,
+        cursor: Option<&str>,
     ) -> Result<ServerLogsResult, ProjectActorError> {
         let min_level = min_level
             .map(str::to_ascii_lowercase)
@@ -10046,30 +10909,62 @@ impl RetainedProjectHistory {
                 ))),
             })
             .transpose()?;
-        Ok(ServerLogsResult {
-            logs: self
-                .logs
-                .iter()
-                .filter(|log| {
-                    min_level.is_none_or(|min| match min {
-                        LogLevel::Error => matches!(log.level, LogLevel::Error),
-                        LogLevel::Warning => {
-                            matches!(log.level, LogLevel::Error | LogLevel::Warning)
-                        }
-                        LogLevel::Info => !matches!(log.level, LogLevel::Debug),
-                        LogLevel::Debug => true,
-                    })
+        let logs: Vec<_> = self
+            .logs
+            .iter()
+            .filter(|log| {
+                min_level.is_none_or(|min| match min {
+                    LogLevel::Error => matches!(log.level, LogLevel::Error),
+                    LogLevel::Warning => {
+                        matches!(log.level, LogLevel::Error | LogLevel::Warning)
+                    }
+                    LogLevel::Info => !matches!(log.level, LogLevel::Debug),
+                    LogLevel::Debug => true,
                 })
-                .take(limit)
-                .cloned()
-                .collect(),
+            })
+            .cloned()
+            .collect();
+        let (page, snapshot_identity, next_cursor) =
+            Self::page_bounds(&logs, limit, cursor, "server_logs")?;
+        let page_end = page.end;
+        let total = logs.len();
+        let logs = (limit > 0).then(|| logs[page].to_vec()).unwrap_or_default();
+        Ok(ServerLogsResult {
+            returned: logs.len(),
+            remaining: total.saturating_sub(page_end),
+            total,
+            snapshot_identity,
+            next_cursor,
+            logs,
         })
     }
 
-    fn server_messages(&self, limit: usize) -> ServerMessagesResult {
-        ServerMessagesResult {
-            messages: self.messages.iter().take(limit).cloned().collect(),
-        }
+    fn server_messages_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ServerMessagesResult, ProjectActorError> {
+        let (page, snapshot_identity, next_cursor) =
+            Self::page_bounds(&self.messages, limit, cursor, "server_messages")?;
+        let page_end = page.end;
+        let messages: Vec<_> = (limit > 0)
+            .then(|| {
+                self.messages
+                    .iter()
+                    .skip(page.start)
+                    .take(page.end - page.start)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ServerMessagesResult {
+            returned: messages.len(),
+            remaining: self.messages.len().saturating_sub(page_end),
+            total: self.messages.len(),
+            snapshot_identity,
+            next_cursor,
+            messages,
+        })
     }
 }
 
@@ -11281,16 +12176,41 @@ impl ProjectRegistry {
         limit: usize,
         min_level: Option<String>,
     ) -> Result<ServerLogsResult, ProjectRegistryError> {
+        self.server_logs_page(id, limit, min_level, None).await
+    }
+
+    /// Return one snapshot-bound page of logs from a project's primary actor.
+    pub async fn server_logs_page(
+        &self,
+        id: &ProjectId,
+        limit: usize,
+        min_level: Option<String>,
+        cursor: Option<String>,
+    ) -> Result<ServerLogsResult, ProjectRegistryError> {
         match self.actor(id).await {
             Ok(actor) => actor
-                .server_logs(limit, min_level)
+                .server_logs_page(limit, min_level, cursor)
                 .await
                 .map_err(ProjectRegistryError::from),
-            Err(ProjectRegistryError::ProjectNotFound(_)) => self
-                .retained_history_for(id)
-                .await?
-                .server_logs(limit, min_level.as_deref())
-                .map_err(ProjectRegistryError::from),
+            Err(ProjectRegistryError::ProjectNotFound(_)) => {
+                let mut result = self
+                    .retained_history_for(id)
+                    .await?
+                    .server_logs_page(limit, min_level.as_deref(), cursor.as_deref())
+                    .map_err(ProjectRegistryError::from)?;
+                defer_notification_messages_for_scope(
+                    &mut result.logs,
+                    "diagnostic_log_message",
+                    &self.deferred_results,
+                    id.as_str(),
+                )
+                .map_err(ProjectActorError::Operation)
+                .map_err(ProjectRegistryError::from)?;
+                bound_server_logs_result(&mut result, cursor.as_deref())
+                    .map_err(ProjectActorError::Operation)
+                    .map_err(ProjectRegistryError::from)?;
+                Ok(result)
+            }
             Err(error) => Err(error),
         }
     }
@@ -11305,13 +12225,38 @@ impl ProjectRegistry {
         id: &ProjectId,
         limit: usize,
     ) -> Result<ServerMessagesResult, ProjectRegistryError> {
+        self.server_messages_page(id, limit, None).await
+    }
+
+    /// Return one snapshot-bound page of messages from a project's primary actor.
+    pub async fn server_messages_page(
+        &self,
+        id: &ProjectId,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<ServerMessagesResult, ProjectRegistryError> {
         match self.actor(id).await {
             Ok(actor) => actor
-                .server_messages(limit)
+                .server_messages_page(limit, cursor)
                 .await
                 .map_err(ProjectRegistryError::from),
             Err(ProjectRegistryError::ProjectNotFound(_)) => {
-                Ok(self.retained_history_for(id).await?.server_messages(limit))
+                let mut result = self
+                    .retained_history_for(id)
+                    .await?
+                    .server_messages_page(limit, cursor.as_deref())?;
+                defer_notification_messages_for_scope(
+                    &mut result.messages,
+                    "server_message",
+                    &self.deferred_results,
+                    id.as_str(),
+                )
+                .map_err(ProjectActorError::Operation)
+                .map_err(ProjectRegistryError::from)?;
+                bound_server_messages_result(&mut result, cursor.as_deref())
+                    .map_err(ProjectActorError::Operation)
+                    .map_err(ProjectRegistryError::from)?;
+                Ok(result)
             }
             Err(error) => Err(error),
         }
@@ -11333,6 +12278,7 @@ impl ProjectRegistry {
         end_line: u32,
         end_character: u32,
         kind_filter: Option<String>,
+        page_token: Option<String>,
     ) -> Result<CodeActionsResult, ProjectRegistryError> {
         let (identity, actor, _) = self.entry(id).await?;
         let path = canonicalize(Path::new(&file_path))?;
@@ -11351,6 +12297,7 @@ impl ProjectRegistry {
                 end_line,
                 end_character,
                 kind_filter,
+                page_token,
             )
             .await
             .map_err(ProjectRegistryError::from)
@@ -12861,6 +13808,197 @@ mod tests {
     }
 
     #[test]
+    fn code_action_pages_are_snapshot_bound_and_gap_free() {
+        let actions = (0..130)
+            .map(|index| serde_json::json!({"index": index}))
+            .collect::<Vec<_>>();
+        let (first, snapshot, next) = code_action_page_bounds(&actions, None).unwrap();
+        assert_eq!(first, 0..64);
+        let token = next.unwrap();
+        let (second, same_snapshot, next) =
+            code_action_page_bounds(&actions, Some(&token)).unwrap();
+        assert_eq!(same_snapshot, snapshot);
+        assert_eq!(second, 64..128);
+        let (last, _, next) = code_action_page_bounds(&actions, next.as_deref()).unwrap();
+        assert_eq!(last, 128..130);
+        assert!(next.is_none());
+        assert!(code_action_page_bounds(&actions, Some("stale:64")).is_err());
+    }
+
+    #[test]
+    fn oversized_code_action_details_are_deferred_losslessly() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let action = crate::bridge::translator::CodeAction {
+            action_id: Some("action-1".to_owned()),
+            title: "Fix it".to_owned(),
+            kind: Some("quickfix".to_owned()),
+            diagnostics: Vec::new(),
+            edit: None,
+            workspace_edit: None,
+            command: Some(crate::bridge::translator::CommandDescription {
+                title: "Fix it".to_owned(),
+                command: "fix".to_owned(),
+                arguments: vec![serde_json::Value::String(
+                    "λ".repeat(MAX_NOTIFICATION_RESULT_BYTES),
+                )],
+            }),
+            is_preferred: true,
+            disabled: None,
+            data: None,
+        };
+        let complete = serde_json::to_value(vec![action.clone()]).unwrap();
+        let mut result = CodeActionsResult {
+            actions: vec![action],
+            actions_resource: None,
+            total_actions: 1,
+            returned_actions: 1,
+            remaining_actions: 0,
+            next_cursor: None,
+            snapshot_identity: "snapshot".to_owned(),
+        };
+
+        defer_oversized_code_action_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_NOTIFICATION_RESULT_BYTES);
+        assert!(result.actions[0].command.is_none());
+        let reference = result.actions_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[test]
+    fn completion_pages_are_snapshot_bound_and_gap_free() {
+        let items = (0..130)
+            .map(|index| serde_json::json!({"label": index}))
+            .collect::<Vec<_>>();
+        let (first, snapshot, next) = completion_page_bounds(&items, None).unwrap();
+        assert_eq!(first, 0..64);
+        let token = next.unwrap();
+        let (second, same_snapshot, next) = completion_page_bounds(&items, Some(&token)).unwrap();
+        assert_eq!(same_snapshot, snapshot);
+        assert_eq!(second, 64..128);
+        let (last, _, next) = completion_page_bounds(&items, next.as_deref()).unwrap();
+        assert_eq!(last, 128..130);
+        assert!(next.is_none());
+        assert!(completion_page_bounds(&items, Some("stale:64")).is_err());
+    }
+
+    #[test]
+    fn oversized_completion_details_are_deferred_losslessly() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let item = crate::bridge::Completion {
+            completion_id: Some("completion-1".to_owned()),
+            label: "println!".to_owned(),
+            kind: Some("Function".to_owned()),
+            detail: Some("λ".repeat(MAX_NOTIFICATION_RESULT_BYTES)),
+            documentation: Some("docs".to_owned()),
+            sort_text: Some("01".to_owned()),
+            filter_text: Some("println".to_owned()),
+            insert_text: Some("println!(\"$0\")".to_owned()),
+            text_edit: None,
+            insertion_handle: Some("completion-1".to_owned()),
+        };
+        let complete = serde_json::to_value(vec![item.clone()]).unwrap();
+        let mut result = CompletionsResult {
+            items: vec![item],
+            provider_incomplete: true,
+            total_items: 1,
+            returned_items: 1,
+            remaining_items: 0,
+            next_cursor: None,
+            snapshot_identity: "snapshot".to_owned(),
+            items_resource: None,
+        };
+
+        defer_oversized_completion_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_NOTIFICATION_RESULT_BYTES);
+        assert!(result.items[0].detail.is_none());
+        let reference = result.items_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[test]
+    fn signature_pages_are_snapshot_bound_and_gap_free() {
+        let signatures = (0..70)
+            .map(|index| crate::bridge::translator::SignatureInfo {
+                signature_id: None,
+                label: format!("f{index}()"),
+                documentation: None,
+                parameters: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let (first, snapshot, next) = signature_page_bounds(&signatures, None).unwrap();
+        assert_eq!(first, 0..32);
+        let token = next.unwrap();
+        let (second, same_snapshot, next) =
+            signature_page_bounds(&signatures, Some(&token)).unwrap();
+        assert_eq!(same_snapshot, snapshot);
+        assert_eq!(second, 32..64);
+        let (last, _, next) = signature_page_bounds(&signatures, next.as_deref()).unwrap();
+        assert_eq!(last, 64..70);
+        assert!(next.is_none());
+        assert!(signature_page_bounds(&signatures, Some("stale:32")).is_err());
+    }
+
+    #[test]
+    fn oversized_signature_documentation_is_deferred_losslessly() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let signature = crate::bridge::translator::SignatureInfo {
+            signature_id: Some("signature-1".to_owned()),
+            label: "f(value)".to_owned(),
+            documentation: Some("λ".repeat(MAX_NOTIFICATION_RESULT_BYTES)),
+            parameters: vec![crate::bridge::translator::SignatureParameter {
+                label: "value".to_owned(),
+                documentation: Some("parameter docs".to_owned()),
+            }],
+        };
+        let complete = serde_json::to_value(vec![signature.clone()]).unwrap();
+        let mut result = SignatureHelpResult {
+            signatures: vec![signature],
+            active_signature: Some(0),
+            active_parameter: Some(0),
+            total_signatures: 1,
+            returned_signatures: 1,
+            remaining_signatures: 0,
+            next_cursor: None,
+            snapshot_identity: "snapshot".to_owned(),
+            signatures_resource: None,
+        };
+
+        defer_oversized_signature_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_NOTIFICATION_RESULT_BYTES);
+        assert!(result.signatures[0].documentation.is_none());
+        assert!(result.signatures[0].parameters[0].documentation.is_none());
+        let reference = result.signatures_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[test]
     fn symbol_handle_store_is_bounded_and_rejects_forged_handles() {
         let mut store = SymbolHandleStore {
             entries: HashMap::new(),
@@ -13440,6 +14578,59 @@ mod tests {
         assert!(source_page.text.contains("pub fn caf\u{e9}_000"));
         assert!(source_page.text.contains("pub fn caf\u{e9}_099"));
         responder.await.unwrap();
+    }
+
+    #[test]
+    fn oversized_diagnostic_payloads_are_scoped_and_readable() {
+        let range = crate::bridge::Range {
+            start: crate::bridge::Position2D {
+                line: 1,
+                character: 1,
+            },
+            end: crate::bridge::Position2D {
+                line: 1,
+                character: 2,
+            },
+        };
+        let location = crate::bridge::Location {
+            path: Some("/workspace/src/lib.rs".to_owned()),
+            uri: "file:///workspace/src/lib.rs".to_owned(),
+            range: range.clone(),
+            source: SourceContext::Unavailable {
+                reason: SourceUnavailableReason::NotFound,
+            },
+            symbol_handle: None,
+        };
+        let mut diagnostic = crate::bridge::Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Error,
+            message: "error ".repeat(500),
+            code: Some("E0001".to_owned()),
+            context: crate::bridge::translator::DiagnosticContext::default(),
+        };
+        diagnostic.context.related_information =
+            vec![crate::bridge::translator::DiagnosticRelatedInformation {
+                location,
+                message: "related context ".repeat(200),
+            }];
+        diagnostic.context.data = Some(serde_json::Value::String("data ".repeat(500)));
+        diagnostic.context.fix_handles = (0..200).map(|index| format!("fix-{index}")).collect();
+        let mut result = DiagnosticsResult::raw(vec![diagnostic]);
+        let store = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        defer_oversized_diagnostic_payloads(&mut result, 100, &store, "project").unwrap();
+        let reference = result.diagnostics[0]
+            .context
+            .related_information_resource
+            .as_ref()
+            .unwrap();
+        assert!(result.diagnostics[0].context.related_information.is_empty());
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert!(store.lock().unwrap().read_scoped(token, "other").is_err());
+        let value = store.lock().unwrap().read_scoped(token, "project").unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert!(result.diagnostics[0].context.message_resource.is_some());
+        assert!(result.diagnostics[0].context.data_resource.is_some());
+        assert!(result.diagnostics[0].context.fix_handles_resource.is_some());
     }
 
     #[test]
@@ -15418,7 +16609,7 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle
-            .completions(file.display().to_string(), 0, 0, None)
+            .completions(file.display().to_string(), 0, 0, None, None)
             .await;
 
         assert!(matches!(
@@ -15522,7 +16713,7 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle
-            .code_actions(file.display().to_string(), 1, 5, 1, 15, None)
+            .code_actions(file.display().to_string(), 1, 5, 1, 15, None, None)
             .await;
 
         assert!(matches!(
@@ -15560,7 +16751,7 @@ mod tests {
         let handle = spawn_project_actor_for_root(2, &canonical_root);
 
         let result = handle
-            .signature_help(file.display().to_string(), 1, 5)
+            .signature_help(file.display().to_string(), 1, 5, None)
             .await;
 
         assert!(matches!(
@@ -17623,6 +18814,327 @@ while True:
     }
 
     #[tokio::test]
+    async fn removed_project_history_defers_oversized_notification_messages() {
+        let root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("removed-oversized").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let actor = registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let log = "retained log ".repeat(500);
+        let message = "retained message ".repeat(500);
+
+        for (method, body) in [
+            ("window/logMessage", &log),
+            ("window/showMessage", &message),
+        ] {
+            actor
+                .sender
+                .send(ProjectRequest::Notification {
+                    generation: 0,
+                    server_id: ServerId::from("rust"),
+                    notification: LspNotification::parse(
+                        method,
+                        Some(serde_json::json!({"type": 1, "message": body})),
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        actor.server_logs(10, None).await.unwrap();
+        actor.server_messages(10).await.unwrap();
+        registry.remove(project_id.clone()).await.unwrap();
+
+        let logs = registry.server_logs(&project_id, 10, None).await.unwrap();
+        let log_reference = logs.logs[0].message_resource.as_ref().unwrap();
+        let log_token = log_reference
+            .uri
+            .strip_prefix("mcpls-deferred:///")
+            .unwrap();
+        assert_eq!(logs.logs[0].message, "[server message deferred]");
+        assert_eq!(
+            registry.read_deferred_resource(log_token).unwrap().value,
+            serde_json::Value::String(log)
+        );
+
+        let messages = registry.server_messages(&project_id, 10).await.unwrap();
+        let message_reference = messages.messages[0].message_resource.as_ref().unwrap();
+        let message_token = message_reference
+            .uri
+            .strip_prefix("mcpls-deferred:///")
+            .unwrap();
+        assert_eq!(messages.messages[0].message, "[server message deferred]");
+        assert_eq!(
+            registry
+                .read_deferred_resource(message_token)
+                .unwrap()
+                .value,
+            serde_json::Value::String(message)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_server_notification_messages_are_deferred_losslessly() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let runtime = ProjectRuntime::with_deferred_results_scoped(
+            Translator::new(),
+            None,
+            shared.clone(),
+            None,
+        );
+        let log = "log ".repeat(2_000);
+        let message = "message ".repeat(2_000);
+        let mut logs = vec![LogEntry {
+            generation: 1,
+            level: LogLevel::Error,
+            message: log.clone(),
+            message_resource: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let mut messages = vec![ServerMessage {
+            generation: 1,
+            message_type: crate::bridge::MessageType::Warning,
+            message: message.clone(),
+            message_resource: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        runtime
+            .defer_notification_messages(&mut logs, "diagnostic_log_message")
+            .unwrap();
+        let log_resource = logs[0].message_resource.as_ref().unwrap();
+        assert_eq!(logs[0].message, "[server message deferred]");
+        let log_token = log_resource.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared.lock().unwrap().read_scoped(log_token, "").unwrap(),
+            serde_json::Value::String(log)
+        );
+
+        runtime
+            .defer_notification_messages(&mut messages, "server_message")
+            .unwrap();
+        let message_resource = messages[0].message_resource.as_ref().unwrap();
+        assert_eq!(messages[0].message, "[server message deferred]");
+        let message_token = message_resource
+            .uri
+            .strip_prefix("mcpls-deferred:///")
+            .unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(message_token, "")
+                .unwrap(),
+            serde_json::Value::String(message)
+        );
+    }
+
+    #[test]
+    fn notification_pages_are_bounded_when_many_records_fit_inline() {
+        let mut logs: Vec<_> = (0..400)
+            .map(|index| LogEntry {
+                generation: 1,
+                level: LogLevel::Info,
+                message: format!("log {index}"),
+                message_resource: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .collect();
+        let snapshot_identity = "snapshot".to_owned();
+        let total = logs.len();
+        let mut returned = 0;
+        let mut remaining = total;
+        let mut next_cursor = None;
+        bound_notification_page(
+            &mut logs,
+            total,
+            &snapshot_identity,
+            None,
+            |entries, page_returned, page_remaining, page_cursor| {
+                returned = page_returned;
+                remaining = page_remaining;
+                next_cursor = page_cursor.clone();
+                serde_json::to_vec(&serde_json::json!({
+                    "returned": returned,
+                    "remaining": remaining,
+                    "total": total,
+                    "snapshot_identity": snapshot_identity,
+                    "next_cursor": page_cursor,
+                    "logs": entries,
+                }))
+                .unwrap()
+                .len()
+            },
+        )
+        .unwrap();
+
+        assert!(returned < total);
+        assert_eq!(remaining, total - returned);
+        assert!(next_cursor.is_some());
+    }
+
+    #[test]
+    fn oversized_macro_expansions_are_deferred_without_truncation() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let expansion = crate::bridge::translator::MacroExpansion {
+            name: "macro".to_owned(),
+            expansion: "λ".repeat(MAX_NOTIFICATION_RESULT_BYTES),
+        };
+        let complete = serde_json::to_value(&expansion).unwrap();
+        let mut result = crate::bridge::SemanticDiscoveryResult {
+            supported: true,
+            provider: "rust_analyzer".to_owned(),
+            kind: crate::bridge::SemanticDiscoveryKind::MacroExpansion,
+            locations: Vec::new(),
+            locations_total: 0,
+            locations_returned: 0,
+            remaining_locations: 0,
+            locations_resource: None,
+            selection_ranges: Vec::new(),
+            selection_ranges_total: 0,
+            selection_ranges_returned: 0,
+            remaining_selection_ranges: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+            selection_ranges_resource: None,
+            macro_expansion: Some(expansion),
+            macro_expansion_resource: None,
+            runnables: Vec::new(),
+            runnables_total: 0,
+            runnables_returned: 0,
+            remaining_runnables: 0,
+            runnables_resource: None,
+            truncated: false,
+        };
+
+        defer_semantic_discovery_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(result.macro_expansion.is_none());
+        let reference = result.macro_expansion_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[test]
+    fn oversized_runnable_payloads_are_deferred_with_exact_counts() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let runnables = (0..100)
+            .map(|index| serde_json::json!({"label": "λ".repeat(512), "index": index}))
+            .collect::<Vec<_>>();
+        let complete = serde_json::Value::Array(runnables.clone());
+        let mut result = crate::bridge::SemanticDiscoveryResult {
+            supported: true,
+            provider: "rust_analyzer".to_owned(),
+            kind: crate::bridge::SemanticDiscoveryKind::Runnables,
+            locations: Vec::new(),
+            locations_total: 0,
+            locations_returned: 0,
+            remaining_locations: 0,
+            locations_resource: None,
+            selection_ranges: Vec::new(),
+            selection_ranges_total: 0,
+            selection_ranges_returned: 0,
+            remaining_selection_ranges: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+            selection_ranges_resource: None,
+            macro_expansion: None,
+            macro_expansion_resource: None,
+            runnables,
+            runnables_total: 100,
+            runnables_returned: 100,
+            remaining_runnables: 0,
+            runnables_resource: None,
+            truncated: false,
+        };
+
+        defer_semantic_discovery_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(result.runnables.is_empty());
+        assert_eq!(result.runnables_total, 100);
+        assert_eq!(result.runnables_returned, 0);
+        let reference = result.runnables_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[test]
+    fn oversized_selection_ranges_are_deferred_with_exact_counts() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let selection_ranges = (0..2_000)
+            .map(|index| crate::bridge::Range {
+                start: crate::bridge::Position2D {
+                    line: index,
+                    character: 1,
+                },
+                end: crate::bridge::Position2D {
+                    line: index,
+                    character: 2,
+                },
+            })
+            .collect::<Vec<_>>();
+        let complete = serde_json::to_value(&selection_ranges).unwrap();
+        let mut result = crate::bridge::SemanticDiscoveryResult {
+            supported: true,
+            provider: "standard_lsp".to_owned(),
+            kind: crate::bridge::SemanticDiscoveryKind::SelectionRanges,
+            locations: Vec::new(),
+            locations_total: 0,
+            locations_returned: 0,
+            remaining_locations: 0,
+            locations_resource: None,
+            selection_ranges,
+            selection_ranges_total: 2_000,
+            selection_ranges_returned: 2_000,
+            remaining_selection_ranges: 0,
+            next_cursor: None,
+            snapshot_identity: String::new(),
+            selection_ranges_resource: None,
+            macro_expansion: None,
+            macro_expansion_resource: None,
+            runnables: Vec::new(),
+            runnables_total: 0,
+            runnables_returned: 0,
+            remaining_runnables: 0,
+            runnables_resource: None,
+            truncated: false,
+        };
+
+        defer_semantic_discovery_payloads(&mut result, &shared, "project").unwrap();
+
+        assert!(result.selection_ranges.is_empty());
+        assert_eq!(result.selection_ranges_total, 2_000);
+        assert_eq!(result.selection_ranges_returned, 0);
+        let reference = result.selection_ranges_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
+    }
+
+    #[tokio::test]
     async fn project_registry_evicts_old_removed_history() {
         let registry = ProjectRegistry::new(1);
         let roots = (0..=RETAINED_PROJECT_HISTORY_CAPACITY)
@@ -19039,5 +20551,47 @@ while True:
                 .as_str(),
             "workspace"
         );
+    }
+
+    #[test]
+    fn oversized_hover_contents_are_deferred_without_loss() {
+        let deferred_results =
+            std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let contents = "λ".repeat(MAX_INLINE_HOVER_CONTENT_BYTES);
+        let mut result = HoverResult {
+            provider: "test".to_owned(),
+            kind: crate::bridge::translator::NavigationKind::Hover,
+            contents: contents.clone(),
+            contents_resource: None,
+            range: None,
+            source: SourceContext::Unavailable {
+                reason: crate::bridge::translator::SourceUnavailableReason::NotFound,
+            },
+            truncated: false,
+            symbol_handle: None,
+        };
+
+        defer_oversized_hover_contents(&mut result, &deferred_results, "project").unwrap();
+
+        let reference = result.contents_resource.as_ref().unwrap();
+        assert!(result.truncated);
+        assert!(result.contents.len() <= MAX_INLINE_HOVER_CONTENT_BYTES + "... (truncated)".len());
+        assert_eq!(
+            reference.total_bytes,
+            Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "contents": contents
+                }))
+                .unwrap()
+                .len()
+            )
+        );
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        let value = deferred_results
+            .lock()
+            .unwrap()
+            .read_scoped(token, "project")
+            .unwrap();
+        assert_eq!(value["contents"], contents);
     }
 }

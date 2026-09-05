@@ -751,6 +751,10 @@ impl Translator {
         scope: WorkspaceSymbolScope,
         include_generated: bool,
     ) -> Result<WorkspaceSymbolResult> {
+        let source_bytes = match match_mode {
+            WorkspaceSymbolMatchMode::Exact | WorkspaceSymbolMatchMode::Prefix => Some(16 * 1024),
+            WorkspaceSymbolMatchMode::Fuzzy => Some(0),
+        };
         self.handle_workspace_symbol_filtered(
             query,
             kind_filter,
@@ -759,7 +763,7 @@ impl Translator {
             scope,
             include_generated,
             None,
-            Some(0),
+            source_bytes,
         )
         .await
     }
@@ -868,9 +872,8 @@ impl Translator {
         self.respawn_if_dead(&server_id).await?;
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let Some(client) = client else {
-            return Err(Error::NoServerForWorkspaceTool {
-                tool: ToolKind::WorkspaceSymbols,
-            });
+            tracing::debug!(%server_id, "workspace-symbol server unavailable; using AST fallback");
+            return fallback().await;
         };
         if self
             .require_capability(&server_id, "workspaceSymbolProvider", |caps| {

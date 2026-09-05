@@ -182,6 +182,9 @@ pub struct HoverResult {
     pub kind: NavigationKind,
     /// Hover contents as markdown string.
     pub contents: String,
+    /// Complete hover contents when the inline markdown was bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents_resource: Option<DeferredResourceReference>,
     /// Optional range the hover applies to.
     pub range: Option<Range>,
     /// Bounded source surrounding the hovered target.
@@ -202,6 +205,21 @@ pub struct DefinitionResult {
     pub kind: NavigationKind,
     /// Locations of the definition.
     pub locations: Vec<Location>,
+    /// Number of definition targets in the provider snapshot.
+    #[serde(default)]
+    pub total_locations: usize,
+    /// Number of definition targets returned on this page.
+    #[serde(default)]
+    pub returned_locations: usize,
+    /// Number of definition targets after this page.
+    #[serde(default)]
+    pub remaining_locations: usize,
+    /// Snapshot-bound cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the provider target snapshot.
+    #[serde(default)]
+    pub snapshot_identity: String,
     /// Whether item or response budgets omitted target data.
     pub truncated: bool,
 }
@@ -420,6 +438,9 @@ pub struct DiagnosticContext {
     pub project_relative_path: Option<String>,
     /// Canonical document URI.
     pub uri: String,
+    /// Lossless rendered message when the inline message is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_resource: Option<DeferredResourceReference>,
     /// Bounded source surrounding the highlighted range.
     pub source_frame: SourceContext,
     /// Language-server subsystem that produced the diagnostic.
@@ -434,9 +455,15 @@ pub struct DiagnosticContext {
     /// Related diagnostics with their own authorized source frames.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_information: Vec<DiagnosticRelatedInformation>,
+    /// Lossless related diagnostics when inline context would exceed a page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_information_resource: Option<DeferredResourceReference>,
     /// Language-server-specific payload after secret redaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Lossless diagnostic payload when inline data is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_resource: Option<DeferredResourceReference>,
     /// Number of identical diagnostics represented by this group.
     pub occurrence_count: usize,
     /// Stable identity shared by every page of this diagnostic group.
@@ -447,6 +474,9 @@ pub struct DiagnosticContext {
     pub occurrence_offset: usize,
     /// Actor-owned code-action handles accepted by the preview flow.
     pub fix_handles: Vec<String>,
+    /// Lossless fix handles when the inline list is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_handles_resource: Option<DeferredResourceReference>,
     /// Exact locations returned on this page when requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<DiagnosticOccurrence>,
@@ -458,6 +488,7 @@ impl Default for DiagnosticContext {
             path: None,
             project_relative_path: None,
             uri: String::new(),
+            message_resource: None,
             source_frame: SourceContext::Unavailable {
                 reason: SourceUnavailableReason::NotFound,
             },
@@ -465,11 +496,14 @@ impl Default for DiagnosticContext {
             code_description: None,
             tags: Vec::new(),
             related_information: Vec::new(),
+            related_information_resource: None,
             data: None,
+            data_resource: None,
             occurrence_count: 1,
             group_id: None,
             occurrence_offset: 0,
             fix_handles: Vec::new(),
+            fix_handles_resource: None,
             occurrences: Vec::new(),
         }
     }
@@ -651,6 +685,9 @@ pub struct RenameResult {
 /// A completion item.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Completion {
+    /// Stable identity for this provider completion item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_id: Option<String>,
     /// Label of the completion.
     pub label: String,
     /// Kind of completion.
@@ -659,6 +696,21 @@ pub struct Completion {
     pub detail: Option<String>,
     /// Documentation.
     pub documentation: Option<String>,
+    /// Provider sort key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_text: Option<String>,
+    /// Provider filter key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_text: Option<String>,
+    /// Text inserted when this item is selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+    /// Provider text edit used for insertion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_edit: Option<serde_json::Value>,
+    /// Stable handle for insertion-specific follow-up operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insertion_handle: Option<String>,
 }
 
 /// Result of a completions request.
@@ -666,6 +718,27 @@ pub struct Completion {
 pub struct CompletionsResult {
     /// List of completion items.
     pub items: Vec<Completion>,
+    /// Whether the provider says more completions may be available.
+    #[serde(default)]
+    pub provider_incomplete: bool,
+    /// Number of completions received from the provider in this snapshot.
+    #[serde(default)]
+    pub total_items: usize,
+    /// Number of completions returned on this page.
+    #[serde(default)]
+    pub returned_items: usize,
+    /// Number of completions after this page.
+    #[serde(default)]
+    pub remaining_items: usize,
+    /// Snapshot-bound continuation for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the received provider snapshot.
+    #[serde(default)]
+    pub snapshot_identity: String,
+    /// Complete completion payloads when details are deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_resource: Option<DeferredResourceReference>,
 }
 
 /// A document symbol.
@@ -1508,6 +1581,24 @@ pub struct CommandDescription {
 pub struct CodeActionsResult {
     /// Available code actions.
     pub actions: Vec<CodeAction>,
+    /// Complete action payloads when edits, commands, or other details are deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions_resource: Option<DeferredResourceReference>,
+    /// Number of provider actions in the snapshot.
+    #[serde(default)]
+    pub total_actions: usize,
+    /// Number of actions returned on this page.
+    #[serde(default)]
+    pub returned_actions: usize,
+    /// Number of actions after this page.
+    #[serde(default)]
+    pub remaining_actions: usize,
+    /// Snapshot-bound continuation for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the provider action snapshot.
+    #[serde(default)]
+    pub snapshot_identity: String,
 }
 
 /// A call hierarchy item.
@@ -1595,10 +1686,19 @@ pub struct IncomingCallsResult {
     pub total_calls: usize,
     /// Returned call-group count.
     pub returned_calls: usize,
+    /// Call groups still available after this page.
+    pub remaining_calls: usize,
     /// Complete call-site count before limits.
     pub total_call_sites: usize,
     /// Returned call-site count.
     pub returned_call_sites: usize,
+    /// Call sites still available after this page.
+    pub remaining_call_sites: usize,
+    /// Snapshot identity used by the continuation cursor.
+    pub snapshot_identity: String,
+    /// Cursor for the next caller or call-site page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     /// Groups omitted by limits.
     pub omitted_groups: usize,
     /// Whether any item or source budget truncated the result.
@@ -1627,10 +1727,19 @@ pub struct OutgoingCallsResult {
     pub total_calls: usize,
     /// Returned call-group count.
     pub returned_calls: usize,
+    /// Call groups still available after this page.
+    pub remaining_calls: usize,
     /// Complete call-site count before limits.
     pub total_call_sites: usize,
     /// Returned call-site count.
     pub returned_call_sites: usize,
+    /// Call sites still available after this page.
+    pub remaining_call_sites: usize,
+    /// Snapshot identity used by the continuation cursor.
+    pub snapshot_identity: String,
+    /// Cursor for the next callee or call-site page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     /// Groups omitted by limits.
     pub omitted_groups: usize,
     /// Whether any item or source budget truncated the result.
@@ -1644,6 +1753,16 @@ pub struct OutgoingCallsResult {
 pub struct ServerLogsResult {
     /// List of log entries.
     pub logs: Vec<crate::bridge::notifications::LogEntry>,
+    /// Exact number of entries matching the filter in the snapshot.
+    pub total: usize,
+    /// Number of entries returned on this page.
+    pub returned: usize,
+    /// Number of matching entries after this page.
+    pub remaining: usize,
+    /// Identity of the retained log snapshot and filter.
+    pub snapshot_identity: String,
+    /// Cursor for the next page, when entries remain.
+    pub next_cursor: Option<String>,
 }
 
 /// Result of server messages request.
@@ -1651,6 +1770,16 @@ pub struct ServerLogsResult {
 pub struct ServerMessagesResult {
     /// List of server messages.
     pub messages: Vec<crate::bridge::notifications::ServerMessage>,
+    /// Exact number of messages in the snapshot.
+    pub total: usize,
+    /// Number of messages returned on this page.
+    pub returned: usize,
+    /// Number of messages after this page.
+    pub remaining: usize,
+    /// Identity of the retained message snapshot.
+    pub snapshot_identity: String,
+    /// Cursor for the next page, when messages remain.
+    pub next_cursor: Option<String>,
 }
 
 /// A single parameter in a signature.
@@ -1666,6 +1795,9 @@ pub struct SignatureParameter {
 /// A single signature overload.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SignatureInfo {
+    /// Stable identity of this signature in the provider snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_id: Option<String>,
     /// Full label of the signature.
     pub label: String,
     /// Optional documentation for the signature.
@@ -1686,6 +1818,24 @@ pub struct SignatureHelpResult {
     /// Index of the active parameter within the active signature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_parameter: Option<u32>,
+    /// Number of provider signatures in the snapshot.
+    #[serde(default)]
+    pub total_signatures: usize,
+    /// Number of signatures returned on this page.
+    #[serde(default)]
+    pub returned_signatures: usize,
+    /// Number of signatures after this page.
+    #[serde(default)]
+    pub remaining_signatures: usize,
+    /// Snapshot-bound continuation for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the provider signature snapshot.
+    #[serde(default)]
+    pub snapshot_identity: String,
+    /// Complete signatures when documentation is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures_resource: Option<DeferredResourceReference>,
 }
 
 /// Result of a go-to-implementation or go-to-type-definition request.
@@ -1697,6 +1847,21 @@ pub struct LocationsResult {
     pub kind: NavigationKind,
     /// Locations found.
     pub locations: Vec<Location>,
+    /// Number of provider targets in the snapshot.
+    #[serde(default)]
+    pub total_locations: usize,
+    /// Number of targets returned on this page.
+    #[serde(default)]
+    pub returned_locations: usize,
+    /// Number of targets after this page.
+    #[serde(default)]
+    pub remaining_locations: usize,
+    /// Snapshot-bound cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Identity of the provider target snapshot.
+    #[serde(default)]
+    pub snapshot_identity: String,
     /// Whether item or response budgets omitted target data.
     pub truncated: bool,
 }
