@@ -2421,27 +2421,74 @@ fn sc_native_module_move_code_action_preview(
 ) -> Result<(), String> {
     let lib_rs = workspace.join("src/lib.rs");
     let module_line = find_line(&lib_rs, "pub mod move_target {");
-    let listed = call_json(
-        client,
-        "code_action_list",
-        &json!({
-            "project_id": "default",
-            "file_path": lib_rs,
-            "start_line": module_line,
-            "start_character": 9,
-            "end_line": module_line,
-            "end_character": 9,
-            "kind_filter": "refactor.extract",
-        }),
-    )?;
-    let action = listed["actions"]
-        .as_array()
-        .and_then(|actions| {
-            actions
+    let base_arguments = json!({
+        "project_id": "default",
+        "file_path": lib_rs,
+        "start_line": module_line,
+        "start_character": 9,
+        "end_line": module_line,
+        "end_character": 9,
+        "kind_filter": "refactor.extract",
+    });
+    let mut page_token = None;
+    let mut snapshot_identity = None;
+    let mut total_actions = None;
+    let mut actions = Vec::new();
+    loop {
+        let mut arguments = base_arguments.clone();
+        if let Some(token) = &page_token {
+            arguments["page_token"] = json!(token);
+        }
+        let page = call_json(client, "code_action_list", &arguments)?;
+        let page_snapshot = page["snapshot_identity"]
+            .as_str()
+            .ok_or_else(|| format!("code action page omitted snapshot identity: {page}"))?;
+        if snapshot_identity.get_or_insert_with(|| page_snapshot.to_owned()) != page_snapshot {
+            return Err(format!(
+                "code action pages changed snapshot identity: {page}"
+            ));
+        }
+        let page_total = page["total_actions"]
+            .as_u64()
+            .ok_or_else(|| format!("code action page omitted total_actions: {page}"))?;
+        if total_actions.get_or_insert(page_total) != &page_total {
+            return Err(format!("code action pages changed total_actions: {page}"));
+        }
+        actions.extend(
+            page["actions"]
+                .as_array()
+                .ok_or_else(|| format!("code action page omitted actions: {page}"))?
                 .iter()
-                .find(|action| action["title"] == "Extract module to file")
-        })
-        .ok_or_else(|| format!("rust-analyzer omitted native module move action: {listed}"))?;
+                .cloned(),
+        );
+        let Some(next) = page["next_cursor"].as_str() else {
+            break;
+        };
+        page_token = Some(next.to_owned());
+    }
+    if Some(actions.len() as u64) != total_actions {
+        return Err(format!(
+            "code action page walk omitted actions: total={total_actions:?}, returned={}",
+            actions.len()
+        ));
+    }
+    for (index, action) in actions.iter().enumerate() {
+        let Some(action_id) = action["action_id"].as_str() else {
+            return Err(format!("code action omitted stable action_id: {action}"));
+        };
+        if actions[..index]
+            .iter()
+            .any(|previous| previous["action_id"] == action_id)
+        {
+            return Err(format!(
+                "code action pages duplicated action_id {action_id}"
+            ));
+        }
+    }
+    let action = actions
+        .iter()
+        .find(|action| action["title"] == "Extract module to file")
+        .ok_or_else(|| format!("rust-analyzer omitted native module move action: {actions:?}"))?;
     let action_id = action["action_id"]
         .as_str()
         .ok_or_else(|| format!("native module move omitted action_id: {action}"))?;
