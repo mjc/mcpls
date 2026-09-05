@@ -52,11 +52,12 @@ use super::tools::{
     ProjectAddParams, ProjectCargoFeaturesParams, ProjectIdParams, ProjectListParams,
     ProjectLspCapabilitiesParams, RangeFormatPreviewParams, ReferencesParams, RenameParams,
     RenamePreviewParams, SemanticPositionParams, SemanticResourceReadParams,
-    SemanticResourceReadResult, ServerLogsParams, ServerMessagesParams, SignatureHelpParams,
-    StructuralReplacePreviewParams, SubscriptionListParams, WorkspaceEditApplyParams,
-    WorkspaceEditApplyResult, WorkspaceEditContention, WorkspaceEditContentionScope,
-    WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization, WorkspaceEditRetry,
-    WorkspaceEditRetryAction, WorkspaceSymbolBatchParams, WorkspaceSymbolParams,
+    SemanticResourceReadResult, SemanticSourceMetadata, ServerLogsParams, ServerMessagesParams,
+    SignatureHelpParams, StructuralReplacePreviewParams, SubscriptionListParams,
+    WorkspaceEditApplyParams, WorkspaceEditApplyResult, WorkspaceEditContention,
+    WorkspaceEditContentionScope, WorkspaceEditPreviewParams, WorkspaceEditProviderSynchronization,
+    WorkspaceEditRetry, WorkspaceEditRetryAction, WorkspaceSymbolBatchParams,
+    WorkspaceSymbolParams,
 };
 #[cfg(test)]
 use crate::bridge::Translator;
@@ -85,6 +86,18 @@ use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
 const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 16 * 1024;
 
+fn source_mime_type(language_id: Option<&str>) -> String {
+    match language_id {
+        Some("rust") => "text/x-rust".to_owned(),
+        Some("json") => "application/json".to_owned(),
+        Some("markdown") | Some("md") => "text/markdown".to_owned(),
+        Some("toml") => "application/toml".to_owned(),
+        Some("yaml") | Some("yml") => "application/yaml".to_owned(),
+        Some("javascript") | Some("typescript") => "text/javascript".to_owned(),
+        _ => "text/plain".to_owned(),
+    }
+}
+
 fn deferred_resource_page(
     deferred: &DeferredResource,
     uri: String,
@@ -112,6 +125,7 @@ fn deferred_resource_page(
             uri: uri.clone(),
             mime_type: "application/json".to_owned(),
             text: json[deferred.offset_bytes..end].to_owned(),
+            source: None,
             next_uri,
             total_bytes: Some(total_bytes),
             offset_bytes: Some(deferred.offset_bytes),
@@ -165,6 +179,7 @@ fn edit_diff_resource_page(
             uri,
             mime_type: "text/x-diff".to_owned(),
             text: diff[offset_bytes..end].to_owned(),
+            source: None,
             next_uri,
             total_bytes: Some(total_bytes),
             offset_bytes: Some(offset_bytes),
@@ -220,6 +235,7 @@ fn applied_edit_result_resource_page(
             uri,
             mime_type: "application/json".to_owned(),
             text: detail[offset_bytes..end].to_owned(),
+            source: None,
             next_uri,
             total_bytes: Some(total_bytes),
             offset_bytes: Some(offset_bytes),
@@ -4507,12 +4523,25 @@ impl McplsServer {
                 frame.document_version,
             )
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let text = serde_json::to_string(&frame)
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
             let result = SemanticResourceReadResult {
                 uri,
-                mime_type: "application/json".to_owned(),
-                text,
+                mime_type: source_mime_type(frame.language_id.as_deref()),
+                text: frame.text.clone(),
+                source: Some(SemanticSourceMetadata {
+                    path: frame.path.clone(),
+                    uri: frame.uri.clone(),
+                    range: frame.range.clone(),
+                    highlighted_range: frame.highlighted_range.clone(),
+                    language_id: frame.language_id.clone(),
+                    document_version: frame.document_version,
+                    content_hash: frame.content_hash.clone(),
+                    returned_lines: frame.returned_lines,
+                    total_lines: frame.total_lines,
+                    returned_bytes: frame.returned_bytes,
+                    total_bytes: frame.total_bytes,
+                    truncated: frame.truncated,
+                    resource: frame.resource.clone(),
+                }),
                 next_uri: None,
                 total_bytes: None,
                 offset_bytes: None,
@@ -4565,10 +4594,14 @@ impl McplsServer {
             frame.document_version,
         )
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let json = serde_json::to_string(&frame)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let text = if frame.truncated {
+            serde_json::to_string(&frame)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        } else {
+            frame.text
+        };
         Ok(private_resource_result(
-            vec![ResourceContents::text(json, fresh_uri)],
+            vec![ResourceContents::text(text, fresh_uri)],
             supports_cache_hints,
         )
         .into())
@@ -5192,9 +5225,7 @@ mod tests {
             .await
             .unwrap();
         let refreshed: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
-        let refreshed: serde_json::Value =
-            serde_json::from_str(refreshed["text"].as_str().unwrap()).unwrap();
-        assert_ne!(&refreshed["content_hash"], original_hash);
+        assert_ne!(&refreshed["source"]["content_hash"], original_hash);
         assert!(refreshed["text"].as_str().unwrap().contains("bar("));
 
         let stale_preview: serde_json::Value = serde_json::from_str(
@@ -5362,7 +5393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_resource_tool_pages_an_escaped_source_frame_to_its_outer_budget() {
+    async fn semantic_resource_tool_returns_raw_source_with_structured_metadata() {
         const PAGE_LIMIT: usize = 16 * 1024;
         let root = TempDir::new().unwrap();
         let source = root.path().join("quoted.rs");
@@ -5399,13 +5430,15 @@ mod tests {
         let mut recovered = String::new();
         for _ in 0..16 {
             assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
-            let frame: crate::bridge::SourceFrame = serde_json::from_str(&result.text).unwrap();
-            recovered.push_str(&frame.text);
-            if !frame.truncated {
+            let source = result.source.as_ref().unwrap();
+            assert!(!serde_json::from_str::<crate::bridge::SourceFrame>(&result.text).is_ok());
+            recovered.push_str(&result.text);
+            if !source.truncated {
                 break;
             }
             let next =
-                crate::bridge::resources::parse_source_uri(&frame.resource.unwrap().uri).unwrap();
+                crate::bridge::resources::parse_source_uri(&source.resource.as_ref().unwrap().uri)
+                    .unwrap();
             result = server
                 .read_source_resource_as_tool_result(next)
                 .await

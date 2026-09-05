@@ -4,8 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    DocumentSymbolOptions, InspectSymbolBudget, InspectSymbolSectionKind, SemanticResultLimits,
-    SymbolHandle, WorkspaceSymbolMatchMode, WorkspaceSymbolScope,
+    DeferredResourceReference, DocumentSymbolOptions, InspectSymbolBudget,
+    InspectSymbolSectionKind, Range, SemanticResultLimits, SymbolHandle, WorkspaceSymbolMatchMode,
+    WorkspaceSymbolScope,
 };
 use crate::bridge::{LexicalCaseMode, LexicalMatchMode};
 
@@ -1105,28 +1106,52 @@ pub struct SemanticResourceReadParams {
 pub struct SemanticResourceReadResult {
     /// Resource URI that was read.
     pub uri: String,
-    /// MIME type of `text`.
+    /// MIME type of `text`. Source resources use a text MIME type; deferred resources use JSON.
     pub mime_type: String,
-    /// Complete JSON resource payload, or an ordered UTF-8 JSON fragment when `next_uri` is set.
+    /// Raw source text for a source resource, or an ordered UTF-8 JSON fragment for a deferred resource.
     pub text: String,
+    /// Structured metadata for a source resource. Absent for deferred JSON resources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SemanticSourceMetadata>,
     /// URI for the next fragment, when this response is not the complete payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_uri: Option<String>,
-    /// Total byte length of the complete JSON payload when this is a fragment.
+    /// Total byte length of the complete payload when this is a fragment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<usize>,
-    /// Byte offset of this fragment in the complete JSON payload.
+    /// Byte offset of this fragment in the complete payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset_bytes: Option<usize>,
-    /// Number of JSON bytes returned in this fragment.
+    /// Number of payload bytes returned in this fragment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub returned_bytes: Option<usize>,
-    /// Number of JSON bytes still available after this fragment.
+    /// Number of payload bytes still available after this fragment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_bytes: Option<usize>,
     /// Snapshot identity of the immutable deferred payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_hash: Option<String>,
+}
+
+/// Metadata accompanying raw source text returned by `read_semantic_resource`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticSourceMetadata {
+    pub path: String,
+    pub uri: String,
+    pub range: Range,
+    pub highlighted_range: Range,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_version: Option<i32>,
+    pub content_hash: String,
+    pub returned_lines: usize,
+    pub total_lines: usize,
+    pub returned_bytes: usize,
+    pub total_bytes: usize,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<DeferredResourceReference>,
 }
 
 #[cfg(test)]
