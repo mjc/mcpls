@@ -3242,6 +3242,130 @@ fn sc_local_edit_previews(client: &mut McpClient, workspace: &Path) -> Result<()
     Ok(())
 }
 
+/// Replay an oversized edit-preview diff through standard `resources/read`.
+fn sc_edit_preview_diff_resource(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let large = workspace.join("src/preview_large.rs");
+    let content: String = (0..500)
+        .map(|index| format!("pub fn preview_{index}()->i32{{{index}}}\n"))
+        .collect();
+    fs::write(&large, content).map_err(|error| format!("write large preview fixture: {error}"))?;
+
+    let preview = call_json(
+        client,
+        "format_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": large,
+            "tab_size": 4,
+            "insert_spaces": true,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    if preview["diff_truncated"] != true {
+        return Err(format!(
+            "large format preview did not defer its diff: {preview}"
+        ));
+    }
+    let resource_uri = preview["diff_resource"]["uri"]
+        .as_str()
+        .ok_or_else(|| format!("large format preview omitted diff_resource: {preview}"))?
+        .to_owned();
+    let inline_diff = preview["unified_diff"]
+        .as_str()
+        .ok_or_else(|| format!("large format preview omitted inline unified_diff: {preview}"))?;
+    let inline_prefix = inline_diff
+        .strip_suffix("\n... diff truncated ...\n")
+        .unwrap_or(inline_diff);
+
+    let mut uri = resource_uri.clone();
+    let mut recovered = String::new();
+    let mut expected_offset = 0usize;
+    let mut total_bytes = None;
+    let mut snapshot_hash = None;
+    for _ in 0..64 {
+        let response = client
+            .read_resource(&uri)
+            .map_err(|error| format!("read edit diff resource: {error}"))?;
+        let text = response["result"]["contents"][0]["text"]
+            .as_str()
+            .ok_or_else(|| format!("edit diff resource page omitted text: {response}"))?;
+        let page: Value = serde_json::from_str(text)
+            .map_err(|error| format!("edit diff resource page was not JSON: {error}"))?;
+        if page["offset_bytes"] != expected_offset {
+            return Err(format!(
+                "edit diff resource page had a gap or overlap: {page}"
+            ));
+        }
+        let page_text = page["text"]
+            .as_str()
+            .ok_or_else(|| format!("edit diff resource page omitted diff text: {page}"))?;
+        let returned_bytes = page["returned_bytes"]
+            .as_u64()
+            .ok_or_else(|| format!("edit diff resource page omitted returned_bytes: {page}"))?
+            as usize;
+        if returned_bytes != page_text.len() {
+            return Err(format!(
+                "edit diff resource byte count did not match UTF-8 text: {page}"
+            ));
+        }
+        if let Some(previous) = total_bytes {
+            if page["total_bytes"] != previous {
+                return Err(format!("edit diff resource changed total_bytes: {page}"));
+            }
+        } else {
+            total_bytes = page["total_bytes"].as_u64().map(|value| value as usize);
+        }
+        if let Some(previous) = snapshot_hash.as_deref() {
+            if page["snapshot_hash"] != previous {
+                return Err(format!("edit diff resource changed snapshot_hash: {page}"));
+            }
+        } else {
+            snapshot_hash = page["snapshot_hash"].as_str().map(str::to_owned);
+        }
+        recovered.push_str(page_text);
+        expected_offset += returned_bytes;
+        let Some(next) = page["next_uri"].as_str() else {
+            break;
+        };
+        uri = next.to_owned();
+    }
+
+    if total_bytes != Some(recovered.len()) || expected_offset != recovered.len() {
+        return Err(format!(
+            "edit diff resource replay had incorrect total: expected {:?}, recovered {}",
+            total_bytes,
+            recovered.len()
+        ));
+    }
+    if recovered.len() <= inline_prefix.len() || !recovered.starts_with(inline_prefix) {
+        return Err(
+            "edit diff resource did not preserve the inline prefix and deferred tail".to_owned(),
+        );
+    }
+    if !recovered.contains("preview_499") {
+        return Err("edit diff resource omitted the final diff hunk".to_owned());
+    }
+
+    let mut other =
+        McpClient::spawn().map_err(|error| format!("spawn second MCP session: {error}"))?;
+    other
+        .initialize()
+        .map_err(|error| format!("initialize second MCP session: {error}"))?;
+    let cross_session = other
+        .read_resource(&resource_uri)
+        .expect_err("edit diff resource must not be readable from another session");
+    if !cross_session
+        .to_string()
+        .contains("not owned by this MCP session")
+    {
+        return Err(format!(
+            "cross-session edit diff resource failure was not explicit: {cross_session}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Compose rust-analyzer's folder-module edits with one filesystem rename.
 fn sc_path_rename_folder_semantic_edit(
     client: &mut McpClient,
@@ -3588,6 +3712,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_native_module_move_code_action_preview),
         sub_case!(sc_semantic_discovery),
         sub_case!(sc_local_edit_previews),
+        sub_case!(sc_edit_preview_diff_resource),
         sub_case!(sc_path_rename_folder_semantic_edit),
         sub_case!(sc_path_rename_semantic_edit),
         sub_case!(sc_move_inline_module_semantic_edit),
