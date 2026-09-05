@@ -7000,7 +7000,24 @@ impl ProjectRuntime {
                 .apply_open_document_content(&path, version, content)
                 .await
             {
-                Ok(failures) => document_sync_failures.extend(failures),
+                Ok(failures) => {
+                    document_sync_failures.extend(failures);
+                    // `apply_open_document_content` records the committed
+                    // text as a local edit so ordinary unsaved changes remain
+                    // protected. Once the filesystem phase has also committed
+                    // that same text, establish disk provenance immediately;
+                    // otherwise a later formatter rewrite is indistinguishable
+                    // from an unsaved edit and every preview conflicts until
+                    // the project is restarted.
+                    if let Err(error) = self
+                        .translator
+                        .document_tracker()
+                        .reconciled_snapshot(&path)
+                        .await
+                    {
+                        tracker_sync_failures.push(error.to_string());
+                    }
+                }
                 Err(error) => tracker_sync_failures.push(error.to_string()),
             }
         }
@@ -18432,6 +18449,80 @@ while True:
         assert!(artifact.plan.safe_to_apply(), "{:?}", artifact.conflicts);
         assert_eq!(artifact.plan.files()[0].original_content(), "after!\n");
         assert_eq!(artifact.plan.files()[0].planned_content(), "fresh!\n");
+    }
+
+    #[tokio::test]
+    async fn preview_edit_refreshes_after_mcpls_apply_and_external_formatter() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("source.rs");
+        fs::write(&file, "before\n").unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+        let tracker = translator.document_tracker();
+        tracker.open(file.clone(), "before\n".to_owned()).unwrap();
+        tracker.reconciled_snapshot(&file).await.unwrap();
+
+        let first_edit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                path_to_uri(&file).unwrap().to_string(): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 6}
+                    },
+                    "newText": "changed"
+                }]
+            }
+        }))
+        .unwrap();
+        let mut runtime = ProjectRuntime::new(translator);
+        let first_artifact = runtime
+            .preview_edit("project", first_edit, PositionEncoding::Utf8, root.path())
+            .await
+            .unwrap();
+        runtime
+            .apply_edit_plan_with_context(
+                first_artifact.plan.id(),
+                "project",
+                root.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Model cargo fmt (or another external formatter) rewriting the clean
+        // file after MCPLS has successfully applied its own edit.
+        fs::write(&file, "changed();\n").unwrap();
+        let second_edit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                path_to_uri(&file).unwrap().to_string(): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 7}
+                    },
+                    "newText": "formatted"
+                }]
+            }
+        }))
+        .unwrap();
+        let second_artifact = runtime
+            .preview_edit("project", second_edit, PositionEncoding::Utf8, root.path())
+            .await
+            .unwrap();
+
+        assert!(
+            second_artifact.plan.safe_to_apply(),
+            "{:?}",
+            second_artifact.conflicts
+        );
+        assert_eq!(
+            second_artifact.plan.files()[0].original_content(),
+            "changed();\n"
+        );
+        assert_eq!(
+            second_artifact.plan.files()[0].planned_content(),
+            "formatted();\n"
+        );
     }
 
     #[tokio::test]
