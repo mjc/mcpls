@@ -102,6 +102,15 @@ fn stage_workspace() -> TempDir {
         .push_str("\npub mod move_target {\n    pub fn answer() -> u32 {\n        42\n    }\n}\n");
     lib_content.push_str("\npub mod folder_mod;\n");
     lib_content.push_str("\npub mod move_items;\n");
+    let rename_fixture = tmp.path().join("src/rename_large.rs");
+    let mut rename_content = String::from("pub fn rename_target(value: i32) -> i32 { value }\n");
+    for index in 0..500 {
+        rename_content.push_str(&format!(
+            "pub fn rename_use_{index}() -> i32 {{ rename_target({index}) }}\n"
+        ));
+    }
+    fs::write(&rename_fixture, rename_content).expect("failed to write rename fixture");
+    lib_content.push_str("\npub mod rename_large;\n");
     lib_content.push_str(
         r"
 macro_rules! semantic_answer {
@@ -784,6 +793,99 @@ fn sc_rename_symbol(client: &mut McpClient, workspace: &Path) -> Result<(), Stri
             "rename_symbol returned empty changes; bridge may not handle documentChanges format"
                 .to_owned(),
         );
+    }
+    Ok(())
+}
+
+/// Rename a heavily referenced symbol and replay the complete deferred edit set.
+fn sc_rename_symbol_deferred(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let file = workspace.join("src/rename_large.rs");
+    let target_line = find_line(&file, "pub fn rename_target");
+    let result = call_json(
+        client,
+        "rename_symbol",
+        &json!({
+            "file_path": file,
+            "line": target_line,
+            "character": 8,
+            "new_name": "renamed_target",
+        }),
+    )?;
+    if result["deferred"] != true
+        || !result["changes"].as_array().is_some_and(Vec::is_empty)
+        || !(result["operations"].is_null()
+            || result["operations"].as_array().is_some_and(Vec::is_empty))
+        || result["total_edits"]
+            .as_u64()
+            .is_none_or(|count| count < 500)
+    {
+        return Err(format!(
+            "large rename result was not atomically deferred: {result}"
+        ));
+    }
+    let resource_uri = result["changes_resource"]["uri"]
+        .as_str()
+        .ok_or_else(|| format!("large rename omitted changes_resource: {result}"))?
+        .to_owned();
+    let expected_edits = result["total_edits"]
+        .as_u64()
+        .ok_or_else(|| format!("large rename omitted total_edits: {result}"))?;
+
+    let mut uri = resource_uri.clone();
+    let mut semantic_json = String::new();
+    loop {
+        let page = call_json(client, "read_semantic_resource", &json!({"uri": uri}))?;
+        semantic_json.push_str(
+            page["text"]
+                .as_str()
+                .ok_or_else(|| format!("rename fallback page omitted text: {page}"))?,
+        );
+        let Some(next) = page["next_uri"].as_str() else {
+            break;
+        };
+        uri = next.to_owned();
+    }
+    let semantic: Value = serde_json::from_str(&semantic_json)
+        .map_err(|error| format!("rename fallback was not complete JSON: {error}"))?;
+    if semantic["changes"].as_array().map_or(0, Vec::len) != 1
+        || semantic["changes"][0]["edits"]
+            .as_array()
+            .map_or(0, Vec::len)
+            != expected_edits as usize
+    {
+        return Err(format!("rename fallback omitted edits: {semantic}"));
+    }
+
+    let mut uri = resource_uri;
+    let mut resource_json = String::new();
+    loop {
+        let page = client
+            .read_resource(&uri)
+            .map_err(|error| format!("read rename resource: {error}"))?;
+        let envelope = page["result"]["contents"][0]["text"]
+            .as_str()
+            .ok_or_else(|| format!("rename resource page omitted text: {page}"))?;
+        let envelope: Value = serde_json::from_str(envelope)
+            .map_err(|error| format!("rename resource page was not JSON: {error}"))?;
+        resource_json.push_str(
+            envelope["text"]
+                .as_str()
+                .ok_or_else(|| format!("rename resource envelope omitted text: {envelope}"))?,
+        );
+        let Some(next) = envelope["next_uri"].as_str() else {
+            break;
+        };
+        uri = next.to_owned();
+    }
+    let resource: Value = serde_json::from_str(&resource_json)
+        .map_err(|error| format!("rename resource was not complete JSON: {error}"))?;
+    if resource["changes"].as_array().map_or(0, Vec::len) != 1
+        || resource["changes"][0]["edits"]
+            .as_array()
+            .map_or(0, Vec::len)
+            != expected_edits as usize
+    {
+        return Err(format!("rename resource omitted edits: {resource}"));
     }
     Ok(())
 }
@@ -3371,6 +3473,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_references),
         sub_case!(sc_get_diagnostics),
         sub_case!(sc_rename_symbol),
+        sub_case!(sc_rename_symbol_deferred),
         sub_case!(sc_get_completions),
         sub_case!(sc_get_document_symbols),
         sub_case!(sc_format_document),
