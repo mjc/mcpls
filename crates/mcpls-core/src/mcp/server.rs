@@ -7573,6 +7573,65 @@ finally:
     }
 
     #[tokio::test]
+    async fn resources_read_deferred_inlay_hint_details_reassemble_losslessly() {
+        let server = create_test_server_with_project().await;
+        let hints = (0..80)
+            .map(|index| {
+                serde_json::json!({
+                    "hint_id": format!("hint-{index}"),
+                    "position": {"line": index, "character": 4},
+                    "label": format!("type-{index}"),
+                    "label_parts": [{"value": "type", "command": {"command": "resolve"}}],
+                    "tooltip": "λ".repeat(500),
+                    "text_edit": {"newText": "replacement"},
+                    "data": {"provider": "fixture"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = serde_json::to_string(&hints).unwrap();
+        let reference = server
+            .context
+            .project_registry
+            .store_deferred_resource(
+                &ProjectId::new("project").unwrap(),
+                "inlay_hints",
+                serde_json::Value::Array(hints),
+            )
+            .unwrap();
+
+        let mut uri = reference.uri.clone();
+        let mut recovered = String::new();
+        loop {
+            let resource = parse_session_resource_uri(&uri).unwrap();
+            let SessionResource::Deferred(deferred) = resource else {
+                panic!("expected deferred inlay-hint resource");
+            };
+            let response = server
+                .read_deferred_resource(deferred, uri.clone(), false)
+                .unwrap();
+            let ReadResourceResponse::Complete(response) = response else {
+                panic!("deferred inlay-hint resource unexpectedly requested input");
+            };
+            let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+                panic!("deferred inlay-hint resource was not text");
+            };
+            let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+            recovered.push_str(&page.text);
+            let Some(next) = page.next_uri else {
+                break;
+            };
+            uri = next;
+        }
+
+        assert_eq!(recovered, expected);
+        assert_eq!(
+            reference.snapshot_hash,
+            format!("{:x}", Sha256::digest(expected.as_bytes()))
+        );
+    }
+
+    #[tokio::test]
     async fn resources_read_deferred_signature_documentation_reassembles_losslessly() {
         let server = create_test_server_with_project().await;
         let signatures = (0..70)
