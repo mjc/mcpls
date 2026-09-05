@@ -20999,4 +20999,41 @@ while True:
                 .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn hover_deferred_resource_is_invalidated_with_project_snapshot() {
+        let root = TempDir::new().unwrap();
+        let project_id = ProjectId::new("hover-project").unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let reference = registry
+            .store_deferred_resource(
+                &project_id,
+                "hover_contents",
+                serde_json::json!({"contents": "stale hover"}),
+            )
+            .unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+
+        registry
+            .update_cargo_features(
+                &project_id,
+                crate::config::CargoFeatureProfile {
+                    features: vec!["serde".to_owned()],
+                    all_features: false,
+                    no_default_features: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(registry.read_deferred_resource(token).is_err());
+    }
 }
