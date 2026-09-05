@@ -2747,6 +2747,34 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
     Err("message page walk did not terminate after 128 pages".to_owned())
 }
 
+/// Assert the fields shared by every session-owned edit-preview alias.
+fn assert_preview_envelope(preview: &Value, tool: &str) -> Result<(), String> {
+    let required = [
+        ("project_id", preview["project_id"].is_string()),
+        ("plan_id", preview["plan_id"].is_string()),
+        ("unified_diff", preview["unified_diff"].is_string()),
+        ("diff_files", preview["diff_files"].is_array()),
+        ("affected_files", preview["affected_files"].is_array()),
+        ("operations", preview["operations"].is_array()),
+        ("preconditions", preview["preconditions"].is_array()),
+        ("conflicts", preview["conflicts"].is_array()),
+        ("unsupported", preview["unsupported"].is_array()),
+        ("safe_to_apply", preview["safe_to_apply"].is_boolean()),
+        ("diff_truncated", preview["diff_truncated"].is_boolean()),
+    ];
+    if let Some((field, _)) = required.iter().find(|(_, present)| !present) {
+        return Err(format!(
+            "{tool} omitted shared preview field {field}: {preview}"
+        ));
+    }
+    if preview["diff_truncated"] == true && !preview["diff_resource"]["uri"].is_string() {
+        return Err(format!(
+            "{tool} truncated its diff without diff_resource: {preview}"
+        ));
+    }
+    Ok(())
+}
+
 /// rust-analyzer SSR syntax validation and write-free replacement preview.
 fn sc_structural_replace_preview(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib_rs = workspace.join("src/lib.rs");
@@ -2781,15 +2809,17 @@ fn sc_structural_replace_preview(client: &mut McpClient, workspace: &Path) -> Re
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&preview, "structural_replace_preview")?;
     if preview["producer"] != "rust_analyzer"
         || preview["verification"] != "semantic_verified"
         || preview["match_count"]
             .as_u64()
             .is_none_or(|count| count < 2)
         || preview["plan_id"].as_str().is_none()
-        || !preview["unified_diff"]
-            .as_str()
-            .is_some_and(|diff| diff.contains("add(2, 1)"))
+        || (preview["diff_truncated"] != true
+            && !preview["unified_diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("add(2, 1)")))
     {
         return Err(format!("unexpected SSR replacement preview: {preview}"));
     }
@@ -2812,6 +2842,7 @@ fn sc_native_module_rename_preview(client: &mut McpClient, workspace: &Path) -> 
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&preview, "rename_preview")?;
     let source = workspace.join("src/functions.rs");
     let destination = workspace.join("src/functions_renamed_probe.rs");
     if !preview["operations"].as_array().is_some_and(|operations| {
@@ -2916,6 +2947,7 @@ fn sc_native_module_move_code_action_preview(
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&preview, "code_action_preview")?;
     let destination = workspace.join("src/move_target.rs");
     if !preview["affected_files"].as_array().is_some_and(|files| {
         files
@@ -3243,6 +3275,7 @@ fn sc_local_edit_previews(client: &mut McpClient, workspace: &Path) -> Result<()
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&movement, "move_item_preview")?;
     if movement["supported"] != true || movement["changed"] != true {
         return Err(format!(
             "rust-analyzer move-item returned no edit: {movement}"
@@ -3307,6 +3340,7 @@ fn sc_edit_preview_diff_resource(client: &mut McpClient, workspace: &Path) -> Re
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&preview, "format_preview")?;
     if preview["diff_truncated"] != true {
         return Err(format!(
             "large format preview did not defer its diff: {preview}"
@@ -3429,6 +3463,7 @@ fn sc_path_rename_folder_semantic_edit(
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&preview, "path_rename_preview")?;
     let plan_id = semantic_path_rename_plan(&preview, "module folder rename")?;
     let applied = call_json(
         client,
@@ -3456,6 +3491,7 @@ fn sc_path_rename_folder_semantic_edit(
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&immediate, "path_rename_preview")?;
     let plan_id = semantic_path_rename_plan(&immediate, "immediate nested module rename")?;
     let applied = call_json(
         client,
@@ -3490,6 +3526,7 @@ fn sc_path_rename_semantic_edit(client: &mut McpClient, workspace: &Path) -> Res
             "position_encoding": "utf-8",
         }),
     )?;
+    assert_preview_envelope(&file_preview, "path_rename_preview")?;
     let plan_id = semantic_path_rename_plan(&file_preview, "module file rename")?;
 
     let types = workspace.join("src/types.rs");
@@ -3553,6 +3590,7 @@ fn sc_move_inline_module_semantic_edit(
             "module_character": 8,
         }),
     )?;
+    assert_preview_envelope(&preview, "move_inline_module_preview")?;
 
     if preview["verification"] != "semantic_verified" {
         return Err(format!(

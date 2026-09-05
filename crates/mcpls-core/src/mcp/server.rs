@@ -1562,7 +1562,68 @@ fn bounded_structural_preview_json(
         let details_resource = registry
             .store_deferred_resource(project_id, "structural_plan_details", details)
             .map_err(|error| McpError::internal_error(error, None))?;
+        let diff_files = artifact
+            .plan
+            .diff_files()
+            .iter()
+            .take(16)
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.path(),
+                    "additions": file.additions(),
+                    "deletions": file.deletions(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let affected_files = artifact
+            .affected_files
+            .iter()
+            .take(16)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let operations = artifact
+            .plan
+            .operations()
+            .iter()
+            .take(16)
+            .map(|operation| crate::util::truncate_str(operation, 256))
+            .collect::<Vec<_>>();
+        let preconditions = artifact
+            .plan
+            .files()
+            .iter()
+            .take(16)
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.path(),
+                    "source": match file.source() {
+                        crate::edit_plan::SnapshotSource::Disk => "disk",
+                        crate::edit_plan::SnapshotSource::OpenDocument => "open_document",
+                    },
+                    "version": file.version(),
+                    "sha256": file.content_hash(),
+                })
+            })
+            .collect::<Vec<_>>();
         compact["plan_id"] = serde_json::json!(artifact.plan.id().as_str());
+        compact["unified_diff"] = serde_json::json!(crate::util::truncate_str(
+            artifact.plan.unified_diff(),
+            2 * 1024,
+        ));
+        compact["diff_files"] = serde_json::json!(diff_files);
+        compact["affected_files"] = serde_json::json!(affected_files);
+        compact["operations"] = serde_json::json!(operations);
+        compact["preconditions"] = serde_json::json!(preconditions);
+        compact["conflicts"] =
+            serde_json::json!(artifact.conflicts.iter().take(16).collect::<Vec<_>>());
+        compact["unsupported"] = serde_json::json!(
+            artifact
+                .unsupported
+                .iter()
+                .take(16)
+                .map(|item| crate::util::truncate_str(item, 256))
+                .collect::<Vec<_>>()
+        );
         compact["safe_to_apply"] = serde_json::json!(artifact.plan.safe_to_apply());
         compact["affected_file_count"] = serde_json::json!(artifact.affected_files.len());
         compact["operation_count"] = serde_json::json!(artifact.plan.operations().len());
@@ -1571,6 +1632,13 @@ fn bounded_structural_preview_json(
         compact["conflict_count"] = serde_json::json!(artifact.conflicts.len());
         compact["unsupported_count"] = serde_json::json!(artifact.unsupported.len());
         compact["diff_truncated"] = serde_json::json!(artifact.plan.diff_truncated());
+        compact["diff_resource"] = serde_json::json!({
+            "uri": format!(
+                "mcpls-edit-diff:///{project_id}?plan_id={}&offset_bytes=0",
+                artifact.plan.id().as_str(),
+            ),
+            "mime_type": "text/x-diff",
+        });
         compact["plan_details_resource"] = serde_json::json!(details_resource);
         if let Some(verification) = artifact.verification {
             compact["verification"] = serde_json::json!(verification.as_str());
