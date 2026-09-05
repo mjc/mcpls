@@ -88,6 +88,11 @@ fn stage_workspace() -> TempDir {
     let broken_src = fixture_dir.join("extras/broken.rs");
     let broken_dst = tmp.path().join("src/broken.rs");
     fs::copy(&broken_src, &broken_dst).expect("failed to copy broken.rs");
+    let broken_content = fs::read_to_string(&broken_dst).expect("failed to read broken.rs");
+    let diagnostic_marker = "diagnostic-context-marker";
+    let inflated = format!("    42 /* {diagnostic_marker} {} */", "x".repeat(8 * 1024));
+    fs::write(&broken_dst, broken_content.replace("    42", &inflated))
+        .expect("failed to inflate broken.rs diagnostic context");
 
     let lib_path = tmp.path().join("src/lib.rs");
     let mut lib_content = fs::read_to_string(&lib_path).expect("failed to read lib.rs");
@@ -573,7 +578,7 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
                 "fresh": true,
                 "file_path": broken.to_string_lossy(),
                 "item_limit": 20,
-                "byte_limit": 32768
+                "byte_limit": 4096
             }),
         )
         .map_err(|e| format!("call failed: {e}"))?;
@@ -600,7 +605,7 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
                     &json!({
                         "file_path": broken.to_string_lossy(),
                         "item_limit": 20,
-                        "byte_limit": 32768
+                        "byte_limit": 4096
                     }),
                 )
                 .ok()
@@ -651,12 +656,65 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
                 .as_str()
                 .is_none_or(|path| !path.ends_with("/src/broken.rs"))
             || diagnostic["source_frame"]["highlighted_range"] != diagnostic["range"]
-            || diagnostic["source_frame"]["text"]
-                .as_str()
-                .is_none_or(str::is_empty)
+            || (diagnostic["source_frame"]["text"].as_str().is_none()
+                && diagnostic["source_frame"]["resource"]["uri"]
+                    .as_str()
+                    .is_none())
     }) {
         return Err(format!(
             "diagnostics omitted coherent highlighted source: {final_diags:?}"
+        ));
+    }
+
+    let source_frame = final_diags
+        .iter()
+        .find_map(|diagnostic| diagnostic["source_frame"].as_object())
+        .ok_or_else(|| format!("diagnostics had no source frame: {final_diags:?}"))?;
+    let resource_uri = source_frame["resource"]["uri"]
+        .as_str()
+        .ok_or_else(|| format!("diagnostic source was not deferred: {final_diags:?}"))?
+        .to_owned();
+    let original_hash = source_frame["content_hash"]
+        .as_str()
+        .ok_or_else(|| format!("diagnostic source had no content hash: {source_frame:?}"))?
+        .to_owned();
+
+    let resource = client
+        .read_resource(&resource_uri)
+        .map_err(|error| format!("read diagnostic source resource failed: {error}"))?;
+    let resource_text = resource["result"]["contents"][0]["text"]
+        .as_str()
+        .ok_or_else(|| format!("malformed diagnostic source resource: {resource}"))?;
+    let replay: Value = serde_json::from_str(resource_text)
+        .map_err(|error| format!("diagnostic source resource was not JSON: {error}"))?;
+    if !replay["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("diagnostic-context-marker"))
+    {
+        return Err(format!(
+            "deferred diagnostic source omitted marker: {replay}"
+        ));
+    }
+
+    let changed = fs::read_to_string(&broken)
+        .map_err(|error| format!("read broken.rs before stale replay: {error}"))?
+        .replace("diagnostic-context-marker", "diagnostic-stale-marker");
+    fs::write(&broken, changed).map_err(|error| format!("rewrite broken.rs: {error}"))?;
+    let stale_resource = client
+        .read_resource(&resource_uri)
+        .map_err(|error| format!("read stale diagnostic source resource failed: {error}"))?;
+    let stale_text = stale_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .ok_or_else(|| format!("malformed stale diagnostic source resource: {stale_resource}"))?;
+    let stale_replay: Value = serde_json::from_str(stale_text)
+        .map_err(|error| format!("stale diagnostic source resource was not JSON: {error}"))?;
+    if !stale_replay["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("diagnostic-stale-marker"))
+        || stale_replay["content_hash"].as_str() == Some(&original_hash)
+    {
+        return Err(format!(
+            "stale diagnostic resource did not replay current snapshot: {stale_replay}"
         ));
     }
     Ok(())
