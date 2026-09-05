@@ -2029,25 +2029,50 @@ fn sc_get_cached_diagnostics(client: &mut McpClient, workspace: &Path) -> Result
 /// returns the expected shape, even if entries are empty.  The stronger
 /// liveness signal for the notification pipeline is `sc_get_server_messages`.
 fn sc_get_server_logs(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
-    let resp = client
-        .call_tool(
+    let mut cursor = None;
+    let mut snapshot = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = None;
+    let mut returned = 0;
+    for _ in 0..128 {
+        let page = call_json(
+            client,
             "get_server_logs",
-            &json!({ "project_id": "default", "limit": 50 }),
-        )
-        .map_err(|e| format!("call failed: {e}"))?;
-
-    let text = assertions::assert_tool_ok(&resp);
-    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
-
-    // Verify expected shape; entries may be empty since rust-analyzer does not
-    // emit window/logMessage without additional logging configuration.
-    let _entries = inner["entries"]
-        .as_array()
-        .or_else(|| inner["logs"].as_array())
-        .or_else(|| inner.as_array())
-        .ok_or_else(|| format!("expected log entries array, got {inner}"))?;
-
-    Ok(())
+            &json!({ "project_id": "default", "limit": 1, "cursor": cursor }),
+        )?;
+        let logs = page["logs"]
+            .as_array()
+            .or_else(|| page["entries"].as_array())
+            .ok_or_else(|| format!("expected log entries array, got {page}"))?;
+        let page_snapshot = page["snapshot_identity"]
+            .as_str()
+            .ok_or_else(|| format!("log page omitted snapshot_identity: {page}"))?;
+        if snapshot.get_or_insert(page_snapshot.to_owned()) != page_snapshot {
+            return Err(format!("log pages changed snapshot identity: {page}"));
+        }
+        let page_total = page["total"]
+            .as_u64()
+            .ok_or_else(|| format!("log page omitted total: {page}"))?;
+        if total.get_or_insert(page_total) != &page_total {
+            return Err(format!("log pages changed total: {page}"));
+        }
+        for log in logs {
+            if !seen.insert(log.to_string()) {
+                return Err(format!("log pages duplicated a record: {log}"));
+            }
+        }
+        returned += logs.len() as u64;
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            if returned != page_total || page["remaining"] != 0 {
+                return Err(format!(
+                    "log pages did not exhaust retained records: {page}"
+                ));
+            }
+            return Ok(());
+        }
+    }
+    Err("log page walk did not terminate after 128 pages".to_owned())
 }
 
 /// Resolve a resource URI ending with `suffix` by querying `resources/list`.
@@ -2631,15 +2656,49 @@ fn sc_subscribe_no_replay_without_cached_diagnostics(
 
 /// Tool 16: `get_server_messages` — readiness gate already exercised this tool.
 fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
-    let resp = client
-        .call_tool(
+    let mut cursor = None;
+    let mut snapshot = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = None;
+    let mut returned = 0;
+    for _ in 0..128 {
+        let page = call_json(
+            client,
             "get_server_messages",
-            &json!({ "project_id": "default", "limit": 20 }),
-        )
-        .map_err(|e| format!("call failed: {e}"))?;
-
-    assertions::assert_tool_ok(&resp);
-    Ok(())
+            &json!({ "project_id": "default", "limit": 1, "cursor": cursor }),
+        )?;
+        let messages = page["messages"]
+            .as_array()
+            .ok_or_else(|| format!("expected message entries array, got {page}"))?;
+        let page_snapshot = page["snapshot_identity"]
+            .as_str()
+            .ok_or_else(|| format!("message page omitted snapshot_identity: {page}"))?;
+        if snapshot.get_or_insert(page_snapshot.to_owned()) != page_snapshot {
+            return Err(format!("message pages changed snapshot identity: {page}"));
+        }
+        let page_total = page["total"]
+            .as_u64()
+            .ok_or_else(|| format!("message page omitted total: {page}"))?;
+        if total.get_or_insert(page_total) != &page_total {
+            return Err(format!("message pages changed total: {page}"));
+        }
+        for message in messages {
+            if !seen.insert(message.to_string()) {
+                return Err(format!("message pages duplicated a record: {message}"));
+            }
+        }
+        returned += messages.len() as u64;
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            if returned != page_total || page["remaining"] != 0 {
+                return Err(format!(
+                    "message pages did not exhaust retained records: {page}"
+                ));
+            }
+            return Ok(());
+        }
+    }
+    Err("message page walk did not terminate after 128 pages".to_owned())
 }
 
 /// rust-analyzer SSR syntax validation and write-free replacement preview.
