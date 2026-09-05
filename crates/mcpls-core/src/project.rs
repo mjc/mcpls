@@ -5185,6 +5185,42 @@ fn store_diagnostic_payload(
         .insert_scoped_kind(value, snapshot_hash, scope, kind))
 }
 
+fn bound_format_document_result(
+    result: &mut FormatDocumentResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    let encoded = serde_json::to_vec(&result.edits)
+        .map_err(|error| format!("failed to encode formatting edits: {error}"))?;
+    result.total_edits = result.edits.len();
+    result.returned_edits = result.edits.len();
+    result.edit_bytes = encoded.len();
+    result.edit_digest = format!("{:x}", Sha256::digest(&encoded));
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        <= MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Ok(());
+    }
+
+    let complete = serde_json::to_value(&result.edits)
+        .map_err(|error| format!("failed to store formatting edits: {error}"))?;
+    result.edits_resource = Some(store_diagnostic_payload(
+        complete,
+        "format_document_edits",
+        deferred_results,
+        scope,
+    )?);
+    result.edits.clear();
+    result.returned_edits = 0;
+    result.deferred = true;
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        > MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Err("format document result exceeds the response budget".to_owned());
+    }
+    Ok(())
+}
+
 trait NotificationMessageEntry {
     fn message(&self) -> &str;
     fn take_message(&mut self) -> String;
@@ -7438,10 +7474,17 @@ impl ProjectRuntime {
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_format_document(file_path, tab_size, insert_spaces)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        bound_format_document_result(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn format_workspace_edit(
@@ -13912,6 +13955,54 @@ mod tests {
         assert!(store.take(&first).is_err());
         assert!(store.take(&second).is_ok());
         assert!(store.take(&second).is_err());
+    }
+
+    #[test]
+    fn format_document_results_are_atomic_when_edits_do_not_fit() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let edits = (0..2)
+            .map(|index| crate::bridge::translator::TextEdit {
+                range: crate::bridge::translator::Range {
+                    start: crate::bridge::translator::Position2D {
+                        line: index + 1,
+                        character: 1,
+                    },
+                    end: crate::bridge::translator::Position2D {
+                        line: index + 1,
+                        character: 2,
+                    },
+                },
+                new_text: "λ".repeat(MAX_NOTIFICATION_RESULT_BYTES),
+            })
+            .collect::<Vec<_>>();
+        let complete = serde_json::to_value(&edits).unwrap();
+        let mut result = FormatDocumentResult {
+            edits,
+            total_edits: 0,
+            returned_edits: 0,
+            edit_bytes: 0,
+            edit_digest: String::new(),
+            edits_resource: None,
+            deferred: false,
+        };
+
+        bound_format_document_result(&mut result, &shared, "project").unwrap();
+
+        assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_NOTIFICATION_RESULT_BYTES);
+        assert!(result.deferred);
+        assert_eq!(result.returned_edits, 0);
+        assert_eq!(result.total_edits, 2);
+        assert!(result.edits.is_empty());
+        let reference = result.edits_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read_scoped(token, "project")
+                .unwrap(),
+            complete
+        );
     }
 
     #[test]

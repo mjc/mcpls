@@ -341,6 +341,12 @@ impl Translator {
         let result_edits = normalize_text_edits(&ctx, &response_uri, edits).await;
         let result = FormatDocumentResult {
             edits: result_edits,
+            total_edits: 0,
+            returned_edits: 0,
+            edit_bytes: 0,
+            edit_digest: String::new(),
+            edits_resource: None,
+            deferred: false,
         };
 
         Ok(result)

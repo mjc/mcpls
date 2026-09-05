@@ -893,6 +893,24 @@ pub struct DocumentSymbolsResult {
 pub struct FormatDocumentResult {
     /// List of edits to format the document.
     pub edits: Vec<TextEdit>,
+    /// Number of edits in the complete formatting operation.
+    #[serde(default)]
+    pub total_edits: usize,
+    /// Number of edits returned inline; atomic responses are all-or-nothing.
+    #[serde(default)]
+    pub returned_edits: usize,
+    /// Serialized byte size of the complete edit set.
+    #[serde(default)]
+    pub edit_bytes: usize,
+    /// SHA-256 identity of the complete edit-set snapshot.
+    #[serde(default)]
+    pub edit_digest: String,
+    /// Complete edits when the inline response budget is insufficient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits_resource: Option<DeferredResourceReference>,
+    /// Whether edits were moved out of the inline atomic response.
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 /// A workspace symbol.

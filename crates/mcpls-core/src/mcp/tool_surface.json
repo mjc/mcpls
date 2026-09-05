@@ -3330,6 +3330,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -3391,12 +3431,54 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "deferred": {
+          "default": false,
+          "description": "Whether edits were moved out of the inline atomic response.",
+          "type": "boolean"
+        },
+        "edit_bytes": {
+          "default": 0,
+          "description": "Serialized byte size of the complete edit set.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edit_digest": {
+          "default": "",
+          "description": "SHA-256 identity of the complete edit-set snapshot.",
+          "type": "string"
+        },
         "edits": {
           "description": "List of edits to format the document.",
           "items": {
             "$ref": "#/$defs/TextEdit"
           },
           "type": "array"
+        },
+        "edits_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete edits when the inline response budget is insufficient."
+        },
+        "returned_edits": {
+          "default": 0,
+          "description": "Number of edits returned inline; atomic responses are all-or-nothing.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_edits": {
+          "default": 0,
+          "description": "Number of edits in the complete formatting operation.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
