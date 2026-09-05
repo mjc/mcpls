@@ -701,20 +701,32 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
         .ok_or_else(|| format!("diagnostic source had no content hash: {source_frame:?}"))?
         .to_owned();
 
+    let semantic_resource = call_json(
+        client,
+        "read_semantic_resource",
+        &json!({"uri": resource_uri}),
+    )?;
+    if semantic_resource["mime_type"] != "text/x-rust"
+        || semantic_resource["source"]["content_hash"] != original_hash
+        || !semantic_resource["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("diagnostic-context-marker"))
+        || serde_json::from_str::<Value>(semantic_resource["text"].as_str().unwrap_or("")).is_ok()
+    {
+        return Err(format!(
+            "semantic source resource was not raw text with structured metadata: {semantic_resource}"
+        ));
+    }
+
     let resource = client
         .read_resource(&resource_uri)
         .map_err(|error| format!("read diagnostic source resource failed: {error}"))?;
     let resource_text = resource["result"]["contents"][0]["text"]
         .as_str()
         .ok_or_else(|| format!("malformed diagnostic source resource: {resource}"))?;
-    let replay: Value = serde_json::from_str(resource_text)
-        .map_err(|error| format!("diagnostic source resource was not JSON: {error}"))?;
-    if !replay["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("diagnostic-context-marker"))
-    {
+    if !resource_text.contains("diagnostic-context-marker") {
         return Err(format!(
-            "deferred diagnostic source omitted marker: {replay}"
+            "deferred diagnostic source omitted marker: {resource_text}"
         ));
     }
 
@@ -728,15 +740,11 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
     let stale_text = stale_resource["result"]["contents"][0]["text"]
         .as_str()
         .ok_or_else(|| format!("malformed stale diagnostic source resource: {stale_resource}"))?;
-    let stale_replay: Value = serde_json::from_str(stale_text)
-        .map_err(|error| format!("stale diagnostic source resource was not JSON: {error}"))?;
-    if !stale_replay["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("diagnostic-stale-marker"))
-        || stale_replay["content_hash"].as_str() == Some(&original_hash)
+    if !stale_text.contains("diagnostic-stale-marker")
+        || stale_resource["result"]["contents"][0]["uri"] == resource_uri
     {
         return Err(format!(
-            "stale diagnostic resource did not replay current snapshot: {stale_replay}"
+            "stale diagnostic resource did not replay current snapshot: {stale_text}"
         ));
     }
     Ok(())
