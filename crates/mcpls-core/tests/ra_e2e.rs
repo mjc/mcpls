@@ -142,7 +142,7 @@ mod semantic_discovery_tests {
     fs::write(
         tmp.path().join("src/callers.rs"),
         format!(
-            "pub fn caller_one() -> i32 {{ super::add(1, 2) /* call-context-marker {} */ }}\n\
+            "pub fn caller_one() -> i32 {{ super::add(1, 2) + super::add(3, 4) + super::add(5, 6) /* call-context-marker {} */ }}\n\
              pub fn caller_two() -> i32 {{ super::add(3, 4) }}\n\
              pub fn caller_three() -> i32 {{ super::add(5, 6) }}\n",
             "x".repeat(8 * 1024)
@@ -1544,41 +1544,157 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
     }
 }
 
-/// Tool 13: `get_outgoing_calls` — `add` calls nothing user-defined.
+/// Tool 13: `get_outgoing_calls` — `caller_one` calls `add` at three sites.
 fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
-    let item = prepare_call_hierarchy_item(client, workspace)?;
+    let callers = workspace.join("src/callers.rs");
+    let caller_line = find_line(&callers, "pub fn caller_one(");
     let resp = client
-        .call_tool("get_outgoing_calls", &json!({ "item": item }))
-        .map_err(|e| format!("call failed: {e}"))?;
-
-    let text = assertions::assert_tool_ok(&resp);
-    let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
-
-    let calls = inner["calls"]
+        .call_tool(
+            "prepare_call_hierarchy",
+            &json!({
+                "file_path": callers.to_string_lossy(),
+                "line": caller_line,
+                "character": 8
+            }),
+        )
+        .map_err(|e| format!("prepare caller_one failed: {e}"))?;
+    let prepared: Value = serde_json::from_str(&assertions::assert_tool_ok(&resp))
+        .map_err(|e| format!("bad prepare JSON: {e}"))?;
+    let item = prepared["items"]
         .as_array()
-        .or_else(|| inner.as_array())
-        .ok_or_else(|| format!("expected calls array, got {inner}"))?;
+        .and_then(|items| items.first())
+        .cloned()
+        .ok_or_else(|| format!("prepare caller_one returned no item: {prepared}"))?;
 
-    // `add(a, b) { a + b }` contains no function calls.
-    // An empty result is correct.  Reject any call to a user-defined function
-    // (names outside std/core/alloc/compiler_builtins namespaces).
-    for call in calls {
-        let name = call["to"]["name"]
-            .as_str()
-            .or_else(|| call["callee"]["name"].as_str())
-            .unwrap_or("");
-        let in_std = name.is_empty()
-            || name.contains("core")
-            || name.contains("std")
-            || name.contains("alloc")
-            || name.contains("compiler_builtins");
-        if !in_std {
-            return Err(format!(
-                "unexpected user-defined outgoing call from 'add': '{name}'"
-            ));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut page_token = None;
+    let mut seen_edges = std::collections::BTreeSet::new();
+    let mut expected_total_calls = None;
+    let mut expected_total_call_sites = None;
+    let mut deferred_resource = None;
+    let mut pages = 0;
+    loop {
+        let resp = client
+            .call_tool(
+                "get_outgoing_calls",
+                &json!({
+                    "item": item,
+                    "limits": { "total": 1, "per_symbol": 1 },
+                    "page_token": page_token
+                }),
+            )
+            .map_err(|e| format!("call failed: {e}"))?;
+        let inner: Value = serde_json::from_str(&assertions::assert_tool_ok(&resp))
+            .map_err(|e| format!("bad outgoing JSON: {e}"))?;
+        let calls = inner["calls"]
+            .as_array()
+            .ok_or_else(|| format!("outgoing result omitted calls: {inner}"))?;
+        let total_calls = inner["total_calls"]
+            .as_u64()
+            .ok_or_else(|| format!("outgoing result omitted total_calls: {inner}"))?;
+        let total_call_sites = inner["total_call_sites"]
+            .as_u64()
+            .ok_or_else(|| format!("outgoing result omitted total_call_sites: {inner}"))?;
+        if page_token.is_none() && total_call_sites < 3 {
+            if Instant::now() >= deadline {
+                return Err(format!("outgoing graph did not converge: {inner}"));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        if expected_total_calls.is_some_and(|previous| previous != total_calls)
+            || expected_total_call_sites.is_some_and(|previous| previous != total_call_sites)
+        {
+            return Err(format!("outgoing totals changed across pages: {inner}"));
+        }
+        expected_total_calls = Some(total_calls);
+        expected_total_call_sites = Some(total_call_sites);
+
+        for call in calls {
+            let callee_name = call["to"]["name"]
+                .as_str()
+                .or_else(|| call["callee"]["name"].as_str())
+                .unwrap_or("<unnamed>");
+            if !callee_name.contains("add") {
+                return Err(format!("unexpected outgoing callee: {callee_name}"));
+            }
+            for site in call["call_sites"]
+                .as_array()
+                .ok_or_else(|| format!("outgoing call omitted call_sites: {call}"))?
+            {
+                let range = &site["range"];
+                let edge = format!(
+                    "{callee_name}:{}:{}:{}",
+                    range["start"]["line"], range["start"]["character"], range["end"]["character"]
+                );
+                if !seen_edges.insert(edge.clone()) {
+                    return Err(format!("duplicate outgoing call-site edge: {edge}"));
+                }
+                if deferred_resource.is_none() {
+                    let source = &site["source"];
+                    let uri = source["resource"]["uri"]
+                        .as_str()
+                        .ok_or_else(|| format!("outgoing source was not deferred: {source}"))?;
+                    let original_hash = source["content_hash"]
+                        .as_str()
+                        .ok_or_else(|| format!("outgoing source had no content hash: {source}"))?;
+                    let replay = client
+                        .read_resource(uri)
+                        .map_err(|error| format!("read outgoing source resource: {error}"))?;
+                    let replay_text = replay["result"]["contents"][0]["text"]
+                        .as_str()
+                        .ok_or_else(|| format!("malformed outgoing source resource: {replay}"))?;
+                    let replay: Value = serde_json::from_str(replay_text)
+                        .map_err(|error| format!("outgoing source was not JSON: {error}"))?;
+                    if !replay["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("call-context-marker"))
+                    {
+                        return Err(format!("outgoing source omitted marker: {replay}"));
+                    }
+                    deferred_resource = Some((uri.to_owned(), original_hash.to_owned()));
+                }
+            }
+        }
+
+        pages += 1;
+        page_token = inner["next_cursor"].as_str().map(str::to_owned);
+        if page_token.is_none() {
+            if seen_edges.len() != total_call_sites as usize || total_calls != 1 || pages < 3 {
+                return Err(format!(
+                    "outgoing pages did not reconstruct full graph: pages={pages}, edges={}, result={inner}",
+                    seen_edges.len()
+                ));
+            }
+            let (resource_uri, original_hash) = deferred_resource
+                .ok_or_else(|| "outgoing pages returned no deferred source".to_owned())?;
+            let changed = fs::read_to_string(&callers)
+                .map_err(|error| format!("read callers.rs: {error}"))?
+                .replace("call-context-marker", "call-stale-marker");
+            fs::write(&callers, changed).map_err(|error| format!("rewrite callers.rs: {error}"))?;
+            let stale = client
+                .read_resource(&resource_uri)
+                .map_err(|error| format!("read stale outgoing resource: {error}"))?;
+            let stale_text = stale["result"]["contents"][0]["text"]
+                .as_str()
+                .ok_or_else(|| format!("malformed stale outgoing resource: {stale}"))?;
+            let stale: Value = serde_json::from_str(stale_text)
+                .map_err(|error| format!("stale outgoing resource was not JSON: {error}"))?;
+            if !stale["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("call-stale-marker"))
+                || stale["content_hash"].as_str() == Some(&original_hash)
+            {
+                return Err(format!(
+                    "stale outgoing resource did not replay current source: {stale}"
+                ));
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("outgoing pagination did not exhaust: {inner}"));
         }
     }
-    Ok(())
 }
 
 /// Tool 14: `get_cached_diagnostics` — push cache populated during workspace indexing.
