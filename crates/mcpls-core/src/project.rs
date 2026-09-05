@@ -4144,7 +4144,9 @@ struct CodeActionStore {
 const CODE_ACTION_PAGE_SIZE: usize = 64;
 const COMPLETION_PAGE_SIZE: usize = 64;
 const SIGNATURE_PAGE_SIZE: usize = 32;
-const INLAY_HINT_PAGE_SIZE: usize = 64;
+// Keep the compact page below the shared response ceiling even after hint
+// identities and pagination metadata are attached.
+const INLAY_HINT_PAGE_SIZE: usize = 8;
 
 fn inlay_hint_page_bounds(
     hints: &[crate::bridge::translator::InlayHintEntry],
@@ -14142,12 +14144,12 @@ mod tests {
             .map(|index| serde_json::json!({"index": index}))
             .collect::<Vec<_>>();
         let (first, snapshot, next) = code_action_page_bounds(&actions, None).unwrap();
-        assert_eq!(first, 0..64);
+        assert_eq!(first, 0..8);
         let token = next.unwrap();
         let (second, same_snapshot, next) =
             code_action_page_bounds(&actions, Some(&token)).unwrap();
         assert_eq!(same_snapshot, snapshot);
-        assert_eq!(second, 64..128);
+        assert_eq!(second, 8..16);
         let (last, _, next) = code_action_page_bounds(&actions, next.as_deref()).unwrap();
         assert_eq!(last, 128..130);
         assert!(next.is_none());
@@ -14223,15 +14225,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (first, snapshot, next) = inlay_hint_page_bounds(&hints, None).unwrap();
-        assert_eq!(first, 0..64);
+        assert_eq!(first, 0..8);
         let token = next.unwrap();
-        let (second, same_snapshot, next) = inlay_hint_page_bounds(&hints, Some(&token)).unwrap();
+        let (second, same_snapshot, _) = inlay_hint_page_bounds(&hints, Some(&token)).unwrap();
         assert_eq!(same_snapshot, snapshot);
-        assert_eq!(second, 64..128);
-        let (last, _, next) = inlay_hint_page_bounds(&hints, next.as_deref()).unwrap();
+        assert_eq!(second, 8..16);
+        let last_token = format!("{snapshot}:128");
+        let (last, _, next) = inlay_hint_page_bounds(&hints, Some(&last_token)).unwrap();
         assert_eq!(last, 128..130);
         assert!(next.is_none());
-        assert!(inlay_hint_page_bounds(&hints, Some("stale:64")).is_err());
+        assert!(inlay_hint_page_bounds(&hints, Some("stale:8")).is_err());
     }
 
     #[test]

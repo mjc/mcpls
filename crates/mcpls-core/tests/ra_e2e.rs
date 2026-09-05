@@ -149,6 +149,13 @@ mod semantic_discovery_tests {
         .map(|index| format!("pub fn ad_item_{index:02}() -> u32 {{ {index} }}\n"))
         .collect();
     lib_content.push_str(&completion_items);
+    let inlay_hints: String = (0..80)
+        .map(|index| format!("    let _inlay_value_{index:02} = add({index}, {index});\n"))
+        .collect();
+    lib_content = lib_content.replace(
+        "    let _ = (p, s);",
+        &format!("{inlay_hints}    let _ = (p, s);"),
+    );
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
     fs::write(
         tmp.path().join("src/callers.rs"),
@@ -2141,6 +2148,12 @@ fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), St
     let end_line = find_line(&lib, "let _ = (p, s);") + 1;
 
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut page_token = None;
+    let mut snapshot_identity = None;
+    let mut hint_ids = std::collections::BTreeSet::new();
+    let mut hint_labels = std::collections::BTreeSet::new();
+    let mut total_hints = None;
+    let mut pages = 0;
     loop {
         let resp = client
             .call_tool(
@@ -2151,6 +2164,7 @@ fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), St
                     "start_character": 1,
                     "end_line": end_line,
                     "end_character": 1,
+                    "page_token": page_token,
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
@@ -2158,15 +2172,54 @@ fn sc_get_inlay_hints(client: &mut McpClient, workspace: &Path) -> Result<(), St
         let text = assertions::assert_tool_ok(&resp);
         let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
 
-        let hints_arr = inner["hints"].as_array().or_else(|| inner.as_array());
-        if let Some(hints) = hints_arr
-            && !hints.is_empty()
-        {
-            let serialized = serde_json::to_string(&inner["hints"])
-                .unwrap_or_else(|_| serde_json::to_string(&inner).unwrap_or_default());
-            if !serialized.contains("Point") && !serialized.contains("i32") {
+        let Some(hints) = inner["hints"].as_array() else {
+            return Err(format!("get_inlay_hints omitted hints: {inner}"));
+        };
+        if hints.is_empty() {
+            if Instant::now() >= deadline {
                 return Err(format!(
-                    "get_inlay_hints: no 'Point' or 'i32' hint found; hints={serialized}"
+                    "get_inlay_hints: no hints after 10 s; response={inner}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let snapshot = inner["snapshot_identity"]
+            .as_str()
+            .ok_or_else(|| format!("inlay hint page omitted snapshot identity: {inner}"))?;
+        if snapshot_identity.get_or_insert_with(|| snapshot.to_owned()) != snapshot {
+            return Err(format!(
+                "inlay hint pages changed snapshot identity: {inner}"
+            ));
+        }
+        let total = inner["total_hints"]
+            .as_u64()
+            .ok_or_else(|| format!("inlay hint page omitted total_hints: {inner}"))?;
+        if total_hints.get_or_insert(total) != &total {
+            return Err(format!("inlay hint pages changed total_hints: {inner}"));
+        }
+        for hint in hints {
+            let id = hint["hint_id"]
+                .as_str()
+                .ok_or_else(|| format!("inlay hint omitted hint_id: {hint}"))?;
+            if !hint_ids.insert(id.to_owned()) {
+                return Err(format!("inlay hint pages duplicated hint_id: {id}"));
+            }
+            if let Some(label) = hint["label"].as_str() {
+                hint_labels.insert(label.to_owned());
+            }
+        }
+        pages += 1;
+        page_token = inner["next_cursor"].as_str().map(str::to_owned);
+        if page_token.is_none() {
+            if hint_ids.len() != total as usize
+                || pages < 2
+                || !hint_labels.iter().any(|label| label.contains("Point"))
+                || !hint_labels.iter().any(|label| label.contains("i32"))
+            {
+                return Err(format!(
+                    "inlay hint pages did not exhaust provider results: pages={pages}, hints={}, total={total}, response={inner}",
+                    hint_ids.len()
                 ));
             }
             return Ok(());
