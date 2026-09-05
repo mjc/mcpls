@@ -978,6 +978,7 @@ fn smallest_enclosing_symbol_at(symbols: &[Symbol], position: (u32, u32)) -> Opt
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::format_collect)]
 mod tests {
     use super::*;
+    use crate::bridge::DeferredResourceReference;
 
     fn unavailable_location(path: &str, line: u32) -> Location {
         Location {
@@ -1121,6 +1122,62 @@ mod tests {
 
         assert_eq!(locations.len(), MAX_NAVIGATION_TARGETS);
         assert!(truncated);
+    }
+
+    #[test]
+    fn definition_locations_preserve_deferred_source_context() {
+        let resource = DeferredResourceReference {
+            uri: "mcpls-source:///workspace/lib.rs?offset_bytes=0".to_owned(),
+            kind: "source_context".to_owned(),
+            snapshot_hash: "definition-snapshot".to_owned(),
+            document_version: Some(7),
+            total_bytes: Some(4096),
+        };
+        let result = DefinitionResult {
+            provider: "standard_lsp".to_owned(),
+            kind: NavigationKind::Definition,
+            locations: vec![Location {
+                path: Some("/workspace/lib.rs".to_owned()),
+                uri: "file:///workspace/lib.rs".to_owned(),
+                range: Range {
+                    start: Position2D {
+                        line: 1,
+                        character: 1,
+                    },
+                    end: Position2D {
+                        line: 1,
+                        character: 1,
+                    },
+                },
+                source: SourceContext::Deferred {
+                    resource: resource.clone(),
+                },
+                symbol_handle: None,
+            }],
+            total_locations: 1,
+            returned_locations: 1,
+            remaining_locations: 0,
+            next_cursor: None,
+            snapshot_identity: "definition-targets".to_owned(),
+            truncated: true,
+        };
+
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["locations"][0]["source"]["status"], "deferred");
+        assert_eq!(
+            encoded["locations"][0]["source"]["resource"]["snapshot_hash"],
+            "definition-snapshot"
+        );
+        assert_eq!(
+            encoded["locations"][0]["source"]["resource"]["total_bytes"],
+            4096
+        );
+
+        let restored: DefinitionResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            restored.locations[0].source,
+            SourceContext::Deferred { resource }
+        );
     }
 
     #[test]
