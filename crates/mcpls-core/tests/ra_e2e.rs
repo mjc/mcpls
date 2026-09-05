@@ -1101,6 +1101,52 @@ fn sc_format_document(client: &mut McpClient, workspace: &Path) -> Result<(), St
     Ok(())
 }
 
+/// Ensure a formatter result cannot be applied after its document snapshot changes.
+fn sc_format_document_stale_apply(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let file = workspace.join("src/stale_format.rs");
+    fs::write(&file, "fn stale_format()->i32{1}\n")
+        .map_err(|error| format!("write stale format fixture: {error}"))?;
+    let preview = call_json(
+        client,
+        "format_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": file,
+            "tab_size": 4,
+            "insert_spaces": true,
+            "position_encoding": "utf-8"
+        }),
+    )?;
+    let plan_id = preview["plan_id"]
+        .as_str()
+        .ok_or_else(|| format!("formatter edit preview omitted plan_id: {preview}"))?
+        .to_owned();
+
+    let changed = "fn stale_format()->i32{1}\n// changed after formatting\n";
+    fs::write(&file, changed).map_err(|error| format!("change stale format fixture: {error}"))?;
+    let conflict = call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    if conflict["status"] != "conflict"
+        || conflict["committed"] != false
+        || conflict["retry"]["action"] != "preview_again"
+    {
+        return Err(format!(
+            "stale formatter apply was not an explicit conflict: {conflict}"
+        ));
+    }
+    let after = fs::read_to_string(&file)
+        .map_err(|error| format!("read stale format fixture after conflict: {error}"))?;
+    if after != changed {
+        return Err(format!(
+            "stale formatter apply mutated the document: {after:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Format a deliberately oversized file and replay its complete deferred edit set.
 fn sc_format_document_deferred(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let large = workspace.join("src/format_large.rs");
@@ -3687,6 +3733,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_completions),
         sub_case!(sc_get_document_symbols),
         sub_case!(sc_format_document),
+        sub_case!(sc_format_document_stale_apply),
         sub_case!(sc_format_document_deferred),
         sub_case!(sc_workspace_symbol_search),
         sub_case!(sc_inspect_symbol),
