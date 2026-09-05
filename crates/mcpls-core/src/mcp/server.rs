@@ -5802,6 +5802,11 @@ mod tests {
         let expected = plan.complete_unified_diff();
         assert!(plan.diff_truncated());
         let plan_id = plan.id().clone();
+        std::fs::write(
+            root.path().join("huge.rs"),
+            numbered_lines("old line", 5_000),
+        )
+        .unwrap();
         actor.store_edit_plan(plan).await.unwrap();
 
         let server =
@@ -5843,6 +5848,32 @@ mod tests {
             offset_bytes = next;
         }
         assert_eq!(recovered, expected);
+
+        server
+            .workspace_edit_apply(Parameters(WorkspaceEditApplyParams {
+                project_id: "project".to_owned(),
+                plan_id: plan_id.as_str().to_owned(),
+                wait_timeout_ms: None,
+            }))
+            .await
+            .unwrap();
+        let stale = server
+            .read_edit_diff_resource(
+                project_id.clone(),
+                plan_id.clone(),
+                0,
+                edit_diff_resource_uri(&project_id, &plan_id, 0),
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            stale.contains("stale")
+                || stale.contains("not found")
+                || stale.contains("not owned by this MCP session"),
+            "{stale}"
+        );
 
         let other_session = server.for_session();
         let error = other_session
