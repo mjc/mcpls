@@ -19674,6 +19674,67 @@ while True:
     }
 
     #[tokio::test]
+    async fn notification_history_eviction_reports_a_retention_gap() {
+        let registry = ProjectRegistry::new(1);
+        let target_root = TempDir::new().unwrap();
+        let target = ProjectId::new("notification-retention-target").unwrap();
+        let actor = registry
+            .add(ProjectIdentity::new(
+                target.clone(),
+                CanonicalRoot::new(target_root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        actor
+            .notify(
+                0,
+                ServerId::from("rust"),
+                LspNotification::parse(
+                    "window/logMessage",
+                    Some(serde_json::json!({"type": 3, "message": "retained log"})),
+                ),
+            )
+            .await
+            .unwrap();
+        actor
+            .notify(
+                0,
+                ServerId::from("rust"),
+                LspNotification::parse(
+                    "window/showMessage",
+                    Some(serde_json::json!({"type": 3, "message": "retained message"})),
+                ),
+            )
+            .await
+            .unwrap();
+        actor.server_logs(10, None).await.unwrap();
+        actor.server_messages(10).await.unwrap();
+        registry.remove(target.clone()).await.unwrap();
+
+        for index in 0..=RETAINED_PROJECT_HISTORY_CAPACITY {
+            let root = TempDir::new().unwrap();
+            let id = ProjectId::new(format!("notification-retention-{index}")).unwrap();
+            registry
+                .add(ProjectIdentity::new(
+                    id.clone(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            registry.remove(id).await.unwrap();
+        }
+
+        assert!(matches!(
+            registry.server_logs(&target, 10, None).await,
+            Err(ProjectRegistryError::ProjectNotFound(id)) if id == target
+        ));
+        assert!(matches!(
+            registry.server_messages(&target, 10).await,
+            Err(ProjectRegistryError::ProjectNotFound(id)) if id == target
+        ));
+    }
+
+    #[tokio::test]
     async fn project_registry_persists_add_and_remove_mutations() {
         let root = TempDir::new().unwrap();
         let state_path = root.path().join("state/projects.json");
