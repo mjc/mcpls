@@ -270,6 +270,22 @@ fn find_position(file: &Path, needle: &str) -> (u32, u32) {
         .unwrap_or_else(|| panic!("anchor '{needle}' not found in {}", file.display()))
 }
 
+/// Make the source surrounding both navigation targets exceed the inline
+/// frame budget, so their snapshot-bound source resources must be replayed.
+fn inflate_navigation_source_context(lib_rs: &Path) {
+    let mut content = fs::read_to_string(lib_rs).expect("failed to read lib.rs");
+    let marker = "navigation-context-marker ".to_owned() + &"x".repeat(5 * 1024);
+    for needle in [
+        "pub trait Greet {",
+        "impl Greet for CodeActionTarget {",
+        "pub struct Point {",
+    ] {
+        let replacement = format!("/// {marker}\n{needle}");
+        content = content.replacen(needle, &replacement, 1);
+    }
+    fs::write(lib_rs, content).expect("failed to inflate navigation source context");
+}
+
 // ---------------------------------------------------------------------------
 // Readiness gate
 // ---------------------------------------------------------------------------
@@ -1619,6 +1635,7 @@ fn sc_go_to_implementation(client: &mut McpClient, workspace: &Path) -> Result<(
                     "go_to_implementation: impl line {expected_mcp_line} not in locations: {locs:?}"
                 ));
             }
+            assert_location_source_resource(client, &locs[0], "go_to_implementation")?;
             return Ok(());
         }
 
@@ -1688,6 +1705,7 @@ fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<
                     "go_to_type_definition: expected line {expected_mcp_line}, got {got_line:?}"
                 ));
             }
+            assert_location_source_resource(client, &locs[0], "go_to_type_definition")?;
             return Ok(());
         }
 
@@ -1698,6 +1716,36 @@ fn sc_go_to_type_definition(client: &mut McpClient, workspace: &Path) -> Result<
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn assert_location_source_resource(
+    client: &mut McpClient,
+    location: &Value,
+    label: &str,
+) -> Result<(), String> {
+    if location["source"]["status"] != "available" {
+        return Err(format!("{label}: source was not available: {location}"));
+    }
+    let uri = location["source"]["resource"]["uri"]
+        .as_str()
+        .ok_or_else(|| format!("{label}: source had no deferred resource: {location}"))?;
+    let response = client
+        .read_resource(uri)
+        .map_err(|error| format!("{label}: read deferred source resource: {error}"))?;
+    let contents = response["result"]["contents"]
+        .as_array()
+        .ok_or_else(|| format!("{label}: malformed resource response: {response}"))?;
+    if !contents.iter().any(|content| {
+        content["uri"] == uri
+            && content["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("navigation-context-marker"))
+    }) {
+        return Err(format!(
+            "{label}: deferred resource omitted source text: {response}"
+        ));
+    }
+    Ok(())
 }
 
 /// Tool 20: `get_inlay_hints` — type hints in `lsp317_target`.
@@ -2712,6 +2760,7 @@ fn ra_e2e_suite() {
 
     // Wait for rust-analyzer to index.
     let lib_rs = workspace.join("src/lib.rs");
+    inflate_navigation_source_context(&lib_rs);
     wait_until_ready(&mut client, &lib_rs);
 
     // Sub-case registry.
