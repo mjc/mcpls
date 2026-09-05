@@ -1794,13 +1794,8 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     let replay_text = replay["result"]["contents"][0]["text"]
                         .as_str()
                         .ok_or_else(|| format!("malformed incoming source resource: {replay}"))?;
-                    let replay: Value = serde_json::from_str(replay_text)
-                        .map_err(|error| format!("incoming source was not JSON: {error}"))?;
-                    if !replay["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("call-context-marker"))
-                    {
-                        return Err(format!("incoming source omitted marker: {replay}"));
+                    if !replay_text.contains("call-context-marker") {
+                        return Err(format!("incoming source omitted marker: {replay_text}"));
                     }
 
                     deferred_resource = Some((uri.to_owned(), original_hash.to_owned()));
@@ -1954,13 +1949,8 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     let replay_text = replay["result"]["contents"][0]["text"]
                         .as_str()
                         .ok_or_else(|| format!("malformed outgoing source resource: {replay}"))?;
-                    let replay: Value = serde_json::from_str(replay_text)
-                        .map_err(|error| format!("outgoing source was not JSON: {error}"))?;
-                    if !replay["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("call-context-marker"))
-                    {
-                        return Err(format!("outgoing source omitted marker: {replay}"));
+                    if !replay_text.contains("call-context-marker") {
+                        return Err(format!("outgoing source omitted marker: {replay_text}"));
                     }
                     deferred_resource = Some((uri.to_owned(), original_hash.to_owned()));
                 }
