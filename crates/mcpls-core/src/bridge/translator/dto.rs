@@ -671,6 +671,9 @@ pub struct TextEdit {
 pub struct DocumentChanges {
     /// URI of the document.
     pub uri: String,
+    /// Version of the document expected by the provider, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i32>,
     /// List of edits to apply.
     pub edits: Vec<TextEdit>,
 }
@@ -680,6 +683,39 @@ pub struct DocumentChanges {
 pub struct RenameResult {
     /// Changes to apply across documents.
     pub changes: Vec<DocumentChanges>,
+    /// Workspace file/resource operations not representable as text edits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<serde_json::Value>,
+    /// Number of files in the complete workspace edit.
+    #[serde(default)]
+    pub total_files: usize,
+    /// Number of edits in the complete workspace edit.
+    #[serde(default)]
+    pub total_edits: usize,
+    /// Number of operations in the complete workspace edit.
+    #[serde(default)]
+    pub total_operations: usize,
+    /// Number of files returned inline; atomic responses are all-or-nothing.
+    #[serde(default)]
+    pub returned_files: usize,
+    /// Number of edits returned inline; atomic responses are all-or-nothing.
+    #[serde(default)]
+    pub returned_edits: usize,
+    /// Number of operations returned inline; atomic responses are all-or-nothing.
+    #[serde(default)]
+    pub returned_operations: usize,
+    /// Serialized byte size of the complete normalized workspace edit.
+    #[serde(default)]
+    pub edit_bytes: usize,
+    /// SHA-256 identity of the complete normalized workspace edit.
+    #[serde(default)]
+    pub edit_digest: String,
+    /// Complete workspace edit when the inline response budget is insufficient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_resource: Option<DeferredResourceReference>,
+    /// Whether the atomic workspace edit was moved behind the resource.
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 /// A completion item.

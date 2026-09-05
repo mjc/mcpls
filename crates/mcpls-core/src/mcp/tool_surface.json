@@ -795,6 +795,14 @@
             "uri": {
               "description": "URI of the document.",
               "type": "string"
+            },
+            "version": {
+              "description": "Version of the document expected by the provider, when supplied.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           "required": [
@@ -5472,6 +5480,14 @@
             "uri": {
               "description": "URI of the document.",
               "type": "string"
+            },
+            "version": {
+              "description": "Version of the document expected by the provider, when supplied.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           "required": [
@@ -22109,6 +22125,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "DocumentChanges": {
           "description": "Changes to a document.",
           "properties": {
@@ -22122,6 +22178,14 @@
             "uri": {
               "description": "URI of the document.",
               "type": "string"
+            },
+            "version": {
+              "description": "Version of the document expected by the provider, when supplied.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           "required": [
@@ -22197,6 +22261,81 @@
             "$ref": "#/$defs/DocumentChanges"
           },
           "type": "array"
+        },
+        "changes_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Complete workspace edit when the inline response budget is insufficient."
+        },
+        "deferred": {
+          "default": false,
+          "description": "Whether the atomic workspace edit was moved behind the resource.",
+          "type": "boolean"
+        },
+        "edit_bytes": {
+          "default": 0,
+          "description": "Serialized byte size of the complete normalized workspace edit.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edit_digest": {
+          "default": "",
+          "description": "SHA-256 identity of the complete normalized workspace edit.",
+          "type": "string"
+        },
+        "operations": {
+          "description": "Workspace file/resource operations not representable as text edits.",
+          "items": true,
+          "type": "array"
+        },
+        "returned_edits": {
+          "default": 0,
+          "description": "Number of edits returned inline; atomic responses are all-or-nothing.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_files": {
+          "default": 0,
+          "description": "Number of files returned inline; atomic responses are all-or-nothing.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_operations": {
+          "default": 0,
+          "description": "Number of operations returned inline; atomic responses are all-or-nothing.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_edits": {
+          "default": 0,
+          "description": "Number of edits in the complete workspace edit.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_files": {
+          "default": 0,
+          "description": "Number of files in the complete workspace edit.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_operations": {
+          "default": 0,
+          "description": "Number of operations in the complete workspace edit.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [

@@ -1431,6 +1431,7 @@ fn workspace_edit_description(edit: WorkspaceEdit) -> WorkspaceEditDescription {
             .into_iter()
             .map(|(uri, edits)| DocumentChanges {
                 uri: uri.to_string(),
+                version: None,
                 edits: edits
                     .into_iter()
                     .map(|edit| TextEdit {

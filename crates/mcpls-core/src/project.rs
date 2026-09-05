@@ -5221,6 +5221,52 @@ fn bound_format_document_result(
     Ok(())
 }
 
+fn bound_rename_result(
+    result: &mut RenameResult,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+) -> Result<(), String> {
+    result.total_files = result.changes.len();
+    result.total_edits = result.changes.iter().map(|file| file.edits.len()).sum();
+    result.total_operations = result.operations.len();
+    result.returned_files = result.total_files;
+    result.returned_edits = result.total_edits;
+    result.returned_operations = result.total_operations;
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "changes": &result.changes,
+        "operations": &result.operations,
+    }))
+    .map_err(|error| format!("failed to encode rename workspace edit: {error}"))?;
+    result.edit_bytes = encoded.len();
+    result.edit_digest = format!("{:x}", Sha256::digest(&encoded));
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        <= MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Ok(());
+    }
+
+    let complete = serde_json::to_value(&*result)
+        .map_err(|error| format!("failed to store rename workspace edit: {error}"))?;
+    result.changes_resource = Some(store_diagnostic_payload(
+        complete,
+        "rename_workspace_edit",
+        deferred_results,
+        scope,
+    )?);
+    result.changes.clear();
+    result.operations.clear();
+    result.returned_files = 0;
+    result.returned_edits = 0;
+    result.returned_operations = 0;
+    result.deferred = true;
+    if serde_json::to_vec(result).map_or(usize::MAX, |json| json.len())
+        > MAX_NOTIFICATION_RESULT_BYTES
+    {
+        return Err("rename result exceeds the response budget".to_owned());
+    }
+    Ok(())
+}
+
 trait NotificationMessageEntry {
     fn message(&self) -> &str;
     fn take_message(&mut self) -> String;
@@ -7304,10 +7350,17 @@ impl ProjectRuntime {
         character: u32,
         new_name: String,
     ) -> Result<RenameResult, String> {
-        self.translator
+        let mut result = self
+            .translator
             .handle_rename(file_path, line, character, new_name)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        bound_rename_result(
+            &mut result,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+        )?;
+        Ok(result)
     }
 
     async fn rename_workspace_edit(
@@ -14003,6 +14056,67 @@ mod tests {
                 .unwrap(),
             complete
         );
+    }
+
+    #[test]
+    fn rename_results_are_atomic_and_preserve_workspace_operations() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(DeferredResultStore::new()));
+        let changes = vec![crate::bridge::translator::DocumentChanges {
+            uri: "file:///one.rs".to_owned(),
+            version: Some(7),
+            edits: vec![crate::bridge::translator::TextEdit {
+                range: crate::bridge::translator::Range {
+                    start: crate::bridge::translator::Position2D {
+                        line: 1,
+                        character: 1,
+                    },
+                    end: crate::bridge::translator::Position2D {
+                        line: 1,
+                        character: 2,
+                    },
+                },
+                new_text: "λ".repeat(MAX_NOTIFICATION_RESULT_BYTES),
+            }],
+        }];
+        let operations = vec![serde_json::json!({
+            "kind": "create",
+            "uri": "file:///created.rs"
+        })];
+        let mut result = RenameResult {
+            changes,
+            operations,
+            total_files: 0,
+            total_edits: 0,
+            total_operations: 0,
+            returned_files: 0,
+            returned_edits: 0,
+            returned_operations: 0,
+            edit_bytes: 0,
+            edit_digest: String::new(),
+            changes_resource: None,
+            deferred: false,
+        };
+        let complete_changes = serde_json::to_value(&result.changes).unwrap();
+        let complete_operations = serde_json::to_value(&result.operations).unwrap();
+
+        bound_rename_result(&mut result, &shared, "project").unwrap();
+
+        assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_NOTIFICATION_RESULT_BYTES);
+        assert!(result.deferred);
+        assert_eq!(result.total_files, 1);
+        assert_eq!(result.total_edits, 1);
+        assert_eq!(result.total_operations, 1);
+        assert!(result.changes.is_empty());
+        assert!(result.operations.is_empty());
+        let reference = result.changes_resource.as_ref().unwrap();
+        let token = reference.uri.strip_prefix("mcpls-deferred:///").unwrap();
+        let complete = shared
+            .lock()
+            .unwrap()
+            .read_scoped(token, "project")
+            .unwrap();
+        assert_eq!(complete["changes"], complete_changes);
+        assert_eq!(complete["operations"], complete_operations);
     }
 
     #[test]

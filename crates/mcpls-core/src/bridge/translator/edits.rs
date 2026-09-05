@@ -157,6 +157,7 @@ async fn convert_code_action(
                         let text_edits = normalize_text_edits(ctx, &uri, edits).await;
                         result.push(DocumentChanges {
                             uri: uri.to_string(),
+                            version: None,
                             edits: text_edits,
                         });
                     }
@@ -233,8 +234,9 @@ impl Translator {
             .request("textDocument/rename", params, client.request_timeout())
             .await?;
 
-        let changes = if let Some(edit) = response {
+        let (changes, operations) = if let Some(edit) = response {
             let mut result_changes = Vec::new();
+            let mut result_operations = Vec::new();
 
             // Prefer the legacy `changes` map (HashMap<Uri, Vec<TextEdit>>).
             if let Some(changes_map) = edit.changes {
@@ -248,6 +250,7 @@ impl Translator {
                     }
                     result_changes.push(DocumentChanges {
                         uri: uri.to_string(),
+                        version: None,
                         edits: text_edits,
                     });
                 }
@@ -257,13 +260,18 @@ impl Translator {
             if result_changes.is_empty() {
                 let text_doc_edits = match edit.document_changes {
                     Some(lsp_types::DocumentChanges::Edits(edits)) => edits,
-                    Some(lsp_types::DocumentChanges::Operations(ops)) => ops
-                        .into_iter()
-                        .filter_map(|op| match op {
-                            lsp_types::DocumentChangeOperation::Edit(e) => Some(e),
-                            lsp_types::DocumentChangeOperation::Op(_) => None,
-                        })
-                        .collect(),
+                    Some(lsp_types::DocumentChanges::Operations(ops)) => {
+                        result_operations = ops
+                            .iter()
+                            .filter_map(|op| serde_json::to_value(op).ok())
+                            .collect();
+                        ops.into_iter()
+                            .filter_map(|op| match op {
+                                lsp_types::DocumentChangeOperation::Edit(e) => Some(e),
+                                lsp_types::DocumentChangeOperation::Op(_) => None,
+                            })
+                            .collect()
+                    }
                     None => vec![],
                 };
                 for tde in text_doc_edits {
@@ -281,17 +289,31 @@ impl Translator {
                     }
                     result_changes.push(DocumentChanges {
                         uri: edit_uri.to_string(),
+                        version: tde.text_document.version,
                         edits: text_edits,
                     });
                 }
             }
 
-            result_changes
+            (result_changes, result_operations)
         } else {
-            vec![]
+            (vec![], vec![])
         };
 
-        Ok(RenameResult { changes })
+        Ok(RenameResult {
+            changes,
+            operations,
+            total_files: 0,
+            total_edits: 0,
+            total_operations: 0,
+            returned_files: 0,
+            returned_edits: 0,
+            returned_operations: 0,
+            edit_bytes: 0,
+            edit_digest: String::new(),
+            changes_resource: None,
+            deferred: false,
+        })
     }
 
     /// Handle format document request.
