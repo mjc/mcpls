@@ -14162,12 +14162,12 @@ mod tests {
             .map(|index| serde_json::json!({"index": index}))
             .collect::<Vec<_>>();
         let (first, snapshot, next) = code_action_page_bounds(&actions, None).unwrap();
-        assert_eq!(first, 0..8);
+        assert_eq!(first, 0..64);
         let token = next.unwrap();
         let (second, same_snapshot, next) =
             code_action_page_bounds(&actions, Some(&token)).unwrap();
         assert_eq!(same_snapshot, snapshot);
-        assert_eq!(second, 8..16);
+        assert_eq!(second, 64..128);
         let (last, _, next) = code_action_page_bounds(&actions, next.as_deref()).unwrap();
         assert_eq!(last, 128..130);
         assert!(next.is_none());
