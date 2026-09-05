@@ -972,6 +972,87 @@ fn sc_format_document(client: &mut McpClient, workspace: &Path) -> Result<(), St
     Ok(())
 }
 
+/// Format a deliberately oversized file and replay its complete deferred edit set.
+fn sc_format_document_deferred(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let large = workspace.join("src/format_large.rs");
+    let content: String = (0..2_000)
+        .map(|index| format!("pub fn poorly_{index}()->i32{{{index}}}\n"))
+        .collect();
+    fs::write(&large, content).map_err(|error| format!("write large format fixture: {error}"))?;
+    let result = call_json(
+        client,
+        "format_document",
+        &json!({"file_path": large.to_string_lossy()}),
+    )?;
+    if result["deferred"] != true
+        || !result["edits"].as_array().is_some_and(Vec::is_empty)
+        || result["total_edits"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+    {
+        return Err(format!(
+            "large format result was not atomically deferred: {result}"
+        ));
+    }
+    let resource_uri = result["edits_resource"]
+        .as_object()
+        .and_then(|resource| resource["uri"].as_str())
+        .ok_or_else(|| format!("large format result omitted edits_resource: {result}"))?
+        .to_owned();
+
+    let mut uri = resource_uri.clone();
+    let mut fallback_json = String::new();
+    loop {
+        let page = call_json(client, "read_semantic_resource", &json!({"uri": uri}))?;
+        fallback_json.push_str(
+            page["text"]
+                .as_str()
+                .ok_or_else(|| format!("format fallback page omitted text: {page}"))?,
+        );
+        let Some(next) = page["next_uri"].as_str() else {
+            break;
+        };
+        uri = next.to_owned();
+    }
+    let fallback_edits: Value = serde_json::from_str(&fallback_json)
+        .map_err(|error| format!("format fallback resource was not complete JSON: {error}"))?;
+    if fallback_edits.as_array().map_or(0, Vec::len)
+        != result["total_edits"].as_u64().unwrap() as usize
+    {
+        return Err(format!("format fallback omitted edits: {fallback_edits}"));
+    }
+
+    let mut uri = resource_uri;
+    let mut resource_json = String::new();
+    loop {
+        let page = client
+            .read_resource(&uri)
+            .map_err(|error| format!("read format resource: {error}"))?;
+        let text = page["result"]["contents"][0]["text"]
+            .as_str()
+            .ok_or_else(|| format!("format resource page omitted text: {page}"))?;
+        let page_value: Value = serde_json::from_str(text)
+            .map_err(|error| format!("format resource page was not JSON: {error}"))?;
+        resource_json.push_str(
+            page_value["text"]
+                .as_str()
+                .ok_or_else(|| format!("format resource envelope omitted text: {page_value}"))?,
+        );
+        let Some(next) = page_value["next_uri"].as_str() else {
+            break;
+        };
+        uri = next.to_owned();
+    }
+    let resource_edits: Value = serde_json::from_str(&resource_json)
+        .map_err(|error| format!("format resource was not complete JSON: {error}"))?;
+    if resource_edits.as_array().map_or(0, Vec::len)
+        != result["total_edits"].as_u64().unwrap() as usize
+    {
+        return Err(format!("format resource omitted edits: {resource_edits}"));
+    }
+    Ok(())
+}
+
 /// Tool 9: `workspace_symbol_search` — search for "add".
 fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
     // Retry: workspace symbol search may return empty until rust-analyzer
@@ -3293,6 +3374,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_get_completions),
         sub_case!(sc_get_document_symbols),
         sub_case!(sc_format_document),
+        sub_case!(sc_format_document_deferred),
         sub_case!(sc_workspace_symbol_search),
         sub_case!(sc_inspect_symbol),
         sub_case!(sc_no_reread_corpus),
