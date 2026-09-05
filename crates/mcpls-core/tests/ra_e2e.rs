@@ -97,6 +97,7 @@ fn stage_workspace() -> TempDir {
     let lib_path = tmp.path().join("src/lib.rs");
     let mut lib_content = fs::read_to_string(&lib_path).expect("failed to read lib.rs");
     lib_content.push_str("\npub mod broken;\n");
+    lib_content.push_str("\npub mod callers;\n");
     lib_content
         .push_str("\npub mod move_target {\n    pub fn answer() -> u32 {\n        42\n    }\n}\n");
     lib_content.push_str("\npub mod folder_mod;\n");
@@ -138,6 +139,16 @@ mod semantic_discovery_tests {
 ",
     );
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
+    fs::write(
+        tmp.path().join("src/callers.rs"),
+        format!(
+            "pub fn caller_one() -> i32 {{ super::add(1, 2) /* call-context-marker {} */ }}\n\
+             pub fn caller_two() -> i32 {{ super::add(3, 4) }}\n\
+             pub fn caller_three() -> i32 {{ super::add(5, 6) }}\n",
+            "x".repeat(8 * 1024)
+        ),
+    )
+    .expect("failed to write call hierarchy callers");
 
     let folder_module = tmp.path().join("src/folder_mod");
     fs::create_dir(&folder_module).expect("failed to create folder module");
@@ -1387,9 +1398,22 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
     // Retry: callHierarchy/incomingCalls may return empty on first query while
     // rust-analyzer resolves cross-function relationships.
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut page_token = None;
+    let mut seen_edges = std::collections::BTreeSet::new();
+    let mut expected_total_calls = None;
+    let mut expected_total_call_sites = None;
+    let mut deferred_resource = None;
+    let mut pages = 0;
     loop {
         let resp = client
-            .call_tool("get_incoming_calls", &json!({ "item": item }))
+            .call_tool(
+                "get_incoming_calls",
+                &json!({
+                    "item": item,
+                    "limits": { "total": 1, "per_symbol": 1 },
+                    "page_token": page_token
+                }),
+            )
             .map_err(|e| format!("call failed: {e}"))?;
 
         let text = assertions::assert_tool_ok(&resp);
@@ -1400,18 +1424,112 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
             .or_else(|| inner.as_array())
             .ok_or_else(|| format!("expected calls array, got {inner}"))?;
 
-        if !calls.is_empty() {
-            // Verify that `caller` is among the incoming callers.
-            let found = calls.iter().any(|c| {
-                c["from"]["name"].as_str().unwrap_or("").contains("caller")
-                    || c["caller"]["name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("caller")
-            });
-            if !found {
+        let total_calls = inner["total_calls"]
+            .as_u64()
+            .ok_or_else(|| format!("incoming result omitted total_calls: {inner}"))?;
+        let total_call_sites = inner["total_call_sites"]
+            .as_u64()
+            .ok_or_else(|| format!("incoming result omitted total_call_sites: {inner}"))?;
+        if page_token.is_none() && total_calls < 3 {
+            if Instant::now() >= deadline {
                 return Err(format!(
-                    "get_incoming_calls: 'caller' not found in incoming calls: {calls:?}"
+                    "get_incoming_calls: provider graph did not converge to the fixture callers: {inner}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        if expected_total_calls.is_some_and(|previous| previous != total_calls) {
+            return Err(format!(
+                "incoming total_calls changed across pages: {inner}"
+            ));
+        }
+        if expected_total_call_sites.is_some_and(|previous| previous != total_call_sites) {
+            return Err(format!(
+                "incoming total_call_sites changed across pages: {inner}"
+            ));
+        }
+        expected_total_calls = Some(total_calls);
+        expected_total_call_sites = Some(total_call_sites);
+
+        for call in calls {
+            let caller_name = call["from"]["name"]
+                .as_str()
+                .or_else(|| call["caller"]["name"].as_str())
+                .unwrap_or("<unnamed>");
+            for site in call["call_sites"]
+                .as_array()
+                .ok_or_else(|| format!("incoming call omitted call_sites: {call}"))?
+            {
+                let range = &site["range"];
+                let edge = format!(
+                    "{caller_name}:{}:{}:{}",
+                    range["start"]["line"], range["start"]["character"], range["end"]["character"]
+                );
+                if !seen_edges.insert(edge.clone()) {
+                    return Err(format!("duplicate incoming call-site edge: {edge}"));
+                }
+
+                if caller_name.contains("caller_one") {
+                    let source = &site["source"];
+                    let uri = source["resource"]["uri"]
+                        .as_str()
+                        .ok_or_else(|| format!("caller_one source was not deferred: {source}"))?;
+                    let original_hash = source["content_hash"].as_str().ok_or_else(|| {
+                        format!("caller_one source had no content hash: {source}")
+                    })?;
+                    let replay = client
+                        .read_resource(uri)
+                        .map_err(|error| format!("read incoming source resource: {error}"))?;
+                    let replay_text = replay["result"]["contents"][0]["text"]
+                        .as_str()
+                        .ok_or_else(|| format!("malformed incoming source resource: {replay}"))?;
+                    let replay: Value = serde_json::from_str(replay_text)
+                        .map_err(|error| format!("incoming source was not JSON: {error}"))?;
+                    if !replay["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("call-context-marker"))
+                    {
+                        return Err(format!("incoming source omitted marker: {replay}"));
+                    }
+
+                    deferred_resource = Some((uri.to_owned(), original_hash.to_owned()));
+                }
+            }
+        }
+
+        pages += 1;
+        page_token = inner["next_cursor"].as_str().map(str::to_owned);
+        if page_token.is_none() {
+            if seen_edges.len() != total_call_sites as usize || total_calls < 3 || pages < 3 {
+                return Err(format!(
+                    "incoming pages did not reconstruct full graph: pages={pages}, edges={}, result={inner}",
+                    seen_edges.len()
+                ));
+            }
+
+            let (resource_uri, original_hash) = deferred_resource
+                .ok_or_else(|| "incoming pages never returned caller_one resource".to_owned())?;
+            let callers = workspace.join("src/callers.rs");
+            let changed = fs::read_to_string(&callers)
+                .map_err(|error| format!("read callers.rs: {error}"))?
+                .replace("call-context-marker", "call-stale-marker");
+            fs::write(&callers, changed).map_err(|error| format!("rewrite callers.rs: {error}"))?;
+            let stale = client
+                .read_resource(&resource_uri)
+                .map_err(|error| format!("read stale incoming resource: {error}"))?;
+            let stale_text = stale["result"]["contents"][0]["text"]
+                .as_str()
+                .ok_or_else(|| format!("malformed stale incoming resource: {stale}"))?;
+            let stale: Value = serde_json::from_str(stale_text)
+                .map_err(|error| format!("stale incoming resource was not JSON: {error}"))?;
+            if !stale["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("call-stale-marker"))
+                || stale["content_hash"].as_str() == Some(&original_hash)
+            {
+                return Err(format!(
+                    "stale incoming resource did not replay current source: {stale}"
                 ));
             }
             return Ok(());
