@@ -11262,6 +11262,61 @@ while True:
     }
 
     #[tokio::test]
+    async fn server_message_cursor_rejects_a_concurrent_append() {
+        let server = create_test_server_with_project().await;
+        let project_id = ProjectId::new("project").unwrap();
+        let actor = server
+            .context
+            .project_registry
+            .actor(&project_id)
+            .await
+            .unwrap();
+        for index in 0..4 {
+            actor
+                .notify(
+                    0,
+                    crate::config::ServerId::from("rust"),
+                    crate::lsp::LspNotification::parse(
+                        "window/showMessage",
+                        Some(serde_json::json!({"type": 3, "message": format!("before-{index}")})),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let first = server
+            .get_server_messages(Parameters(ServerMessagesParams {
+                project_id: "project".to_owned(),
+                limit: 2,
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        actor
+            .notify(
+                0,
+                crate::config::ServerId::from("rust"),
+                crate::lsp::LspNotification::parse(
+                    "window/showMessage",
+                    Some(serde_json::json!({"type": 3, "message": "after-cursor"})),
+                ),
+            )
+            .await
+            .unwrap();
+        let error = server
+            .get_server_messages(Parameters(ServerMessagesParams {
+                project_id: "project".to_owned(),
+                limit: 2,
+                cursor: Some(cursor),
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different snapshot"));
+    }
+
+    #[tokio::test]
     async fn test_server_logs_tool_with_error_level() {
         let server = create_test_server_with_project().await;
         let params = Parameters(ServerLogsParams {
