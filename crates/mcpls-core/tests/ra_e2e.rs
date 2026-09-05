@@ -1876,6 +1876,9 @@ fn sc_get_signature_help(client: &mut McpClient, workspace: &Path) -> Result<(),
     .expect("column fits u32");
 
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut page_token = None;
+    let mut snapshot_identity = None;
+    let mut signatures_seen = Vec::new();
     loop {
         let resp = client
             .call_tool(
@@ -1884,6 +1887,7 @@ fn sc_get_signature_help(client: &mut McpClient, workspace: &Path) -> Result<(),
                     "file_path": lib.to_string_lossy(),
                     "line": line,
                     "character": character,
+                    "page_token": page_token,
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
@@ -1891,9 +1895,52 @@ fn sc_get_signature_help(client: &mut McpClient, workspace: &Path) -> Result<(),
         let text = assertions::assert_tool_ok(&resp);
         let inner: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
 
-        if let Some(sigs) = inner["signatures"].as_array()
-            && !sigs.is_empty()
+        let Some(sigs) = inner["signatures"].as_array() else {
+            return Err(format!("signature help omitted signatures: {inner}"));
+        };
+        if sigs.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "get_signature_help: no signatures after 10 s; response={inner}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let snapshot = inner["snapshot_identity"]
+            .as_str()
+            .ok_or_else(|| format!("signature help omitted snapshot identity: {inner}"))?;
+        if snapshot_identity.get_or_insert_with(|| snapshot.to_owned()) != snapshot {
+            return Err(format!("signature help changed snapshot identity: {inner}"));
+        }
+        let total = inner["total_signatures"]
+            .as_u64()
+            .ok_or_else(|| format!("signature help omitted total_signatures: {inner}"))?;
+        signatures_seen.extend(sigs.iter().map(|signature| {
+            signature["signature_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        }));
+        if let Some(active) = inner["active_signature"].as_u64()
+            && active >= total
         {
+            return Err(format!("active signature index escaped total: {inner}"));
+        }
+        page_token = inner["next_cursor"].as_str().map(str::to_owned);
+        if page_token.is_none() {
+            if signatures_seen.len() != total as usize
+                || signatures_seen.iter().any(String::is_empty)
+                || signatures_seen
+                    .iter()
+                    .enumerate()
+                    .any(|(index, id)| signatures_seen[..index].contains(id))
+            {
+                return Err(format!(
+                    "signature pages were incomplete or duplicated: seen={}, total={total}, response={inner}",
+                    signatures_seen.len()
+                ));
+            }
             let label = sigs[0]["label"].as_str().unwrap_or("");
             if !label.contains("add") {
                 return Err(format!("signature label missing 'add': {label}"));
