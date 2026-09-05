@@ -869,6 +869,19 @@ fn sc_rename_symbol_deferred(client: &mut McpClient, workspace: &Path) -> Result
             "cross-session rename resource failure was not explicit: {cross_session}"
         ));
     }
+    let missing = client
+        .call_tool(
+            "read_semantic_resource",
+            &json!({
+                "uri": "mcpls-deferred:///00000000-0000-0000-0000-000000000000"
+            }),
+        )
+        .expect_err("missing rename resource must fail closed");
+    if !missing.to_string().contains("stale_resource") {
+        return Err(format!(
+            "missing rename resource failure was not explicit: {missing}"
+        ));
+    }
 
     let mut uri = resource_uri;
     let mut resource_json = String::new();
