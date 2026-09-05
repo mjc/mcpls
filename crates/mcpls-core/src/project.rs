@@ -3688,6 +3688,24 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Forward one language-server notification into this project's actor.
+    #[cfg(test)]
+    pub(crate) async fn notify(
+        &self,
+        generation: u64,
+        server_id: ServerId,
+        notification: LspNotification,
+    ) -> Result<(), ProjectActorError> {
+        self.sender
+            .send(ProjectRequest::Notification {
+                generation,
+                server_id,
+                notification,
+            })
+            .await
+            .map_err(|_| ProjectActorError::Closed)
+    }
+
     /// Return recent logs from this project's language servers.
     ///
     /// # Errors
