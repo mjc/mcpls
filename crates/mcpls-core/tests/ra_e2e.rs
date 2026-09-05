@@ -1785,7 +1785,7 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     let uri = source["resource"]["uri"]
                         .as_str()
                         .ok_or_else(|| format!("caller_one source was not deferred: {source}"))?;
-                    let original_hash = source["content_hash"].as_str().ok_or_else(|| {
+                    source["content_hash"].as_str().ok_or_else(|| {
                         format!("caller_one source had no content hash: {source}")
                     })?;
                     let replay = client
@@ -1798,7 +1798,7 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                         return Err(format!("incoming source omitted marker: {replay_text}"));
                     }
 
-                    deferred_resource = Some((uri.to_owned(), original_hash.to_owned()));
+                    deferred_resource = Some(uri.to_owned());
                 }
             }
         }
@@ -1813,7 +1813,7 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                 ));
             }
 
-            let (resource_uri, original_hash) = deferred_resource
+            let resource_uri = deferred_resource
                 .ok_or_else(|| "incoming pages never returned caller_one resource".to_owned())?;
             let callers = workspace.join("src/callers.rs");
             let changed = fs::read_to_string(&callers)
@@ -1826,15 +1826,11 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
             let stale_text = stale["result"]["contents"][0]["text"]
                 .as_str()
                 .ok_or_else(|| format!("malformed stale incoming resource: {stale}"))?;
-            let stale: Value = serde_json::from_str(stale_text)
-                .map_err(|error| format!("stale incoming resource was not JSON: {error}"))?;
-            if !stale["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("call-stale-marker"))
-                || stale["content_hash"].as_str() == Some(&original_hash)
+            if !stale_text.contains("call-stale-marker")
+                || stale["result"]["contents"][0]["uri"] == resource_uri
             {
                 return Err(format!(
-                    "stale incoming resource did not replay current source: {stale}"
+                    "stale incoming resource did not replay current source: {stale_text}"
                 ));
             }
             return Ok(());
@@ -1940,7 +1936,7 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     let uri = source["resource"]["uri"]
                         .as_str()
                         .ok_or_else(|| format!("outgoing source was not deferred: {source}"))?;
-                    let original_hash = source["content_hash"]
+                    source["content_hash"]
                         .as_str()
                         .ok_or_else(|| format!("outgoing source had no content hash: {source}"))?;
                     let replay = client
@@ -1952,7 +1948,7 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     if !replay_text.contains("call-context-marker") {
                         return Err(format!("outgoing source omitted marker: {replay_text}"));
                     }
-                    deferred_resource = Some((uri.to_owned(), original_hash.to_owned()));
+                    deferred_resource = Some(uri.to_owned());
                 }
             }
         }
@@ -1966,7 +1962,7 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     seen_edges.len()
                 ));
             }
-            let (resource_uri, original_hash) = deferred_resource
+            let resource_uri = deferred_resource
                 .ok_or_else(|| "outgoing pages returned no deferred source".to_owned())?;
             let changed = fs::read_to_string(&callers)
                 .map_err(|error| format!("read callers.rs: {error}"))?
@@ -1978,15 +1974,11 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
             let stale_text = stale["result"]["contents"][0]["text"]
                 .as_str()
                 .ok_or_else(|| format!("malformed stale outgoing resource: {stale}"))?;
-            let stale: Value = serde_json::from_str(stale_text)
-                .map_err(|error| format!("stale outgoing resource was not JSON: {error}"))?;
-            if !stale["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("call-stale-marker"))
-                || stale["content_hash"].as_str() == Some(&original_hash)
+            if !stale_text.contains("call-stale-marker")
+                || stale["result"]["contents"][0]["uri"] == resource_uri
             {
                 return Err(format!(
-                    "stale outgoing resource did not replay current source: {stale}"
+                    "stale outgoing resource did not replay current source: {stale_text}"
                 ));
             }
             return Ok(());
