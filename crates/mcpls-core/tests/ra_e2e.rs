@@ -145,6 +145,10 @@ mod semantic_discovery_tests {
         "\nmacro_rules! huge_semantic {{ () => {{ {{ {huge_macro_statements} 7_u32 }} }} }}\n\
          pub fn huge_semantic_user() -> u32 {{ huge_semantic!() }}\n"
     ));
+    let completion_items: String = (0..80)
+        .map(|index| format!("pub fn ad_item_{index:02}() -> u32 {{ {index} }}\n"))
+        .collect();
+    lib_content.push_str(&completion_items);
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
     fs::write(
         tmp.path().join("src/callers.rs"),
@@ -769,7 +773,7 @@ fn sc_rename_symbol(client: &mut McpClient, workspace: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Tool 6: `get_completions` — completions after `ad` inside `caller`.
+/// Tool 6: `get_completions` — page every `ad*` completion inside `caller`.
 fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let lib = workspace.join("src/lib.rs");
     // Inside caller body: `    add(1, 2)` — column 7 is after 'a','d' (prefix "ad").
@@ -778,6 +782,10 @@ fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), St
 
     // Retry loop: completions may not be available until rust-analyzer is fully ready.
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut page_token = None;
+    let mut labels = std::collections::BTreeSet::new();
+    let mut expected_total = None;
+    let mut pages = 0;
     loop {
         let resp = client
             .call_tool(
@@ -786,6 +794,7 @@ fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), St
                     "file_path": lib.to_string_lossy(),
                     "line": body_line,
                     "character": 7,
+                    "page_token": page_token
                 }),
             )
             .map_err(|e| format!("call failed: {e}"))?;
@@ -798,16 +807,39 @@ fn sc_get_completions(client: &mut McpClient, workspace: &Path) -> Result<(), St
             .or_else(|| inner.as_array())
             .ok_or_else(|| format!("expected completions array, got {inner}"))?;
 
-        let found = items
-            .iter()
-            .any(|i| i["label"].as_str().unwrap_or("").contains("add"));
-        if found {
-            return Ok(());
+        let total = inner["total_items"]
+            .as_u64()
+            .ok_or_else(|| format!("completion result omitted total_items: {inner}"))?;
+        if expected_total.is_some_and(|previous| previous != total) {
+            return Err(format!("completion total changed across pages: {inner}"));
+        }
+        expected_total = Some(total);
+        for item in items {
+            let label = item["label"]
+                .as_str()
+                .ok_or_else(|| format!("completion omitted label: {item}"))?;
+            if !labels.insert(label.to_owned()) {
+                return Err(format!("duplicate completion label across pages: {label}"));
+            }
         }
 
+        pages += 1;
+        page_token = inner["next_cursor"].as_str().map(str::to_owned);
+        if page_token.is_none() {
+            if labels.len() != total as usize || total < 64 || pages < 2 {
+                return Err(format!(
+                    "completion pages did not exhaust provider results: pages={pages}, labels={}, result={inner}",
+                    labels.len()
+                ));
+            }
+            if !labels.contains("add") {
+                return Err(format!("completion pages omitted add: {labels:?}"));
+            }
+            return Ok(());
+        }
         if Instant::now() >= deadline {
             return Err(format!(
-                "get_completions: 'add' not returned after 10 s; items: {items:?}"
+                "get_completions: pages did not exhaust after 10 s; result: {inner}"
             ));
         }
         std::thread::sleep(Duration::from_millis(250));
