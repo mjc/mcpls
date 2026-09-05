@@ -11064,6 +11064,33 @@ while True:
             )
             .await
             .unwrap();
+        for index in 0..80 {
+            actor
+                .notify(
+                    0,
+                    crate::config::ServerId::from("rust"),
+                    crate::lsp::LspNotification::parse(
+                        "window/showMessage",
+                        Some(serde_json::json!({"type": 3, "message": format!("message-{index}")})),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        actor
+            .notify(
+                0,
+                crate::config::ServerId::from("rust"),
+                crate::lsp::LspNotification::parse(
+                    "window/showMessage",
+                    Some(serde_json::json!({
+                        "type": 1,
+                        "message": "oversized message ".repeat(2_000)
+                    })),
+                ),
+            )
+            .await
+            .unwrap();
 
         let mut cursor = None;
         let mut seen = std::collections::BTreeSet::new();
@@ -11119,6 +11146,62 @@ while True:
         };
         let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
         assert!(page.text.contains("oversized log"));
+
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = None;
+        let mut pages = 0;
+        let mut deferred_uri = None;
+        loop {
+            let value = server
+                .get_server_messages(Parameters(ServerMessagesParams {
+                    project_id: "project".to_owned(),
+                    limit: 7,
+                    cursor: cursor.clone(),
+                }))
+                .await
+                .unwrap();
+            let page: Value = serde_json::from_str(&value).unwrap();
+            let messages = page["messages"].as_array().unwrap();
+            let page_total = page["total"].as_u64().unwrap();
+            assert_eq!(total.get_or_insert(page_total), &page_total);
+            for message in messages {
+                assert!(
+                    seen.insert(message.to_string()),
+                    "duplicate message: {message}"
+                );
+                if let Some(uri) = message["message_resource"]["uri"].as_str() {
+                    deferred_uri = Some(uri.to_owned());
+                }
+            }
+            pages += 1;
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                assert_eq!(seen.len(), page_total as usize);
+                assert_eq!(page["remaining"], 0);
+                break;
+            }
+        }
+        assert!(pages > 1);
+        let uri = deferred_uri.expect("oversized message should have a resource");
+        let semantic = server
+            .read_semantic_resource(Parameters(SemanticResourceReadParams { uri: uri.clone() }))
+            .await
+            .unwrap();
+        let semantic: SemanticResourceReadResult = serde_json::from_value(semantic.value).unwrap();
+        assert!(semantic.text.contains("oversized message"));
+        let SessionResource::Deferred(deferred) = parse_session_resource_uri(&uri).unwrap() else {
+            panic!("expected deferred message resource");
+        };
+        let response = server.read_deferred_resource(deferred, uri, false).unwrap();
+        let ReadResourceResponse::Complete(response) = response else {
+            panic!("deferred message resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+            panic!("deferred message resource was not text");
+        };
+        let page: SemanticResourceReadResult = serde_json::from_str(text).unwrap();
+        assert!(page.text.contains("oversized message"));
     }
 
     #[tokio::test]
