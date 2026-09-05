@@ -138,6 +138,13 @@ mod semantic_discovery_tests {
 }
 ",
     );
+    let huge_macro_statements: String = (0..3_000)
+        .map(|index| format!("let _macro_value_{index} = {index};\n"))
+        .collect();
+    lib_content.push_str(&format!(
+        "\nmacro_rules! huge_semantic {{ () => {{ {{ {huge_macro_statements} 7_u32 }} }} }}\n\
+         pub fn huge_semantic_user() -> u32 {{ huge_semantic!() }}\n"
+    ));
     fs::write(&lib_path, lib_content).expect("failed to append pub mod broken");
     fs::write(
         tmp.path().join("src/callers.rs"),
@@ -2576,7 +2583,7 @@ fn sc_semantic_discovery(client: &mut McpClient, workspace: &Path) -> Result<(),
         ));
     }
 
-    let macro_line = find_line(&lib, "semantic_answer!()");
+    let (macro_line, macro_character) = find_position(&lib, "huge_semantic!()");
     let expansion = call_json(
         client,
         "expand_macro",
@@ -2584,15 +2591,48 @@ fn sc_semantic_discovery(client: &mut McpClient, workspace: &Path) -> Result<(),
             "project_id": "default",
             "file_path": lib,
             "line": macro_line,
-            "character": 42,
+            "character": macro_character,
         }),
     )?;
-    if expansion["supported"] != true
-        || !expansion["macro_expansion"]["expansion"]
-            .as_str()
-            .is_some_and(|value| value.contains("7_u32"))
-    {
+    if expansion["supported"] != true || expansion["kind"] != "macro_expansion" {
         return Err(format!("macro expansion was unavailable: {expansion}"));
+    }
+
+    let macro_resource_uri = expansion["macro_expansion_resource"]["uri"]
+        .as_str()
+        .ok_or_else(|| format!("oversized macro expansion was not deferred: {expansion}"))?;
+    let mut resource_uri = macro_resource_uri.to_owned();
+    let mut expansion_text = String::new();
+    let mut resource_pages = 0;
+    loop {
+        let resource = client
+            .read_resource(&resource_uri)
+            .map_err(|error| format!("read macro expansion resource failed: {error}"))?;
+        let resource_text = resource["result"]["contents"][0]["text"]
+            .as_str()
+            .ok_or_else(|| format!("malformed macro expansion resource: {resource}"))?;
+        let replay: Value = serde_json::from_str(resource_text)
+            .map_err(|error| format!("macro expansion resource was not JSON: {error}"))?;
+        expansion_text.push_str(
+            replay["text"]
+                .as_str()
+                .ok_or_else(|| format!("macro expansion page omitted text: {replay}"))?,
+        );
+        resource_pages += 1;
+        if let Some(next_uri) = replay["next_uri"].as_str() {
+            resource_uri = next_uri.to_owned();
+        } else {
+            break;
+        }
+        if resource_pages > 64 {
+            return Err("macro expansion resource did not exhaust within 64 pages".to_owned());
+        }
+    }
+    if resource_pages < 2 || !expansion_text.contains("7_u32") {
+        return Err(format!(
+            "macro expansion resource omitted complete expansion: pages={resource_pages}, tail_present={}",
+            expansion_text.contains("7_u32")
+        ));
     }
 
     let selection_line = find_line(&lib, "let nested = (");
