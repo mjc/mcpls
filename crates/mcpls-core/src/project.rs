@@ -7843,9 +7843,7 @@ impl ProjectRuntime {
                 let (path, document_version, content_hash, source) =
                     match self.translator.source_snapshot(&path).await {
                         Ok(snapshot) => snapshot,
-                        Err(crate::error::Error::Io(error))
-                            if error.kind() == std::io::ErrorKind::InvalidData =>
-                        {
+                        Err(error) if is_invalid_utf8_error(&error) => {
                             continue;
                         }
                         Err(error) => return Err(error.to_string()),
@@ -7993,9 +7991,7 @@ impl ProjectRuntime {
             let (path, document_version, content_hash, source) =
                 match self.translator.source_snapshot(&path).await {
                     Ok(snapshot) => snapshot,
-                    Err(crate::error::Error::Io(error))
-                        if error.kind() == std::io::ErrorKind::InvalidData =>
-                    {
+                    Err(error) if is_invalid_utf8_error(&error) => {
                         continue;
                     }
                     Err(error) => return Err(error.to_string()),
@@ -13586,6 +13582,15 @@ async fn load_persisted_state(
         .map_err(ProjectRegistryError::from)
 }
 
+fn is_invalid_utf8_error(error: &crate::error::Error) -> bool {
+    let source = match error {
+        crate::error::Error::Io(source) => source,
+        crate::error::Error::FileIo { source, .. } => source,
+        _ => return false,
+    };
+    source.kind() == std::io::ErrorKind::InvalidData
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -13632,6 +13637,21 @@ mod tests {
         assert_eq!(scan.total_matches, 2);
         assert_eq!(scan.scanned_files, 2);
         assert_eq!(scan.matches[0].project_relative_path, "source.rs");
+    }
+
+    #[test]
+    fn invalid_utf8_file_errors_are_skipped_through_both_error_wrappers() {
+        let source = std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8");
+        assert!(is_invalid_utf8_error(&crate::error::Error::Io(source)));
+
+        let source = std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8");
+        assert!(is_invalid_utf8_error(&crate::error::Error::FileIo {
+            path: "binary.dat".into(),
+            source,
+        }));
+
+        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!is_invalid_utf8_error(&crate::error::Error::Io(source)));
     }
 
     #[tokio::test]
