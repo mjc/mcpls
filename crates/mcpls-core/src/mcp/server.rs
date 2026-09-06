@@ -1680,6 +1680,8 @@ const LEGACY_COMPATIBILITY_TOOLS: &[&str] = &[
     "range_format_preview",
 ];
 const DEFAULT_TOOL_PAGE: &[&str] = &[
+    "project_add",
+    "project_activate",
     "workspace_symbol_search",
     "inspect_symbol",
     "get_diagnostics",
@@ -1689,8 +1691,8 @@ const DEFAULT_TOOL_PAGE: &[&str] = &[
     "structural_replace_preview",
     "workspace_edit_preview",
     "workspace_edit_apply",
-    "code_action_apply",
     "project_list",
+    "code_action_apply",
 ];
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -7171,6 +7173,8 @@ finally:
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
             [
+                "project_add",
+                "project_activate",
                 "workspace_symbol_search",
                 "inspect_symbol",
                 "get_diagnostics",
@@ -7180,9 +7184,7 @@ finally:
                 "structural_replace_preview",
                 "workspace_edit_preview",
                 "workspace_edit_apply",
-                "code_action_apply",
                 "project_list",
-                "code_action_list",
             ]
         );
         assert!(
