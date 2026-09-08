@@ -7,6 +7,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+#[allow(clippy::wildcard_imports)]
+use super::{actor::*, identity::*, registry::*, runtime::*, state::*};
 
 #[tokio::test]
 async fn lexical_search_skips_non_utf8_files() {

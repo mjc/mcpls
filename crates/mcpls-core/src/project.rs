@@ -89,6 +89,7 @@ pub use registry::{
 };
 pub(crate) use runtime::lexical_page_cursor;
 pub use runtime::{AppliedEditPlan, ApplyEditPlanOutcome, EditConflict, EditNotReady};
+#[allow(unused_imports)]
 pub(crate) use runtime::{
     DeferredResourcePayload, GeneratedEditPreview, GeneratedEditRequest, PathRenamePreview,
     PathRenameRequest, ResolvedSymbolTarget, StructuralDialect, StructuralMatchedFile,
@@ -98,14 +99,3 @@ pub use state::{
     ProjectDormancy, ProjectDormancyReason, ProjectEvent, ProjectEventHistory, ProjectEventRecord,
     ProjectEventSnapshot, ProjectRuntimeSummary, ProjectState, ProjectStatus,
 };
-
-#[allow(clippy::wildcard_imports)]
-use actor::*;
-#[allow(clippy::wildcard_imports)]
-use identity::*;
-#[allow(clippy::wildcard_imports)]
-use registry::*;
-#[allow(clippy::wildcard_imports)]
-use runtime::*;
-#[allow(clippy::wildcard_imports)]
-use state::*;

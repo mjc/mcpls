@@ -2,6 +2,8 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+#[allow(clippy::wildcard_imports)]
+use super::{actor::*, identity::*, registry::*, state::*};
 
 /// Result of consuming and applying one project-owned edit plan.
 #[derive(Clone, Debug, PartialEq, Eq)]

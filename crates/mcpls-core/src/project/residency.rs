@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
-use super::{ProjectDormancy, ProjectDormancyReason, ProjectRequest};
+use super::{
+    actor::ProjectRequest,
+    state::{ProjectDormancy, ProjectDormancyReason},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct RustGroupId(pub(super) u64);

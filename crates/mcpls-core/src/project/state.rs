@@ -2,6 +2,8 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+#[allow(clippy::wildcard_imports)]
+use super::{identity::*, runtime::*};
 
 /// Observable lifecycle state for one project actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

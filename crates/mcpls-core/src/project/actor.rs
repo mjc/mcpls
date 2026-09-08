@@ -2,6 +2,8 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+#[allow(clippy::wildcard_imports)]
+use super::{identity::*, registry::*, runtime::*, state::*};
 
 /// Errors returned when a project actor cannot service a request.
 #[derive(Debug, thiserror::Error)]
