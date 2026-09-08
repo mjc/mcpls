@@ -2337,31 +2337,90 @@ impl ProjectRegistry {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(ProjectId, ProjectHandle), ProjectRegistryError> {
-        let canonical = canonicalize(path.as_ref())?;
+        let candidates = self.path_candidates(path.as_ref()).await?;
         self.projects
             .read()
             .await
             .values()
-            .filter_map(|project| {
-                project
-                    .identity
-                    .roots()
-                    .iter()
-                    .filter(|root| canonical.starts_with(root.as_path()))
-                    .max_by_key(|root| root.as_path().components().count())
-                    .and_then(|root| {
-                        project.actor_for_root(root.as_path()).map(|actor| {
-                            (
-                                root.as_path().components().count(),
-                                project.identity.id().clone(),
-                                actor.actor.clone(),
-                            )
+            .flat_map(|project| {
+                candidates.iter().filter_map(|canonical| {
+                    project
+                        .identity
+                        .roots()
+                        .iter()
+                        .filter(|root| canonical.starts_with(root.as_path()))
+                        .max_by_key(|root| root.as_path().components().count())
+                        .and_then(|root| {
+                            project.actor_for_root(root.as_path()).map(|actor| {
+                                (
+                                    root.as_path().components().count(),
+                                    project.identity.id().clone(),
+                                    actor.actor.clone(),
+                                )
+                            })
                         })
-                    })
+                })
             })
             .max_by_key(|(components, _, _)| *components)
             .map(|(_, project_id, actor)| (project_id, actor))
-            .ok_or_else(|| ProjectIdentityError::UnregisteredPath(canonical).into())
+            .ok_or_else(|| ProjectIdentityError::UnregisteredPath(candidates[0].clone()).into())
+    }
+
+    /// Resolve a project-relative or absolute path to its canonical registered path.
+    ///
+    /// Relative paths are checked against every registered root so source paths
+    /// returned by project-scoped tools can be passed directly to path-based tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error when the path cannot be canonicalized or is not
+    /// contained by a registered project root.
+    pub async fn canonical_registered_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<PathBuf, ProjectRegistryError> {
+        let candidates = self.path_candidates(path.as_ref()).await?;
+        let projects = self.projects.read().await;
+        candidates
+            .iter()
+            .find(|canonical| {
+                projects.values().any(|project| {
+                    project
+                        .identity
+                        .roots()
+                        .iter()
+                        .any(|root| canonical.starts_with(root.as_path()))
+                })
+            })
+            .cloned()
+            .ok_or_else(|| ProjectIdentityError::UnregisteredPath(candidates[0].clone()).into())
+    }
+
+    async fn path_candidates(
+        &self,
+        requested: &Path,
+    ) -> Result<Vec<PathBuf>, ProjectRegistryError> {
+        let mut candidates = canonicalize(requested).ok().into_iter().collect::<Vec<_>>();
+        if requested.is_relative() {
+            let roots = self
+                .projects
+                .read()
+                .await
+                .values()
+                .flat_map(|project| project.identity.roots().iter())
+                .map(|root| root.as_path().to_owned())
+                .collect::<Vec<_>>();
+            candidates.extend(
+                roots
+                    .iter()
+                    .filter_map(|root| canonicalize(&root.join(requested)).ok()),
+            );
+        }
+        if candidates.is_empty() {
+            let canonical = canonicalize(requested)?;
+            return Err(ProjectIdentityError::UnregisteredPath(canonical).into());
+        }
+        Ok(candidates)
     }
 
     /// Resolve a registered project ID to its actor without holding the registry lock.

@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::bridge::ResourceSubscriptions;
 use crate::edit_plan::PlanId;
 use crate::mcp::session::SessionEventSink;
-use crate::project::{ProjectHandle, ProjectRegistry, ProjectRegistryError};
+use crate::project::{ProjectHandle, ProjectId, ProjectRegistry, ProjectRegistryError};
 use crate::transport::{self, SessionManagerHandle, TransportSnapshot};
 
 pub(super) const APPROVAL_INPUT_ID: &str = "approval";
@@ -332,6 +332,46 @@ impl HandlerContext {
         Ok(actor)
     }
 
+    /// Resolve either a registered project ID or one of its registered roots.
+    ///
+    /// Clients commonly copy a project root from a source result into a later
+    /// project-scoped call. Accept that form as an alias without registering a
+    /// second project or changing the stable project identity.
+    pub(crate) async fn resolve_project_selector(
+        &self,
+        selector: &str,
+    ) -> Result<ProjectId, ProjectRegistryError> {
+        if let Ok(id) = ProjectId::new(selector.to_owned()) {
+            if self.project_registry.actor_for_project(&id).await.is_ok() {
+                return Ok(id);
+            }
+            if !looks_like_path(selector) {
+                return Err(ProjectRegistryError::ProjectNotFound(id));
+            }
+        }
+        self.project_registry
+            .project_for_path(selector)
+            .await
+            .map(|(id, _)| id)
+    }
+
+    /// Return the active actor selected by a stable ID or registered root.
+    pub(crate) async fn required_actor_for_project_selector(
+        &self,
+        selector: &str,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        if let Ok(id) = ProjectId::new(selector.to_owned()) {
+            match self.required_actor_for_project(&id).await {
+                Ok(actor) => return Ok(actor),
+                Err(_) if !looks_like_path(selector) => {
+                    return Err(ProjectRegistryError::ProjectNotFound(id));
+                }
+                Err(_) => {}
+            }
+        }
+        self.required_actor_for_path(selector).await
+    }
+
     /// Return the owning project identity and actor for a path.
     pub async fn required_project_for_path(
         &self,
@@ -339,6 +379,15 @@ impl HandlerContext {
     ) -> Result<(crate::project::ProjectId, ProjectHandle), ProjectRegistryError> {
         self.project_registry.project_for_path(path).await
     }
+}
+
+fn looks_like_path(selector: &str) -> bool {
+    let path = std::path::Path::new(selector);
+    path.is_absolute()
+        || selector.contains('/')
+        || selector.contains('\\')
+        || selector == "."
+        || selector == ".."
 }
 
 #[cfg(test)]

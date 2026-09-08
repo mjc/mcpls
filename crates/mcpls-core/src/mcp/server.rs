@@ -4059,6 +4059,14 @@ impl McplsServer {
             options,
         }): Parameters<DiagnosticsParams>,
     ) -> Result<Json<crate::bridge::DiagnosticsResult>, McpError> {
+        let file_path = self
+            .context
+            .project_registry
+            .canonical_registered_path(&file_path)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+            .display()
+            .to_string();
         let actor = self
             .context
             .required_actor_for_path(&file_path)
@@ -4246,10 +4254,9 @@ impl McplsServer {
                 None,
             ));
         }
-        let id = parse_project_id(params.project_id)?;
         let actor = self
             .context
-            .required_actor_for_project(&id)
+            .required_actor_for_project_selector(&params.project_id)
             .await
             .map_err(project_routing_error)?;
         let result = actor
@@ -4275,10 +4282,9 @@ impl McplsServer {
         params: WorkspaceSymbolBatchParams,
     ) -> Result<crate::bridge::WorkspaceSymbolBatchResult, String> {
         validate_workspace_symbol_batch(&params).map_err(|error| error.to_string())?;
-        let id = parse_project_id(params.project_id).map_err(|error| error.to_string())?;
         let actor = self
             .context
-            .required_actor_for_project(&id)
+            .required_actor_for_project_selector(&params.project_id)
             .await
             .map_err(project_routing_error)
             .map_err(|error| error.to_string())?;
@@ -4346,11 +4352,9 @@ impl McplsServer {
         validate_path_globs(&params.include_paths, &params.exclude_paths)
             .map_err(|error| McpError::invalid_params(error, None))?;
         let limit = params.max_matches;
-        let id = parse_project_id(params.project_id)?;
         let actor = self
             .context
-            .project_registry
-            .actor_for_project(&id)
+            .required_actor_for_project_selector(&params.project_id)
             .await
             .map_err(project_routing_error)?;
         let max_bytes = effective_lexical_page_bytes(params.max_bytes);
@@ -4481,7 +4485,11 @@ impl McplsServer {
                 None,
             ));
         }
-        let id = parse_project_id(params.project_id)?;
+        let id = self
+            .context
+            .resolve_project_selector(&params.project_id)
+            .await
+            .map_err(project_operation_error)?;
         let actor = self
             .context
             .project_registry
@@ -4510,7 +4518,12 @@ impl McplsServer {
         params: InspectSymbolBatchParams,
     ) -> Result<crate::bridge::InspectSymbolBatchResult, String> {
         validate_inspect_symbol_batch(&params).map_err(|error| error.to_string())?;
-        let id = parse_project_id(params.project_id).map_err(|error| error.to_string())?;
+        let id = self
+            .context
+            .resolve_project_selector(&params.project_id)
+            .await
+            .map_err(project_operation_error)
+            .map_err(|error| error.to_string())?;
         let actor = self
             .context
             .project_registry
@@ -6879,7 +6892,7 @@ finally:
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
         assert_eq!(status["actor_groups"].as_array().unwrap().len(), 1);
-        assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
         assert!(file.exists());
     }
 
@@ -6918,6 +6931,25 @@ finally:
             .expect("first semantic request should wait for rust-analyzer readiness");
         let result: serde_json::Value = serde_json::from_str(&result).unwrap();
 
+        assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+        let result = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: root.path().display().to_string(),
+                query: Some("fixture".to_string()),
+                queries: Vec::new(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
+                limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .expect("a registered root should select its stable project actor");
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
         assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
     }
@@ -11456,6 +11488,18 @@ while True:
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["diagnostics"], serde_json::json!([]));
         assert_eq!(response["cache"]["hit"], false);
+
+        let relative = server
+            .get_diagnostics(Parameters(DiagnosticsParams {
+                file_path: "src.rs".to_owned(),
+                mode: DiagnosticsMode::CacheOnly,
+                fresh: None,
+                options: DiagnosticOptions::default(),
+            }))
+            .await
+            .expect("a project-relative path should resolve against a registered root");
+        let relative: serde_json::Value = serde_json::from_str(&relative).unwrap();
+        assert_eq!(relative["diagnostics"], serde_json::json!([]));
     }
 
     #[tokio::test]
