@@ -2121,6 +2121,41 @@ impl McplsServer {
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?,
             );
         }
+        if serde_json::to_vec(&value)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len()
+            > MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+        {
+            let details_resource = self
+                .context
+                .project_registry
+                .store_deferred_resource(project_id, "project_state_details", value.clone())
+                .map_err(|error| McpError::internal_error(error, None))?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("actor_groups".to_owned(), serde_json::json!([]));
+                object.insert(
+                    "configured_language_servers".to_owned(),
+                    serde_json::json!([]),
+                );
+                object.insert("active_language_servers".to_owned(), serde_json::json!([]));
+                object.insert("cargo_features".to_owned(), serde_json::Value::Null);
+                if object
+                    .get("last_error")
+                    .is_some_and(serde_json::Value::is_string)
+                {
+                    object.insert(
+                        "last_error".to_owned(),
+                        serde_json::json!("error detail deferred to state_detail_resource"),
+                    );
+                }
+                object.insert("details_truncated".to_owned(), serde_json::json!(true));
+                object.insert(
+                    "state_detail_resource".to_owned(),
+                    serde_json::to_value(details_resource)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))?,
+                );
+            }
+        }
         encode_json(&value)
     }
 
