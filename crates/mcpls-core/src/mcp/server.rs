@@ -2040,6 +2040,28 @@ fn project_list_page(
     Ok((start..end, next_cursor))
 }
 
+fn bounded_project_summary_page<F>(
+    start: usize,
+    initial_end: usize,
+    build: F,
+) -> Result<std::ops::Range<usize>, usize>
+where
+    F: Fn(std::ops::Range<usize>) -> serde_json::Value,
+{
+    let mut end = initial_end;
+    loop {
+        let page = build(start..end);
+        let encoded_bytes = serde_json::to_vec(&page).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_bytes <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+            return Ok(start..end);
+        }
+        if end.saturating_sub(start) <= 1 {
+            return Err(encoded_bytes);
+        }
+        end -= 1;
+    }
+}
+
 /// MCP server that exposes LSP capabilities as tools.
 pub struct McplsServer {
     context: Arc<HandlerContext>,
@@ -3138,17 +3160,43 @@ impl McplsServer {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&summaries).unwrap_or_default())
         );
-        let (page, next_cursor) = project_list_page(
+        let (initial_page, _) = project_list_page(
             snapshot.project_summaries.len(),
             cursor.as_deref(),
             &snapshot_identity,
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
-        let start = page.start;
-        let end = page.end;
-        let summaries = summaries
-            .as_array()
-            .map_or_else(Vec::new, |summaries| summaries[page].to_vec());
+        let summary_values = summaries.as_array().cloned().unwrap_or_default();
+        let page = bounded_project_summary_page(initial_page.start, initial_page.end, |range| {
+            let next_cursor = (range.end < summary_values.len())
+                .then(|| format!("{snapshot_identity}:{}", range.end));
+            serde_json::json!({
+                "schema_version": 1,
+                "status": health_status(&snapshot).as_str(),
+                "lifecycle": snapshot.lifecycle(),
+                "persistence": snapshot.persistence.clone(),
+                "transport": snapshot.transport.clone(),
+                "session_count": snapshot.session_count,
+                "queue_pressure": project_queue_pressure_json(snapshot.queue_pressure),
+                "projects": project_status_counts_json(snapshot.project_counts),
+                "actor_groups": snapshot.actor_groups,
+                "project_summaries": summary_values[range.clone()].to_vec(),
+                "project_summaries_returned": range.end.saturating_sub(range.start),
+                "project_summaries_total": snapshot.project_summaries.len(),
+                "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(range.end),
+                "project_summaries_snapshot_identity": snapshot_identity,
+                "project_summaries_next_cursor": next_cursor,
+            })
+        })
+        .map_err(|encoded_bytes| {
+            McpError::internal_error(
+                format!("one project summary still exceeds the response budget ({encoded_bytes} bytes)"),
+                None,
+            )
+        })?;
+        let next_cursor =
+            (page.end < summary_values.len()).then(|| format!("{snapshot_identity}:{}", page.end));
+        let summaries = summary_values[page.clone()].to_vec();
         encode_json(&serde_json::json!({
             "schema_version": 1,
             "status": health_status(&snapshot).as_str(),
@@ -3160,9 +3208,9 @@ impl McplsServer {
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": summaries,
-            "project_summaries_returned": end.saturating_sub(start),
+            "project_summaries_returned": page.end.saturating_sub(page.start),
             "project_summaries_total": snapshot.project_summaries.len(),
-            "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(end),
+            "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(page.end),
             "project_summaries_snapshot_identity": snapshot_identity,
             "project_summaries_next_cursor": next_cursor,
         }))
@@ -3180,17 +3228,44 @@ impl McplsServer {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&summaries).unwrap_or_default())
         );
-        let (page, next_cursor) = project_list_page(
+        let (initial_page, _) = project_list_page(
             snapshot.project_summaries.len(),
             cursor.as_deref(),
             &snapshot_identity,
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
-        let start = page.start;
-        let end = page.end;
-        let summaries = summaries
-            .as_array()
-            .map_or_else(Vec::new, |summaries| summaries[page].to_vec());
+        let summary_values = summaries.as_array().cloned().unwrap_or_default();
+        let page = bounded_project_summary_page(initial_page.start, initial_page.end, |range| {
+            let next_cursor = (range.end < summary_values.len())
+                .then(|| format!("{snapshot_identity}:{}", range.end));
+            serde_json::json!({
+                "schema_version": 1,
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_seconds": self.context.started_at.elapsed().as_secs(),
+                "lifecycle": snapshot.lifecycle(),
+                "persistence": snapshot.persistence.clone(),
+                "transport": snapshot.transport.clone(),
+                "session_count": snapshot.session_count,
+                "queue_pressure": project_queue_pressure_json(snapshot.queue_pressure),
+                "projects": project_status_counts_json(snapshot.project_counts),
+                "actor_groups": snapshot.actor_groups,
+                "project_summaries": summary_values[range.clone()].to_vec(),
+                "project_summaries_returned": range.end.saturating_sub(range.start),
+                "project_summaries_total": snapshot.project_summaries.len(),
+                "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(range.end),
+                "project_summaries_snapshot_identity": snapshot_identity,
+                "project_summaries_next_cursor": next_cursor,
+            })
+        })
+        .map_err(|encoded_bytes| {
+            McpError::internal_error(
+                format!("one project summary still exceeds the response budget ({encoded_bytes} bytes)"),
+                None,
+            )
+        })?;
+        let next_cursor =
+            (page.end < summary_values.len()).then(|| format!("{snapshot_identity}:{}", page.end));
+        let summaries = summary_values[page.clone()].to_vec();
         encode_json(&serde_json::json!({
             "schema_version": 1,
             "version": env!("CARGO_PKG_VERSION"),
@@ -3203,9 +3278,9 @@ impl McplsServer {
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
             "project_summaries": summaries,
-            "project_summaries_returned": end.saturating_sub(start),
+            "project_summaries_returned": page.end.saturating_sub(page.start),
             "project_summaries_total": snapshot.project_summaries.len(),
-            "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(end),
+            "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(page.end),
             "project_summaries_snapshot_identity": snapshot_identity,
             "project_summaries_next_cursor": next_cursor,
         }))
@@ -8488,6 +8563,36 @@ finally:
         assert_eq!(page.returned + page.remaining, page.total);
         let expected_cursor = format!("{snapshot_identity}:{end}");
         assert_eq!(page.next_cursor.as_deref(), Some(expected_cursor.as_str()));
+    }
+
+    #[test]
+    fn project_summary_pages_fit_the_response_budget() {
+        let summaries = (0..32)
+            .map(|index| {
+                serde_json::json!({
+                    "project_id": format!("project-{index}"),
+                    "roots": ["x".repeat(1_000)],
+                })
+            })
+            .collect::<Vec<_>>();
+        let page = bounded_project_summary_page(0, summaries.len(), |range| {
+            serde_json::json!({
+                "project_summaries": summaries[range.clone()].to_vec(),
+                "project_summaries_returned": range.end - range.start,
+                "project_summaries_total": summaries.len(),
+                "project_summaries_remaining": summaries.len() - range.end,
+            })
+        })
+        .unwrap();
+        assert!(page.end < summaries.len());
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "project_summaries": summaries[page.clone()].to_vec(),
+            "project_summaries_returned": page.end - page.start,
+            "project_summaries_total": summaries.len(),
+            "project_summaries_remaining": summaries.len() - page.end,
+        }))
+        .unwrap();
+        assert!(encoded.len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
     }
 
     #[tokio::test]
