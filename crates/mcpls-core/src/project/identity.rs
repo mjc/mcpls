@@ -1,5 +1,7 @@
 //! Project identity and canonical path routing.
 
+#![allow(clippy::redundant_pub_crate)]
+
 #[allow(clippy::wildcard_imports)]
 use super::*;
 

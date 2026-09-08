@@ -1,5 +1,7 @@
 //! Project actor protocol, handles, dispatch, and lifecycle transitions.
 
+#![allow(clippy::redundant_pub_crate)]
+
 #[allow(clippy::wildcard_imports)]
 use super::*;
 #[allow(clippy::wildcard_imports)]

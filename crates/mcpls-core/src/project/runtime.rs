@@ -1,5 +1,7 @@
 //! Project-owned translator, edit, result, and pagination runtime.
 
+#![allow(clippy::redundant_pub_crate)]
+
 #[allow(clippy::wildcard_imports)]
 use super::*;
 #[allow(clippy::wildcard_imports)]
