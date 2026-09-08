@@ -241,7 +241,7 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
             latencies.push(*latency_ms);
         }
         TraceEvent::SourceRead { output_bytes, .. } => {
-            report.source_read_output_bytes += output_bytes
+            report.source_read_output_bytes += output_bytes;
         }
         TraceEvent::ShellOutput { bytes } => report.shell_output_bytes += bytes,
         TraceEvent::Compaction => report.compactions += 1,
@@ -351,10 +351,17 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
 
 pub fn parse_history(reader: impl BufRead) -> Result<Vec<TraceEvent>> {
     let mut events = Vec::new();
+    let mut pending_codex_mcp_calls = BTreeMap::new();
     for line in reader.lines() {
         let line = line?;
         let event: Value = serde_json::from_str(&line).context("parsing history JSONL")?;
-        if let Some(semantic) = semantic_history_event(&event) {
+        if let Some((call_id, call)) = codex_mcp_call(&event) {
+            pending_codex_mcp_calls.insert(call_id, call);
+        } else if let Some((call_id, result)) = codex_mcp_result(&event) {
+            if let Some(call) = pending_codex_mcp_calls.remove(&call_id) {
+                events.push(mcp_trace_event(&call.tool, &call.arguments, &result, 0));
+            }
+        } else if let Some(semantic) = semantic_history_event(&event) {
             events.push(semantic);
         } else if let Some(call) = other_mcpls_history_event(&event) {
             events.push(call);
@@ -369,6 +376,198 @@ pub fn parse_history(reader: impl BufRead) -> Result<Vec<TraceEvent>> {
     Ok(events)
 }
 
+struct PendingCodexMcpCall {
+    tool: String,
+    arguments: Value,
+}
+
+fn codex_mcp_call(event: &Value) -> Option<(String, PendingCodexMcpCall)> {
+    let payload = event.get("payload")?;
+    if event.get("type")?.as_str()? != "response_item"
+        || payload.get("type")?.as_str()? != "custom_tool_call"
+        || payload.get("name")?.as_str()? != "exec"
+    {
+        return None;
+    }
+    let input = payload.get("input")?.as_str()?;
+    let marker = "tools.mcp__mcpls__";
+    let start = input.find(marker)? + marker.len();
+    let tool_end = input[start..].find('(')? + start;
+    let tool = &input[start..tool_end];
+    let arguments_start = input[tool_end..].find('{')? + tool_end;
+    let arguments_end = balanced_json_object_end(&input[arguments_start..])? + arguments_start;
+    let arguments = parse_codex_object_literal(&input[arguments_start..=arguments_end])?;
+    Some((
+        payload.get("call_id")?.as_str()?.to_owned(),
+        PendingCodexMcpCall {
+            tool: tool.to_owned(),
+            arguments,
+        },
+    ))
+}
+
+fn parse_codex_object_literal(input: &str) -> Option<Value> {
+    let mut json = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < input.len() {
+        let character = input[index..].chars().next()?;
+        if in_string {
+            json.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            index += character.len_utf8();
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            json.push(character);
+            index += 1;
+            continue;
+        }
+        if character.is_ascii_alphabetic() || character == '_' {
+            let key_start = index;
+            let mut key_end = index + character.len_utf8();
+            while key_end < input.len() {
+                let next = input[key_end..].chars().next()?;
+                if next.is_ascii_alphanumeric() || next == '_' {
+                    key_end += next.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let previous = input[..key_start]
+                .chars()
+                .rev()
+                .find(|c| !c.is_whitespace());
+            let next = input[key_end..].chars().find(|c| !c.is_whitespace());
+            if matches!(previous, Some('{' | ',')) && next == Some(':') {
+                json.push('"');
+                json.push_str(&input[key_start..key_end]);
+                json.push('"');
+                index = key_end;
+                continue;
+            }
+        }
+        json.push(character);
+        index += character.len_utf8();
+    }
+    serde_json::from_str(&json).ok()
+}
+
+fn codex_mcp_result(event: &Value) -> Option<(String, Value)> {
+    let payload = event.get("payload")?;
+    if event.get("type")?.as_str()? != "response_item"
+        || payload.get("type")?.as_str()? != "custom_tool_call_output"
+    {
+        return None;
+    }
+    let output = payload.get("output")?.as_array()?;
+    let text = output
+        .iter()
+        .rev()
+        .find_map(|item| item.get("text").and_then(Value::as_str))?;
+    let result = serde_json::from_str(text).ok()?;
+    Some((payload.get("call_id")?.as_str()?.to_owned(), result))
+}
+
+fn balanced_json_object_end(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut in_string = false;
+    for (index, character) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn mcp_trace_event(tool: &str, arguments: &Value, result: &Value, latency_ms: u64) -> TraceEvent {
+    if is_semantic_tool(tool) {
+        let source_path = find_path(arguments)
+            .or_else(|| find_path(result))
+            .map(|path| scrub_path(&path));
+        let error = mcp_result_is_error(result);
+        return TraceEvent::Semantic {
+            tool: tool.to_owned(),
+            source_path,
+            coordinate_input: arguments.get("line").is_some()
+                && arguments.get("symbol_handle").is_none(),
+            request_bytes: serialized_len(arguments),
+            result_bytes: serialized_len(result),
+            query_fingerprint: Some(query_fingerprint(tool, arguments)),
+            deferred_bytes: deferred_bytes(result),
+            truncated: contains_true(result, "truncated"),
+            latency_ms,
+            unsupported: error
+                && result
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("unsupported"),
+            error,
+        };
+    }
+
+    let request_bytes = serialized_len(arguments);
+    let result_bytes = serialized_len(result);
+    if is_lifecycle_tool(tool) {
+        return TraceEvent::Lifecycle {
+            tool: tool.to_owned(),
+            request_bytes,
+            result_bytes,
+            latency_ms,
+        };
+    }
+    if tool == "read_semantic_resource" {
+        return TraceEvent::ResourceRead {
+            deferred: arguments
+                .get("uri")
+                .and_then(Value::as_str)
+                .is_some_and(|uri| uri.starts_with("mcpls-deferred://")),
+            request_bytes,
+            result_bytes,
+            latency_ms,
+        };
+    }
+    TraceEvent::McpTool {
+        tool: tool.to_owned(),
+        request_bytes,
+        result_bytes,
+        latency_ms,
+    }
+}
+
+fn mcp_result_is_error(result: &Value) -> bool {
+    result.get("Err").is_some()
+        || result.get("isError").and_then(Value::as_bool) == Some(true)
+        || result.get("error").is_some_and(|error| !error.is_null())
+}
+
 fn semantic_history_event(event: &Value) -> Option<TraceEvent> {
     let payload = event.get("payload")?;
     let invocation = (event.get("type")?.as_str()? == "event_msg"
@@ -381,42 +580,12 @@ fn semantic_history_event(event: &Value) -> Option<TraceEvent> {
     if !is_semantic_tool(tool) {
         return None;
     }
-    let arguments = invocation.get("arguments").unwrap_or(&Value::Null);
-    let result = payload.get("result").unwrap_or(&Value::Null);
-    let source_path = find_path(arguments)
-        .or_else(|| find_path(result))
-        .map(|path| scrub_path(&path));
-    let duration = payload.get("duration").unwrap_or(&Value::Null);
-    let latency_ms = duration
-        .get("secs")
-        .and_then(Value::as_u64)
-        .unwrap_or_default()
-        .saturating_mul(1_000)
-        + duration
-            .get("nanos")
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-            / 1_000_000;
-    let serialized = serde_json::to_vec(result).unwrap_or_default();
-    let error = result.get("Err").is_some();
-    Some(TraceEvent::Semantic {
-        tool: tool.to_owned(),
-        source_path,
-        coordinate_input: arguments.get("line").is_some()
-            && arguments.get("symbol_handle").is_none(),
-        request_bytes: serialized_len(arguments),
-        result_bytes: serialized.len(),
-        query_fingerprint: Some(query_fingerprint(tool, arguments)),
-        deferred_bytes: deferred_bytes(result),
-        truncated: contains_true(result, "truncated"),
-        latency_ms,
-        unsupported: error
-            && result
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("unsupported"),
-        error,
-    })
+    Some(mcp_trace_event(
+        tool,
+        invocation.get("arguments").unwrap_or(&Value::Null),
+        payload.get("result").unwrap_or(&Value::Null),
+        history_latency_ms(payload),
+    ))
 }
 
 fn other_mcpls_history_event(event: &Value) -> Option<TraceEvent> {
@@ -431,35 +600,12 @@ fn other_mcpls_history_event(event: &Value) -> Option<TraceEvent> {
     if is_semantic_tool(tool) {
         return None;
     }
-    let arguments = invocation.get("arguments").unwrap_or(&Value::Null);
-    let request_bytes = serialized_len(arguments);
-    let result_bytes = serialized_len(payload.get("result").unwrap_or(&Value::Null));
-    let latency_ms = history_latency_ms(payload);
-    if is_lifecycle_tool(tool) {
-        return Some(TraceEvent::Lifecycle {
-            tool: tool.to_owned(),
-            request_bytes,
-            result_bytes,
-            latency_ms,
-        });
-    }
-    if tool == "read_semantic_resource" {
-        return Some(TraceEvent::ResourceRead {
-            deferred: arguments
-                .get("uri")
-                .and_then(Value::as_str)
-                .is_some_and(|uri| uri.starts_with("mcpls-deferred://")),
-            request_bytes,
-            result_bytes,
-            latency_ms,
-        });
-    }
-    Some(TraceEvent::McpTool {
-        tool: tool.to_owned(),
-        request_bytes,
-        result_bytes,
-        latency_ms,
-    })
+    Some(mcp_trace_event(
+        tool,
+        invocation.get("arguments").unwrap_or(&Value::Null),
+        payload.get("result").unwrap_or(&Value::Null),
+        history_latency_ms(payload),
+    ))
 }
 
 fn source_read_history_event(event: &Value) -> Option<TraceEvent> {
@@ -827,6 +973,68 @@ mod tests {
                 .iter()
                 .all(|event| !format!("{event:?}").contains("private_type"))
         );
+    }
+
+    #[test]
+    fn history_parser_reads_current_codex_mcp_exec_records() {
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call-search",
+                "input": "const result = await tools.mcp__mcpls__workspace_symbol_search({project_id: \"fixture\", query: \"private_type\", max_bytes: 4096}); text(JSON.stringify(result));"
+            }
+        });
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-search",
+                "output": [
+                    {"type": "input_text", "text": "Script completed"},
+                    {"type": "input_text", "text": serde_json::json!({
+                        "structuredContent": {
+                            "truncated": true,
+                            "resource": {"uri": "mcpls-source://fixture", "total_bytes": 55}
+                        },
+                        "isError": false
+                    }).to_string()}
+                ]
+            }
+        });
+        let lifecycle_call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call-add",
+                "input": "const result = await tools.mcp__mcpls__project_add({root: \"/home/alice/fixture\"}); text(JSON.stringify(result));"
+            }
+        });
+        let lifecycle_output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-add",
+                "output": [{"type": "input_text", "text": "{}"}]
+            }
+        });
+        let history = [call, output, lifecycle_call, lifecycle_output]
+            .into_iter()
+            .map(|event| event.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let report = evaluate(&parse_history(history.as_bytes()).unwrap()).aggregate;
+
+        assert_eq!(report.mcpls_calls, 2);
+        assert_eq!(report.semantic_calls, 1);
+        assert_eq!(report.lifecycle_calls, 1);
+        assert_eq!(report.truncated, 1);
+        assert_eq!(report.deferred_bytes, 55);
+        assert!(report.request_bytes > 0);
+        assert!(report.result_bytes > 0);
     }
 
     #[test]
