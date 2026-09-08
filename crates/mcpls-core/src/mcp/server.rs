@@ -663,8 +663,47 @@ struct ActorGroupState {
 
 #[derive(Serialize, schemars::JsonSchema)]
 struct ProjectLspCapabilitiesResponse {
+    schema_version: u8,
     project_id: String,
+    returned: usize,
+    total: usize,
+    remaining: usize,
+    snapshot_identity: String,
+    next_cursor: Option<String>,
     servers: Vec<ProjectServerCapability>,
+    capabilities_resource: Option<DeferredResourceReference>,
+}
+
+fn project_lsp_capabilities_page(
+    count: usize,
+    cursor: Option<&str>,
+    snapshot_identity: &str,
+) -> Result<(usize, usize), String> {
+    let start = match cursor {
+        Some(cursor) => {
+            let (identity, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| format!("invalid project_lsp_capabilities cursor: {cursor}"))?;
+            if identity != snapshot_identity {
+                return Err(
+                    "project_lsp_capabilities cursor belongs to a different snapshot".to_owned(),
+                );
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| format!("invalid project_lsp_capabilities cursor: {cursor}"))?
+        }
+        None => 0,
+    };
+    if start > count || (cursor.is_some() && start == count) {
+        return Err(format!(
+            "project_lsp_capabilities cursor is outside the server list: {start}"
+        ));
+    }
+    Ok((
+        start,
+        start.saturating_add(PROJECT_STATE_PAGE_SIZE).min(count),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -4494,6 +4533,7 @@ impl McplsServer {
         Parameters(ProjectLspCapabilitiesParams {
             project_id,
             language_id,
+            page_token,
         }): Parameters<ProjectLspCapabilitiesParams>,
     ) -> Result<Json<ProjectLspCapabilitiesResponse>, McpError> {
         let id = parse_project_id(project_id)?;
@@ -4503,9 +4543,47 @@ impl McplsServer {
             .server_capabilities(&id, language_id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&servers).unwrap_or_default())
+        );
+        let (start, end) =
+            project_lsp_capabilities_page(servers.len(), page_token.as_deref(), &snapshot_identity)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+        let total = servers.len();
+        let mut page_servers = servers[start..end].to_vec();
+        let details_resource = if page_servers.iter().any(|server| {
+            serde_json::to_vec(&server.capabilities)
+                .is_ok_and(|bytes| bytes.len() > MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2)
+        }) {
+            let details = serde_json::to_value(&servers)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let resource = self
+                .context
+                .project_registry
+                .store_deferred_resource(&id, "project_lsp_capabilities", details)
+                .map_err(|error| McpError::internal_error(error, None))?;
+            for server in &mut page_servers {
+                server.capabilities = serde_json::json!({
+                    "deferred": true,
+                    "capabilities_resource": resource.clone(),
+                });
+            }
+            Some(resource)
+        } else {
+            None
+        };
+        let next_cursor = (end < total).then(|| format!("{snapshot_identity}:{end}"));
         encode_tool_result::<_, std::convert::Infallible>(Ok(ProjectLspCapabilitiesResponse {
+            schema_version: 1,
             project_id: id.as_str().to_string(),
-            servers,
+            returned: page_servers.len(),
+            total,
+            remaining: total.saturating_sub(end),
+            snapshot_identity,
+            next_cursor,
+            servers: page_servers,
+            capabilities_resource: details_resource,
         }))
     }
 
@@ -8085,6 +8163,7 @@ finally:
             .project_lsp_capabilities(Parameters(ProjectLspCapabilitiesParams {
                 project_id: "demo".to_string(),
                 language_id: None,
+                page_token: None,
             }))
             .await
             .unwrap();
@@ -8175,6 +8254,17 @@ finally:
         assert!(
             project_state_page(groups.len(), Some(&format!("{identity}:35")), &identity).is_err()
         );
+
+        assert_eq!(
+            project_lsp_capabilities_page(groups.len(), None, &identity).unwrap(),
+            (0, 16)
+        );
+        assert_eq!(
+            project_lsp_capabilities_page(groups.len(), Some(&format!("{identity}:16")), &identity)
+                .unwrap(),
+            (16, 32)
+        );
+        assert!(project_lsp_capabilities_page(groups.len(), Some("wrong:16"), &identity).is_err());
     }
 
     #[tokio::test]

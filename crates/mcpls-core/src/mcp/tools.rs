@@ -778,6 +778,9 @@ pub struct ProjectLspCapabilitiesParams {
     /// Optional language-server identity to filter by.
     #[serde(default)]
     pub language_id: Option<String>,
+    /// Snapshot-bound cursor returned by a prior capabilities response.
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 const fn default_message_limit() -> usize {
