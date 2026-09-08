@@ -83,6 +83,18 @@ fn is_generated_path(path: &std::path::Path) -> bool {
     })
 }
 
+fn is_invalid_utf8_error(error: &Error) -> bool {
+    match error {
+        Error::Io(source) | Error::FileIo { source, .. } => {
+            source.kind() == std::io::ErrorKind::InvalidData
+        }
+        Error::LspProtocolError(message) | Error::LspServerError { message, .. } => {
+            message.contains("valid UTF-8")
+        }
+        _ => false,
+    }
+}
+
 async fn convert_workspace_symbol(
     symbol: WorkspaceSymbolCandidate,
     ctx: &EncodingCtx,
@@ -873,7 +885,16 @@ impl Translator {
             tracing::debug!(%server_id, "workspace-symbol server still initializing");
             return Err(Error::ServerInitializing { server_id });
         }
-        self.respawn_if_dead(&server_id).await?;
+        if let Err(error) = self.respawn_if_dead(&server_id).await {
+            if is_invalid_utf8_error(&error) {
+                tracing::warn!(
+                    %server_id,
+                    "workspace-symbol provider encountered invalid UTF-8; using bounded AST fallback"
+                );
+                return fallback().await;
+            }
+            return Err(error);
+        }
         let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
         let Some(client) = client else {
             tracing::debug!(%server_id, "workspace-symbol server unavailable; using AST fallback");
@@ -906,6 +927,13 @@ impl Translator {
             .await
         {
             Ok(response) => response,
+            Err(error) if is_invalid_utf8_error(&error) => {
+                tracing::warn!(
+                    %server_id,
+                    "workspace-symbol provider returned invalid UTF-8; using bounded AST fallback"
+                );
+                return fallback().await;
+            }
             Err(error) => return Err(error),
         };
 
@@ -1456,6 +1484,46 @@ mod tests {
                 ..
             } if message == "provider unavailable"
         ));
+        let _ = responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lsp_workspace_symbol_invalid_utf8_degrades_to_ast_results() {
+        let dir = TempDir::new().unwrap();
+        let fallback_path = dir.path().join("main.rs");
+        fs::write(&fallback_path, "fn fallback_target() {}\n").unwrap();
+        let server_id = ServerId::from("rust");
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, capabilities);
+        let responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut wire).await;
+            write_error_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                -32603,
+                "stream did not contain valid UTF-8",
+            )
+            .await;
+            (server._write_half, server._read_half)
+        });
+
+        let result = translator
+            .handle_workspace_symbol(
+                "fallback_target".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "fallback_target");
         let _ = responder.await.unwrap();
     }
 
