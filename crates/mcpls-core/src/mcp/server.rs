@@ -706,6 +706,69 @@ fn project_lsp_capabilities_page(
     ))
 }
 
+fn project_lsp_capabilities_response(
+    project_id: &str,
+    snapshot_identity: &str,
+    total: usize,
+    servers: &[ProjectServerCapability],
+    start: usize,
+    end: usize,
+    capabilities_resource: Option<&DeferredResourceReference>,
+) -> ProjectLspCapabilitiesResponse {
+    let mut page_servers = servers[start..end].to_vec();
+    if let Some(resource) = capabilities_resource {
+        for server in &mut page_servers {
+            server.capabilities = serde_json::json!({
+                "deferred": true,
+                "capabilities_resource": resource,
+            });
+        }
+    }
+    ProjectLspCapabilitiesResponse {
+        schema_version: 1,
+        project_id: project_id.to_owned(),
+        returned: page_servers.len(),
+        total,
+        remaining: total.saturating_sub(end),
+        snapshot_identity: snapshot_identity.to_owned(),
+        next_cursor: (end < total).then(|| format!("{snapshot_identity}:{end}")),
+        servers: page_servers,
+        capabilities_resource: capabilities_resource.cloned(),
+    }
+}
+
+fn bounded_project_lsp_capabilities_end(
+    project_id: &str,
+    snapshot_identity: &str,
+    total: usize,
+    servers: &[ProjectServerCapability],
+    start: usize,
+    initial_end: usize,
+    capabilities_resource: Option<&DeferredResourceReference>,
+) -> Result<usize, usize> {
+    let mut end = initial_end;
+    loop {
+        let response = project_lsp_capabilities_response(
+            project_id,
+            snapshot_identity,
+            total,
+            servers,
+            start,
+            end,
+            capabilities_resource,
+        );
+        let encoded_bytes =
+            serde_json::to_vec(&response).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_bytes <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+            return Ok(end);
+        }
+        if end.saturating_sub(start) <= 1 {
+            return Err(encoded_bytes);
+        }
+        end -= 1;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 struct DaemonPersistenceSnapshot {
     configured: bool,
@@ -4618,12 +4681,11 @@ impl McplsServer {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&servers).unwrap_or_default())
         );
-        let (start, end) =
+        let (start, initial_end) =
             project_lsp_capabilities_page(servers.len(), page_token.as_deref(), &snapshot_identity)
                 .map_err(|error| McpError::invalid_params(error, None))?;
         let total = servers.len();
-        let mut page_servers = servers[start..end].to_vec();
-        let details_resource = if page_servers.iter().any(|server| {
+        let details_resource = if servers[start..initial_end].iter().any(|server| {
             serde_json::to_vec(&server.capabilities)
                 .is_ok_and(|bytes| bytes.len() > MAX_SEMANTIC_RESOURCE_RESULT_BYTES / 2)
         }) {
@@ -4634,28 +4696,34 @@ impl McplsServer {
                 .project_registry
                 .store_deferred_resource(&id, "project_lsp_capabilities", details)
                 .map_err(|error| McpError::internal_error(error, None))?;
-            for server in &mut page_servers {
-                server.capabilities = serde_json::json!({
-                    "deferred": true,
-                    "capabilities_resource": resource.clone(),
-                });
-            }
             Some(resource)
         } else {
             None
         };
-        let next_cursor = (end < total).then(|| format!("{snapshot_identity}:{end}"));
-        encode_tool_result::<_, std::convert::Infallible>(Ok(ProjectLspCapabilitiesResponse {
-            schema_version: 1,
-            project_id: id.as_str().to_string(),
-            returned: page_servers.len(),
+        let end = bounded_project_lsp_capabilities_end(
+            id.as_str(),
+            &snapshot_identity,
             total,
-            remaining: total.saturating_sub(end),
-            snapshot_identity,
-            next_cursor,
-            servers: page_servers,
-            capabilities_resource: details_resource,
-        }))
+            &servers,
+            start,
+            initial_end,
+            details_resource.as_ref(),
+        )
+        .map_err(|encoded_bytes| {
+            McpError::internal_error(
+                format!("one project LSP capability still exceeds the response budget ({encoded_bytes} bytes)"),
+                None,
+            )
+        })?;
+        encode_tool_result::<_, std::convert::Infallible>(Ok(project_lsp_capabilities_response(
+            id.as_str(),
+            &snapshot_identity,
+            total,
+            &servers,
+            start,
+            end,
+            details_resource.as_ref(),
+        )))
     }
 
     /// Get signature help at a position.
@@ -8378,6 +8446,48 @@ finally:
             (16, 32)
         );
         assert!(project_lsp_capabilities_page(groups.len(), Some("wrong:16"), &identity).is_err());
+    }
+
+    #[test]
+    fn project_lsp_capability_pages_fit_the_response_budget() {
+        let servers = (0..16)
+            .map(|group_id| ProjectServerCapability {
+                group_id,
+                language_id: format!("language-{group_id}"),
+                position_encoding: "utf-8".to_owned(),
+                capabilities: serde_json::json!({
+                    "payload": "x".repeat(2_000),
+                }),
+            })
+            .collect::<Vec<_>>();
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&servers).unwrap())
+        );
+        let end = bounded_project_lsp_capabilities_end(
+            "project",
+            &snapshot_identity,
+            servers.len(),
+            &servers,
+            0,
+            servers.len(),
+            None,
+        )
+        .unwrap();
+        assert!(end < servers.len());
+        let page = project_lsp_capabilities_response(
+            "project",
+            &snapshot_identity,
+            servers.len(),
+            &servers,
+            0,
+            end,
+            None,
+        );
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+        assert_eq!(page.returned + page.remaining, page.total);
+        let expected_cursor = format!("{snapshot_identity}:{end}");
+        assert_eq!(page.next_cursor.as_deref(), Some(expected_cursor.as_str()));
     }
 
     #[tokio::test]
