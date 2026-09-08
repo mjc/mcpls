@@ -3082,10 +3082,27 @@ impl McplsServer {
     #[tool(description = "Return daemon version, uptime, and non-blocking project status.")]
     async fn server_status(
         &self,
-        Parameters(_params): Parameters<DaemonStatusParams>,
+        Parameters(DaemonStatusParams { cursor }): Parameters<DaemonStatusParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
+        let summaries = project_status_summaries_json(&snapshot.project_summaries);
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&summaries).unwrap_or_default())
+        );
+        let (page, next_cursor) = project_list_page(
+            snapshot.project_summaries.len(),
+            cursor.as_deref(),
+            &snapshot_identity,
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let start = page.start;
+        let end = page.end;
+        let summaries = summaries
+            .as_array()
+            .map_or_else(Vec::new, |summaries| summaries[page].to_vec());
         encode_json(&serde_json::json!({
+            "schema_version": 1,
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.context.started_at.elapsed().as_secs(),
             "lifecycle": snapshot.lifecycle(),
@@ -3095,7 +3112,12 @@ impl McplsServer {
             "queue_pressure": project_queue_pressure_json(snapshot.queue_pressure),
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
-            "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
+            "project_summaries": summaries,
+            "project_summaries_returned": end.saturating_sub(start),
+            "project_summaries_total": snapshot.project_summaries.len(),
+            "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(end),
+            "project_summaries_snapshot_identity": snapshot_identity,
+            "project_summaries_next_cursor": next_cursor,
         }))
     }
 
@@ -8522,6 +8544,45 @@ finally:
             status["project_summaries"][0]["roots"][0].as_str(),
             Some(root.path().to_str().unwrap())
         );
+
+        for index in 0..32 {
+            let root = TempDir::new().unwrap();
+            server
+                .context
+                .project_registry
+                .add(ProjectIdentity::new(
+                    ProjectId::new(format!("health-{index:02}")).unwrap(),
+                    CanonicalRoot::new(root.path()).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let first_page: serde_json::Value = serde_json::from_str(
+            &server
+                .server_status(Parameters(DaemonStatusParams { cursor: None }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_page["project_summaries_returned"], 32);
+        assert_eq!(first_page["project_summaries_total"], 33);
+        assert_eq!(first_page["project_summaries_remaining"], 1);
+        let cursor = first_page["project_summaries_next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let final_page: serde_json::Value = serde_json::from_str(
+            &server
+                .server_status(Parameters(DaemonStatusParams {
+                    cursor: Some(cursor),
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(final_page["project_summaries_returned"], 1);
+        assert_eq!(final_page["project_summaries_remaining"], 0);
+        assert!(final_page["project_summaries_next_cursor"].is_null());
 
         server.context.project_registry.shutdown_all().await;
         let shutdown_health: serde_json::Value = serde_json::from_str(
