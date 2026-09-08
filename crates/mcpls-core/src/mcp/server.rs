@@ -85,6 +85,7 @@ use crate::project::{
 use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
 const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 16 * 1024;
+const PROJECT_STATE_PAGE_SIZE: usize = 16;
 
 fn source_mime_type(language_id: Option<&str>) -> String {
     match language_id {
@@ -706,8 +707,18 @@ fn project_state_json(
     identity: &ProjectIdentity,
     state: &ProjectState,
     actor_groups: &[ActorGroupState],
+    cursor: Option<&str>,
 ) -> serde_json::Value {
+    let snapshot_identity = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(actor_groups).unwrap_or_default())
+    );
+    let (start, end) = project_state_page(actor_groups.len(), cursor, &snapshot_identity)
+        .unwrap_or((0, actor_groups.len().min(PROJECT_STATE_PAGE_SIZE)));
+    let actor_groups_page = &actor_groups[start..end];
+    let next_cursor = (end < actor_groups.len()).then(|| format!("{snapshot_identity}:{end}"));
     serde_json::json!({
+        "schema_version": 1,
         "project_id": identity.id().as_str(),
         "root": identity.root().as_path(),
         "roots": project_root_paths(identity),
@@ -725,8 +736,42 @@ fn project_state_json(
         "open_document_count": state.open_document_count(),
         "generation": state.runtime().generation(),
         "actor_group_count": actor_groups.len(),
-        "actor_groups": actor_groups,
+        "actor_groups": actor_groups_page,
+        "actor_groups_returned": actor_groups_page.len(),
+        "actor_groups_remaining": actor_groups.len().saturating_sub(end),
+        "actor_groups_snapshot_identity": snapshot_identity,
+        "actor_groups_next_cursor": next_cursor,
     })
+}
+
+fn project_state_page(
+    count: usize,
+    cursor: Option<&str>,
+    snapshot_identity: &str,
+) -> Result<(usize, usize), String> {
+    let start = match cursor {
+        Some(cursor) => {
+            let (identity, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| format!("invalid project-state cursor: {cursor}"))?;
+            if identity != snapshot_identity {
+                return Err("project-state cursor belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| format!("invalid project-state cursor: {cursor}"))?
+        }
+        None => 0,
+    };
+    if start > count || (cursor.is_some() && start == count) {
+        return Err(format!(
+            "project-state cursor is outside the actor-group list: {start}"
+        ));
+    }
+    Ok((
+        start,
+        start.saturating_add(PROJECT_STATE_PAGE_SIZE).min(count),
+    ))
 }
 
 fn project_root_paths(identity: &ProjectIdentity) -> Vec<PathBuf> {
@@ -2047,6 +2092,7 @@ impl McplsServer {
         project_id: &ProjectId,
         identity: &ProjectIdentity,
         state: &ProjectState,
+        cursor: Option<&str>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let actor_group_roots = self
             .context
@@ -2055,7 +2101,13 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let actor_groups = actor_group_states(actor_group_roots);
-        let mut value = project_state_json(identity, state, &actor_groups);
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&actor_groups).unwrap_or_default())
+        );
+        project_state_page(actor_groups.len(), cursor, &snapshot_identity)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let mut value = project_state_json(identity, state, &actor_groups, cursor);
         let cargo_features = self
             .context
             .project_registry
@@ -2126,7 +2178,7 @@ impl McplsServer {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let json = self
-            .project_state_json(&project_id, &identity, &state)
+            .project_state_json(&project_id, &identity, &state, None)
             .await?;
         Ok(private_resource_result(
             vec![ResourceContents::text(json.legacy, uri)],
@@ -2773,6 +2825,7 @@ impl McplsServer {
             project_id,
             root,
             config,
+            cursor,
         }): Parameters<ProjectAddParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
@@ -2791,12 +2844,19 @@ impl McplsServer {
                     .with_repository_identity(repository)
             },
         );
-        let actor = self
-            .context
-            .project_registry
-            .add_with_config(identity.clone(), config)
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let actor = if cursor.is_some() {
+            self.context
+                .project_registry
+                .actor_for_project(&id)
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        } else {
+            self.context
+                .project_registry
+                .add_with_config(identity.clone(), config)
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        };
         let identity = self
             .context
             .project_registry
@@ -2807,7 +2867,8 @@ impl McplsServer {
             .query()
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        self.project_state_json(&id, &identity, &state).await
+        self.project_state_json(&id, &identity, &state, cursor.as_deref())
+            .await
     }
 
     /// Activate a registered project and return while its language servers load.
@@ -2816,7 +2877,7 @@ impl McplsServer {
     )]
     async fn project_activate(
         &self,
-        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+        Parameters(ProjectIdParams { project_id, cursor }): Parameters<ProjectIdParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
@@ -2825,13 +2886,14 @@ impl McplsServer {
             .identity(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let state = self
-            .context
-            .project_registry
-            .activate(&id)
+        let state = if cursor.is_some() {
+            self.context.project_registry.status(&id).await
+        } else {
+            self.context.project_registry.activate(&id).await
+        }
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        self.project_state_json(&id, &identity, &state).await
     }
 
     /// List all registered projects without waiting on project actors.
@@ -2945,7 +3007,7 @@ impl McplsServer {
     #[tool(description = "Return lifecycle status and the last failure for a project.")]
     async fn project_status(
         &self,
-        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+        Parameters(ProjectIdParams { project_id, cursor }): Parameters<ProjectIdParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
@@ -2960,7 +3022,8 @@ impl McplsServer {
             .status(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        self.project_state_json(&id, &identity, &state).await
+        self.project_state_json(&id, &identity, &state, cursor.as_deref())
+            .await
     }
 
     /// Remove a project and shut down its actor.
@@ -2969,7 +3032,7 @@ impl McplsServer {
     )]
     async fn project_remove(
         &self,
-        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+        Parameters(ProjectIdParams { project_id, .. }): Parameters<ProjectIdParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         self.context
@@ -3359,7 +3422,7 @@ impl McplsServer {
     #[tool(description = "Restart the language servers for a registered project.")]
     async fn project_restart_lsp(
         &self,
-        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+        Parameters(ProjectIdParams { project_id, cursor }): Parameters<ProjectIdParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
@@ -3368,13 +3431,14 @@ impl McplsServer {
             .identity(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let state = self
-            .context
-            .project_registry
-            .restart(&id)
+        let state = if cursor.is_some() {
+            self.context.project_registry.status(&id).await
+        } else {
+            self.context.project_registry.restart(&id).await
+        }
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        self.project_state_json(&id, &identity, &state).await
     }
 
     /// Replace one project's Cargo feature profile and restart its actors.
@@ -3410,14 +3474,14 @@ impl McplsServer {
             .identity(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        self.project_state_json(&id, &identity, &state).await
+        self.project_state_json(&id, &identity, &state, None).await
     }
 
     /// Refresh one project actor's observable state.
     #[tool(description = "Refresh the status of a registered project.")]
     async fn project_refresh(
         &self,
-        Parameters(ProjectIdParams { project_id }): Parameters<ProjectIdParams>,
+        Parameters(ProjectIdParams { project_id, cursor }): Parameters<ProjectIdParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let id = parse_project_id(project_id)?;
         let identity = self
@@ -3426,13 +3490,14 @@ impl McplsServer {
             .identity(&id)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let state = self
-            .context
-            .project_registry
-            .refresh(&id)
+        let state = if cursor.is_some() {
+            self.context.project_registry.status(&id).await
+        } else {
+            self.context.project_registry.refresh(&id).await
+        }
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        self.project_state_json(&id, &identity, &state).await
     }
 
     /// Get hover information at a position in a file.
@@ -6286,6 +6351,7 @@ finally:
     fn project_params(project_id: &str) -> Parameters<ProjectIdParams> {
         Parameters(ProjectIdParams {
             project_id: project_id.to_string(),
+            cursor: None,
         })
     }
 
@@ -6298,6 +6364,7 @@ finally:
             project_id: project_id.to_string(),
             root: root.display().to_string(),
             config: None,
+            cursor: None,
         })
     }
 
@@ -6786,9 +6853,11 @@ finally:
         let (first_activation, second_activation) = tokio::join!(
             server.project_activate(Parameters(ProjectIdParams {
                 project_id: first_id.as_str().to_string(),
+                cursor: None,
             })),
             server.project_activate(Parameters(ProjectIdParams {
                 project_id: second_id.as_str().to_string(),
+                cursor: None,
             })),
         );
         first_activation.unwrap();
@@ -7924,6 +7993,7 @@ finally:
                 project_id: "dormant".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -7941,6 +8011,7 @@ finally:
         let status = server
             .project_status(Parameters(ProjectIdParams {
                 project_id: "dormant".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -7958,6 +8029,7 @@ finally:
                 project_id: "demo".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -7988,6 +8060,7 @@ finally:
                 project_id: "demo".to_string(),
                 root: root.path().display().to_string(),
                 config: Some(serde_json::json!({})),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -8002,6 +8075,7 @@ finally:
         let status = server
             .project_status(Parameters(ProjectIdParams {
                 project_id: "demo".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -8010,6 +8084,7 @@ finally:
         let restarted = server
             .project_restart_lsp(Parameters(ProjectIdParams {
                 project_id: "demo".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -8017,6 +8092,7 @@ finally:
         let refreshed = server
             .project_refresh(Parameters(ProjectIdParams {
                 project_id: "demo".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -8025,6 +8101,7 @@ finally:
         server
             .project_remove(Parameters(ProjectIdParams {
                 project_id: "demo".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -8034,6 +8111,34 @@ finally:
                 .await
                 .unwrap()
                 .contains("demo")
+        );
+    }
+
+    #[test]
+    fn project_state_pages_are_snapshot_bound_and_exact() {
+        let groups = (0..35)
+            .map(|group_id| ActorGroupState {
+                group_id,
+                roots: vec![PathBuf::from(format!("/tmp/project-{group_id}"))],
+            })
+            .collect::<Vec<_>>();
+        let identity = format!("{:x}", Sha256::digest(serde_json::to_vec(&groups).unwrap()));
+
+        assert_eq!(
+            project_state_page(groups.len(), None, &identity).unwrap(),
+            (0, 16)
+        );
+        assert_eq!(
+            project_state_page(groups.len(), Some(&format!("{identity}:16")), &identity).unwrap(),
+            (16, 32)
+        );
+        assert_eq!(
+            project_state_page(groups.len(), Some(&format!("{identity}:32")), &identity).unwrap(),
+            (32, 35)
+        );
+        assert!(project_state_page(groups.len(), Some("wrong:16"), &identity).is_err());
+        assert!(
+            project_state_page(groups.len(), Some(&format!("{identity}:35")), &identity).is_err()
         );
     }
 
@@ -8161,6 +8266,7 @@ finally:
                     }],
                     "heuristics_max_depth": 3
                 })),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -8192,6 +8298,7 @@ finally:
                         "heuristics": {"project_markers": ["Cargo.toml"]}
                     }]
                 })),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -10269,6 +10376,7 @@ while True:
                 project_id: "fixture".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -10276,6 +10384,7 @@ while True:
         let result = server
             .project_activate(Parameters(ProjectIdParams {
                 project_id: "fixture".to_string(),
+                cursor: None,
             }))
             .await;
 
@@ -10283,6 +10392,7 @@ while True:
         let state = server
             .project_status(Parameters(ProjectIdParams {
                 project_id: "fixture".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -10340,6 +10450,7 @@ while True:
                 project_id: "fallback-only".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -10347,6 +10458,7 @@ while True:
             std::time::Duration::from_secs(1),
             server.project_activate(Parameters(ProjectIdParams {
                 project_id: "fallback-only".to_string(),
+                cursor: None,
             })),
         )
         .await
@@ -10387,6 +10499,7 @@ while True:
         let repeated = server
             .project_activate(Parameters(ProjectIdParams {
                 project_id: "fallback-only".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();
@@ -10445,12 +10558,14 @@ while True:
                 project_id: "missing-optional".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
+                cursor: None,
             }))
             .await
             .unwrap();
         let activated = server
             .project_activate(Parameters(ProjectIdParams {
                 project_id: "missing-optional".to_string(),
+                cursor: None,
             }))
             .await
             .unwrap();

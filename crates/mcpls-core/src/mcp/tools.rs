@@ -892,6 +892,9 @@ pub struct ProjectAddParams {
     #[serde(default)]
     #[schemars(description = "Optional project-specific configuration.")]
     pub config: Option<serde_json::Value>,
+    /// Snapshot-bound cursor returned by a prior project-state response.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// Parameters selecting a registered project.
@@ -900,6 +903,9 @@ pub struct ProjectAddParams {
 pub struct ProjectIdParams {
     /// Stable project identifier.
     pub project_id: String,
+    /// Snapshot-bound cursor returned by a prior project-state response.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// Parameters for replacing one project's Rust Cargo feature profile.
