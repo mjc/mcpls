@@ -9,6 +9,7 @@ use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::{Peer, RoleServer};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
+use url::Url;
 
 use crate::bridge::resources::{
     ResourceUriError, SourceResource, make_uri, parse_source_uri, parse_uri,
@@ -175,7 +176,7 @@ pub fn parse_project_events_resource_uri(uri: &str) -> Option<(ProjectId, Option
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionResource {
     /// Cached diagnostics for one absolute file path.
-    Diagnostics(PathBuf),
+    Diagnostics(DiagnosticsResource),
     /// Lifecycle state for one registered project.
     ProjectStatus(ProjectId),
     /// Bounded ordered event history for one project and optional cursor.
@@ -234,6 +235,15 @@ pub struct DeferredResource {
     pub offset_bytes: usize,
 }
 
+/// A cached diagnostic resource and its optional snapshot continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsResource {
+    /// Authorized absolute file path.
+    pub path: PathBuf,
+    /// Snapshot-bound continuation returned by the diagnostics actor.
+    pub page_token: Option<String>,
+}
+
 /// Parse either a diagnostics or project-status resource URI.
 pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, ResourceUriError> {
     if let Some(project_id) = parse_project_status_resource_uri(uri) {
@@ -290,7 +300,15 @@ pub fn parse_session_resource_uri(uri: &str) -> Result<SessionResource, Resource
             }));
         }
     }
-    parse_uri(uri).map(SessionResource::Diagnostics)
+    let path = parse_uri(uri)?;
+    let page_token = Url::parse(uri)
+        .map_err(|error| ResourceUriError::DecodeFailed(error.to_string()))?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "page_token").then(|| value.into_owned()));
+    Ok(SessionResource::Diagnostics(DiagnosticsResource {
+        path,
+        page_token,
+    }))
 }
 
 /// Convert an LSP file URI from a diagnostics event into the MCP resource URI
@@ -605,8 +623,8 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        PlanId, SessionResource, diagnostics_resource_uri, event_resource_uris,
-        parse_project_events_resource_uri, parse_project_status_resource_uri,
+        DiagnosticsResource, PlanId, SessionResource, diagnostics_resource_uri,
+        event_resource_uris, parse_project_events_resource_uri, parse_project_status_resource_uri,
         parse_session_resource_uri, project_events_resource_uri, project_status_resource_uri,
     };
     use super::{SessionEventSink, SessionNotifier};
@@ -724,7 +742,20 @@ mod tests {
         );
         assert_eq!(
             parse_session_resource_uri("lsp-diagnostics:///workspace/a.rs").unwrap(),
-            SessionResource::Diagnostics(std::path::PathBuf::from("/workspace/a.rs"))
+            SessionResource::Diagnostics(DiagnosticsResource {
+                path: std::path::PathBuf::from("/workspace/a.rs"),
+                page_token: None,
+            })
+        );
+        assert_eq!(
+            parse_session_resource_uri(
+                "lsp-diagnostics:///workspace/a.rs?page_token=mcpls-deferred%3A%2F%2F%2Ftoken"
+            )
+            .unwrap(),
+            SessionResource::Diagnostics(DiagnosticsResource {
+                path: std::path::PathBuf::from("/workspace/a.rs"),
+                page_token: Some("mcpls-deferred:///token".to_owned()),
+            })
         );
         assert_eq!(
             event_resource_uris(

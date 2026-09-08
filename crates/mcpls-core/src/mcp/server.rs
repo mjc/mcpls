@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::handlers::{APPROVAL_INPUT_ID, HandlerContext, MutationApprovalState};
 use super::session::{
@@ -64,7 +65,6 @@ use crate::bridge::Translator;
 use crate::bridge::lexical::{LexicalSearchBatchRequest, find_matches, validate_path_globs};
 use crate::bridge::resources::make_source_uri;
 use crate::bridge::resources::make_uri;
-#[cfg(test)]
 use crate::bridge::translator::DiagnosticOptions;
 use crate::bridge::{
     DeferredResourceReference, LexicalSearchRequest, PositionEncoding, ResourceSubscriptions,
@@ -4948,10 +4948,10 @@ impl McplsServer {
                 | SessionResource::ProjectEvent { project_id, .. } => {
                     project_ids.insert(project_id);
                 }
-                SessionResource::Diagnostics(path) => {
+                SessionResource::Diagnostics(resource) => {
                     let (project_id, _) = self
                         .context
-                        .required_project_for_path(path)
+                        .required_project_for_path(&resource.path)
                         .await
                         .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
                     project_ids.insert(project_id);
@@ -5171,7 +5171,7 @@ impl ServerHandler for McplsServer {
         let resource = parse_session_resource_uri(&request.uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let supports_cache_hints = supports_cache_hints(&context);
-        let path = match resource {
+        match resource {
             SessionResource::ProjectStatus(project_id) => {
                 return self
                     .read_project_status_resource(project_id, request.uri, supports_cache_hints)
@@ -5245,7 +5245,46 @@ impl ServerHandler for McplsServer {
                     )
                     .await;
             }
-            SessionResource::Diagnostics(path) => path,
+            SessionResource::Diagnostics(resource) => {
+                let actor = self
+                    .context
+                    .required_actor_for_path(&resource.path)
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                actor
+                    .validate_path(resource.path.display().to_string())
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let diagnostics = actor
+                    .cached_diagnostics_with_options(
+                        resource.path.display().to_string(),
+                        DiagnosticOptions {
+                            preserve_locations: true,
+                            item_limit: 1_000,
+                            byte_limit: MAX_SEMANTIC_RESOURCE_RESULT_BYTES * 3 / 4,
+                            page_token: resource.page_token,
+                            ..DiagnosticOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                let mut value = serde_json::to_value(&diagnostics)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                if let Some(cursor) = diagnostics.next_cursor.as_deref() {
+                    let mut next_uri = Url::parse(&request.uri)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                    next_uri.set_query(None);
+                    next_uri.query_pairs_mut().append_pair("page_token", cursor);
+                    value["next_uri"] = Value::String(next_uri.to_string());
+                }
+                let json = serde_json::to_string(&value)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                return Ok(private_resource_result(
+                    vec![ResourceContents::text(json, request.uri)],
+                    supports_cache_hints,
+                )
+                .into());
+            }
             SessionResource::Source(source) => {
                 return self
                     .read_source_resource(source, request.uri, supports_cache_hints)
@@ -5254,32 +5293,7 @@ impl ServerHandler for McplsServer {
             SessionResource::Deferred(deferred) => {
                 return self.read_deferred_resource(deferred, request.uri, supports_cache_hints);
             }
-        };
-
-        // TODO(critic-S2): distinguish "file not tracked" from "file tracked but clean"
-        // in the response shape. Currently both return `{"diagnostics":null}` which is
-        // ambiguous for clients that need to know whether analysis has run yet.
-        let actor = self
-            .context
-            .required_actor_for_path(&path)
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        actor
-            .validate_path(path.display().to_string())
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let diagnostics = actor
-            .cached_diagnostics(path.display().to_string())
-            .await
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let json = serde_json::to_string(&diagnostics)
-            .map_err(|e| McpError::internal_error(format!("Serialization error: {e}"), None))?;
-
-        Ok(private_resource_result(
-            vec![ResourceContents::text(json, request.uri)],
-            supports_cache_hints,
-        )
-        .into())
+        }
     }
 
     fn accepted_subscription_filter(
@@ -5400,7 +5414,7 @@ impl ServerHandler for McplsServer {
                     None,
                 ));
             }
-            SessionResource::Diagnostics(path) => path,
+            SessionResource::Diagnostics(resource) => resource.path,
             SessionResource::Source(source) => source.path,
             SessionResource::Deferred(_) => {
                 return Err(McpError::invalid_params(
