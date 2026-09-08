@@ -1058,6 +1058,8 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
     let fixture = HttpFixture::new();
     let root_a = fixture.project_root("blocked-project");
     let root_b = fixture.project_root("ready-project");
+    let blocked_project_id = "blocked-project";
+    let ready_project_id = "ready-project";
     let mut daemon = HttpDaemon::spawn(&fixture.config);
     let mut first = HttpClient::new(daemon.address);
     let mut second = HttpClient::new(daemon.address);
@@ -1089,7 +1091,10 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
         json!({"project_id": "ready", "root": root_b}),
     );
 
-    let blocked = first.call_tool_response("project_activate", json!({"project_id": "blocked"}));
+    let blocked = first.call_tool_response(
+        "project_activate",
+        json!({"project_id": blocked_project_id}),
+    );
     let blocked_status = blocked["result"]["content"][0]["text"]
         .as_str()
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
@@ -1099,12 +1104,12 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
         "blocked project unexpectedly activated: {blocked}"
     );
 
-    let ready = second.call_tool("project_activate", json!({"project_id": "ready"}));
+    let ready = second.call_tool("project_activate", json!({"project_id": ready_project_id}));
     assert!(matches!(
         ready["status"].as_str(),
         Some("Starting" | "Ready")
     ));
-    wait_project_ready(&mut second, "ready");
+    wait_project_ready(&mut second, ready_project_id);
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "2"
@@ -1112,15 +1117,23 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
 
     for client in [&mut first, &mut second] {
         assert_eq!(
-            client.call_tool("project_status", json!({"project_id": "ready"}))["status"],
+            client.call_tool("project_status", json!({"project_id": ready_project_id}))["status"],
             "Ready"
         );
     }
     let (restart_one, restart_two) = std::thread::scope(|scope| {
-        let first_restart =
-            scope.spawn(|| first.call_tool("project_restart_lsp", json!({"project_id": "ready"})));
-        let second_restart =
-            scope.spawn(|| second.call_tool("project_restart_lsp", json!({"project_id": "ready"})));
+        let first_restart = scope.spawn(|| {
+            first.call_tool(
+                "project_restart_lsp",
+                json!({"project_id": ready_project_id}),
+            )
+        });
+        let second_restart = scope.spawn(|| {
+            second.call_tool(
+                "project_restart_lsp",
+                json!({"project_id": ready_project_id}),
+            )
+        });
         (
             first_restart.join().unwrap(),
             second_restart.join().unwrap(),
@@ -1134,7 +1147,7 @@ fn http_project_blockage_is_isolated_and_mutations_are_serialized() {
         matches!(restart_two["status"].as_str(), Some("Starting" | "Ready")),
         "restart response: {restart_two}"
     );
-    wait_project_ready(&mut first, "ready");
+    wait_project_ready(&mut first, ready_project_id);
     assert_eq!(
         std::fs::read_to_string(&fixture.spawn_counter).unwrap(),
         "4"
