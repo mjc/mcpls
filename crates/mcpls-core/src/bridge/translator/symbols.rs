@@ -720,6 +720,10 @@ impl Translator {
     }
 
     /// Handle workspace symbol search with explicit generated-file inclusion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query, scope, or routed language server is invalid.
     pub async fn handle_workspace_symbol_with_generated(
         &self,
         query: String,
@@ -797,7 +801,7 @@ impl Translator {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn handle_workspace_symbol_filtered(
         &self,
         query: String,
@@ -953,6 +957,7 @@ impl Translator {
         .await)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ast_grep_workspace_symbols(
         &self,
         roots: &[std::path::PathBuf],

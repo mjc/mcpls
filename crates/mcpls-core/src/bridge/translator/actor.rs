@@ -959,7 +959,8 @@ impl Translator {
                     hit: true,
                     age_ms: (chrono::Utc::now() - entry.received_at)
                         .num_milliseconds()
-                        .max(0) as u64,
+                        .max(0)
+                        .cast_unsigned(),
                     snapshot_identity: Some(entry.snapshot_identity.clone()),
                     document_version: entry.version,
                 }
@@ -1013,6 +1014,10 @@ impl Translator {
     }
 
     /// Return one snapshot-bound page of redacted server logs owned by this actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid level filter or continuation cursor.
     pub fn actor_server_logs_page(
         &self,
         limit: usize,
@@ -1041,6 +1046,10 @@ impl Translator {
     }
 
     /// Return one snapshot-bound page of redacted server messages owned by this actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid continuation cursor.
     pub fn actor_server_messages_page(
         &self,
         limit: usize,

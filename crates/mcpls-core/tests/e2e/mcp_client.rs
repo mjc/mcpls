@@ -15,6 +15,8 @@
 //! keeps the suite tied to the binary built from the current workspace rather
 //! than an arbitrary pre-existing `target/debug/mcpls`.
 
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

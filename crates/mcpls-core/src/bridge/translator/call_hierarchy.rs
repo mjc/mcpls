@@ -246,6 +246,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails, the item is invalid, or the
     /// routed server does not advertise `callHierarchyProvider` support.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_incoming_calls(
         &self,
         item: serde_json::Value,
@@ -396,6 +397,7 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails, the item is invalid, or the
     /// routed server does not advertise `callHierarchyProvider` support.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_outgoing_calls(
         &self,
         item: serde_json::Value,

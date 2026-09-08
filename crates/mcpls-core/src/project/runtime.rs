@@ -1221,7 +1221,7 @@ pub(super) fn source_symbol_position(
 pub(super) fn symbol_position_in_line(line: u32, text: &str, name: &str) -> Option<(u32, u32)> {
     (!name.is_empty()).then_some(())?;
     let text = text.trim_start();
-    if text.starts_with("//") || text.starts_with("#") {
+    if text.starts_with("//") || text.starts_with('#') {
         return None;
     }
     text.match_indices(name).find_map(|(offset, _)| {
@@ -1933,7 +1933,7 @@ pub(super) fn defer_oversized_diagnostic_payloads(
                 deferred_results,
                 scope,
             )?);
-            diagnostic.message = "[diagnostic message deferred]".to_owned();
+            "[diagnostic message deferred]".clone_into(&mut diagnostic.message);
         }
         if diagnostic
             .context
@@ -1968,6 +1968,7 @@ pub(super) fn defer_oversized_diagnostic_payloads(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn bounded_diagnostics_page(
     mut state: DiagnosticsPageState,
     max_items: usize,
@@ -2097,15 +2098,15 @@ pub(super) fn flatten_document_symbols(
         let mut symbol = symbol;
         let children = symbol.children.take().unwrap_or_default();
         output.push(symbol);
-        children
-            .into_iter()
-            .for_each(|child| flatten(child, output));
+        for child in children {
+            flatten(child, output);
+        }
     }
 
     let mut output = Vec::new();
-    symbols
-        .into_iter()
-        .for_each(|symbol| flatten(symbol, &mut output));
+    for symbol in symbols {
+        flatten(symbol, &mut output);
+    }
     output
 }
 
@@ -2118,7 +2119,10 @@ pub(super) fn clear_document_symbol_sources(symbols: &mut [crate::bridge::Symbol
     }
 }
 
-pub(super) fn document_symbol_matches(symbol: &crate::bridge::Symbol, has_query: bool) -> bool {
+pub(super) const fn document_symbol_matches(
+    symbol: &crate::bridge::Symbol,
+    has_query: bool,
+) -> bool {
     !has_query || symbol.match_class.is_some()
 }
 
@@ -2410,7 +2414,7 @@ impl ProjectRuntime {
                 else {
                     return;
                 };
-                let position = source_symbol_position(&source, &symbol.name, &location.range)
+                let position = source_symbol_position(source, &symbol.name, &location.range)
                     .unwrap_or((location.range.start.line, location.range.start.character));
                 let snapshot = document_version.map_or_else(
                     || SourceSnapshot::Hash(content_hash.to_owned()),
@@ -2637,6 +2641,7 @@ impl ProjectRuntime {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn structural_replace_preview(
         &mut self,
         project_id: &str,
@@ -3267,6 +3272,7 @@ impl ProjectRuntime {
         })))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn finish_prepared_edit(
         &mut self,
         prepared: PreparedEditPlan,
@@ -3623,6 +3629,7 @@ impl ProjectRuntime {
         self.diagnostics_page(file_path, options, true).await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn diagnostics_page(
         &mut self,
         file_path: String,
@@ -3843,6 +3850,7 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn document_symbols(
         &self,
         request: DocumentSymbolPageRequest,
@@ -4099,6 +4107,7 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    #[allow(clippy::significant_drop_in_scrutinee, clippy::expect_used)]
     pub(super) async fn workspace_symbol_batch(
         &self,
         request: WorkspaceSymbolBatchRequest,
@@ -4197,6 +4206,7 @@ impl ProjectRuntime {
         Ok(batch)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn lexical_search(
         &self,
         request: LexicalSearchRequest,
@@ -4361,6 +4371,7 @@ impl ProjectRuntime {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn lexical_search_batch(
         &self,
         request: LexicalSearchBatchRequest,
@@ -5231,6 +5242,7 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn code_actions(
         &self,
         file_path: String,
@@ -5275,6 +5287,7 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn code_action_list(
         &mut self,
         file_path: String,

@@ -469,7 +469,7 @@ pub(crate) async fn bind_http_listener(
 }
 
 /// Run the HTTP service using a listener reserved before project startup.
-#[cfg(feature = "transport-http")]
+#[cfg(all(feature = "transport-http", test))]
 pub(crate) async fn run_http(
     mcp_server: crate::mcp::McplsServer,
     cfg: HttpConfig,

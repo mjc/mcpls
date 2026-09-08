@@ -3,6 +3,8 @@
 //! These tests validate the complete MCP protocol flow by spawning the mcpls
 //! binary and communicating with it as a real MCP client would.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use anyhow::Result;
 use serde_json::json;
 

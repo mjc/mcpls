@@ -201,7 +201,11 @@ impl RetainedProjectHistory {
             Self::page_bounds(&logs, limit, cursor, "server_logs")?;
         let page_end = page.end;
         let total = logs.len();
-        let logs = (limit > 0).then(|| logs[page].to_vec()).unwrap_or_default();
+        let logs = if limit > 0 {
+            logs[page].to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(ServerLogsResult {
             returned: logs.len(),
             remaining: total.saturating_sub(page_end),
@@ -220,16 +224,16 @@ impl RetainedProjectHistory {
         let (page, snapshot_identity, next_cursor) =
             Self::page_bounds(&self.messages, limit, cursor, "server_messages")?;
         let page_end = page.end;
-        let messages: Vec<_> = (limit > 0)
-            .then(|| {
-                self.messages
-                    .iter()
-                    .skip(page.start)
-                    .take(page.end - page.start)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let messages: Vec<_> = if limit > 0 {
+            self.messages
+                .iter()
+                .skip(page.start)
+                .take(page.end - page.start)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(ServerMessagesResult {
             returned: messages.len(),
             remaining: self.messages.len().saturating_sub(page_end),
@@ -1465,6 +1469,11 @@ impl ProjectRegistry {
     }
 
     /// Return one snapshot-bound page of logs from a project's primary actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project is not registered, the actor closes, or
+    /// the requested log filter is invalid.
     pub async fn server_logs_page(
         &self,
         id: &ProjectId,
@@ -1514,6 +1523,10 @@ impl ProjectRegistry {
     }
 
     /// Return one snapshot-bound page of messages from a project's primary actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project is not registered or its actor closes.
     pub async fn server_messages_page(
         &self,
         id: &ProjectId,
@@ -2266,6 +2279,10 @@ impl ProjectRegistry {
     }
 
     /// Resolve a path and wake its registered project when it is dormant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not registered or activation fails.
     pub async fn active_actor_for_path(
         &self,
         path: impl AsRef<Path>,
@@ -2278,6 +2295,10 @@ impl ProjectRegistry {
     }
 
     /// Resolve a dependency source previously surfaced by an active LSP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path cannot be canonicalized or no actor owns it.
     pub async fn actor_for_source_path(
         &self,
         path: impl AsRef<Path>,
@@ -2636,10 +2657,9 @@ pub(super) async fn load_persisted_state(
 }
 
 pub(super) fn is_invalid_utf8_error(error: &crate::error::Error) -> bool {
-    let source = match error {
-        crate::error::Error::Io(source) => source,
-        crate::error::Error::FileIo { source, .. } => source,
-        _ => return false,
+    let (crate::error::Error::Io(source) | crate::error::Error::FileIo { source, .. }) = error
+    else {
+        return false;
     };
     source.kind() == std::io::ErrorKind::InvalidData
 }

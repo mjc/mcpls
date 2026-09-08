@@ -104,7 +104,10 @@ impl Drop for LspRequestTiming {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
         let over_house_budget = exceeds_lsp_house_budget(elapsed);
-        self.span.record("lsp_ms", elapsed.as_millis() as u64);
+        self.span.record(
+            "lsp_ms",
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        );
         self.span.record("lsp_over_house_budget", over_house_budget);
         if over_house_budget {
             let _entered = self.span.enter();
@@ -765,6 +768,7 @@ impl LspClient {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     async fn message_loop_inner(
         reader: &mut LspReader,
         command_rx: &mut mpsc::Receiver<ClientCommand>,

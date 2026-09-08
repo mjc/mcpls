@@ -1,5 +1,7 @@
 //! Bounded lexical matching primitives for project-scoped text search.
 
+#![allow(clippy::redundant_pub_crate)]
+
 use std::{collections::BTreeSet, ops::Range, path::PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};

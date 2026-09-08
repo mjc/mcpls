@@ -1,5 +1,7 @@
 //! MCP tool parameter definitions.
 
+#![allow(clippy::redundant_pub_crate)]
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

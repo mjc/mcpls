@@ -338,7 +338,7 @@ impl ProjectEventHistory {
         let events = records.by_ref().take(max_events.max(1)).collect::<Vec<_>>();
         let truncated = records.next().is_some();
         let next_sequence = events.last().map_or_else(
-            || cursor.unwrap_or(self.next_sequence.saturating_sub(1)),
+            || cursor.unwrap_or_else(|| self.next_sequence.saturating_sub(1)),
             ProjectEventRecord::sequence,
         );
         ProjectEventSnapshot {

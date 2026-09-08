@@ -27,6 +27,8 @@ use crate::error::{Error, Result};
 const PROVIDER_SYNC_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 const MAX_DISCOVERY_PAGE_ITEMS: usize = 64;
 
+type PagedJsonValues = (Vec<serde_json::Value>, usize, usize, Option<String>, String);
+
 #[derive(Debug, Clone)]
 /// Edits returned by language servers participating in a file rename.
 pub struct WillRenameFilesResult {
@@ -1333,7 +1335,7 @@ fn semantic_page_offset(page_token: Option<&str>, snapshot_identity: &str) -> Re
 fn paged_json_values(
     values: &[serde_json::Value],
     page_token: Option<&str>,
-) -> Result<(Vec<serde_json::Value>, usize, usize, Option<String>, String)> {
+) -> Result<PagedJsonValues> {
     let snapshot_identity = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(values).unwrap_or_default())
@@ -1494,8 +1496,7 @@ fn file_operation_registration_matches(
             && globset::GlobBuilder::new(pattern)
                 .literal_separator(true)
                 .build()
-                .ok()
-                .is_some_and(|glob| glob.compile_matcher().is_match(path))
+                .is_ok_and(|glob| glob.compile_matcher().is_match(path))
     })
 }
 

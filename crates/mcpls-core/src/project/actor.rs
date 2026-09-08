@@ -124,6 +124,7 @@ impl ProjectRequestSender {
         self.gate.accept_new_work();
     }
 
+    #[allow(clippy::result_large_err)]
     pub(super) async fn send(
         &self,
         mut request: ProjectRequest,
@@ -165,6 +166,7 @@ impl ProjectRequestSender {
     }
 
     // Lifecycle control must still reach the actor after normal work is rejected.
+    #[allow(clippy::result_large_err)]
     pub(super) async fn send_unchecked(
         &self,
         request: ProjectRequest,
@@ -709,8 +711,7 @@ impl ProjectRequest {
 impl ProjectRequest {
     pub(super) fn is_cancelled(&self) -> bool {
         match self {
-            Self::Timed { request, .. } => request.is_cancelled(),
-            Self::Resident { request, .. } => request.is_cancelled(),
+            Self::Timed { request, .. } | Self::Resident { request, .. } => request.is_cancelled(),
             Self::Query { reply } | Self::Refresh { reply } | Self::Restart { reply } => {
                 reply.is_closed()
             }
@@ -766,8 +767,9 @@ impl ProjectRequest {
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
-            Self::ReadEditPlanDiff { reply, .. } => reply.is_closed(),
-            Self::ReadAppliedEditDetail { reply, .. } => reply.is_closed(),
+            Self::ReadEditPlanDiff { reply, .. } | Self::ReadAppliedEditDetail { reply, .. } => {
+                reply.is_closed()
+            }
             Self::ApplyEditPlan { reply, .. } => reply.is_closed(),
             Self::ServerLogs { reply, .. } => reply.is_closed(),
             Self::ServerMessages { reply, .. } => reply.is_closed(),
@@ -986,6 +988,11 @@ impl ProjectHandle {
     }
 
     /// Route one snapshot-bound definition page through the actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
     pub async fn definition_page(
         &self,
         file_path: String,
@@ -1518,6 +1525,7 @@ impl ProjectHandle {
     ///
     /// Returns an error if the actor is closed, cancels the response, or the
     /// actor-owned translator rejects the request.
+    #[allow(clippy::too_many_arguments)]
     pub async fn code_actions(
         &self,
         file_path: String,
@@ -1554,6 +1562,7 @@ impl ProjectHandle {
     ///
     /// Returns an error if the actor is unavailable or the language server
     /// rejects the request.
+    #[allow(clippy::too_many_arguments)]
     pub async fn code_action_list(
         &self,
         file_path: String,
@@ -1781,6 +1790,11 @@ impl ProjectHandle {
     }
 
     /// Route one snapshot-bound implementation page through the actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
     pub async fn go_to_implementation_page(
         &self,
         file_path: String,
@@ -1822,6 +1836,11 @@ impl ProjectHandle {
     }
 
     /// Route one snapshot-bound type-definition page through the actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// actor-owned translator rejects the request.
     pub async fn go_to_type_definition_page(
         &self,
         file_path: String,
@@ -1939,6 +1958,10 @@ impl ProjectHandle {
     }
 
     /// Whether this actor has an active-LSP source-read capability for `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or cancels the response.
     pub async fn source_path_is_authorized(
         &self,
         path: PathBuf,
@@ -2250,6 +2273,11 @@ impl ProjectHandle {
     }
 
     /// Return one snapshot-bound page of recent logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed, cancels the response, or the
+    /// requested log filter is invalid.
     pub async fn server_logs_page(
         &self,
         limit: usize,
@@ -2285,6 +2313,10 @@ impl ProjectHandle {
     }
 
     /// Return one snapshot-bound page of recent messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is closed or cancels the response.
     pub async fn server_messages_page(
         &self,
         limit: usize,
@@ -2807,15 +2839,16 @@ pub(super) async fn handle_timed_project_request(
 ) -> bool {
     timing.span.record(
         "actor_queue_ms",
-        timing.queued_at.elapsed().as_millis() as u64,
+        u64::try_from(timing.queued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     let started = Instant::now();
     let stop = handle_project_request(request, actor_sender, channels, state, runtime, residency)
         .instrument(timing.span.clone())
         .await;
-    timing
-        .span
-        .record("actor_execution_ms", started.elapsed().as_millis() as u64);
+    timing.span.record(
+        "actor_execution_ms",
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     stop
 }
 
@@ -2927,10 +2960,9 @@ pub(super) fn mark_project_started(
     );
     let status = runtime.readiness_status();
     if !runtime.translator.is_initializing() {
-        let elapsed_ms = runtime
-            .activation_started_at
-            .take()
-            .map_or(0, |started| started.elapsed().as_millis() as u64);
+        let elapsed_ms = runtime.activation_started_at.take().map_or(0, |started| {
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
         tracing::info!(
             stage = "readiness",
             ?status,
@@ -3807,10 +3839,9 @@ pub(super) async fn handle_project_request(
             channels.publish_notification(runtime, generation, &server_id, notification);
             if was_initializing && !runtime.translator.is_initializing() {
                 let status = runtime.readiness_status();
-                let elapsed_ms = runtime
-                    .activation_started_at
-                    .take()
-                    .map_or(0, |started| started.elapsed().as_millis() as u64);
+                let elapsed_ms = runtime.activation_started_at.take().map_or(0, |started| {
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                });
                 tracing::info!(
                     stage = "readiness",
                     ?status,

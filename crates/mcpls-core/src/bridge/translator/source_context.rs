@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_pub_crate)]
+
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -259,7 +261,7 @@ fn numbered_line_bytes(line_number: usize, line: &str) -> usize {
     format!("{line_number:>4} | {line}\n").len()
 }
 
-fn json_escaped_character_bytes(character: char) -> usize {
+const fn json_escaped_character_bytes(character: char) -> usize {
     match character {
         '"' | '\\' | '\u{08}' | '\u{0C}' | '\n' | '\r' | '\t' => 2,
         '\u{00}'..='\u{1F}' => 6,
@@ -453,6 +455,7 @@ impl super::Translator {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn read_source_resource_with_max_bytes(
         &self,
         resource: &SourceResource,

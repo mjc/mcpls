@@ -92,18 +92,18 @@ fn source_mime_type(language_id: Option<&str>) -> String {
     match language_id {
         Some("rust") => "text/x-rust".to_owned(),
         Some("json") => "application/json".to_owned(),
-        Some("markdown") | Some("md") => "text/markdown".to_owned(),
+        Some("markdown" | "md") => "text/markdown".to_owned(),
         Some("toml") => "application/toml".to_owned(),
-        Some("yaml") | Some("yml") => "application/yaml".to_owned(),
-        Some("javascript") | Some("typescript") => "text/javascript".to_owned(),
+        Some("yaml" | "yml") => "application/yaml".to_owned(),
+        Some("javascript" | "typescript") => "text/javascript".to_owned(),
         _ => "text/plain".to_owned(),
     }
 }
 
 fn deferred_resource_page(
     deferred: &DeferredResource,
-    uri: String,
-    value: serde_json::Value,
+    uri: &str,
+    value: &serde_json::Value,
     snapshot_hash: &str,
 ) -> Result<SemanticResourceReadResult, McpError> {
     let json = serde_json::to_string(&value)
@@ -124,7 +124,7 @@ fn deferred_resource_page(
         let next_uri = (end < total_bytes)
             .then(|| format!("mcpls-deferred:///{}?offset_bytes={end}", deferred.token));
         let result = SemanticResourceReadResult {
-            uri: uri.clone(),
+            uri: uri.to_owned(),
             mime_type: "application/json".to_owned(),
             text: json[deferred.offset_bytes..end].to_owned(),
             source: None,
@@ -393,9 +393,9 @@ fn operation_error(error: impl std::fmt::Display) -> McpError {
     McpError::internal_error(error.message.clone(), serde_json::to_value(error).ok())
 }
 
-fn project_not_registered_error(message: String) -> McpError {
+fn project_not_registered_error(message: &str) -> McpError {
     McpError::invalid_params(
-        message.clone(),
+        message.to_owned(),
         Some(serde_json::json!({
             "code": "project_not_registered",
             "message": message,
@@ -408,7 +408,7 @@ fn project_not_registered_error(message: String) -> McpError {
 fn project_routing_error(error: impl std::fmt::Display) -> McpError {
     let message = error.to_string();
     if message.starts_with("project is not registered:") {
-        return project_not_registered_error(message);
+        return project_not_registered_error(&message);
     }
     McpError::invalid_params(message, None)
 }
@@ -416,7 +416,7 @@ fn project_routing_error(error: impl std::fmt::Display) -> McpError {
 fn project_operation_error(error: impl std::fmt::Display) -> McpError {
     let message = error.to_string();
     if message.starts_with("project is not registered:") {
-        return project_not_registered_error(message);
+        return project_not_registered_error(&message);
     }
     operation_error(message)
 }
@@ -574,6 +574,7 @@ fn bounded_lexical_page(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bounded_lexical_page_with_accounting(
     mut matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
     offset: usize,
@@ -647,7 +648,9 @@ fn bounded_lexical_batch(
         }) else {
             return Err(encoded_bytes);
         };
-        let result = entry.result.as_mut().expect("entry was selected above");
+        let Some(result) = entry.result.as_mut() else {
+            return Err(encoded_bytes);
+        };
         result.matches.pop();
         result.returned = result.matches.len();
         result.truncated = true;
@@ -836,7 +839,7 @@ fn project_state_json(
         Sha256::digest(serde_json::to_vec(actor_groups).unwrap_or_default())
     );
     let (start, end) = project_state_page(actor_groups.len(), cursor, &snapshot_identity)
-        .unwrap_or((0, actor_groups.len().min(PROJECT_STATE_PAGE_SIZE)));
+        .unwrap_or_else(|_| (0, actor_groups.len().min(PROJECT_STATE_PAGE_SIZE)));
     let actor_groups_page = &actor_groups[start..end];
     let next_cursor = (end < actor_groups.len()).then(|| format!("{snapshot_identity}:{end}"));
     serde_json::json!({
@@ -1070,6 +1073,7 @@ fn project_relative_paths(roots: &[PathBuf], paths: Vec<PathBuf>) -> Vec<String>
 
 const MAX_INLINE_APPLIED_ITEMS: usize = 8;
 
+#[allow(clippy::too_many_lines, clippy::expect_used)]
 fn workspace_edit_apply_result(
     outcome: ApplyEditPlanOutcome,
     project_id: &str,
@@ -1273,6 +1277,7 @@ fn bounded_approval_text(value: &str) -> String {
     crate::util::truncate_str(value, MAX_APPROVAL_TEXT_BYTES)
 }
 
+#[allow(clippy::too_many_lines, clippy::expect_used)]
 fn approval_summary_json(summary: &EditPlanApprovalSummary) -> serde_json::Value {
     let mut created_files = Vec::new();
     let mut renamed_files = Vec::new();
@@ -1684,6 +1689,7 @@ fn structural_match_inventory_json(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 fn bounded_structural_preview_json(
     registry: &ProjectRegistry,
     project_id: &ProjectId,
@@ -1990,7 +1996,7 @@ fn advertised_tools_page(cursor: Option<&str>) -> Result<(Vec<Tool>, Option<Stri
 }
 
 fn resource_page(
-    resources: Vec<Resource>,
+    resources: &[Resource],
     cursor: Option<&str>,
     snapshot_identity: &str,
 ) -> Result<(Vec<Resource>, Option<String>), String> {
@@ -2021,7 +2027,7 @@ fn resource_page(
         let next_cursor = (end < resources.len()).then(|| format!("{snapshot_identity}:{end}"));
         let page = resources[start..end].to_vec();
         let mut result = ListResourcesResult::with_all_items(page.clone());
-        result.next_cursor = next_cursor.clone();
+        next_cursor.clone_into(&mut result.next_cursor);
         let encoded_bytes = serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len());
         if encoded_bytes <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
             return Ok((page, next_cursor));
@@ -5009,7 +5015,7 @@ impl McplsServer {
                     .project_registry
                     .read_deferred_resource(&deferred.token)
                     .map_err(|error| McpError::invalid_params(error, None))?;
-                deferred_resource_page(&deferred, uri, payload.value, &payload.snapshot_hash)?
+                deferred_resource_page(&deferred, &uri, &payload.value, &payload.snapshot_hash)?
             }
             SessionResource::Diagnostics(_)
             | SessionResource::ProjectStatus(_)
@@ -5144,6 +5150,7 @@ impl McplsServer {
         .into())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn read_deferred_resource(
         &self,
         deferred: DeferredResource,
@@ -5155,12 +5162,7 @@ impl McplsServer {
             .project_registry
             .read_deferred_resource(&deferred.token)
             .map_err(|error| McpError::invalid_params(error, None))?;
-        let page = deferred_resource_page(
-            &deferred,
-            uri.clone(),
-            payload.value,
-            &payload.snapshot_hash,
-        )?;
+        let page = deferred_resource_page(&deferred, &uri, &payload.value, &payload.snapshot_hash)?;
         let json = serde_json::to_string(&page)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
@@ -5279,6 +5281,7 @@ impl McplsServer {
 
 #[tool_handler]
 impl ServerHandler for McplsServer {
+    #[allow(clippy::unused_async_trait_impl)]
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -5383,7 +5386,7 @@ impl ServerHandler for McplsServer {
         );
 
         let (resources, next_cursor) = resource_page(
-            resources,
+            &resources,
             request
                 .as_ref()
                 .and_then(|request| request.cursor.as_deref()),
@@ -5399,6 +5402,7 @@ impl ServerHandler for McplsServer {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -5515,11 +5519,11 @@ impl ServerHandler for McplsServer {
                 }
                 let json = serde_json::to_string(&value)
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                return Ok(private_resource_result(
+                Ok(private_resource_result(
                     vec![ResourceContents::text(json, request.uri)],
                     supports_cache_hints,
                 )
-                .into());
+                .into())
             }
             SessionResource::Source(source) => {
                 return self
@@ -5527,7 +5531,7 @@ impl ServerHandler for McplsServer {
                     .await;
             }
             SessionResource::Deferred(deferred) => {
-                return self.read_deferred_resource(deferred, request.uri, supports_cache_hints);
+                self.read_deferred_resource(deferred, request.uri, supports_cache_hints)
             }
         }
     }
@@ -5614,16 +5618,8 @@ impl ServerHandler for McplsServer {
                     .await?;
                 return Ok(());
             }
-            SessionResource::ProjectEvents { project_id, .. } => {
-                self.attach_project_subscription(
-                    project_id.clone(),
-                    project_events_resource_uri(&project_id),
-                    context.peer,
-                )
-                .await?;
-                return Ok(());
-            }
-            SessionResource::ProjectEvent { project_id, .. } => {
+            SessionResource::ProjectEvents { project_id, .. }
+            | SessionResource::ProjectEvent { project_id, .. } => {
                 self.attach_project_subscription(
                     project_id.clone(),
                     project_events_resource_uri(&project_id),
@@ -5699,16 +5695,14 @@ impl ServerHandler for McplsServer {
         let resource = parse_session_resource_uri(&request.uri)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let uri = match resource {
-            SessionResource::ProjectEvents { project_id, .. } => {
-                project_events_resource_uri(&project_id)
-            }
-            SessionResource::ProjectEvent { project_id, .. } => {
+            SessionResource::ProjectEvents { project_id, .. }
+            | SessionResource::ProjectEvent { project_id, .. } => {
                 project_events_resource_uri(&project_id)
             }
             SessionResource::EditDiff { .. }
             | SessionResource::AppliedEditResult { .. }
-            | SessionResource::EditApproval { .. } => request.uri,
-            SessionResource::ProjectStatus(_)
+            | SessionResource::EditApproval { .. }
+            | SessionResource::ProjectStatus(_)
             | SessionResource::Diagnostics(_)
             | SessionResource::Source(_)
             | SessionResource::Deferred(_) => request.uri,
@@ -5931,13 +5925,8 @@ mod tests {
                 token: "token".to_owned(),
                 offset_bytes,
             };
-            let result = deferred_resource_page(
-                &deferred,
-                format!("mcpls-deferred:///token?offset_bytes={offset_bytes}"),
-                value.clone(),
-                "snapshot",
-            )
-            .unwrap();
+            let uri = format!("mcpls-deferred:///token?offset_bytes={offset_bytes}");
+            let result = deferred_resource_page(&deferred, &uri, &value, "snapshot").unwrap();
             assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
             assert_eq!(result.total_bytes, Some(expected.len()));
             assert_eq!(result.offset_bytes, Some(offset_bytes));
@@ -6000,7 +5989,7 @@ mod tests {
         for _ in 0..16 {
             assert!(serde_json::to_vec(&result).unwrap().len() <= PAGE_LIMIT);
             let source = result.source.as_ref().unwrap();
-            assert!(!serde_json::from_str::<crate::bridge::SourceFrame>(&result.text).is_ok());
+            assert!(serde_json::from_str::<crate::bridge::SourceFrame>(&result.text).is_err());
             recovered.push_str(&result.text);
             if !source.truncated {
                 break;
@@ -7757,7 +7746,7 @@ finally:
 
         loop {
             let (page, next_cursor) =
-                resource_page(resources(), cursor.as_deref(), snapshot_identity).unwrap();
+                resource_page(&resources(), cursor.as_deref(), snapshot_identity).unwrap();
             assert!(page.len() <= RESOURCE_PAGE_SIZE);
             let mut result = ListResourcesResult::with_all_items(page.clone());
             result.next_cursor = next_cursor.clone();
@@ -7772,16 +7761,16 @@ finally:
         }
 
         assert_eq!(uris, expected);
-        assert!(resource_page(resources(), Some("not-an-offset"), snapshot_identity).is_err());
+        assert!(resource_page(&resources(), Some("not-an-offset"), snapshot_identity).is_err());
         assert!(
             resource_page(
-                resources(),
+                &resources(),
                 Some(&format!("{snapshot_identity}:{}", expected.len())),
                 snapshot_identity
             )
             .is_err()
         );
-        assert!(resource_page(resources(), Some("other:64"), snapshot_identity).is_err());
+        assert!(resource_page(&resources(), Some("other:64"), snapshot_identity).is_err());
     }
 
     #[test]

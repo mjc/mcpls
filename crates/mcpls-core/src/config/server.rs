@@ -208,12 +208,10 @@ impl ServerHeuristics {
                         .iter()
                         .any(|marker| marker == file_name);
                 let source_match = source_patterns.as_ref().is_some_and(|patterns| {
-                    path.strip_prefix(workspace_root)
-                        .ok()
-                        .is_some_and(|relative| {
-                            patterns.is_match(relative)
-                                && !content_excluded(path, &self.content_exclusions)
-                        })
+                    path.strip_prefix(workspace_root).is_ok_and(|relative| {
+                        patterns.is_match(relative)
+                            && !content_excluded(path, &self.content_exclusions)
+                    })
                 });
                 (marker_match || source_match)
                     .then_some(path)

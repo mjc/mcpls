@@ -419,11 +419,11 @@ const SENSITIVE_KEYS: &[&str] = &[
     "token",
 ];
 
-fn is_boundary_before(bytes: &[u8], index: usize) -> bool {
+const fn is_boundary_before(bytes: &[u8], index: usize) -> bool {
     index == 0 || !bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_'
 }
 
-fn is_boundary_after(bytes: &[u8], index: usize) -> bool {
+const fn is_boundary_after(bytes: &[u8], index: usize) -> bool {
     index == bytes.len() || !bytes[index].is_ascii_alphanumeric() && bytes[index] != b'_'
 }
 

@@ -6,6 +6,8 @@
 //! registration, shutdown); actual tool-call handling lives in the sibling
 //! modules below, grouped by domain.
 
+#![allow(clippy::redundant_pub_crate)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};

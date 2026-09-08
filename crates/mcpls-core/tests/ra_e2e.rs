@@ -19,8 +19,16 @@
 //! Set `MCPLS_RA_FILTER=<substring>` to run only matching sub-cases locally.
 
 #![allow(
+    clippy::assigning_clones,
+    clippy::cast_possible_truncation,
     clippy::expect_used,
+    clippy::format_collect,
+    clippy::format_push_string,
+    clippy::manual_is_variant_and,
+    clippy::or_fun_call,
+    clippy::redundant_clone,
     clippy::unwrap_used,
+    clippy::used_underscore_binding,
     clippy::panic,
     clippy::too_many_lines,
     clippy::missing_docs_in_private_items,

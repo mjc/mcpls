@@ -36,11 +36,7 @@ pub fn parse_project_status_resource_uri(uri: &str) -> Option<ProjectId> {
     let (id, query) = value
         .split_once('?')
         .map_or((value, None), |(id, query)| (id, Some(query)));
-    if query.is_some_and(|query| {
-        !query
-            .strip_prefix("cursor=")
-            .is_some_and(|cursor| !cursor.is_empty())
-    }) {
+    if query.is_some_and(|query| query.strip_prefix("cursor=").is_none_or(str::is_empty)) {
         return None;
     }
     if id.is_empty() || id.contains('/') {

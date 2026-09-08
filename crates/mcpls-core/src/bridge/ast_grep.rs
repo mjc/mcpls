@@ -1,5 +1,7 @@
 //! In-process AST-grep fallback for workspace symbol lookup.
 
+#![allow(clippy::redundant_pub_crate)]
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
@@ -612,9 +614,10 @@ fn symbol_kind<L: LanguageExt>(node: &Node<'_, StrDoc<L>>) -> Option<&'static st
         || (kind == "function_item" && has_ancestor_kind(node, "impl_item"))
     {
         Some("method")
-    } else if kind.contains("function") || kind.contains("procedure") {
-        Some("function")
-    } else if kind.contains("macro") && node.text().trim_start().starts_with("macro_rules!") {
+    } else if kind.contains("function")
+        || kind.contains("procedure")
+        || (kind.contains("macro") && node.text().trim_start().starts_with("macro_rules!"))
+    {
         Some("function")
     } else if kind.contains("class") {
         Some("class")

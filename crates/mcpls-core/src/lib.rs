@@ -33,6 +33,27 @@
 //! }
 //! ```
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assigning_clones,
+        clippy::cast_possible_truncation,
+        clippy::expect_used,
+        clippy::explicit_auto_deref,
+        clippy::format_collect,
+        clippy::format_push_string,
+        clippy::large_futures,
+        clippy::or_fun_call,
+        clippy::redundant_clone,
+        clippy::significant_drop_tightening,
+        clippy::similar_names,
+        clippy::too_many_lines,
+        clippy::tuple_array_conversions,
+        clippy::unwrap_used,
+        clippy::used_underscore_binding,
+    )
+)]
+
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 pub mod bench_support;
@@ -300,7 +321,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                 mcp_server,
                 cfg,
                 transport::ShutdownSignal::new(),
-                http_listener.expect("HTTP listener is bound before server startup"),
+                http_listener.ok_or_else(|| {
+                    Error::McpServer("HTTP listener is missing before server startup".to_owned())
+                })?,
             )
             .await
         }

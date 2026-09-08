@@ -238,6 +238,10 @@ impl Translator {
     }
 
     /// Handle one snapshot-bound page of definition targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file, cursor, or routed language server is invalid.
     pub async fn handle_definition_page(
         &self,
         file_path: String,
@@ -473,6 +477,10 @@ impl Translator {
     }
 
     /// Handle one snapshot-bound page of implementation targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file, cursor, or routed language server is invalid.
     pub async fn handle_implementation_page(
         &self,
         file_path: String,
@@ -564,6 +572,10 @@ impl Translator {
     }
 
     /// Handle one snapshot-bound page of type-definition targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file, cursor, or routed language server is invalid.
     pub async fn handle_type_definition_page(
         &self,
         file_path: String,

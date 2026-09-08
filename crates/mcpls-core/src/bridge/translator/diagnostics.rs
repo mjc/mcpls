@@ -657,6 +657,10 @@ impl Translator {
     }
 
     /// Return one snapshot-bound page of server logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid level filter or continuation cursor.
     pub fn handle_server_logs_page(
         cache: &NotificationCache,
         limit: usize,
@@ -708,9 +712,11 @@ impl Translator {
             limit,
         )?;
         let page_end = page.end;
-        let logs = (limit > 0)
-            .then(|| filtered_logs[page].to_vec())
-            .unwrap_or_default();
+        let logs = if limit > 0 {
+            filtered_logs[page].to_vec()
+        } else {
+            Vec::new()
+        };
 
         Ok(ServerLogsResult {
             returned: logs.len(),
@@ -735,6 +741,10 @@ impl Translator {
     }
 
     /// Return one snapshot-bound page of server messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid continuation cursor.
     pub fn handle_server_messages_page(
         cache: &NotificationCache,
         limit: usize,
@@ -753,16 +763,16 @@ impl Translator {
             limit,
         )?;
         let page_end = page.end;
-        let messages: Vec<_> = (limit > 0)
-            .then(|| {
-                all_messages
-                    .iter()
-                    .skip(page.start)
-                    .take(page.end - page.start)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let messages: Vec<_> = if limit > 0 {
+            all_messages
+                .iter()
+                .skip(page.start)
+                .take(page.end - page.start)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(ServerMessagesResult {
             returned: messages.len(),
             remaining: all_messages.len().saturating_sub(page_end),
