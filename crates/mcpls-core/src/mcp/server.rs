@@ -1994,18 +1994,25 @@ fn resource_page(
         ));
     }
 
-    let end = start
+    let mut end = start
         .saturating_add(RESOURCE_PAGE_SIZE)
         .min(resources.len());
-    let next_cursor = (end < resources.len()).then(|| format!("{snapshot_identity}:{end}"));
-    Ok((
-        resources
-            .into_iter()
-            .skip(start)
-            .take(end - start)
-            .collect(),
-        next_cursor,
-    ))
+    loop {
+        let next_cursor = (end < resources.len()).then(|| format!("{snapshot_identity}:{end}"));
+        let page = resources[start..end].to_vec();
+        let mut result = ListResourcesResult::with_all_items(page.clone());
+        result.next_cursor = next_cursor.clone();
+        let encoded_bytes = serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_bytes <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES {
+            return Ok((page, next_cursor));
+        }
+        if end.saturating_sub(start) <= 1 {
+            return Err(format!(
+                "one resources/list entry exceeds the response budget ({encoded_bytes} bytes)"
+            ));
+        }
+        end -= 1;
+    }
 }
 
 fn project_list_page(
@@ -7661,7 +7668,10 @@ finally:
         let snapshot_identity = "snapshot";
         let resources = || {
             (0..=RESOURCE_PAGE_SIZE)
-                .map(|index| Resource::new(format!("mcpls://resource/{index}"), index.to_string()))
+                .map(|index| {
+                    Resource::new(format!("mcpls://resource/{index}"), index.to_string())
+                        .with_description("x".repeat(1_000))
+                })
                 .collect::<Vec<_>>()
         };
         let expected = resources()
@@ -7675,6 +7685,11 @@ finally:
             let (page, next_cursor) =
                 resource_page(resources(), cursor.as_deref(), snapshot_identity).unwrap();
             assert!(page.len() <= RESOURCE_PAGE_SIZE);
+            let mut result = ListResourcesResult::with_all_items(page.clone());
+            result.next_cursor = next_cursor.clone();
+            assert!(
+                serde_json::to_vec(&result).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+            );
             uris.extend(page.into_iter().map(|resource| resource.uri));
             let Some(next_cursor) = next_cursor else {
                 break;
