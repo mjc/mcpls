@@ -2260,11 +2260,29 @@ impl McplsServer {
             .status(&project_id)
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let cursor = Url::parse(&uri)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+            .query_pairs()
+            .find_map(|(key, value)| (key == "cursor").then(|| value.into_owned()));
         let json = self
-            .project_state_json(&project_id, &identity, &state, None)
+            .project_state_json(&project_id, &identity, &state, cursor.as_deref())
             .await?;
+        let mut value: Value = serde_json::from_str(&json.legacy)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        if let Some(cursor) = value
+            .get("actor_groups_next_cursor")
+            .and_then(Value::as_str)
+        {
+            let mut next_uri = Url::parse(&uri)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            next_uri.set_query(None);
+            next_uri.query_pairs_mut().append_pair("cursor", cursor);
+            value["next_uri"] = Value::String(next_uri.to_string());
+        }
+        let text = serde_json::to_string(&value)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(private_resource_result(
-            vec![ResourceContents::text(json.legacy, uri)],
+            vec![ResourceContents::text(text, uri)],
             supports_cache_hints,
         )
         .into())

@@ -32,9 +32,21 @@ pub fn project_status_resource_uri(project_id: &ProjectId) -> String {
 
 /// Decode a project status resource URI into its stable project identity.
 pub fn parse_project_status_resource_uri(uri: &str) -> Option<ProjectId> {
-    uri.strip_prefix(PROJECT_STATUS_PREFIX)
-        .filter(|value| !value.is_empty() && !value.contains('/'))
-        .and_then(|value| ProjectId::new(value.to_string()).ok())
+    let value = uri.strip_prefix(PROJECT_STATUS_PREFIX)?;
+    let (id, query) = value
+        .split_once('?')
+        .map_or((value, None), |(id, query)| (id, Some(query)));
+    if query.is_some_and(|query| {
+        !query
+            .strip_prefix("cursor=")
+            .is_some_and(|cursor| !cursor.is_empty())
+    }) {
+        return None;
+    }
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    ProjectId::new(id.to_owned()).ok()
 }
 
 /// Encode a project identity as a bounded event-history resource URI.
