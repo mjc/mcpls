@@ -3111,10 +3111,33 @@ impl McplsServer {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&project_values).unwrap_or_default())
         );
-        let (page, next_cursor) =
+        let (initial_page, _) =
             project_list_page(project_values.len(), cursor.as_deref(), &snapshot_identity)
                 .map_err(|error| McpError::invalid_params(error, None))?;
+        let page = bounded_project_summary_page(initial_page.start, initial_page.end, |range| {
+            let next_cursor = (range.end < project_values.len())
+                .then(|| format!("{snapshot_identity}:{}", range.end));
+            serde_json::json!({
+                "projects": project_values[range.clone()].to_vec(),
+                "returned": range.end.saturating_sub(range.start),
+                "total": project_values.len(),
+                "remaining": project_values.len().saturating_sub(range.end),
+                "snapshot_identity": snapshot_identity,
+                "truncated": next_cursor.is_some(),
+                "next_cursor": next_cursor,
+            })
+        })
+        .map_err(|encoded_bytes| {
+            McpError::internal_error(
+                format!(
+                    "one project entry still exceeds the response budget ({encoded_bytes} bytes)"
+                ),
+                None,
+            )
+        })?;
         let page_end = page.end;
+        let next_cursor =
+            (page_end < project_values.len()).then(|| format!("{snapshot_identity}:{page_end}"));
         let result = project_values[page].to_vec();
         encode_json(&serde_json::json!({
             "projects": result,
