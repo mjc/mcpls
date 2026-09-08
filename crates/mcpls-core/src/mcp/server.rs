@@ -1909,11 +1909,20 @@ fn advertised_tools_page(cursor: Option<&str>) -> Result<(Vec<Tool>, Option<Stri
 fn resource_page(
     resources: Vec<Resource>,
     cursor: Option<&str>,
+    snapshot_identity: &str,
 ) -> Result<(Vec<Resource>, Option<String>), String> {
     let start = match cursor {
-        Some(cursor) => cursor
-            .parse::<usize>()
-            .map_err(|_| format!("invalid resources/list cursor: {cursor}"))?,
+        Some(cursor) => {
+            let (identity, offset) = cursor
+                .split_once(':')
+                .ok_or_else(|| format!("invalid resources/list cursor: {cursor}"))?;
+            if identity != snapshot_identity {
+                return Err("resources/list cursor belongs to a different snapshot".to_owned());
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| format!("invalid resources/list cursor: {cursor}"))?
+        }
         None => 0,
     };
     if cursor.is_some() && start >= resources.len() {
@@ -1925,7 +1934,7 @@ fn resource_page(
     let end = start
         .saturating_add(RESOURCE_PAGE_SIZE)
         .min(resources.len());
-    let next_cursor = (end < resources.len()).then(|| end.to_string());
+    let next_cursor = (end < resources.len()).then(|| format!("{snapshot_identity}:{end}"));
     Ok((
         resources
             .into_iter()
@@ -5081,6 +5090,7 @@ impl ServerHandler for McplsServer {
             .open_document_paths()
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let mut skipped_documents = 0;
         let mut resources: Vec<_> = open_documents
             .into_iter()
             .filter_map(|(project_id, path)| {
@@ -5091,7 +5101,11 @@ impl ServerHandler for McplsServer {
                             path.display()
                         );
                     })
-                    .ok()?;
+                    .ok();
+                let Some(uri) = uri else {
+                    skipped_documents += 1;
+                    return None;
+                };
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -5120,11 +5134,24 @@ impl ServerHandler for McplsServer {
                 .with_description(format!("Ordered project events for {project_id}"))
         }));
 
+        resources.sort_by(|left, right| left.uri.cmp(&right.uri));
+        if skipped_documents > 0 {
+            tracing::warn!(
+                skipped_documents,
+                "Skipped unrepresentable open documents in resources/list"
+            );
+        }
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&resources).unwrap_or_default())
+        );
+
         let (resources, next_cursor) = resource_page(
             resources,
             request
                 .as_ref()
                 .and_then(|request| request.cursor.as_deref()),
+            &snapshot_identity,
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
         let mut result = ListResourcesResult::with_all_items(resources);
@@ -7456,6 +7483,7 @@ finally:
 
     #[test]
     fn resource_pages_are_lossless_and_bounded() {
+        let snapshot_identity = "snapshot";
         let resources = || {
             (0..=RESOURCE_PAGE_SIZE)
                 .map(|index| Resource::new(format!("mcpls://resource/{index}"), index.to_string()))
@@ -7469,7 +7497,8 @@ finally:
         let mut uris = Vec::new();
 
         loop {
-            let (page, next_cursor) = resource_page(resources(), cursor.as_deref()).unwrap();
+            let (page, next_cursor) =
+                resource_page(resources(), cursor.as_deref(), snapshot_identity).unwrap();
             assert!(page.len() <= RESOURCE_PAGE_SIZE);
             uris.extend(page.into_iter().map(|resource| resource.uri));
             let Some(next_cursor) = next_cursor else {
@@ -7479,8 +7508,16 @@ finally:
         }
 
         assert_eq!(uris, expected);
-        assert!(resource_page(resources(), Some("not-an-offset")).is_err());
-        assert!(resource_page(resources(), Some(&expected.len().to_string())).is_err());
+        assert!(resource_page(resources(), Some("not-an-offset"), snapshot_identity).is_err());
+        assert!(
+            resource_page(
+                resources(),
+                Some(&format!("{snapshot_identity}:{}", expected.len())),
+                snapshot_identity
+            )
+            .is_err()
+        );
+        assert!(resource_page(resources(), Some("other:64"), snapshot_identity).is_err());
     }
 
     #[test]
