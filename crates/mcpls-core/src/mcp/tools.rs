@@ -1092,7 +1092,11 @@ pub struct ProjectListParams {
 /// Empty parameters for daemon health and status snapshots.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Return a daemon health or status snapshot.")]
-pub struct DaemonStatusParams {}
+pub struct DaemonStatusParams {
+    /// Snapshot-bound cursor returned by a prior health or status response.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
 
 /// Parameters for listing this MCP session's resource subscriptions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

@@ -3040,10 +3040,27 @@ impl McplsServer {
     #[tool(description = "Return daemon liveness and non-blocking project lifecycle counts.")]
     async fn health(
         &self,
-        Parameters(_params): Parameters<DaemonStatusParams>,
+        Parameters(DaemonStatusParams { cursor }): Parameters<DaemonStatusParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
         let snapshot = self.daemon_snapshot().await;
+        let summaries = project_status_summaries_json(&snapshot.project_summaries);
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&summaries).unwrap_or_default())
+        );
+        let (page, next_cursor) = project_list_page(
+            snapshot.project_summaries.len(),
+            cursor.as_deref(),
+            &snapshot_identity,
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        let start = page.start;
+        let end = page.end;
+        let summaries = summaries
+            .as_array()
+            .map_or_else(Vec::new, |summaries| summaries[page].to_vec());
         encode_json(&serde_json::json!({
+            "schema_version": 1,
             "status": health_status(&snapshot).as_str(),
             "lifecycle": snapshot.lifecycle(),
             "persistence": snapshot.persistence,
@@ -3052,7 +3069,12 @@ impl McplsServer {
             "queue_pressure": project_queue_pressure_json(snapshot.queue_pressure),
             "projects": project_status_counts_json(snapshot.project_counts),
             "actor_groups": snapshot.actor_groups,
-            "project_summaries": project_status_summaries_json(&snapshot.project_summaries),
+            "project_summaries": summaries,
+            "project_summaries_returned": end.saturating_sub(start),
+            "project_summaries_total": snapshot.project_summaries.len(),
+            "project_summaries_remaining": snapshot.project_summaries.len().saturating_sub(end),
+            "project_summaries_snapshot_identity": snapshot_identity,
+            "project_summaries_next_cursor": next_cursor,
         }))
     }
 
@@ -8453,7 +8475,7 @@ finally:
         let server = create_test_server();
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(DaemonStatusParams {}))
+                .health(Parameters(DaemonStatusParams { cursor: None }))
                 .await
                 .unwrap(),
         )
@@ -8479,7 +8501,7 @@ finally:
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(
             &server
-                .server_status(Parameters(DaemonStatusParams {}))
+                .server_status(Parameters(DaemonStatusParams { cursor: None }))
                 .await
                 .unwrap(),
         )
@@ -8504,7 +8526,7 @@ finally:
         server.context.project_registry.shutdown_all().await;
         let shutdown_health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(DaemonStatusParams {}))
+                .health(Parameters(DaemonStatusParams { cursor: None }))
                 .await
                 .unwrap(),
         )
@@ -8538,7 +8560,7 @@ finally:
 
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(DaemonStatusParams {}))
+                .health(Parameters(DaemonStatusParams { cursor: None }))
                 .await
                 .unwrap(),
         )
@@ -8572,7 +8594,7 @@ finally:
 
         let health: serde_json::Value = serde_json::from_str(
             &server
-                .health(Parameters(DaemonStatusParams {}))
+                .health(Parameters(DaemonStatusParams { cursor: None }))
                 .await
                 .unwrap(),
         )
