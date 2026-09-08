@@ -10136,6 +10136,7 @@ async fn suspend_project_runtime(
 }
 
 const PROJECT_SHUTDOWN_CANCELLED: &str = "project shutdown requested";
+const PROJECT_REQUEST_CANCELLED: &str = "project request cancelled";
 
 async fn run_cancellable_transition<T, F>(
     gate: &ProjectRequestGate,
@@ -10158,6 +10159,37 @@ where
             cancellation.cancel();
             let _ = operation.await;
             Err(PROJECT_SHUTDOWN_CANCELLED.to_string())
+        }
+    }
+}
+
+async fn run_cancellable_transition_until_reply<T, F, R>(
+    gate: &ProjectRequestGate,
+    cancellation: CancellationToken,
+    reply: &mut oneshot::Sender<R>,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    if !gate.is_accepting() {
+        cancellation.cancel();
+        let _ = operation.await;
+        return Err(PROJECT_SHUTDOWN_CANCELLED.to_string());
+    }
+
+    tokio::select! {
+        result = &mut operation => result,
+        () = gate.wait_for_rejection() => {
+            cancellation.cancel();
+            let _ = operation.await;
+            Err(PROJECT_SHUTDOWN_CANCELLED.to_string())
+        }
+        () = reply.closed() => {
+            cancellation.cancel();
+            let _ = operation.await;
+            Err(PROJECT_REQUEST_CANCELLED.to_string())
         }
     }
 }
@@ -10193,7 +10225,7 @@ async fn handle_project_request(
         ProjectRequest::Suspend { reply, dormancy } => {
             let _ = reply.send(suspend_project_runtime(channels, state, runtime, dormancy).await);
         }
-        ProjectRequest::Activate { root, reply } => {
+        ProjectRequest::Activate { root, mut reply } => {
             if runtime.activation_is_reusable(state.status, std::slice::from_ref(&root)) {
                 state.sync_runtime(runtime);
                 let _ = reply.send(Ok(state.clone()));
@@ -10203,9 +10235,10 @@ async fn handle_project_request(
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
             let cancellation = CancellationToken::new();
-            match run_cancellable_transition(
+            match run_cancellable_transition_until_reply(
                 &channels.gate,
                 cancellation.clone(),
+                &mut reply,
                 runtime.activate_workspace_roots(vec![root], cancellation),
             )
             .await
@@ -10222,7 +10255,9 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    channels.publish_failure(state, error.clone());
+                    if error != PROJECT_REQUEST_CANCELLED {
+                        channels.publish_failure(state, error.clone());
+                    }
                     if let Some(residency) = residency {
                         residency.remove();
                     }
@@ -10230,7 +10265,7 @@ async fn handle_project_request(
                 }
             }
         }
-        ProjectRequest::ActivateWorkspaceRoots { roots, reply } => {
+        ProjectRequest::ActivateWorkspaceRoots { roots, mut reply } => {
             if runtime.activation_is_reusable(state.status, &roots) {
                 state.sync_runtime(runtime);
                 let _ = reply.send(Ok(state.clone()));
@@ -10240,9 +10275,10 @@ async fn handle_project_request(
             state.last_error = None;
             channels.publish_status(state, ProjectStatus::Starting);
             let cancellation = CancellationToken::new();
-            match run_cancellable_transition(
+            match run_cancellable_transition_until_reply(
                 &channels.gate,
                 cancellation.clone(),
+                &mut reply,
                 runtime.activate_workspace_roots(roots, cancellation),
             )
             .await
@@ -10259,7 +10295,9 @@ async fn handle_project_request(
                 }
                 Err(error) => {
                     state.sync_runtime(runtime);
-                    channels.publish_failure(state, error.clone());
+                    if error != PROJECT_REQUEST_CANCELLED {
+                        channels.publish_failure(state, error.clone());
+                    }
                     if let Some(residency) = residency {
                         residency.remove();
                     }

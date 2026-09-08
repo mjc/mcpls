@@ -3,6 +3,7 @@
 //! This module provides the MCP server that exposes LSP capabilities
 //! as MCP tools using the rmcp SDK.
 
+use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -274,6 +275,25 @@ struct StructuredObject {
 
 fn parse_project_id(value: String) -> Result<ProjectId, McpError> {
     ProjectId::new(value).map_err(|error| McpError::invalid_params(error.to_string(), None))
+}
+
+fn infer_project_id(
+    root: &CanonicalRoot,
+    repository: Option<&GitRepositoryIdentity>,
+) -> Result<ProjectId, McpError> {
+    let name = repository
+        .and_then(|repository| {
+            (repository.common_dir().file_name() == Some(OsStr::new(".git")))
+                .then(|| repository.common_dir().parent())
+                .flatten()
+                .and_then(Path::file_name)
+        })
+        .or_else(|| root.as_path().file_name())
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            McpError::invalid_params("project root must have a valid directory name", None)
+        })?;
+    parse_project_id(name.to_owned())
 }
 
 fn parse_position_encoding(value: Option<&str>) -> Result<PositionEncoding, McpError> {
@@ -2239,7 +2259,7 @@ impl McplsServer {
             .project_registry
             .actor_group_roots(project_id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_operation_error)?;
         let actor_groups = actor_group_states(actor_group_roots);
         let snapshot_identity = format!(
             "{:x}",
@@ -2253,7 +2273,7 @@ impl McplsServer {
             .project_registry
             .cargo_features(project_id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_operation_error)?;
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "cargo_features".to_owned(),
@@ -3011,17 +3031,18 @@ impl McplsServer {
     }
 
     /// Register a project root for long-lived lifecycle and routing operations.
-    #[tool(description = "Register a project root under a stable project ID.")]
+    #[tool(
+        description = "Register a project root. The stable project ID is derived from the main worktree directory name."
+    )]
     async fn project_add(
         &self,
         Parameters(ProjectAddParams {
-            project_id,
+            project_id: _,
             root,
             config,
             cursor,
         }): Parameters<ProjectAddParams>,
     ) -> Result<Json<StructuredObject>, McpError> {
-        let id = parse_project_id(project_id)?;
         let config = config
             .map(serde_json::from_value::<crate::config::ProjectConfig>)
             .transpose()
@@ -3030,36 +3051,60 @@ impl McplsServer {
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let repository = GitRepositoryIdentity::discover(canonical_root.as_path())
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let identity = repository.map_or_else(
-            || ProjectIdentity::new(id.clone(), canonical_root.clone()),
+        let inferred_id = infer_project_id(&canonical_root, repository.as_ref())?;
+        let identity = repository.clone().map_or_else(
+            || ProjectIdentity::new(inferred_id.clone(), canonical_root.clone()),
             |repository| {
-                ProjectIdentity::new(id.clone(), canonical_root.clone())
+                ProjectIdentity::new(inferred_id.clone(), canonical_root.clone())
                     .with_repository_identity(repository)
             },
         );
-        let actor = if cursor.is_some() {
-            self.context
+        let (id, actor) = match self
+            .context
+            .project_registry
+            .project_for_path(canonical_root.as_path())
+            .await
+        {
+            Ok(existing) => existing,
+            Err(crate::project::ProjectRegistryError::Identity(
+                crate::project::ProjectIdentityError::UnregisteredPath(_),
+            )) if cursor.is_none() => match self
+                .context
                 .project_registry
-                .actor_for_project(&id)
+                .add_with_config(identity, config.clone())
                 .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?
-        } else {
-            self.context
-                .project_registry
-                .add_with_config(identity.clone(), config)
-                .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            {
+                Ok(actor) => (inferred_id, actor),
+                Err(crate::project::ProjectRegistryError::LinkedWorktreeProject {
+                    existing_id,
+                    ..
+                }) => {
+                    let identity = repository.map_or_else(
+                        || ProjectIdentity::new(existing_id.clone(), canonical_root.clone()),
+                        |repository| {
+                            ProjectIdentity::new(existing_id.clone(), canonical_root.clone())
+                                .with_repository_identity(repository)
+                        },
+                    );
+                    let actor = self
+                        .context
+                        .project_registry
+                        .add_with_config(identity, config)
+                        .await
+                        .map_err(project_operation_error)?;
+                    (existing_id, actor)
+                }
+                Err(error) => return Err(project_operation_error(error)),
+            },
+            Err(error) => return Err(project_routing_error(error)),
         };
         let identity = self
             .context
             .project_registry
             .identity(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let state = actor
-            .query()
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_operation_error)?;
+        let state = actor.query().await.map_err(project_operation_error)?;
         self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
     }
@@ -3078,13 +3123,13 @@ impl McplsServer {
             .project_registry
             .identity(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let state = if cursor.is_some() {
             self.context.project_registry.status(&id).await
         } else {
             self.context.project_registry.activate(&id).await
         }
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        .map_err(project_operation_error)?;
         self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
     }
@@ -3328,13 +3373,13 @@ impl McplsServer {
             .project_registry
             .identity(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let state = self
             .context
             .project_registry
             .status(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_operation_error)?;
         self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
     }
@@ -3352,7 +3397,7 @@ impl McplsServer {
             .project_registry
             .remove(id.clone())
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_operation_error)?;
         encode_json(&serde_json::json!({
             "project_id": id.as_str(),
             "removed": true,
@@ -3743,13 +3788,13 @@ impl McplsServer {
             .project_registry
             .identity(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let state = if cursor.is_some() {
             self.context.project_registry.status(&id).await
         } else {
             self.context.project_registry.restart(&id).await
         }
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        .map_err(project_operation_error)?;
         self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
     }
@@ -3780,13 +3825,13 @@ impl McplsServer {
                 },
             )
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_operation_error)?;
         let identity = self
             .context
             .project_registry
             .identity(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         self.project_state_json(&id, &identity, &state, None).await
     }
 
@@ -3802,13 +3847,13 @@ impl McplsServer {
             .project_registry
             .identity(&id)
             .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            .map_err(project_routing_error)?;
         let state = if cursor.is_some() {
             self.context.project_registry.status(&id).await
         } else {
             self.context.project_registry.refresh(&id).await
         }
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        .map_err(project_operation_error)?;
         self.project_state_json(&id, &identity, &state, cursor.as_deref())
             .await
     }
@@ -6758,6 +6803,11 @@ finally:
     }
 
     #[cfg(unix)]
+    fn project_id_for_root(root: &std::path::Path) -> String {
+        root.file_name().unwrap().to_str().unwrap().to_owned()
+    }
+
+    #[cfg(unix)]
     async fn add_two_projects(
         registry: &ProjectRegistry,
         first_root: &std::path::Path,
@@ -6812,6 +6862,7 @@ finally:
     #[tokio::test]
     async fn http_sessions_share_one_project_actor_and_lsp_process() {
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         let file = write_rust_fixture(root.path());
         let counter = root.path().join("spawn-count");
         let config = write_concurrency_lsp(root.path(), &counter, None, None, None);
@@ -6821,20 +6872,20 @@ finally:
         let first_session = server.for_session();
         let second_session = server.for_session();
 
-        let add_first = first_session.project_add(project_add_params("shared", root.path()));
-        let add_second = second_session.project_add(project_add_params("shared", root.path()));
+        let add_first = first_session.project_add(project_add_params("ignored", root.path()));
+        let add_second = second_session.project_add(project_add_params("ignored", root.path()));
         let (first, second) = tokio::join!(add_first, add_second);
         first.unwrap();
         second.unwrap();
 
-        let activate_first = first_session.project_activate(project_params("shared"));
-        let activate_second = second_session.project_activate(project_params("shared"));
+        let activate_first = first_session.project_activate(project_params(&project_id));
+        let activate_second = second_session.project_activate(project_params(&project_id));
         let (first, second) = tokio::join!(activate_first, activate_second);
         first.unwrap();
         second.unwrap();
 
         let status = first_session
-            .project_status(project_params("shared"))
+            .project_status(project_params(&project_id))
             .await
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
@@ -8395,9 +8446,10 @@ finally:
     async fn project_status_reports_dormancy_metadata() {
         let server = create_test_server();
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "dormant".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
                 cursor: None,
@@ -8407,7 +8459,7 @@ finally:
         let actor = server
             .context
             .project_registry
-            .actor_for_project(&ProjectId::new("dormant").unwrap())
+            .actor_for_project(&ProjectId::new(project_id.clone()).unwrap())
             .await
             .unwrap();
         actor
@@ -8417,7 +8469,7 @@ finally:
 
         let status = server
             .project_status(Parameters(ProjectIdParams {
-                project_id: "dormant".to_string(),
+                project_id,
                 cursor: None,
             }))
             .await
@@ -8431,9 +8483,10 @@ finally:
     async fn test_project_lifecycle_tools_share_registry() {
         let server = create_test_server();
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         let added = server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "demo".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
                 cursor: None,
@@ -8441,7 +8494,7 @@ finally:
             .await
             .unwrap();
         let added_json: serde_json::Value = serde_json::from_str(&added).unwrap();
-        assert_eq!(added_json["project_id"], "demo");
+        assert_eq!(added_json["project_id"], project_id);
         assert_eq!(added_json["roots"].as_array().unwrap().len(), 1);
         assert_eq!(added_json["actor_group_count"], 1);
         assert_eq!(added_json["generation"], 0);
@@ -8455,7 +8508,7 @@ finally:
         );
         let capabilities = server
             .project_lsp_capabilities(Parameters(ProjectLspCapabilitiesParams {
-                project_id: "demo".to_string(),
+                project_id: project_id.clone(),
                 language_id: None,
                 page_token: None,
             }))
@@ -8465,24 +8518,24 @@ finally:
         assert!(capabilities_json["servers"].is_array());
         let duplicate = server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "demo".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: Some(serde_json::json!({})),
                 cursor: None,
             }))
             .await
             .unwrap();
-        assert!(duplicate.contains("demo"));
+        assert!(duplicate.contains(&project_id));
 
         let listed = server
             .project_list(Parameters(ProjectListParams::default()))
             .await
             .unwrap();
-        assert!(listed.contains("demo"));
+        assert!(listed.contains(&project_id));
 
         let status = server
             .project_status(Parameters(ProjectIdParams {
-                project_id: "demo".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await
@@ -8491,7 +8544,7 @@ finally:
 
         let restarted = server
             .project_restart_lsp(Parameters(ProjectIdParams {
-                project_id: "demo".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await
@@ -8499,7 +8552,7 @@ finally:
         assert!(restarted.contains("Ready"));
         let refreshed = server
             .project_refresh(Parameters(ProjectIdParams {
-                project_id: "demo".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await
@@ -8508,7 +8561,7 @@ finally:
 
         server
             .project_remove(Parameters(ProjectIdParams {
-                project_id: "demo".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await
@@ -8518,7 +8571,7 @@ finally:
                 .project_list(Parameters(ProjectListParams::default()))
                 .await
                 .unwrap()
-                .contains("demo")
+                .contains(&project_id)
         );
     }
 
@@ -8771,15 +8824,119 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn project_add_infers_main_worktree_name_and_shares_linked_worktree() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        for root in [repository.path(), worktree.path()] {
+            std::fs::write(
+                root.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"stable\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+        }
+
+        let server = create_test_server();
+        let project_id = repository
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let main = server
+            .project_add(project_add_params("ignored-main-name", repository.path()))
+            .await
+            .unwrap();
+        let main: serde_json::Value = serde_json::from_str(&main).unwrap();
+        assert_eq!(main["project_id"], project_id);
+
+        let linked = server
+            .project_add(project_add_params("ignored-worktree-name", worktree.path()))
+            .await
+            .unwrap();
+        let linked: serde_json::Value = serde_json::from_str(&linked).unwrap();
+        assert_eq!(linked["project_id"], project_id);
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams::default()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["projects"][0]["project_id"], project_id);
+        assert_eq!(listed["projects"][0]["roots"].as_array().unwrap().len(), 2);
+
+        let add_tool = McplsServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "project_add")
+            .unwrap();
+        assert!(
+            !add_tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .unwrap()
+                .contains_key("project_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_add_is_idempotent_for_an_already_registered_root() {
+        let root = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new(2);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("legacy-project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let result = server
+            .project_add(project_add_params("ignored", root.path()))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["project_id"], "legacy-project");
+        assert_eq!(result["roots"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn workspace_symbol_falls_back_when_project_activation_fails() {
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         let source = write_rust_fixture(root.path());
         std::fs::write(&source, "fn fixture_symbol() {}\n").unwrap();
         let server = create_test_server();
 
         server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "activation-fallback".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: Some(serde_json::json!({
                     "lsp_servers": [{
@@ -8796,7 +8953,7 @@ finally:
 
         let result = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
-                project_id: "activation-fallback".to_string(),
+                project_id,
                 query: Some("fixture_symbol".to_string()),
                 queries: Vec::new(),
                 kind_filter: None,
@@ -10887,6 +11044,7 @@ while True:
     #[tokio::test]
     async fn test_project_activate_uses_actor_runtime() {
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         std::fs::write(
             root.path().join("Cargo.toml"),
             "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
@@ -10903,7 +11061,7 @@ while True:
 
         server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "fixture".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
                 cursor: None,
@@ -10913,7 +11071,7 @@ while True:
 
         let result = server
             .project_activate(Parameters(ProjectIdParams {
-                project_id: "fixture".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await;
@@ -10921,7 +11079,7 @@ while True:
         assert!(result.is_err());
         let state = server
             .project_status(Parameters(ProjectIdParams {
-                project_id: "fixture".to_string(),
+                project_id,
                 cursor: None,
             }))
             .await
@@ -10933,17 +11091,18 @@ while True:
     #[tokio::test]
     async fn project_configure_cargo_features_returns_effective_profile() {
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         let registry = ProjectRegistry::new(2);
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
         server
-            .project_add(project_add_params("fixture", root.path()))
+            .project_add(project_add_params("ignored", root.path()))
             .await
             .unwrap();
 
         let result = server
             .project_configure_cargo_features(Parameters(ProjectCargoFeaturesParams {
-                project_id: "fixture".to_owned(),
+                project_id,
                 features: vec!["zeta".to_owned(), "alpha".to_owned(), "alpha".to_owned()],
                 all_features: false,
                 no_default_features: true,
@@ -10964,6 +11123,7 @@ while True:
     #[tokio::test]
     async fn project_activate_without_applicable_lsp_reaches_degraded_fallback() {
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         std::fs::write(root.path().join("main.rs"), "fn fallback_symbol() {}\n").unwrap();
         let mut translator = Translator::new();
         translator.set_lsp_configs(
@@ -10977,7 +11137,7 @@ while True:
 
         server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "fallback-only".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
                 cursor: None,
@@ -10987,7 +11147,7 @@ while True:
         let activated = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             server.project_activate(Parameters(ProjectIdParams {
-                project_id: "fallback-only".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             })),
         )
@@ -10997,7 +11157,7 @@ while True:
         let activated: serde_json::Value = serde_json::from_str(&activated).unwrap();
         let symbols = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
-                project_id: "fallback-only".to_string(),
+                project_id: project_id.clone(),
                 query: Some("fallback_symbol".to_string()),
                 queries: Vec::new(),
                 kind_filter: None,
@@ -11020,7 +11180,7 @@ while True:
                 file_path: String::new(),
                 line: 0,
                 character: 0,
-                project_id: Some("fallback-only".to_owned()),
+                project_id: Some(project_id.clone()),
                 symbol_handle: Some(handle),
             }))
             .await
@@ -11028,7 +11188,7 @@ while True:
             .to_string();
         let repeated = server
             .project_activate(Parameters(ProjectIdParams {
-                project_id: "fallback-only".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await
@@ -11063,6 +11223,7 @@ while True:
     #[tokio::test]
     async fn project_activate_without_optional_executable_keeps_ast_fallback() {
         let root = TempDir::new().unwrap();
+        let project_id = project_id_for_root(root.path());
         std::fs::write(
             root.path().join("pyproject.toml"),
             "[project]\nname=\"fixture\"\n",
@@ -11085,7 +11246,7 @@ while True:
 
         server
             .project_add(Parameters(ProjectAddParams {
-                project_id: "missing-optional".to_string(),
+                project_id: "ignored".to_string(),
                 root: root.path().display().to_string(),
                 config: None,
                 cursor: None,
@@ -11094,7 +11255,7 @@ while True:
             .unwrap();
         let activated = server
             .project_activate(Parameters(ProjectIdParams {
-                project_id: "missing-optional".to_string(),
+                project_id: project_id.clone(),
                 cursor: None,
             }))
             .await
@@ -11105,7 +11266,7 @@ while True:
 
         let symbols = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
-                project_id: "missing-optional".to_string(),
+                project_id,
                 query: Some("missing_server_fallback".to_string()),
                 queries: Vec::new(),
                 kind_filter: None,

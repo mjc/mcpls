@@ -13835,6 +13835,16 @@
     "description": "Return daemon liveness and non-blocking project lifecycle counts.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior health or status response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "outputSchema": {
@@ -21248,6 +21258,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior project-state response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Stable project identifier.",
           "type": "string"
@@ -21266,7 +21284,7 @@
   },
   {
     "name": "project_add",
-    "description": "Register a project root under a stable project ID.",
+    "description": "Register a project root. The stable project ID is derived from the main worktree directory name.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -21274,9 +21292,13 @@
           "default": null,
           "description": "Optional project-specific configuration."
         },
-        "project_id": {
-          "description": "Stable project identifier.",
-          "type": "string"
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior project-state response.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "root": {
           "description": "Absolute or relative path to an existing project directory.",
@@ -21284,7 +21306,6 @@
         }
       },
       "required": [
-        "project_id",
         "root"
       ],
       "type": "object"
@@ -21372,6 +21393,14 @@
             "null"
           ]
         },
+        "page_token": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior capabilities response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Registered project whose capabilities should be returned.",
           "type": "string"
@@ -21384,6 +21413,46 @@
     },
     "outputSchema": {
       "$defs": {
+        "DeferredResourceReference": {
+          "description": "Snapshot-bound MCP resource for context omitted from an inline result.",
+          "properties": {
+            "document_version": {
+              "description": "Open-document version when available.",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "description": "Stable kind of deferred payload.",
+              "type": "string"
+            },
+            "snapshot_hash": {
+              "description": "Snapshot content hash used to reject stale reads.",
+              "type": "string"
+            },
+            "total_bytes": {
+              "description": "Known byte size of the deferred payload.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI for `resources/read` or the `read_semantic_resource` tool fallback.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "kind",
+            "snapshot_hash"
+          ],
+          "type": "object"
+        },
         "ProjectServerCapability": {
           "description": "Negotiated capability data for one actor group in a logical project.",
           "properties": {
@@ -21416,18 +21485,63 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "capabilities_resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredResourceReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "type": "string"
+        },
+        "remaining": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "schema_version": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
         },
         "servers": {
           "items": {
             "$ref": "#/$defs/ProjectServerCapability"
           },
           "type": "array"
+        },
+        "snapshot_identity": {
+          "type": "string"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
+        "schema_version",
         "project_id",
+        "returned",
+        "total",
+        "remaining",
+        "snapshot_identity",
         "servers"
       ],
       "type": "object"
@@ -21439,6 +21553,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior project-state response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Stable project identifier.",
           "type": "string"
@@ -21461,6 +21583,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior project-state response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Stable project identifier.",
           "type": "string"
@@ -21483,6 +21613,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior project-state response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Stable project identifier.",
           "type": "string"
@@ -21505,6 +21643,14 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior project-state response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "description": "Stable project identifier.",
           "type": "string"
@@ -22521,6 +22667,16 @@
     "description": "Return daemon version, uptime, and non-blocking project status.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Snapshot-bound cursor returned by a prior health or status response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "outputSchema": {

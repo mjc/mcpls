@@ -881,10 +881,14 @@ pub struct InlayHintsParams {
 
 /// Parameters for registering a project with the long-lived daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Register a project root under a stable project ID.")]
+#[schemars(
+    description = "Register a project root. The project ID is derived from the main worktree directory name."
+)]
 pub struct ProjectAddParams {
-    /// Stable project identifier used by subsequent lifecycle tools.
-    #[schemars(description = "Stable project identifier.")]
+    /// Legacy client field. The daemon derives the stable project identifier
+    /// from the main worktree directory name and ignores this value.
+    #[serde(default)]
+    #[schemars(skip)]
     pub project_id: String,
     /// Existing directory to register as the project root.
     #[schemars(description = "Absolute or relative path to an existing project directory.")]
