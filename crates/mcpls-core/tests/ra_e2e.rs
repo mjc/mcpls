@@ -1228,6 +1228,96 @@ fn sc_format_document_deferred(client: &mut McpClient, workspace: &Path) -> Resu
     Ok(())
 }
 
+/// Apply an oversized format plan and replay its complete post-commit receipt.
+fn sc_applied_edit_result_resource(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
+    let large = workspace.join("src/apply_large.rs");
+    let content: String = (0..500)
+        .map(|index| format!("pub fn applied_{index}()->i32{{{index}}}\n"))
+        .collect();
+    fs::write(&large, content).map_err(|error| format!("write large apply fixture: {error}"))?;
+
+    let preview = call_json(
+        client,
+        "format_preview",
+        &json!({
+            "project_id": "default",
+            "file_path": large,
+            "tab_size": 4,
+            "insert_spaces": true,
+            "position_encoding": "utf-8",
+        }),
+    )?;
+    assert_preview_envelope(&preview, "format_preview")?;
+    let plan_id = preview["plan_id"]
+        .as_str()
+        .ok_or_else(|| format!("large format preview omitted plan_id: {preview}"))?;
+    let applied = call_json(
+        client,
+        "workspace_edit_apply",
+        &json!({"project_id": "default", "plan_id": plan_id}),
+    )?;
+    if applied["status"] != "applied"
+        || applied["committed"] != true
+        || applied["details_truncated"] != true
+        || applied["detail_resource"].as_str().is_none()
+        || applied["operation_count"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+    {
+        return Err(format!(
+            "oversized applied result was incomplete: {applied}"
+        ));
+    }
+    if serde_json::to_vec(&applied)
+        .map_err(|error| format!("serialize applied result: {error}"))?
+        .len()
+        > 16 * 1024
+    {
+        return Err(format!(
+            "applied result exceeded response budget: {applied}"
+        ));
+    }
+
+    let resource_uri = applied["detail_resource"].as_str().unwrap().to_owned();
+    let mut uri = resource_uri.clone();
+    let mut resource_json = String::new();
+    loop {
+        let page = client
+            .read_resource(&uri)
+            .map_err(|error| format!("read applied detail resource: {error}"))?;
+        let text = page["result"]["contents"][0]["text"]
+            .as_str()
+            .ok_or_else(|| format!("applied detail resource omitted text: {page}"))?;
+        let envelope: Value = serde_json::from_str(text)
+            .map_err(|error| format!("applied detail page was not JSON: {error}"))?;
+        resource_json.push_str(
+            envelope["text"]
+                .as_str()
+                .ok_or_else(|| format!("applied detail envelope omitted text: {envelope}"))?,
+        );
+        let Some(next) = envelope["next_uri"].as_str() else {
+            break;
+        };
+        uri = next.to_owned();
+    }
+
+    let detail: Value = serde_json::from_str(&resource_json)
+        .map_err(|error| format!("applied detail was not complete JSON: {error}"))?;
+    if detail["unified_diff"]
+        .as_str()
+        .is_none_or(|diff| !diff.contains("applied_499"))
+        || detail["operations"].as_array().is_none_or(Vec::is_empty)
+        || detail["committed_files"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(format!(
+            "applied detail omitted complete receipt data: {detail}"
+        ));
+    }
+    Ok(())
+}
+
 /// Tool 9: `workspace_symbol_search` — search for "add".
 fn sc_workspace_symbol_search(client: &mut McpClient, _workspace: &Path) -> Result<(), String> {
     // Retry: workspace symbol search may return empty until rust-analyzer
@@ -3755,6 +3845,7 @@ fn ra_e2e_suite() {
         sub_case!(sc_format_document),
         sub_case!(sc_format_document_stale_apply),
         sub_case!(sc_format_document_deferred),
+        sub_case!(sc_applied_edit_result_resource),
         sub_case!(sc_workspace_symbol_search),
         sub_case!(sc_inspect_symbol),
         sub_case!(sc_no_reread_corpus),
