@@ -23890,6 +23890,12 @@
           "$ref": "#/$defs/WorkspaceSymbolBatchResult"
         }
       ]
+    },
+    "annotations": {
+      "title": "Workspace symbol search",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {

@@ -4210,7 +4210,13 @@ impl McplsServer {
     /// Search one symbol query or several queries across the workspace.
     #[tool(
         output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceSymbolSearchResponse>(),
-        description = "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; use page_token with queries omitted to continue a bounded batch page. Results have bounded source frames and reusable symbol handles."
+        description = "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; use page_token with queries omitted to continue a bounded batch page. Results have bounded source frames and reusable symbol handles.",
+        annotations(
+            title = "Workspace symbol search",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn workspace_symbol_search(
         &self,
@@ -12841,6 +12847,17 @@ while True:
             assert_eq!(annotations.destructive_hint, Some(true));
             assert_eq!(annotations.idempotent_hint, Some(true));
         }
+    }
+
+    #[test]
+    fn read_only_symbol_search_advertises_safe_annotations() {
+        let tool = McplsServer::workspace_symbol_search_tool_attr();
+        let Some(annotations) = tool.annotations else {
+            panic!("workspace symbol search annotations");
+        };
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
     }
 
     async fn approval_fixture() -> (TempDir, McplsServer, String) {
