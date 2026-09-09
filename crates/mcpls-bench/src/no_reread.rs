@@ -147,7 +147,7 @@ pub struct EvaluationReport {
 pub const EVALUATION_SCHEMA_VERSION: u32 = 6;
 
 /// Version of the privacy-preserving before/after comparison schema.
-pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 1;
+pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 2;
 
 /// One lower-is-better metric from two like-for-like evaluations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -172,12 +172,13 @@ impl MetricComparison {
 /// Privacy-preserving comparison of two task evaluations.
 ///
 /// The comparison deliberately contains counts and byte totals only. The
-/// acceptance flag requires both fewer MCPLS calls and fewer model-visible
-/// context bytes, and requires the two reports to cover the same number of
-/// completed task segments.
+/// acceptance flag requires matching report schemas and completed-task counts,
+/// plus both fewer MCPLS calls and fewer model-visible context bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EvaluationComparison {
     pub schema_version: u32,
+    pub report_schema_versions: [u32; 2],
+    pub comparable_report_schemas: bool,
     pub comparable_task_counts: bool,
     pub accepted: bool,
     pub mcpls_calls: MetricComparison,
@@ -202,6 +203,7 @@ pub const fn compare_evaluations(
     before: &EvaluationReport,
     after: &EvaluationReport,
 ) -> EvaluationComparison {
+    let comparable_report_schemas = before.schema_version == after.schema_version;
     let comparable_task_counts =
         before.aggregate.completed_tasks == after.aggregate.completed_tasks;
     let mcpls_calls =
@@ -234,8 +236,13 @@ pub const fn compare_evaluations(
     );
     EvaluationComparison {
         schema_version: EVALUATION_COMPARISON_SCHEMA_VERSION,
+        report_schema_versions: [before.schema_version, after.schema_version],
+        comparable_report_schemas,
         comparable_task_counts,
-        accepted: comparable_task_counts && mcpls_calls.reduced && context_bytes.reduced,
+        accepted: comparable_report_schemas
+            && comparable_task_counts
+            && mcpls_calls.reduced
+            && context_bytes.reduced,
         mcpls_calls,
         context_bytes,
         result_bytes,
@@ -1743,6 +1750,19 @@ mod tests {
         let comparison = compare_evaluations(&before, &after);
 
         assert!(!comparison.comparable_task_counts);
+        assert!(!comparison.accepted);
+    }
+
+    #[test]
+    fn evaluation_comparison_rejects_mismatched_report_schemas() {
+        let before = evaluate(&[TraceEvent::TaskComplete]);
+        let mut after = evaluate(&[]);
+        after.schema_version = before.schema_version.saturating_sub(1);
+
+        let comparison = compare_evaluations(&before, &after);
+
+        assert_eq!(comparison.report_schema_versions, [6, 5]);
+        assert!(!comparison.comparable_report_schemas);
         assert!(!comparison.accepted);
     }
 

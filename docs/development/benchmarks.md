@@ -81,8 +81,8 @@ cargo run -p mcpls-bench --bin no-reread-compare -- \
   --require-reduction
 ```
 
-The gate requires matching completed-task counts and strictly fewer MCPLS
-calls plus fewer model-visible context bytes (`result_bytes +
+The gate requires matching evaluator report schemas and completed-task counts,
+plus strictly fewer MCPLS calls and fewer model-visible context bytes (`result_bytes +
 shell_output_bytes`). The JSON output also includes reductions for semantic
 calls, duplicate queries, source-context dumps, fan-out tasks, and each byte
 component. Equal task counts do not prove the histories used the same model,

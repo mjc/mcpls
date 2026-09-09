@@ -16,7 +16,8 @@ struct Args {
     after: PathBuf,
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Exit unsuccessfully unless both MCPLS calls and context bytes decrease.
+    /// Exit unsuccessfully unless report schemas and task counts match and
+    /// both MCPLS calls and context bytes decrease.
     #[arg(long)]
     require_reduction: bool,
 }
@@ -44,7 +45,7 @@ fn run(args: &Args) -> Result<Vec<u8>> {
     let comparison: EvaluationComparison = compare_evaluations(&before, &after);
     if args.require_reduction && !comparison.accepted {
         bail!(
-            "evaluation did not reduce both MCPLS calls and model-visible context bytes with matching task counts"
+            "evaluation reports are not comparable or did not reduce both MCPLS calls and model-visible context bytes"
         );
     }
     serde_json::to_vec_pretty(&comparison).map_err(Into::into)
