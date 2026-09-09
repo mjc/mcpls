@@ -336,9 +336,10 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
     let mut by_tool_events = BTreeMap::<String, Vec<TraceEvent>>::new();
     for (index, event) in events.iter().enumerate() {
         let (tool, semantic) = match event {
-            TraceEvent::Semantic { tool, .. }
-            | TraceEvent::Lifecycle { tool, .. }
-            | TraceEvent::McpTool { tool, .. } => (tool.as_str(), true),
+            TraceEvent::Semantic { tool, .. } => (tool.as_str(), true),
+            TraceEvent::Lifecycle { tool, .. } | TraceEvent::McpTool { tool, .. } => {
+                (tool.as_str(), false)
+            }
             TraceEvent::ResourceRead { .. } => ("read_semantic_resource", false),
             TraceEvent::SourceRead { .. }
             | TraceEvent::ShellOutput { .. }
@@ -1444,6 +1445,40 @@ mod tests {
         assert_eq!(report.by_tool["read_semantic_resource"].mcpls_calls, 1);
         assert_eq!(
             report.by_tool["read_semantic_resource"].deferred_resource_reads,
+            1
+        );
+    }
+
+    #[test]
+    fn per_tool_source_read_adjacency_only_belongs_to_semantic_calls() {
+        let events = [
+            mcp_trace_event("project_add", &Value::Null, &Value::Null, 3),
+            TraceEvent::SourceRead {
+                path: "src/project.rs".to_owned(),
+                output_bytes: 11,
+            },
+            mcp_trace_event(
+                "workspace_symbol_search",
+                &serde_json::json!({"query": "Project"}),
+                &Value::Null,
+                4,
+            ),
+            TraceEvent::SourceRead {
+                path: "src/project.rs".to_owned(),
+                output_bytes: 13,
+            },
+        ];
+
+        let report = evaluate(&events);
+
+        assert_eq!(report.by_tool["project_add"].shell_source_reads, 0);
+        assert_eq!(report.by_tool["project_add"].shell_output_bytes, 0);
+        assert_eq!(
+            report.by_tool["workspace_symbol_search"].shell_source_reads,
+            2
+        );
+        assert_eq!(
+            report.by_tool["workspace_symbol_search"].semantic_calls_followed_by_shell_read,
             1
         );
     }
