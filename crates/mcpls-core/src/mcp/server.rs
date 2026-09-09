@@ -9046,6 +9046,64 @@ finally:
         assert_eq!(detail["roots"].as_array().unwrap().len(), roots.len());
     }
 
+    #[tokio::test]
+    async fn project_status_resource_replays_oversized_root_inventory_contract() {
+        let parent = TempDir::new().unwrap();
+        let project_id = ProjectId::new("large-roots-resource").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let git_common = parent.path().join("common.git");
+        std::fs::create_dir_all(git_common.join("objects")).unwrap();
+        std::fs::write(git_common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_common.join("config"), "[core]\n").unwrap();
+
+        for index in 0..160 {
+            let root = parent
+                .path()
+                .join(format!("root-{index:03}-{}", "x".repeat(120)));
+            std::fs::create_dir(&root).unwrap();
+            let worktree_git = git_common
+                .join("worktrees")
+                .join(format!("root-{index:03}"));
+            std::fs::create_dir_all(&worktree_git).unwrap();
+            std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                root.join(".git"),
+                format!("gitdir: {}\n", worktree_git.display()),
+            )
+            .unwrap();
+            let repository = GitRepositoryIdentity::discover(&root).unwrap().unwrap();
+            registry
+                .add(
+                    ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(&root).unwrap())
+                        .with_repository_identity(repository),
+                )
+                .await
+                .unwrap();
+        }
+
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let uri = project_status_resource_uri(&project_id);
+        let response = server
+            .read_project_status_resource(project_id, uri, false)
+            .await
+            .unwrap();
+        let ReadResourceResponse::Complete(response) = response else {
+            panic!("project status resource unexpectedly requested input");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+            panic!("project status resource was not text");
+        };
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 16 * 1024);
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["roots_total"], 160);
+        assert_eq!(value["roots_returned"], 0);
+        assert_eq!(value["roots_remaining"], 160);
+        assert_eq!(value["roots_deferred"], true);
+        assert!(value["state_detail_resource"]["uri"].is_string());
+        assert!(value["next_uri"].as_str().unwrap().contains("cursor="));
+    }
+
     #[test]
     fn project_lsp_capability_pages_fit_the_response_budget() {
         let servers = (0..16)
