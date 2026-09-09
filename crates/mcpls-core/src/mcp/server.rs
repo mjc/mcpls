@@ -7060,22 +7060,50 @@ finally:
         let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
         let server =
             McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
-        let first_session = server.for_session();
-        let second_session = server.for_session();
+        let sessions = (0..4).map(|_| server.for_session()).collect::<Vec<_>>();
 
-        let add_first = first_session.project_add(project_add_params("ignored", root.path()));
-        let add_second = second_session.project_add(project_add_params("ignored", root.path()));
-        let (first, second) = tokio::join!(add_first, add_second);
-        first.unwrap();
-        second.unwrap();
+        let additions = futures::future::join_all(
+            sessions
+                .iter()
+                .map(|session| session.project_add(project_add_params("ignored", root.path()))),
+        )
+        .await;
+        for result in additions {
+            result.unwrap();
+        }
 
-        let activate_first = first_session.project_activate(project_params(&project_id));
-        let activate_second = second_session.project_activate(project_params(&project_id));
-        let (first, second) = tokio::join!(activate_first, activate_second);
-        first.unwrap();
-        second.unwrap();
+        let activations = futures::future::join_all(
+            sessions
+                .iter()
+                .map(|session| session.project_activate(project_params(&project_id))),
+        )
+        .await;
+        for result in activations {
+            result.unwrap();
+        }
 
-        let status = first_session
+        let searches = futures::future::join_all(sessions.iter().map(|session| {
+            session.workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: project_id.clone(),
+                query: Some("fixture".to_owned()),
+                queries: Vec::new(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
+                limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+        }))
+        .await;
+        for result in searches {
+            let result = result.unwrap();
+            let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
+        }
+
+        let status = sessions[0]
             .project_status(project_params(&project_id))
             .await
             .unwrap();
