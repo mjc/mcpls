@@ -150,7 +150,7 @@ pub struct EvaluationReport {
 pub const EVALUATION_SCHEMA_VERSION: u32 = 7;
 
 /// Version of the privacy-preserving before/after comparison schema.
-pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 3;
+pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 4;
 
 /// One lower-is-better metric from two like-for-like evaluations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -180,6 +180,16 @@ pub struct EvaluationCompatibility {
     pub task_counts_match: bool,
 }
 
+/// Correctness counters that must not regress in the after evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct QualityComparison {
+    pub errors: MetricComparison,
+    pub failed_calls: MetricComparison,
+    pub unsupported: MetricComparison,
+    pub truncated: MetricComparison,
+    pub non_regression: bool,
+}
+
 /// Privacy-preserving comparison of two task evaluations.
 ///
 /// The comparison deliberately contains counts and byte totals only. The
@@ -190,6 +200,7 @@ pub struct EvaluationComparison {
     pub schema_version: u32,
     pub report_schema_versions: [u32; 2],
     pub compatibility: EvaluationCompatibility,
+    pub quality: QualityComparison,
     pub accepted: bool,
     pub mcpls_calls: MetricComparison,
     pub context_bytes: MetricComparison,
@@ -217,6 +228,22 @@ pub fn compare_evaluations(
     let comparison_keys_match = before.comparison_key.is_some()
         && before.comparison_key.as_deref() == after.comparison_key.as_deref();
     let task_counts_match = before.aggregate.completed_tasks == after.aggregate.completed_tasks;
+    let quality = QualityComparison {
+        errors: MetricComparison::new(before.aggregate.errors, after.aggregate.errors),
+        failed_calls: MetricComparison::new(
+            before.aggregate.failed_calls,
+            after.aggregate.failed_calls,
+        ),
+        unsupported: MetricComparison::new(
+            before.aggregate.unsupported,
+            after.aggregate.unsupported,
+        ),
+        truncated: MetricComparison::new(before.aggregate.truncated, after.aggregate.truncated),
+        non_regression: after.aggregate.errors <= before.aggregate.errors
+            && after.aggregate.failed_calls <= before.aggregate.failed_calls
+            && after.aggregate.unsupported <= before.aggregate.unsupported
+            && after.aggregate.truncated <= before.aggregate.truncated,
+    };
     let mcpls_calls =
         MetricComparison::new(before.aggregate.mcpls_calls, after.aggregate.mcpls_calls);
     let context_bytes = MetricComparison::new(
@@ -253,9 +280,11 @@ pub fn compare_evaluations(
             comparison_keys_match,
             task_counts_match,
         },
+        quality,
         accepted: report_schemas_match
             && comparison_keys_match
             && task_counts_match
+            && quality.non_regression
             && mcpls_calls.reduced
             && context_bytes.reduced,
         mcpls_calls,
@@ -1803,6 +1832,30 @@ mod tests {
         let comparison = compare_evaluations(&before, &after);
 
         assert!(!comparison.compatibility.comparison_keys_match);
+        assert!(!comparison.accepted);
+    }
+
+    #[test]
+    fn evaluation_comparison_rejects_quality_regression() {
+        let before_event = semantic("src/lib.rs", true);
+        let mut after_event = semantic("src/lib.rs", true);
+        if let TraceEvent::Semantic { error, .. } = &mut after_event {
+            *error = true;
+        }
+        let before = with_comparison_key(
+            evaluate(&[before_event.clone(), before_event, TraceEvent::TaskComplete]),
+            "same-run-contract",
+        );
+        let after = with_comparison_key(
+            evaluate(&[after_event, TraceEvent::TaskComplete]),
+            "same-run-contract",
+        );
+
+        let comparison = compare_evaluations(&before, &after);
+
+        assert_eq!(comparison.quality.errors.before, 0);
+        assert_eq!(comparison.quality.errors.after, 1);
+        assert!(!comparison.quality.non_regression);
         assert!(!comparison.accepted);
     }
 

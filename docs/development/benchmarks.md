@@ -92,7 +92,9 @@ digests, and completed-task counts, plus strictly fewer MCPLS calls and fewer
 model-visible context bytes (`result_bytes +
 shell_output_bytes`). The JSON output also includes reductions for semantic
 calls, duplicate queries, source-context dumps, fan-out tasks, and each byte
-component. Equal task counts do not prove the histories used the same model,
+component, plus correctness counters for errors, failed calls, unsupported
+operations, and truncation. The after run must not regress those counters.
+Equal task counts do not prove the histories used the same model,
 repository, or task corpus; those inputs remain an explicit responsibility of
 the acceptance run.
 
