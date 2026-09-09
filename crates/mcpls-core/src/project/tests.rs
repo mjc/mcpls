@@ -7476,6 +7476,72 @@ async fn project_registry_adds_compatible_worktree_to_one_logical_project() {
 }
 
 #[tokio::test]
+async fn project_registry_keeps_unknown_worktree_in_one_logical_project() {
+    let repository = TempDir::new().unwrap();
+    let git_dir = repository.path().join(".git");
+    let worktree_git_dir = git_dir.join("worktrees").join("linked");
+    fs::create_dir_all(&worktree_git_dir).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(git_dir.join("config"), "[core]\n").unwrap();
+    fs::create_dir(git_dir.join("objects")).unwrap();
+    fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+    let worktree = TempDir::new().unwrap();
+    fs::write(
+        worktree.path().join(".git"),
+        format!("gitdir: {}\n", worktree_git_dir.display()),
+    )
+    .unwrap();
+    for root in [repository.path(), worktree.path()] {
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+    }
+
+    let repository_identity = GitRepositoryIdentity::discover(repository.path())
+        .unwrap()
+        .unwrap();
+    let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+        .unwrap()
+        .unwrap();
+    let project_id = ProjectId::new("repository").unwrap();
+    let registry = ProjectRegistry::new(2);
+
+    registry
+        .add(
+            ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(repository.path()).unwrap(),
+            )
+            .with_repository_identity(repository_identity),
+        )
+        .await
+        .unwrap();
+    let linked_actor = registry
+        .add(
+            ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(worktree.path()).unwrap(),
+            )
+            .with_repository_identity(linked_identity),
+        )
+        .await
+        .unwrap();
+
+    let projects = registry.list().await;
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].roots().len(), 2);
+    assert_eq!(registry.actor_group_count(&project_id).await.unwrap(), 2);
+    assert_eq!(
+        linked_actor.query().await.unwrap().workspace_roots().len(),
+        1
+    );
+    let file = worktree.path().join("src.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let (resolved_id, resolved_actor) = registry.project_for_path(&file).await.unwrap();
+    assert_eq!(resolved_id, project_id);
+    assert!(resolved_actor.sender.same_channel(&linked_actor.sender));
+}
+
+#[tokio::test]
 async fn linked_worktrees_share_only_when_cargo_profiles_match() {
     let (repository, worktrees, roots) = compatible_worktree_fixture();
     let project_id = ProjectId::new("profile-linked").unwrap();

@@ -1039,9 +1039,10 @@ impl ProjectRegistry {
                 self.persist().await?;
                 return Ok(actor);
             }
+            // An unknown compatibility key is not a conflict: keep the root
+            // in the logical repository while isolating it in its own actor.
             if existing.identity.repository_identity().is_none()
                 || identity.repository_identity().is_none()
-                || compatibility_key.is_none()
                 || existing.identity.repository_identity() != identity.repository_identity()
             {
                 return Err(ProjectRegistryError::ConflictingProject {
