@@ -1114,6 +1114,7 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
     };
     let (translator, server) =
         translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+    let (release_responder, keep_responder_alive) = tokio::sync::oneshot::channel();
     let FakeServer {
         _write_half,
         _read_half,
@@ -1154,6 +1155,7 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
             .await;
             queries.push(query);
         }
+        let _ = keep_responder_alive.await;
         queries
     });
     let actor = spawn_project_actor_with_translator(4, translator);
@@ -1212,6 +1214,7 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
     assert_eq!(refreshed.provider_requests, 1);
     assert!(!refreshed.cache_hit);
     assert_ne!(result.snapshot_identity, refreshed.snapshot_identity);
+    release_responder.send(()).unwrap();
     assert_eq!(responder.await.unwrap(), ["alpha", "beta", "alpha"]);
 }
 
@@ -1819,6 +1822,99 @@ async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls(
     assert_eq!(client_calls, 5);
     assert_eq!(provider_requests, 117);
     assert_eq!(responder.await.unwrap().len(), 117);
+}
+
+#[tokio::test]
+async fn workspace_symbol_batches_cache_truncated_results_for_the_same_limit() {
+    use crate::bridge::translator::testing::{
+        FakeServer, read_framed_message, translator_with_capabilities, write_response,
+    };
+
+    let root = TempDir::new().unwrap();
+    let source = root.path().join("symbols.rs");
+    fs::write(&source, "fn alpha() {}\nfn alpha_two() {}\n").unwrap();
+    let capabilities = lsp_types::ServerCapabilities {
+        workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        ..lsp_types::ServerCapabilities::default()
+    };
+    let (translator, server) =
+        translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+    let (release_responder, keep_responder_alive) = tokio::sync::oneshot::channel();
+    let FakeServer {
+        _write_half,
+        _read_half,
+        mut read_half_stdin,
+        mut write_stdout,
+    } = server;
+    let responder = tokio::spawn(async move {
+        let _processes = (_write_half, _read_half);
+        let mut reader = BufReader::new(&mut write_stdout);
+        let mut queries = Vec::new();
+        while queries.len() < 2 {
+            let message = read_framed_message(&mut reader).await;
+            let Some(id) = message.get("id") else {
+                continue;
+            };
+            write_response(
+                &mut read_half_stdin,
+                id,
+                serde_json::json!([
+                    {
+                        "name": "alpha",
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(&source).unwrap(),
+                            "range": {
+                                "start": {"line": 0, "character": 3},
+                                "end": {"line": 0, "character": 8}
+                            }
+                        }
+                    },
+                    {
+                        "name": "alpha",
+                        "kind": 12,
+                        "location": {
+                            "uri": path_to_uri(&source).unwrap(),
+                            "range": {
+                                "start": {"line": 1, "character": 3},
+                                "end": {"line": 1, "character": 11}
+                            }
+                        }
+                    }
+                ]),
+            )
+            .await;
+            queries.push(message["params"]["query"].as_str().unwrap().to_owned());
+        }
+        let _ = keep_responder_alive.await;
+        queries
+    });
+    let actor = spawn_project_actor_with_translator(8, translator);
+    let request = |max_items| WorkspaceSymbolBatchRequest {
+        queries: vec!["alpha".to_owned()],
+        kind_filter: None,
+        match_mode: WorkspaceSymbolMatchMode::Exact,
+        scope: WorkspaceSymbolScope::Project,
+        include_generated: false,
+        max_items,
+        max_bytes: 16 * 1024,
+    };
+
+    let first = actor.workspace_symbol_batch(request(1)).await.unwrap();
+    assert_eq!(first.provider_requests, 1);
+    assert!(first.truncated);
+
+    let repeated = actor.workspace_symbol_batch(request(1)).await.unwrap();
+    assert_eq!(repeated.provider_requests, 0);
+    assert!(repeated.cache_hit);
+    assert!(repeated.truncated);
+
+    let larger = actor.workspace_symbol_batch(request(2)).await.unwrap();
+    assert_eq!(larger.provider_requests, 1);
+    assert_eq!(larger.returned, 2);
+    assert!(!larger.truncated);
+    release_responder.send(()).unwrap();
+    assert_eq!(responder.await.unwrap().len(), 2);
 }
 
 #[tokio::test]

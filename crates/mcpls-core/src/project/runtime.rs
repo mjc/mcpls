@@ -2260,6 +2260,18 @@ pub(super) fn bounded_workspace_symbol_page(
     Ok((result, remaining))
 }
 
+fn bound_workspace_symbol_result(
+    mut result: WorkspaceSymbolResult,
+    max_items: usize,
+) -> WorkspaceSymbolResult {
+    result.symbols.truncate(max_items);
+    result.returned = result.symbols.len();
+    result.remaining = result.total.saturating_sub(result.returned);
+    result.truncated = result.returned < result.total;
+    result.next_cursor = None;
+    result
+}
+
 impl ProjectRuntime {
     #[cfg(test)]
     pub(super) fn new(translator: Translator) -> Self {
@@ -4163,34 +4175,35 @@ impl ProjectRuntime {
                 request.match_mode,
                 request.scope,
             );
-            let result = if let Some(result) = self
+            let cached = self
                 .workspace_symbol_results
                 .lock()
                 .expect("workspace-symbol cache lock poisoned")
                 .get(&cache_key)
-                .cloned()
-            {
-                batch.cache_hit = true;
-                result
-            } else {
-                let result = self
-                    .workspace_symbol(
-                        query.clone(),
-                        request.kind_filter.clone(),
-                        limit,
-                        request.match_mode,
-                        request.scope,
-                        request.include_generated,
-                    )
-                    .await?;
-                batch.provider_requests += 1;
-                if !result.truncated {
+                .cloned();
+            let result = match cached {
+                Some(result) if !result.truncated || result.returned >= remaining => {
+                    batch.cache_hit = true;
+                    bound_workspace_symbol_result(result, remaining)
+                }
+                _ => {
+                    let result = self
+                        .workspace_symbol(
+                            query.clone(),
+                            request.kind_filter.clone(),
+                            limit,
+                            request.match_mode,
+                            request.scope,
+                            request.include_generated,
+                        )
+                        .await?;
+                    batch.provider_requests += 1;
                     self.workspace_symbol_results
                         .lock()
                         .expect("workspace-symbol cache lock poisoned")
                         .insert(cache_key, result.clone());
+                    result
                 }
-                result
             };
             batch.returned += result.returned;
             batch.truncated |= result.truncated;
