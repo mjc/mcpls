@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout_at};
-use tracing::{debug, debug_span, error, trace, warn};
+use tracing::{Instrument as _, debug, debug_span, error, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
@@ -498,83 +498,91 @@ impl LspClient {
         P: Serialize,
         R: DeserializeOwned,
     {
-        let _timing = LspRequestTiming::new(method);
-        let params_value = serde_json::to_value(params)?;
-        let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
+        let timing = LspRequestTiming::new(method);
+        let result = async {
+            let params_value = serde_json::to_value(params)?;
+            let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
-        for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
-            if attempt > 0 {
-                debug!(
-                    "Retrying {} after ServerCancelled (attempt {}/{}), backoff={}ms",
-                    method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
-                );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                delay_ms *= 2;
-            }
-
-            let id = RequestId::Number(self.request_counter.fetch_add(1, Ordering::SeqCst));
-            let (response_tx, response_rx) = oneshot::channel();
-            let request = JsonRpcRequest {
-                jsonrpc: JSONRPC_VERSION.to_string(),
-                id: id.clone(),
-                method: method.to_string(),
-                params: Some(params_value.clone()),
-            };
-
-            debug!("Sending request: {} (id={:?})", method, id);
-
-            let deadline = Instant::now() + timeout_duration;
-            self.command_queue
-                .send_until(
-                    ClientCommand::SendRequest {
-                        request,
-                        response_tx,
-                    },
-                    deadline,
-                    timeout_duration,
-                )
-                .await?;
-
-            let outcome = match timeout_at(deadline, response_rx).await {
-                Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
-                Err(_elapsed) => {
-                    // Remove the pending sender before returning so a timed-out
-                    // request cannot leak even when the outbound command queue
-                    // is saturated. Cancellation stays detached so queue
-                    // pressure cannot extend the caller's request deadline.
-                    self.pending_requests.lock().await.remove(&id);
-                    self.command_queue
-                        .try_send(ClientCommand::CancelRequest { id });
-                    return Err(Error::Timeout(timeout_duration.as_secs()));
+            for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
+                if attempt > 0 {
+                    debug!(
+                        "Retrying {} after ServerCancelled (attempt {}/{}), backoff={}ms",
+                        method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2;
                 }
-            };
 
-            match outcome {
-                Ok(result_value) => {
-                    return serde_json::from_value(result_value).map_err(|e| {
-                        Error::LspProtocolError(format!("Failed to deserialize response: {e}"))
-                    });
-                }
-                Err(Error::LspServerError {
-                    code,
-                    ref message,
-                    ref data,
-                }) if Self::should_retry(code, data.as_ref()) => {
-                    warn!("retryable LSP response ({code}) on '{method}', will retry: {message}");
-                    if attempt == SERVER_CANCELLED_MAX_RETRIES {
-                        return Err(Error::LspServerError {
-                            code,
-                            message: message.clone(),
-                            data: data.clone(),
+                let id = RequestId::Number(self.request_counter.fetch_add(1, Ordering::SeqCst));
+                let (response_tx, response_rx) = oneshot::channel();
+                let request = JsonRpcRequest {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: id.clone(),
+                    method: method.to_string(),
+                    params: Some(params_value.clone()),
+                };
+
+                debug!("Sending request: {} (id={:?})", method, id);
+
+                let deadline = Instant::now() + timeout_duration;
+                self.command_queue
+                    .send_until(
+                        ClientCommand::SendRequest {
+                            request,
+                            response_tx,
+                        },
+                        deadline,
+                        timeout_duration,
+                    )
+                    .await?;
+
+                let outcome = match timeout_at(deadline, response_rx).await {
+                    Ok(received) => received.map_err(|_| Error::ServerTerminated)?,
+                    Err(_elapsed) => {
+                        // Remove the pending sender before returning so a timed-out
+                        // request cannot leak even when the outbound command queue
+                        // is saturated. Cancellation stays detached so queue
+                        // pressure cannot extend the caller's request deadline.
+                        self.pending_requests.lock().await.remove(&id);
+                        self.command_queue
+                            .try_send(ClientCommand::CancelRequest { id });
+                        return Err(Error::Timeout(timeout_duration.as_secs()));
+                    }
+                };
+
+                match outcome {
+                    Ok(result_value) => {
+                        return serde_json::from_value(result_value).map_err(|e| {
+                            Error::LspProtocolError(format!("Failed to deserialize response: {e}"))
                         });
                     }
-                    // continue loop for next attempt
+                    Err(Error::LspServerError {
+                        code,
+                        ref message,
+                        ref data,
+                    }) if Self::should_retry(code, data.as_ref()) => {
+                        warn!(
+                            "retryable LSP response ({code}) on '{method}', will retry: {message}"
+                        );
+                        if attempt == SERVER_CANCELLED_MAX_RETRIES {
+                            return Err(Error::LspServerError {
+                                code,
+                                message: message.clone(),
+                                data: data.clone(),
+                            });
+                        }
+                        // continue loop for next attempt
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
-        }
 
-        Err(Error::ServerTerminated)
+            Err(Error::ServerTerminated)
+        }
+        .instrument(timing.span.clone())
+        .await;
+        drop(timing);
+        result
     }
 
     /// Returns true when the error data from a `ServerCancelled` (-32802) response
