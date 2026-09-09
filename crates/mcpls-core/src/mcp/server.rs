@@ -4216,13 +4216,13 @@ impl McplsServer {
         &self,
         Parameters(params): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<WorkspaceSymbolSearchResponse>, McpError> {
-        if !params.queries.is_empty() {
-            if params.query.is_some() || params.page_token.is_some() {
-                return Err(McpError::invalid_params(
-                    "queries cannot be combined with query or page_token",
-                    None,
-                ));
-            }
+        if !params.queries.is_empty() && (params.query.is_some() || params.page_token.is_some()) {
+            return Err(McpError::invalid_params(
+                "queries cannot be combined with query or page_token",
+                None,
+            ));
+        }
+        if params.queries.len() > 1 {
             let batch = WorkspaceSymbolBatchParams {
                 project_id: params.project_id,
                 queries: params.queries,
@@ -4241,6 +4241,7 @@ impl McplsServer {
         }
         let query = params
             .query
+            .or_else(|| params.queries.into_iter().next())
             .ok_or_else(|| McpError::invalid_params("query or queries is required", None))?;
         if params.limit == 0 || params.limit > 1_000 {
             return Err(McpError::invalid_params(
@@ -6933,6 +6934,25 @@ finally:
 
         assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+        let result = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: "dormant".to_string(),
+                query: None,
+                queries: vec!["fixture".to_string()],
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::default(),
+                scope: crate::bridge::WorkspaceSymbolScope::default(),
+                limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .expect("a single queries entry should use the pageable result shape");
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["symbols"][0]["name"], "fixture_symbol");
+        assert!(result.get("entries").is_none());
 
         let result = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
