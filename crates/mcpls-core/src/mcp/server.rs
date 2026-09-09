@@ -847,6 +847,9 @@ fn project_state_json(
         "project_id": identity.id().as_str(),
         "root": identity.root().as_path(),
         "roots": project_root_paths(identity),
+        "roots_total": identity.roots().len(),
+        "roots_returned": identity.roots().len(),
+        "roots_remaining": 0,
         "repository_root": identity.repository_identity().map(GitRepositoryIdentity::common_dir),
         "status": state.status().as_str(),
         "last_error": state.last_error(),
@@ -2317,6 +2320,13 @@ impl McplsServer {
                 .map_err(|error| McpError::internal_error(error, None))?;
             if let Some(object) = value.as_object_mut() {
                 object.insert("actor_groups".to_owned(), serde_json::json!([]));
+                object.insert("roots".to_owned(), serde_json::json!([]));
+                object.insert("roots_returned".to_owned(), serde_json::json!(0));
+                object.insert(
+                    "roots_remaining".to_owned(),
+                    serde_json::json!(identity.roots().len()),
+                );
+                object.insert("roots_deferred".to_owned(), serde_json::json!(true));
                 object.insert(
                     "configured_language_servers".to_owned(),
                     serde_json::json!([]),
@@ -2339,6 +2349,25 @@ impl McplsServer {
                         .map_err(|error| McpError::internal_error(error.to_string(), None))?,
                 );
             }
+            if serde_json::to_vec(&value)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?
+                .len()
+                > MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("root".to_owned(), serde_json::Value::Null);
+                object.insert("repository_root".to_owned(), serde_json::Value::Null);
+            }
+        }
+        if serde_json::to_vec(&value)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .len()
+            > MAX_SEMANTIC_RESOURCE_RESULT_BYTES
+        {
+            return Err(McpError::internal_error(
+                "project state summary exceeds the response budget after deferring details",
+                None,
+            ));
         }
         encode_json(&value)
     }
@@ -8955,6 +8984,66 @@ finally:
             (16, 32)
         );
         assert!(project_lsp_capabilities_page(groups.len(), Some("wrong:16"), &identity).is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_project_state_defers_root_inventory_and_stays_bounded() {
+        let parent = TempDir::new().unwrap();
+        let project_id = ProjectId::new("large-roots").unwrap();
+        let registry = ProjectRegistry::new(2);
+        let git_common = parent.path().join("common.git");
+        std::fs::create_dir_all(git_common.join("objects")).unwrap();
+        std::fs::write(git_common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_common.join("config"), "[core]\n").unwrap();
+        let mut roots = Vec::new();
+        for index in 0..160 {
+            let root = parent
+                .path()
+                .join(format!("root-{index:03}-{}", "x".repeat(120)));
+            std::fs::create_dir(&root).unwrap();
+            let worktree_git = git_common
+                .join("worktrees")
+                .join(format!("root-{index:03}"));
+            std::fs::create_dir_all(&worktree_git).unwrap();
+            std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                root.join(".git"),
+                format!("gitdir: {}\n", worktree_git.display()),
+            )
+            .unwrap();
+            let repository = GitRepositoryIdentity::discover(&root).unwrap().unwrap();
+            registry
+                .add(
+                    ProjectIdentity::new(project_id.clone(), CanonicalRoot::new(&root).unwrap())
+                        .with_repository_identity(repository),
+                )
+                .await
+                .unwrap();
+            roots.push(root);
+        }
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+
+        let response = server
+            .project_status(Parameters(ProjectIdParams {
+                project_id: project_id.to_string(),
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_SEMANTIC_RESOURCE_RESULT_BYTES);
+        assert_eq!(value["roots_total"], roots.len());
+        assert_eq!(value["roots_returned"], 0);
+        assert_eq!(value["roots_remaining"], roots.len());
+        assert_eq!(value["roots_deferred"], true);
+        let detail_uri = value["state_detail_resource"]["uri"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let detail = read_all_semantic_json(&server, detail_uri).await;
+        assert_eq!(detail["roots"].as_array().unwrap().len(), roots.len());
     }
 
     #[test]
