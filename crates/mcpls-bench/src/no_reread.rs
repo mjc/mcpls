@@ -83,6 +83,7 @@ pub struct TraceReport {
     pub source_read_output_bytes: usize,
     pub shell_output_bytes: usize,
     pub shell_source_reads: usize,
+    pub semantic_calls_followed_by_shell_read: usize,
     pub completed_tasks: usize,
     pub calls_per_completed_task: Rate,
     pub semantic_to_shell_read_rate: Rate,
@@ -145,6 +146,7 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
         source_read_output_bytes: 0,
         shell_output_bytes: 0,
         shell_source_reads: 0,
+        semantic_calls_followed_by_shell_read: 0,
         completed_tasks: 0,
         calls_per_completed_task: Rate {
             numerator: 0,
@@ -212,7 +214,10 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
     report.pre_coordinate_source_read_rate =
         rate(report.pre_coordinate_source_reads, report.coordinate_calls);
     report.calls_per_completed_task = rate(report.mcpls_calls, report.completed_tasks);
-    report.semantic_to_shell_read_rate = rate(report.shell_source_reads, report.semantic_calls);
+    report.semantic_to_shell_read_rate = rate(
+        report.semantic_calls_followed_by_shell_read,
+        report.semantic_calls,
+    );
     report.truncation_rate = rate(report.truncated, report.semantic_calls);
     report.unsupported_rate = rate(report.unsupported, report.semantic_calls);
     report.error_rate = rate(report.errors, report.semantic_calls);
@@ -303,6 +308,10 @@ fn record_semantic(
     report.errors += usize::from(*error);
     report.coordinate_calls += usize::from(*coordinate_input);
     latencies.push(*latency_ms);
+    report.semantic_calls_followed_by_shell_read += usize::from(matches!(
+        events.get(index + 1),
+        Some(TraceEvent::SourceRead { .. })
+    ));
     report.duplicate_queries += usize::from(
         query_fingerprint
             .as_ref()
@@ -1016,13 +1025,14 @@ mod tests {
                 source_read_output_bytes: 18,
                 shell_output_bytes: 0,
                 shell_source_reads: 3,
+                semantic_calls_followed_by_shell_read: 2,
                 completed_tasks: 0,
                 calls_per_completed_task: Rate {
                     numerator: 2,
                     denominator: 0,
                 },
                 semantic_to_shell_read_rate: Rate {
-                    numerator: 3,
+                    numerator: 2,
                     denominator: 2,
                 },
                 compactions: 0,
