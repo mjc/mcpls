@@ -1163,6 +1163,10 @@ impl DeferredResultStore {
             .filter(|result| scope.is_none_or(|scope| result.scope == scope))
             .ok_or_else(|| "stale_resource: deferred result is missing or expired".to_owned())
     }
+
+    pub(super) fn remove(&mut self, token: &str) {
+        self.entries.remove(token);
+    }
 }
 
 pub(super) fn attach_document_symbol_handles(
@@ -4322,7 +4326,7 @@ impl ProjectRuntime {
         request: WorkspaceSymbolBatchRequest,
     ) -> Result<WorkspaceSymbolBatchResult, String> {
         let scope = self.deferred_scope.as_deref().unwrap_or_default();
-        let (state, token, entry_offset, symbol_offset) = if let Some(page_token) =
+        let (state, token, entry_offset, symbol_offset, continuation) = if let Some(page_token) =
             request.page_token.as_deref()
         {
             let (token, entry_offset, symbol_offset) =
@@ -4339,7 +4343,7 @@ impl ProjectRuntime {
                     "page_token belongs to a different workspace-symbol batch request".to_owned(),
                 );
             }
-            (state, token.to_owned(), entry_offset, symbol_offset)
+            (state, token.to_owned(), entry_offset, symbol_offset, true)
         } else {
             let snapshot_identity = self.workspace_snapshot_identity().await?;
             let filter_identity = workspace_symbol_batch_filter_identity(&request);
@@ -4431,17 +4435,24 @@ impl ProjectRuntime {
                 .strip_prefix("mcpls-deferred:///")
                 .ok_or_else(|| "workspace-symbol batch cursor has an invalid URI".to_owned())?
                 .to_owned();
-            (state, token, 0, 0)
+            (state, token, 0, 0, false)
         };
 
-        bounded_workspace_symbol_batch_page(
+        let page = bounded_workspace_symbol_batch_page(
             &state,
             &token,
             entry_offset,
             symbol_offset,
             request.max_items,
             request.max_bytes,
-        )
+        )?;
+        if !continuation && page.next_cursor.is_none() {
+            self.deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&token);
+        }
+        Ok(page)
     }
 
     #[allow(clippy::too_many_lines)]
