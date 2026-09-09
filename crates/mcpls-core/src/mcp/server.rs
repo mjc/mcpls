@@ -9147,6 +9147,78 @@ finally:
     }
 
     #[test]
+    fn project_lsp_capability_response_points_to_lossless_deferred_pages() {
+        let servers = (0..16)
+            .map(|group_id| ProjectServerCapability {
+                group_id,
+                language_id: format!("language-{group_id}"),
+                position_encoding: "utf-8".to_owned(),
+                capabilities: serde_json::json!({
+                    "experimental": "x".repeat(2_000),
+                }),
+            })
+            .collect::<Vec<_>>();
+        let snapshot_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&servers).unwrap())
+        );
+        let resource = DeferredResourceReference {
+            uri: "mcpls-deferred:///capabilities".to_owned(),
+            kind: "project_lsp_capabilities".to_owned(),
+            snapshot_hash: snapshot_identity.clone(),
+            document_version: None,
+            total_bytes: None,
+        };
+        let page = project_lsp_capabilities_response(
+            "project",
+            &snapshot_identity,
+            servers.len(),
+            &servers,
+            0,
+            servers.len(),
+            Some(&resource),
+        );
+
+        assert_eq!(page.returned, servers.len());
+        assert_eq!(page.remaining, 0);
+        assert_eq!(page.capabilities_resource, Some(resource.clone()));
+        let resource_value = serde_json::to_value(&resource).unwrap();
+        assert!(page.servers.iter().all(|server| {
+            server.capabilities["deferred"] == true
+                && server.capabilities["capabilities_resource"] == resource_value
+        }));
+
+        let payload = serde_json::to_value(&servers).unwrap();
+        let expected = serde_json::to_string(&payload).unwrap();
+        let mut offset_bytes = 0;
+        let mut actual = String::new();
+        loop {
+            let deferred = DeferredResource {
+                token: "capabilities".to_owned(),
+                offset_bytes,
+            };
+            let uri = format!("mcpls-deferred:///capabilities?offset_bytes={offset_bytes}");
+            let fragment =
+                deferred_resource_page(&deferred, &uri, &payload, &snapshot_identity).unwrap();
+            actual.push_str(&fragment.text);
+            let Some(next_uri) = fragment.next_uri else {
+                break;
+            };
+            let SessionResource::Deferred(next) = parse_session_resource_uri(&next_uri).unwrap()
+            else {
+                panic!("capability continuation must remain deferred");
+            };
+            offset_bytes = next.offset_bytes;
+        }
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
     fn project_summary_pages_fit_the_response_budget() {
         let summaries = (0..32)
             .map(|index| {
