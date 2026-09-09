@@ -113,6 +113,8 @@ pub struct EvaluationReport {
     pub by_tool: BTreeMap<String, TraceReport>,
 }
 
+pub const EVALUATION_SCHEMA_VERSION: u32 = 2;
+
 #[must_use]
 pub fn scrub_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
@@ -368,7 +370,7 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
         }
     }
     EvaluationReport {
-        schema_version: 1,
+        schema_version: EVALUATION_SCHEMA_VERSION,
         aggregate: classify_trace(events),
         by_tool: by_tool_events
             .into_iter()
@@ -1277,6 +1279,7 @@ mod tests {
         let events = parse_history(history.as_bytes()).unwrap();
         let report = evaluate(&events).aggregate;
 
+        assert_eq!(evaluate(&events).schema_version, EVALUATION_SCHEMA_VERSION);
         assert_eq!(report.completed_tasks, 1);
         assert_eq!(report.calls_per_completed_task.numerator, 0);
         assert_eq!(report.calls_per_completed_task.denominator, 1);

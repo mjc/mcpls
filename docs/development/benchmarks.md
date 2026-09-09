@@ -45,6 +45,13 @@ reads as exact numerator/denominator rates, plus total result bytes and latency,
 and truncation, unsupported, and error rates. These are workflow heuristics,
 not a model-quality score; model selection remains outside required CI.
 
+The aggregate report also records completed-task count and the
+MCPLS-calls/completed-task ratio, total shell source reads, semantic calls
+immediately followed by a shell read, shell output bytes, deferred-resource
+follow-through, compactions, and latency percentiles. Current Codex histories
+are read from their completed-item records; older event records remain
+supported. The report schema version is bumped when these fields change.
+
 To evaluate another instrumented runner, serialize its scrubbed events as a JSON
 array of `semantic` and `source_read` records and replace `--history` with
 `--trace`. `benchmarks/no-reread-baseline.json` preserves the original
