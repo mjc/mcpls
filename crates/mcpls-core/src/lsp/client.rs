@@ -1619,9 +1619,12 @@ mod tests {
 
     mod retry_behavior {
         use std::process::Stdio;
+        use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
 
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
 
         use super::*;
         use crate::config::LspServerConfig;
@@ -1792,6 +1795,81 @@ mod tests {
             stdin.write_all(header.as_bytes()).await.unwrap();
             stdin.write_all(content.as_bytes()).await.unwrap();
             stdin.flush().await.unwrap();
+        }
+
+        struct LspTimingSpanLayer {
+            entered: Arc<AtomicBool>,
+            lsp_span: Arc<StdMutex<Option<tracing::span::Id>>>,
+        }
+
+        impl<S> Layer<S> for LspTimingSpanLayer
+        where
+            S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+        {
+            fn on_new_span(
+                &self,
+                attributes: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                _context: Context<'_, S>,
+            ) {
+                if attributes.metadata().name() == "lsp.request" {
+                    *self.lsp_span.lock().unwrap() = Some(id.clone());
+                }
+            }
+
+            fn on_enter(&self, id: &tracing::span::Id, context: Context<'_, S>) {
+                if self
+                    .lsp_span
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|span_id| span_id == id)
+                    && context.span(id).is_some()
+                {
+                    self.entered.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        #[test]
+        fn lsp_request_events_run_inside_the_timing_span() {
+            let seen = Arc::new(AtomicBool::new(false));
+            let subscriber = tracing_subscriber::registry().with(LspTimingSpanLayer {
+                entered: Arc::clone(&seen),
+                lsp_span: Arc::new(StdMutex::new(None)),
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                runtime.block_on(async {
+                    let (client, mut server) = fake_lsp_client();
+                    let request_task = tokio::spawn(
+                        async move {
+                            client
+                                .request::<_, Value>(
+                                    "textDocument/hover",
+                                    serde_json::json!({}),
+                                    Duration::from_secs(1),
+                                )
+                                .await
+                        }
+                        .instrument(tracing::info_span!("lsp.timing.test")),
+                    );
+
+                    let mut reader = BufReader::new(&mut server.write_stdout);
+                    let request = read_framed_message(&mut reader).await;
+                    write_success_response(
+                        &mut server.read_half_stdin,
+                        &request["id"],
+                        Value::Null,
+                    )
+                    .await;
+                    assert!(request_task.await.unwrap().is_ok());
+                });
+            });
+            assert!(seen.load(Ordering::Acquire));
         }
 
         async fn write_notification(stdin: &mut ChildStdin, method: &str, params: Value) {
