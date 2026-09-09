@@ -99,6 +99,13 @@ should target `2026-07-28`. HTTP is loopback-only; use an authenticated reverse
 proxy for network access. Stateless request and concurrent-session limits are
 configurable through `HttpConfig`.
 
+Source resources returned by `resources/read` contain raw source text with the
+source MIME type. If a bounded read is truncated, its `_meta.mcpls.next_uri`
+field is the snapshot-bound continuation; do not parse JSON from the source
+text. Clients without resource support can use `read_semantic_resource`, which
+returns the same source text plus structured continuation metadata in
+`structuredContent`.
+
 <details>
 <summary><strong>Prerequisites (language servers)</strong></summary>
 

@@ -2123,6 +2123,22 @@ fn private_resource_result(
     }
 }
 
+fn source_resource_meta(frame: &crate::bridge::SourceFrame) -> Option<MetaObject> {
+    let resource = frame.resource.as_ref()?;
+    let mut meta = MetaObject::new();
+    meta.0.insert(
+        "mcpls".to_owned(),
+        serde_json::json!({
+            "kind": resource.kind,
+            "next_uri": resource.uri,
+            "snapshot_hash": resource.snapshot_hash,
+            "document_version": resource.document_version,
+            "total_bytes": resource.total_bytes,
+        }),
+    );
+    Some(meta)
+}
+
 async fn send_listen_update(context: &SubscriptionContext, uri: String) -> bool {
     tokio::select! {
         () = context.cancelled() => false,
@@ -5258,17 +5274,14 @@ impl McplsServer {
             frame.document_version,
         )
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let text = if frame.truncated {
-            serde_json::to_string(&frame)
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?
-        } else {
-            frame.text
+        let meta = source_resource_meta(&frame);
+        let contents = ResourceContents::text(frame.text, fresh_uri)
+            .with_mime_type(source_mime_type(frame.language_id.as_deref()));
+        let contents = match meta {
+            Some(meta) => contents.with_meta(meta),
+            None => contents,
         };
-        Ok(private_resource_result(
-            vec![ResourceContents::text(text, fresh_uri)],
-            supports_cache_hints,
-        )
-        .into())
+        Ok(private_resource_result(vec![contents], supports_cache_hints).into())
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -6124,6 +6137,74 @@ mod tests {
                 .unwrap();
         }
 
+        assert!(recovered.contains("tail sentinel"));
+    }
+
+    #[tokio::test]
+    async fn resources_read_returns_raw_truncated_source_with_structured_continuation() {
+        const PAGE_LIMIT: usize = 16 * 1024;
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("quoted.rs");
+        let content = format!("{}\ntail sentinel\n", "x".repeat(PAGE_LIMIT * 2));
+        std::fs::write(&source, &content).unwrap();
+        let registry = ProjectRegistry::new(1);
+        registry
+            .add(ProjectIdentity::new(
+                ProjectId::new("project").unwrap(),
+                CanonicalRoot::new(root.path()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let snapshot_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let mut resource = crate::bridge::resources::SourceResource {
+            path: source,
+            start_line: 1,
+            start_character: 1,
+            end_line: 3,
+            end_character: 1,
+            snapshot_hash,
+            document_version: None,
+            offset_bytes: 0,
+        };
+        let mut recovered = String::new();
+        let mut pages = 0;
+
+        loop {
+            let uri = resource.to_uri().unwrap();
+            let response = server
+                .read_source_resource(resource, uri, false)
+                .await
+                .unwrap();
+            let ReadResourceResponse::Complete(response) = response else {
+                panic!("source resource unexpectedly requested input");
+            };
+            let ResourceContents::TextResourceContents {
+                mime_type,
+                text,
+                meta,
+                ..
+            } = &response.contents[0]
+            else {
+                panic!("source resource was not text");
+            };
+            assert_eq!(mime_type.as_deref(), Some("text/x-rust"));
+            assert!(!text.starts_with('{'), "source text must not be JSON");
+            assert!(serde_json::to_vec(&response).unwrap().len() <= PAGE_LIMIT);
+            recovered.push_str(text);
+            pages += 1;
+
+            let Some(meta) = meta else {
+                break;
+            };
+            let next_uri = meta.0["mcpls"]["next_uri"]
+                .as_str()
+                .expect("truncated source must expose a continuation URI");
+            resource = crate::bridge::resources::parse_source_uri(next_uri).unwrap();
+        }
+
+        assert!(pages > 1);
         assert!(recovered.contains("tail sentinel"));
     }
 
