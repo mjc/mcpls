@@ -213,6 +213,7 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
             );
         } else {
             record_non_semantic(&mut report, event, &mut latencies);
+            reset_query_fingerprints_at_task_boundary(event, &mut query_fingerprints);
         }
     }
 
@@ -285,6 +286,15 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
         TraceEvent::TaskComplete => report.completed_tasks += 1,
         TraceEvent::Compaction => report.compactions += 1,
         TraceEvent::Semantic { .. } => {}
+    }
+}
+
+fn reset_query_fingerprints_at_task_boundary(
+    event: &TraceEvent,
+    query_fingerprints: &mut BTreeSet<String>,
+) {
+    if matches!(event, TraceEvent::TaskComplete) {
+        query_fingerprints.clear();
     }
 }
 
@@ -1398,6 +1408,27 @@ mod tests {
                 denominator: 2,
             }
         );
+    }
+
+    #[test]
+    fn duplicate_queries_are_scoped_to_a_completed_task() {
+        let first = mcp_trace_event(
+            "workspace_symbol_search",
+            &serde_json::json!({"query": "same"}),
+            &Value::Null,
+            1,
+        );
+        let second = mcp_trace_event(
+            "workspace_symbol_search",
+            &serde_json::json!({"query": "same"}),
+            &Value::Null,
+            1,
+        );
+
+        let report = classify_trace(&[first, TraceEvent::TaskComplete, second]);
+
+        assert_eq!(report.duplicate_queries, 0);
+        assert_eq!(report.completed_tasks, 1);
     }
 
     #[test]
