@@ -2016,6 +2016,7 @@ async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budg
         path: None,
         container: None,
     });
+    targets.push(targets[0].clone());
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
@@ -2025,7 +2026,7 @@ async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budg
             sections: vec![crate::bridge::InspectSymbolSectionKind::Declaration],
             budget: crate::bridge::InspectSymbolBudget {
                 max_bytes: 24 * 1024,
-                max_items: 3,
+                max_items: 4,
             },
             page_token: None,
         }),
@@ -2034,14 +2035,14 @@ async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budg
     .expect("batch serialized target inspections")
     .unwrap();
 
-    assert_eq!(result.entries.len(), 3);
+    assert_eq!(result.entries.len(), 4);
     assert_eq!(result.inspections_started, 3);
-    assert_eq!(result.total_targets, 3);
-    assert_eq!(result.returned_targets, 3);
+    assert_eq!(result.total_targets, 4);
+    assert_eq!(result.returned_targets, 4);
     assert_eq!(result.remaining_targets, 0);
     assert!(result.next_cursor.is_none());
     assert_eq!(result.budget.max_bytes, 16 * 1024);
-    assert_eq!(result.returned_items, 2, "{result:#?}");
+    assert_eq!(result.returned_items, 3, "{result:#?}");
     assert!(result.entries[..2].iter().all(|entry| matches!(
         entry.result.as_ref().unwrap().resolution,
         crate::bridge::InspectSymbolResolution::Selected { .. }
@@ -2057,6 +2058,10 @@ async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budg
             .error
             .as_deref()
             .is_some_and(|error| { error.starts_with("invalid_symbol_handle:") })
+    );
+    assert_eq!(
+        result.entries[0].result.as_ref().unwrap().returned_bytes,
+        result.entries[3].result.as_ref().unwrap().returned_bytes
     );
     assert!(result.returned_bytes <= result.budget.max_bytes);
     release_server.send(()).unwrap();

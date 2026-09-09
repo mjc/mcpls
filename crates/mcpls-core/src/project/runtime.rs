@@ -5372,6 +5372,7 @@ impl ProjectRuntime {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn collect_inspect_symbol_batch(
         &self,
         request: InspectSymbolBatchRequest,
@@ -5402,35 +5403,52 @@ impl ProjectRuntime {
             return Err("batch budget is too small for every symbol target".to_owned());
         }
 
-        let inspections = request.targets.into_iter().map(|target| {
+        let mut unique_targets = Vec::new();
+        let mut target_indices = HashMap::new();
+        let mut target_sources = Vec::with_capacity(target_count);
+        for target in &request.targets {
+            let index = target_indices.get(target).copied().unwrap_or_else(|| {
+                let index = unique_targets.len();
+                target_indices.insert(target.clone(), index);
+                unique_targets.push(target.clone());
+                index
+            });
+            target_sources.push(index);
+        }
+
+        let inspections = unique_targets.into_iter().map(|target| {
             let inspect_request = InspectSymbolRequest {
                 symbol_handle: target.symbol_handle.clone(),
                 query: target.query.clone(),
                 kind: target.kind.clone(),
                 path: target.path.clone(),
-                container: target.container.clone(),
+                container: target.container,
                 candidate_limit: request.candidate_limit,
                 sections: request.sections.clone(),
                 budget: target_budget,
             };
-            async move {
-                match Box::pin(self.inspect_symbol(inspect_request)).await {
-                    Ok(result) => InspectSymbolBatchEntry {
-                        target,
-                        result: Some(result),
-                        error: None,
-                        resource: None,
-                    },
-                    Err(error) => InspectSymbolBatchEntry {
-                        target,
-                        result: None,
-                        error: Some(error),
-                        resource: None,
-                    },
-                }
-            }
+            async move { Box::pin(self.inspect_symbol(inspect_request)).await }
         });
-        let mut entries = futures::future::join_all(inspections).await;
+        let unique_results = futures::future::join_all(inspections).await;
+        let mut entries = request
+            .targets
+            .into_iter()
+            .zip(target_sources)
+            .map(|(target, source)| match &unique_results[source] {
+                Ok(result) => InspectSymbolBatchEntry {
+                    target,
+                    result: Some(result.clone()),
+                    error: None,
+                    resource: None,
+                },
+                Err(error) => InspectSymbolBatchEntry {
+                    target,
+                    result: None,
+                    error: Some(error.clone()),
+                    resource: None,
+                },
+            })
+            .collect::<Vec<_>>();
         let truncated = entries
             .iter()
             .filter_map(|entry| entry.result.as_ref())
@@ -5456,7 +5474,7 @@ impl ProjectRuntime {
             entry.resource = Some(resource);
         }
         Ok(InspectSymbolBatchSnapshot {
-            inspections_started: entries.len(),
+            inspections_started: unique_results.len(),
             entries,
             snapshot_identity,
             truncated,

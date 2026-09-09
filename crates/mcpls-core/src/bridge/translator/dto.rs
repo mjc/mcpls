@@ -1193,7 +1193,7 @@ pub struct InspectSymbolRequest {
 }
 
 /// One symbol identity in a batch inspection request.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InspectSymbolTarget {
     /// Snapshot-bound handle returned by symbol discovery.
@@ -1548,7 +1548,7 @@ pub struct InspectSymbolBatchEntry {
 pub struct InspectSymbolBatchResult {
     /// One result for every input target, in input order.
     pub entries: Vec<InspectSymbolBatchEntry>,
-    /// Number of target inspections started concurrently.
+    /// Number of unique target inspections started concurrently.
     pub inspections_started: usize,
     /// Number of caller targets across every page.
     pub total_targets: usize,

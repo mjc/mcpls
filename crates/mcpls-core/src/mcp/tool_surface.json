@@ -15521,7 +15521,7 @@
               "type": "array"
             },
             "inspections_started": {
-              "description": "Number of target inspections started concurrently.",
+              "description": "Number of unique target inspections started concurrently.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -19886,7 +19886,7 @@
           "type": "array"
         },
         "inspections_started": {
-          "description": "Number of target inspections started concurrently.",
+          "description": "Number of unique target inspections started concurrently.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
