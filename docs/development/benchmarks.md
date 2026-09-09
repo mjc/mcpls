@@ -50,6 +50,13 @@ MCPLS-calls/completed-task ratio, total shell source reads, semantic calls
 immediately followed by a shell read, shell output bytes, deferred-resource
 references and reads as a follow-through numerator/denominator rate,
 all-call failures as a count/rate, compactions, and latency percentiles.
+It also reports two task-level MCPLS-122 access-pattern measurements:
+`semantic_fanout_tasks` counts task segments with at least 32 semantic calls,
+and `source_context_dump_tasks` counts segments where a semantic call is
+immediately followed by a shell source read. The accompanying maxima expose
+the largest semantic fan-out, duplicate-query count, shell-read count, and
+shell-output volume in one segment. These fields contain counts only; query
+text, prompts, source text, and paths are not retained.
 Current Codex histories
 are read from their completed-item records; older event records remain
 supported. The report schema version is bumped when these fields change.

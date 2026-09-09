@@ -118,14 +118,33 @@ pub struct Rate {
     pub denominator: usize,
 }
 
+/// Task-level measurements for the two MCPLS-122 access patterns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AccessPatternReport {
+    /// Completed or trailing task segments with at least 32 semantic calls.
+    pub semantic_fanout_tasks: usize,
+    /// Completed or trailing task segments with a semantic call immediately
+    /// followed by a shell source read.
+    pub source_context_dump_tasks: usize,
+    /// Largest number of semantic calls in one task segment.
+    pub max_semantic_calls_per_task: usize,
+    /// Largest number of duplicate semantic queries in one task segment.
+    pub max_duplicate_queries_per_task: usize,
+    /// Largest number of shell source reads in one task segment.
+    pub max_shell_source_reads_per_task: usize,
+    /// Largest shell output volume in one task segment.
+    pub max_shell_output_bytes_per_task: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvaluationReport {
     pub schema_version: u32,
     pub aggregate: TraceReport,
     pub by_tool: BTreeMap<String, TraceReport>,
+    pub access_patterns: AccessPatternReport,
 }
 
-pub const EVALUATION_SCHEMA_VERSION: u32 = 5;
+pub const EVALUATION_SCHEMA_VERSION: u32 = 6;
 
 #[must_use]
 pub fn scrub_path(path: &str) -> String {
@@ -332,6 +351,46 @@ fn latency_percentiles(latencies: &mut [u64]) -> LatencyPercentiles {
 }
 
 #[must_use]
+pub fn access_pattern_report(events: &[TraceEvent]) -> AccessPatternReport {
+    let mut report = AccessPatternReport::default();
+    let mut task_start = 0;
+
+    for (index, event) in events.iter().enumerate() {
+        if matches!(event, TraceEvent::TaskComplete) {
+            record_access_pattern_task(&mut report, &events[task_start..index]);
+            task_start = index + 1;
+        }
+    }
+    record_access_pattern_task(&mut report, &events[task_start..]);
+
+    report
+}
+
+fn record_access_pattern_task(report: &mut AccessPatternReport, events: &[TraceEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let task = classify_trace(events);
+    report.max_semantic_calls_per_task =
+        report.max_semantic_calls_per_task.max(task.semantic_calls);
+    report.max_duplicate_queries_per_task = report
+        .max_duplicate_queries_per_task
+        .max(task.duplicate_queries);
+    report.max_shell_source_reads_per_task = report
+        .max_shell_source_reads_per_task
+        .max(task.shell_source_reads);
+    report.max_shell_output_bytes_per_task = report
+        .max_shell_output_bytes_per_task
+        .max(task.shell_output_bytes);
+    if task.semantic_calls >= 32 {
+        report.semantic_fanout_tasks += 1;
+    }
+    if task.semantic_calls_followed_by_shell_read > 0 {
+        report.source_context_dump_tasks += 1;
+    }
+}
+
+#[must_use]
 pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
     let mut by_tool_events = BTreeMap::<String, Vec<TraceEvent>>::new();
     for (index, event) in events.iter().enumerate() {
@@ -366,6 +425,7 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
             .into_iter()
             .map(|(tool, events)| (tool, classify_trace(&events)))
             .collect(),
+        access_patterns: access_pattern_report(events),
     }
 }
 
@@ -1481,6 +1541,50 @@ mod tests {
             report.by_tool["workspace_symbol_search"].semantic_calls_followed_by_shell_read,
             1
         );
+    }
+
+    #[test]
+    fn access_pattern_report_identifies_fanout_and_source_context_dump_tasks() {
+        let mut events = Vec::new();
+        for index in 0..32 {
+            events.push(mcp_trace_event(
+                "workspace_symbol_search",
+                &serde_json::json!({"query": format!("symbol_{index}")}),
+                &Value::Null,
+                1,
+            ));
+        }
+        events.push(TraceEvent::SourceRead {
+            path: "src/lib.rs".to_owned(),
+            output_bytes: 17,
+        });
+        events.push(TraceEvent::ShellOutput { bytes: 101 });
+        events.push(TraceEvent::TaskComplete);
+        events.push(mcp_trace_event(
+            "workspace_symbol_search",
+            &serde_json::json!({"query": "same"}),
+            &Value::Null,
+            1,
+        ));
+        events.push(mcp_trace_event(
+            "workspace_symbol_search",
+            &serde_json::json!({"query": "same"}),
+            &Value::Null,
+            1,
+        ));
+        events.push(TraceEvent::SourceRead {
+            path: "src/lib.rs".to_owned(),
+            output_bytes: 19,
+        });
+
+        let report = access_pattern_report(&events);
+
+        assert_eq!(report.semantic_fanout_tasks, 1);
+        assert_eq!(report.source_context_dump_tasks, 2);
+        assert_eq!(report.max_semantic_calls_per_task, 32);
+        assert_eq!(report.max_duplicate_queries_per_task, 1);
+        assert_eq!(report.max_shell_source_reads_per_task, 1);
+        assert_eq!(report.max_shell_output_bytes_per_task, 101);
     }
 
     #[test]
