@@ -4576,11 +4576,12 @@ impl ProjectRuntime {
         paths.sort_unstable();
         let mut hasher = Sha256::new();
         for path in paths {
-            let (_, version, content_hash, _) = self
-                .translator
-                .source_snapshot(&path)
-                .await
-                .map_err(|error| error.to_string())?;
+            let snapshot = match self.translator.source_snapshot(&path).await {
+                Ok(snapshot) => snapshot,
+                Err(error) if error.to_string().contains("valid UTF-8") => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let (_, version, content_hash, _) = snapshot;
             hasher.update(path.as_os_str().as_encoded_bytes());
             hasher.update(version.unwrap_or_default().to_le_bytes());
             hasher.update(content_hash.as_bytes());

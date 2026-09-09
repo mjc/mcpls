@@ -46,6 +46,35 @@ async fn lexical_search_skips_non_utf8_files() {
     assert_eq!(scan.matches[0].project_relative_path, "source.rs");
 }
 
+#[tokio::test]
+async fn workspace_symbol_snapshot_skips_non_utf8_files() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("binary.dat"), [0xff]).unwrap();
+    fs::write(root.path().join("source.rs"), "fn status_chip() {}\n").unwrap();
+    let mut translator = Translator::new()
+        .with_extensions(HashMap::from([(String::from("rs"), String::from("rust"))]));
+    translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+    let runtime = ProjectRuntime::new(translator);
+
+    let result = runtime
+        .workspace_symbol_page(WorkspaceSymbolPageRequest {
+            query: "status_chip".to_owned(),
+            kind_filter: None,
+            match_mode: WorkspaceSymbolMatchMode::Fuzzy,
+            scope: WorkspaceSymbolScope::Project,
+            include_generated: false,
+            max_items: 10,
+            max_bytes: 16 * 1024,
+            page_token: None,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "binary files must not make workspace search fail"
+    );
+}
+
 #[test]
 fn invalid_utf8_file_errors_are_skipped_through_both_error_wrappers() {
     let source = std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8");
