@@ -254,6 +254,25 @@ pub(crate) struct GeneratedEditPreview {
 const WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES: usize = 128;
 const WORKSPACE_SYMBOL_BATCH_CONCURRENCY: usize = 4;
 
+fn record_workspace_symbol_batch_metrics(
+    snapshot_identity_ms: u64,
+    provider_wall_ms: u64,
+    provider_total_ms: u64,
+    unique_queries: usize,
+    duplicate_queries: usize,
+    cache_hits: usize,
+    provider_requests: usize,
+) {
+    let span = tracing::Span::current();
+    span.record("batch_snapshot_identity_ms", snapshot_identity_ms);
+    span.record("batch_provider_wall_ms", provider_wall_ms);
+    span.record("batch_provider_total_ms", provider_total_ms);
+    span.record("batch_unique_queries", unique_queries);
+    span.record("batch_duplicate_queries", duplicate_queries);
+    span.record("batch_cache_hits", cache_hits);
+    span.record("batch_provider_requests", provider_requests);
+}
+
 /// Coordinate target recovered from an actor-owned snapshot handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedSymbolTarget {
@@ -4364,11 +4383,15 @@ impl ProjectRuntime {
             }
             (state, token.to_owned(), entry_offset, symbol_offset, true)
         } else {
+            let snapshot_started = Instant::now();
             let snapshot_identity = self.workspace_snapshot_identity().await?;
+            let snapshot_identity_ms =
+                u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let filter_identity = workspace_symbol_batch_filter_identity(&request);
             let mut seen = HashMap::new();
             let mut entries = Vec::with_capacity(request.queries.len());
             let mut cache_hit = false;
+            let mut cache_hits = 0;
             let mut unique_queries = 0;
             let mut uncached = Vec::new();
 
@@ -4403,6 +4426,7 @@ impl ProjectRuntime {
                     .cloned();
                 if let Some(result) = cached {
                     cache_hit = true;
+                    cache_hits += 1;
                     entries.push(Some(WorkspaceSymbolBatchEntry {
                         query,
                         result: Some(result),
@@ -4420,10 +4444,12 @@ impl ProjectRuntime {
             let match_mode = request.match_mode;
             let workspace_scope = request.scope;
             let include_generated = request.include_generated;
+            let provider_started = Instant::now();
             let results = futures::stream::iter(uncached.into_iter().map(
                 |(entry_index, query, cache_key)| {
                     let kind_filter = kind_filter.clone();
                     async move {
+                        let started = Instant::now();
                         let result = self
                             .workspace_symbol_complete(
                                 query.clone(),
@@ -4433,17 +4459,23 @@ impl ProjectRuntime {
                                 include_generated,
                             )
                             .await?;
-                        Ok::<_, String>((entry_index, query, cache_key, result))
+                        let elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        Ok::<_, String>((entry_index, query, cache_key, result, elapsed_ms))
                     }
                 },
             ))
             .buffer_unordered(WORKSPACE_SYMBOL_BATCH_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
+            let provider_wall_ms =
+                u64::try_from(provider_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let mut provider_requests = 0;
+            let mut provider_total_ms: u64 = 0;
             for result in results {
-                let (entry_index, query, cache_key, result) = result?;
+                let (entry_index, query, cache_key, result, elapsed_ms) = result?;
                 provider_requests += 1;
+                provider_total_ms = provider_total_ms.saturating_add(elapsed_ms);
                 let mut cache = self
                     .workspace_symbol_results
                     .lock()
@@ -4460,6 +4492,15 @@ impl ProjectRuntime {
                     skipped_by_budget: false,
                 });
             }
+            record_workspace_symbol_batch_metrics(
+                snapshot_identity_ms,
+                provider_wall_ms,
+                provider_total_ms,
+                unique_queries,
+                request.queries.len().saturating_sub(unique_queries),
+                cache_hits,
+                provider_requests,
+            );
             let entries = entries
                 .into_iter()
                 .collect::<Option<Vec<_>>>()
