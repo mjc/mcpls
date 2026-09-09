@@ -7115,6 +7115,91 @@ finally:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_sessions_route_separate_worktree_paths_to_their_actors() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        write_rust_fixture(repository.path());
+        write_rust_fixture(worktree.path());
+        std::fs::write(
+            worktree.path().join("src/main.rs"),
+            "fn linked_fixture_symbol() {}\n",
+        )
+        .unwrap();
+        // Deliberately leave the linked root without this marker so the
+        // registry must keep it in the same logical project but isolate its
+        // actor profile.
+        std::fs::write(
+            repository.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+
+        let project_id = project_id_for_root(repository.path());
+        let counter = repository.path().join("spawn-count");
+        let config = write_concurrency_lsp(repository.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        let sessions = (0..4).map(|_| server.for_session()).collect::<Vec<_>>();
+
+        sessions[0]
+            .project_add(project_add_params("ignored", repository.path()))
+            .await
+            .unwrap();
+        sessions[1]
+            .project_add(project_add_params("ignored", worktree.path()))
+            .await
+            .unwrap();
+
+        let main_file = repository.path().join("src/main.rs");
+        let linked_file = worktree.path().join("src/main.rs");
+        let paths = [&main_file, &linked_file, &main_file, &linked_file];
+        let results =
+            futures::future::join_all(sessions.iter().zip(paths.iter().copied()).map(
+                |(session, path)| session.get_document_symbols(document_symbols_params(path)),
+            ))
+            .await;
+
+        let mut snapshot_identities = Vec::new();
+        for (result, path) in results.into_iter().zip(paths.iter().copied()) {
+            let result: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+            assert_eq!(result["project_relative_path"], "src/main.rs");
+            assert!(
+                result["source_resource"]["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.contains("src/main.rs"))
+            );
+            assert_eq!(result["symbols"], serde_json::json!([]), "{path:?}");
+            snapshot_identities.push(result["snapshot_identity"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(snapshot_identities[0], snapshot_identities[2]);
+        assert_eq!(snapshot_identities[1], snapshot_identities[3]);
+        assert_ne!(snapshot_identities[0], snapshot_identities[1]);
+
+        let status = sessions[0]
+            .project_status(project_params(&project_id))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["actor_groups"].as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn workspace_symbol_search_lazily_activates_and_waits_for_requested_project() {
         let root = TempDir::new().unwrap();
         write_rust_fixture(root.path());
