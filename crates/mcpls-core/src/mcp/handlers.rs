@@ -338,9 +338,17 @@ impl HandlerContext {
         id: &crate::project::ProjectId,
         path: impl AsRef<std::path::Path>,
     ) -> Result<ProjectHandle, ProjectRegistryError> {
-        self.project_registry
+        match self
+            .project_registry
             .active_actor_for_project_path(id, path)
             .await
+        {
+            Ok(actor) => Ok(actor),
+            Err(ProjectRegistryError::Identity(
+                crate::project::ProjectIdentityError::ProjectPathMismatch { .. },
+            )) => self.required_actor_for_project(id).await,
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolve either a registered project ID or one of its registered roots.
