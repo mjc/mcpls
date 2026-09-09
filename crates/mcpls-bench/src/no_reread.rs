@@ -1637,6 +1637,20 @@ mod tests {
         assert!(!baseline.contains("/home/") && !baseline.contains("C:\\Users\\"));
         let baseline: Value = serde_json::from_str(&baseline)
             .unwrap_or_else(|error| panic!("parsing baseline: {error}"));
+        let access_patterns = baseline["mcpls_122_access_pattern_baselines"]
+            .as_object()
+            .unwrap_or_else(|| panic!("MCPLS-122 access-pattern baselines must be an object"));
+        for pattern in ["semantic_fanout", "source_context_dump"] {
+            let pattern = access_patterns
+                .get(pattern)
+                .unwrap_or_else(|| panic!("missing MCPLS-122 access-pattern baseline: {pattern}"));
+            assert!(pattern.as_object().is_some());
+            assert!(pattern.as_object().unwrap().values().all(Value::is_number));
+        }
+        assert!(
+            !baseline.to_string().contains("/home/")
+                && !baseline.to_string().contains("C:\\Users\\")
+        );
         for ticket in [
             "MCPLS-54", "MCPLS-55", "MCPLS-56", "MCPLS-57", "MCPLS-58", "MCPLS-59", "MCPLS-60",
             "MCPLS-61", "MCPLS-62", "MCPLS-64",

@@ -9,6 +9,18 @@
     "get_hover": {"post_source_read": 8, "semantic_calls": 11},
     "get_references": {"post_source_read": 56, "semantic_calls": 64}
   },
+  "mcpls_122_access_pattern_baselines": {
+    "semantic_fanout": {
+      "workspace_symbol_search_calls": 143,
+      "duplicate_queries": 26,
+      "mcpls_calls": 272
+    },
+    "source_context_dump": {
+      "semantic_calls": 6,
+      "shell_source_read_commands": 20,
+      "shell_output_bytes": 148136
+    }
+  },
   "ticket_baselines": {
     "MCPLS-54": {"kind":"observed","metric":"post_semantic_source_read_rate","value":{"numerator":70,"denominator":96}},
     "MCPLS-55": {"kind":"observed","metric":"post_semantic_same_file_read_rate","value":{"numerator":182,"denominator":280}},
