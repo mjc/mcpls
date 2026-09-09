@@ -352,28 +352,122 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
 pub fn parse_history(reader: impl BufRead) -> Result<Vec<TraceEvent>> {
     let mut events = Vec::new();
     let mut pending_codex_mcp_calls = BTreeMap::new();
+    let mut legacy_codex_event_indices = Vec::new();
+    let mut current_item_format = false;
     for line in reader.lines() {
         let line = line?;
         let event: Value = serde_json::from_str(&line).context("parsing history JSONL")?;
-        if let Some((call_id, call)) = codex_mcp_call(&event) {
-            pending_codex_mcp_calls.insert(call_id, call);
-        } else if let Some((call_id, result)) = codex_mcp_result(&event) {
-            if let Some(call) = pending_codex_mcp_calls.remove(&call_id) {
-                events.push(mcp_trace_event(&call.tool, &call.arguments, &result, 0));
+        if let Some(call) = current_codex_mcp_event(&event) {
+            if !current_item_format {
+                current_item_format = true;
+                for index in std::mem::take(&mut legacy_codex_event_indices)
+                    .into_iter()
+                    .rev()
+                {
+                    events.remove(index);
+                }
+                pending_codex_mcp_calls.clear();
             }
-        } else if let Some(semantic) = semantic_history_event(&event) {
+            events.push(call);
+        } else if let Some(command_events) = current_codex_command_events(&event) {
+            if !current_item_format {
+                current_item_format = true;
+                for index in std::mem::take(&mut legacy_codex_event_indices)
+                    .into_iter()
+                    .rev()
+                {
+                    events.remove(index);
+                }
+                pending_codex_mcp_calls.clear();
+            }
+            events.extend(command_events);
+        } else if !current_item_format {
+            if let Some((call_id, call)) = codex_mcp_call(&event) {
+                pending_codex_mcp_calls.insert(call_id, call);
+            } else if let Some((call_id, result)) = codex_mcp_result(&event) {
+                if let Some(call) = pending_codex_mcp_calls.remove(&call_id) {
+                    legacy_codex_event_indices.push(events.len());
+                    events.push(mcp_trace_event(&call.tool, &call.arguments, &result, 0));
+                }
+            } else if let Some(read) = source_read_history_event(&event) {
+                legacy_codex_event_indices.push(events.len());
+                events.push(read);
+            } else if let Some(output) = shell_output_history_event(&event) {
+                legacy_codex_event_indices.push(events.len());
+                events.push(output);
+            }
+        }
+        if let Some(semantic) = semantic_history_event(&event) {
             events.push(semantic);
         } else if let Some(call) = other_mcpls_history_event(&event) {
             events.push(call);
-        } else if let Some(read) = source_read_history_event(&event) {
-            events.push(read);
-        } else if let Some(output) = shell_output_history_event(&event) {
-            events.push(output);
         } else if compaction_history_event(&event) {
             events.push(TraceEvent::Compaction);
         }
     }
     Ok(events)
+}
+
+fn current_codex_mcp_event(event: &Value) -> Option<TraceEvent> {
+    let payload = event.get("payload")?;
+    if payload.get("type")?.as_str()? != "item_completed" {
+        return None;
+    }
+    let item = payload.get("item")?;
+    if item.get("type")?.as_str()? != "McpToolCall" || item.get("server")?.as_str()? != "mcpls" {
+        return None;
+    }
+    Some(mcp_trace_event(
+        item.get("tool")?.as_str()?,
+        item.get("arguments").unwrap_or(&Value::Null),
+        item.get("result").unwrap_or(&Value::Null),
+        history_latency_ms(item),
+    ))
+}
+
+fn current_codex_command_events(event: &Value) -> Option<Vec<TraceEvent>> {
+    let payload = event.get("payload")?;
+    if payload.get("type")?.as_str()? != "item_completed" {
+        return None;
+    }
+    let item = payload.get("item")?;
+    if item.get("type")?.as_str()? != "CommandExecution" {
+        return None;
+    }
+    let command = item
+        .get("command")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output_bytes = ["stdout", "stderr"]
+        .into_iter()
+        .filter_map(|key| item.get(key).and_then(Value::as_str))
+        .map(str::len)
+        .sum();
+    let mut events = Vec::with_capacity(2);
+    if let Some(path) = source_read_command_path(&command) {
+        events.push(TraceEvent::SourceRead {
+            path: scrub_path(path),
+            output_bytes,
+        });
+    }
+    events.push(TraceEvent::ShellOutput {
+        bytes: output_bytes,
+    });
+    Some(events)
+}
+
+fn source_read_command_path(command: &str) -> Option<&str> {
+    let lower = command.to_ascii_lowercase();
+    if !["sed ", "rg ", "cat ", "bat ", "read_file", "view_image"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return None;
+    }
+    source_path_token(command)
 }
 
 struct PendingCodexMcpCall {
@@ -648,12 +742,13 @@ fn shell_output_history_event(event: &Value) -> Option<TraceEvent> {
 }
 
 fn compaction_history_event(event: &Value) -> bool {
-    event.get("type").and_then(Value::as_str) == Some("event_msg")
-        && event
-            .get("payload")
-            .and_then(|payload| payload.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.contains("compact"))
+    event.get("type").and_then(Value::as_str) == Some("compacted")
+        || (event.get("type").and_then(Value::as_str) == Some("event_msg")
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.contains("compact")))
 }
 
 fn history_latency_ms(payload: &Value) -> u64 {
@@ -1035,6 +1130,79 @@ mod tests {
         assert_eq!(report.deferred_bytes, 55);
         assert!(report.request_bytes > 0);
         assert!(report.result_bytes > 0);
+    }
+
+    #[test]
+    fn history_parser_reads_current_completed_items_with_timing_and_shell_bytes() {
+        let mcp = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "McpToolCall",
+                    "server": "mcpls",
+                    "tool": "workspace_symbol_search",
+                    "arguments": {
+                        "project_id": "fixture",
+                        "file_path": "/home/alice/fixture/src/lib.rs",
+                        "query": "private_type",
+                        "max_bytes": 4096
+                    },
+                    "duration": {"secs": 1, "nanos": 250000000},
+                    "result": {
+                        "structuredContent": {
+                            "truncated": true,
+                            "resource": {"uri": "mcpls-source://fixture", "total_bytes": 55}
+                        },
+                        "isError": false
+                    }
+                }
+            }
+        });
+        let command = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "command": ["zsh", "-lc", "sed -n 1,10p /home/alice/fixture/src/lib.rs"],
+                    "stdout": "source\n",
+                    "stderr": ""
+                }
+            }
+        });
+        let history = [mcp, command]
+            .into_iter()
+            .map(|event| event.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let events = parse_history(history.as_bytes()).unwrap();
+        let report = evaluate(&events).aggregate;
+
+        assert_eq!(report.mcpls_calls, 1);
+        assert_eq!(report.semantic_calls, 1);
+        assert_eq!(report.result_bytes, 117);
+        assert_eq!(report.deferred_bytes, 55);
+        assert_eq!(report.latency_ms, 1_250);
+        assert_eq!(report.latency.p50_ms, 1_250);
+        assert_eq!(report.shell_output_bytes, 7);
+        assert_eq!(report.source_read_output_bytes, 7);
+        assert_eq!(report.post_semantic_same_file_reads, 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| !format!("{event:?}").contains("alice"))
+        );
+    }
+
+    #[test]
+    fn history_parser_counts_current_top_level_compaction_records() {
+        let history = r#"{"type":"compacted","thread_id":"opaque"}"#;
+
+        let events = parse_history(history.as_bytes()).unwrap();
+
+        assert_eq!(evaluate(&events).aggregate.compactions, 1);
     }
 
     #[test]
