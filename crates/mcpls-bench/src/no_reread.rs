@@ -54,6 +54,7 @@ pub enum TraceEvent {
     ShellOutput {
         bytes: usize,
     },
+    TaskComplete,
     Compaction,
 }
 
@@ -81,6 +82,10 @@ pub struct TraceReport {
     pub deferred_resource_reads: usize,
     pub source_read_output_bytes: usize,
     pub shell_output_bytes: usize,
+    pub shell_source_reads: usize,
+    pub completed_tasks: usize,
+    pub calls_per_completed_task: Rate,
+    pub semantic_to_shell_read_rate: Rate,
     pub compactions: usize,
     pub latency: LatencyPercentiles,
     pub truncated: usize,
@@ -139,6 +144,16 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
         deferred_resource_reads: 0,
         source_read_output_bytes: 0,
         shell_output_bytes: 0,
+        shell_source_reads: 0,
+        completed_tasks: 0,
+        calls_per_completed_task: Rate {
+            numerator: 0,
+            denominator: 0,
+        },
+        semantic_to_shell_read_rate: Rate {
+            numerator: 0,
+            denominator: 0,
+        },
         compactions: 0,
         latency: LatencyPercentiles {
             p50_ms: 0,
@@ -196,6 +211,8 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
         rate(report.post_semantic_same_file_reads, report.semantic_calls);
     report.pre_coordinate_source_read_rate =
         rate(report.pre_coordinate_source_reads, report.coordinate_calls);
+    report.calls_per_completed_task = rate(report.mcpls_calls, report.completed_tasks);
+    report.semantic_to_shell_read_rate = rate(report.shell_source_reads, report.semantic_calls);
     report.truncation_rate = rate(report.truncated, report.semantic_calls);
     report.unsupported_rate = rate(report.unsupported, report.semantic_calls);
     report.error_rate = rate(report.errors, report.semantic_calls);
@@ -241,9 +258,11 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
             latencies.push(*latency_ms);
         }
         TraceEvent::SourceRead { output_bytes, .. } => {
+            report.shell_source_reads += 1;
             report.source_read_output_bytes += output_bytes;
         }
         TraceEvent::ShellOutput { bytes } => report.shell_output_bytes += bytes,
+        TraceEvent::TaskComplete => report.completed_tasks += 1,
         TraceEvent::Compaction => report.compactions += 1,
         TraceEvent::Semantic { .. } => {}
     }
@@ -401,6 +420,8 @@ pub fn parse_history(reader: impl BufRead) -> Result<Vec<TraceEvent>> {
             events.push(semantic);
         } else if let Some(call) = other_mcpls_history_event(&event) {
             events.push(call);
+        } else if task_complete_history_event(&event) {
+            events.push(TraceEvent::TaskComplete);
         } else if compaction_history_event(&event) {
             events.push(TraceEvent::Compaction);
         }
@@ -763,6 +784,15 @@ fn compaction_history_event(event: &Value) -> bool {
                 .is_some_and(|kind| kind.contains("compact")))
 }
 
+fn task_complete_history_event(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("event_msg")
+        && event
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("task_complete")
+}
+
 fn history_latency_ms(payload: &Value) -> u64 {
     let duration = payload.get("duration").unwrap_or(&Value::Null);
     duration
@@ -985,6 +1015,16 @@ mod tests {
                 deferred_resource_reads: 0,
                 source_read_output_bytes: 18,
                 shell_output_bytes: 0,
+                shell_source_reads: 3,
+                completed_tasks: 0,
+                calls_per_completed_task: Rate {
+                    numerator: 2,
+                    denominator: 0,
+                },
+                semantic_to_shell_read_rate: Rate {
+                    numerator: 3,
+                    denominator: 2,
+                },
                 compactions: 0,
                 latency: LatencyPercentiles {
                     p50_ms: 12,
@@ -1217,6 +1257,24 @@ mod tests {
         let events = parse_history(history.as_bytes()).unwrap();
 
         assert_eq!(evaluate(&events).aggregate.compactions, 1);
+    }
+
+    #[test]
+    fn history_parser_counts_completed_tasks_without_retaining_task_data() {
+        let history =
+            r#"{"type":"event_msg","payload":{"type":"task_complete","thread_id":"opaque"}}"#;
+
+        let events = parse_history(history.as_bytes()).unwrap();
+        let report = evaluate(&events).aggregate;
+
+        assert_eq!(report.completed_tasks, 1);
+        assert_eq!(report.calls_per_completed_task.numerator, 0);
+        assert_eq!(report.calls_per_completed_task.denominator, 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| !format!("{event:?}").contains("opaque"))
+        );
     }
 
     #[test]
