@@ -2620,7 +2620,7 @@ impl ProjectRegistry {
         id: &ProjectId,
         path: &Path,
     ) -> Result<(ProjectHandle, MutationGate, PathBuf), ProjectRegistryError> {
-        let path = canonicalize(path)?;
+        let path = canonicalize_routing_path(path)?;
         let projects = self.projects.read().await;
         let result = (|| {
             let project = projects
@@ -2703,6 +2703,20 @@ fn workspace_edit_path(edit: &WorkspaceEdit) -> Option<PathBuf> {
             | EditOperation::Delete { uri, .. } => uri_to_path(&uri),
             EditOperation::Rename { old_uri, .. } => uri_to_path(&old_uri),
         })
+}
+
+fn canonicalize_routing_path(path: &Path) -> Result<PathBuf, ProjectRegistryError> {
+    let error = match canonicalize(path) {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    let Some(file_name) = path.file_name() else {
+        return Err(error.into());
+    };
+    let Some(parent) = path.parent() else {
+        return Err(error.into());
+    };
+    Ok(canonicalize(parent)?.join(file_name))
 }
 
 pub(super) fn aggregate_statuses(

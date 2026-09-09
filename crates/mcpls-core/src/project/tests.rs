@@ -7637,6 +7637,42 @@ async fn project_registry_applies_a_plan_from_a_non_primary_worktree_actor() {
             .is_ok(),
         "retained applied receipts must remain routable"
     );
+
+    let created = worktree.path().join("created.rs");
+    let create_edit = lsp_types::WorkspaceEdit {
+        changes: None,
+        document_changes: Some(lsp_types::DocumentChanges::Operations(vec![
+            lsp_types::DocumentChangeOperation::Op(lsp_types::ResourceOp::Create(
+                lsp_types::CreateFile {
+                    uri: crate::bridge::path_to_uri(&created).unwrap(),
+                    options: None,
+                    annotation_id: None,
+                },
+            )),
+        ])),
+        change_annotations: None,
+    };
+    let create_artifact = registry
+        .preview_edit(&project_id, create_edit, PositionEncoding::Utf8)
+        .await
+        .unwrap();
+    assert!(matches!(
+        create_artifact.plan.file_operations(),
+        [crate::edit_paths::FileOperation::Create { path, .. }] if path == &created
+    ));
+    let create_plan_id = create_artifact.plan.id().clone();
+    let create_outcome = registry
+        .apply_edit_plan_with_wait(
+            &project_id,
+            create_plan_id,
+            Some("separate-worktree-create-test".to_owned()),
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(create_outcome, ApplyEditPlanOutcome::Applied(_)));
+    assert!(created.is_file());
 }
 
 #[tokio::test]
