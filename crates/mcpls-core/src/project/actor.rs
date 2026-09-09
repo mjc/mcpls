@@ -335,6 +335,10 @@ pub(super) enum ProjectRequest {
         page_token: Option<String>,
         reply: oneshot::Sender<Result<CodeActionsResult, String>>,
     },
+    HasCodeAction {
+        action_id: PlanId,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     CodeActionPreview {
         action_id: PlanId,
         project_id: String,
@@ -418,6 +422,11 @@ pub(super) enum ProjectRequest {
     StoreEditPlan {
         plan: EditPlan,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    #[cfg(test)]
+    StoreCodeAction {
+        action: StoredCodeAction,
+        reply: oneshot::Sender<Result<PlanId, String>>,
     },
     TakeEditPlan {
         plan_id: PlanId,
@@ -699,6 +708,7 @@ impl ProjectRequest {
             Self::CodeActions { reply, .. } | Self::CodeActionList { reply, .. } => {
                 reject!(reply)
             }
+            Self::HasCodeAction { reply, .. } => reject!(reply),
             Self::PrepareCallHierarchy { reply, .. } => reject!(reply),
             Self::IncomingCalls { reply, .. } => reject!(reply),
             Self::OutgoingCalls { reply, .. } => reject!(reply),
@@ -762,11 +772,15 @@ impl ProjectRequest {
             Self::GoToImplementation { reply, .. } | Self::GoToTypeDefinition { reply, .. } => {
                 reply.is_closed()
             }
-            Self::HasCachedDiagnostics { reply, .. } => reply.is_closed(),
+            Self::HasCodeAction { reply, .. } | Self::HasCachedDiagnostics { reply, .. } => {
+                reply.is_closed()
+            }
             Self::OpenDocumentPaths { reply } => reply.is_closed(),
             Self::ValidatePath { reply, .. } | Self::StoreEditPlan { reply, .. } => {
                 reply.is_closed()
             }
+            #[cfg(test)]
+            Self::StoreCodeAction { reply, .. } => reply.is_closed(),
             Self::SourcePathAuthorized { reply, .. }
             | Self::HasEditPlanReceiptOrConflict { reply, .. } => reply.is_closed(),
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
@@ -1628,6 +1642,22 @@ impl ProjectHandle {
             .map_err(ProjectActorError::Operation)
     }
 
+    /// Return whether this actor retains a code-action reference.
+    pub(crate) async fn has_code_action(
+        &self,
+        action_id: PlanId,
+    ) -> Result<bool, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::HasCodeAction { action_id, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
     /// Route call-hierarchy preparation through this project's actor-owned translator.
     ///
     /// # Errors
@@ -2010,6 +2040,23 @@ impl ProjectHandle {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ProjectRequest::StoreEditPlan { plan, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response
+            .await
+            .map_err(|_| ProjectActorError::Cancelled)?
+            .map_err(ProjectActorError::Operation)
+    }
+
+    /// Store a project-owned code-action reference.
+    #[cfg(test)]
+    pub(super) async fn store_code_action(
+        &self,
+        action: StoredCodeAction,
+    ) -> Result<PlanId, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::StoreCodeAction { action, reply })
             .await
             .map_err(|_| ProjectActorError::Closed)?;
         response
@@ -3491,6 +3538,9 @@ pub(super) async fn handle_project_request(
                     .await,
             );
         }
+        ProjectRequest::HasCodeAction { action_id, reply } => {
+            let _ = reply.send(Ok(runtime.has_code_action(&action_id)));
+        }
         ProjectRequest::CodeActionPreview {
             action_id,
             project_id,
@@ -3645,6 +3695,10 @@ pub(super) async fn handle_project_request(
         }
         ProjectRequest::StoreEditPlan { plan, reply } => {
             let _ = reply.send(runtime.store_edit_plan(plan));
+        }
+        #[cfg(test)]
+        ProjectRequest::StoreCodeAction { action, reply } => {
+            let _ = reply.send(Ok(runtime.store_code_action(action)));
         }
         ProjectRequest::PreviewEdit {
             project_id,

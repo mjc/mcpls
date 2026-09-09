@@ -7640,6 +7640,94 @@ async fn project_registry_applies_a_plan_from_a_non_primary_worktree_actor() {
 }
 
 #[tokio::test]
+async fn project_registry_previews_a_code_action_from_a_non_primary_worktree_actor() {
+    let repository = TempDir::new().unwrap();
+    let git_dir = repository.path().join(".git");
+    let worktree_git_dir = git_dir.join("worktrees").join("linked");
+    fs::create_dir_all(&worktree_git_dir).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(git_dir.join("config"), "[core]\n").unwrap();
+    fs::create_dir(git_dir.join("objects")).unwrap();
+    fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+    let worktree = TempDir::new().unwrap();
+    fs::write(
+        worktree.path().join(".git"),
+        format!("gitdir: {}\n", worktree_git_dir.display()),
+    )
+    .unwrap();
+    for root in [repository.path(), worktree.path()] {
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+    }
+    let file = worktree.path().join("src.rs");
+    fs::write(&file, "before\n").unwrap();
+
+    let project_id = ProjectId::new("repository").unwrap();
+    let registry = ProjectRegistry::new(2);
+    let repository_identity = GitRepositoryIdentity::discover(repository.path())
+        .unwrap()
+        .unwrap();
+    registry
+        .add(
+            ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(repository.path()).unwrap(),
+            )
+            .with_repository_identity(repository_identity),
+        )
+        .await
+        .unwrap();
+    let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+        .unwrap()
+        .unwrap();
+    let linked_actor = registry
+        .add(
+            ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(worktree.path()).unwrap(),
+            )
+            .with_repository_identity(linked_identity),
+        )
+        .await
+        .unwrap();
+
+    let edit = lsp_types::WorkspaceEdit {
+        changes: Some(HashMap::from([(
+            crate::bridge::path_to_uri(&file).unwrap(),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 6),
+                },
+                new_text: "after".to_owned(),
+            }],
+        )])),
+        document_changes: None,
+        change_annotations: None,
+    };
+    let action_id = linked_actor
+        .store_code_action(StoredCodeAction {
+            file_path: file.display().to_string(),
+            action: lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction {
+                title: "replace text".to_owned(),
+                edit: Some(edit),
+                ..lsp_types::CodeAction::default()
+            }),
+            created_at: Instant::now(),
+        })
+        .await
+        .unwrap();
+
+    let artifact = registry
+        .preview_code_action(&project_id, action_id, PositionEncoding::Utf8)
+        .await
+        .unwrap();
+    assert_eq!(artifact.plan.files()[0].path(), file.as_path());
+    assert!(artifact.plan.safe_to_apply());
+    assert_eq!(fs::read_to_string(file).unwrap(), "before\n");
+}
+
+#[tokio::test]
 async fn linked_worktrees_share_only_when_cargo_profiles_match() {
     let (repository, worktrees, roots) = compatible_worktree_fixture();
     let project_id = ProjectId::new("profile-linked").unwrap();

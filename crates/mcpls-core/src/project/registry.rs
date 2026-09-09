@@ -1621,15 +1621,10 @@ impl ProjectRegistry {
         action_id: PlanId,
         encoding: PositionEncoding,
     ) -> Result<PreviewArtifact, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
+        let (actor, mutation, root) = self.locate_code_action(id, action_id.clone()).await?;
         let _mutation = mutation.lock().await;
         actor
-            .preview_code_action(
-                action_id,
-                id.as_str().to_string(),
-                encoding,
-                identity.root().as_path().to_path_buf(),
-            )
+            .preview_code_action(action_id, id.as_str().to_string(), encoding, root)
             .await
             .map_err(ProjectRegistryError::from)
     }
@@ -2658,6 +2653,42 @@ impl ProjectRegistry {
         })();
         drop(projects);
         result
+    }
+
+    async fn locate_code_action(
+        &self,
+        id: &ProjectId,
+        action_id: PlanId,
+    ) -> Result<(ProjectHandle, MutationGate, PathBuf), ProjectRegistryError> {
+        let candidates = self
+            .projects
+            .read()
+            .await
+            .get(id)
+            .map(|project| {
+                project
+                    .actors
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.roots.first().map(|root| {
+                            (
+                                entry.actor.clone(),
+                                entry.mutation.clone(),
+                                root.as_path().to_path_buf(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        for (actor, mutation, root) in candidates {
+            if actor.has_code_action(action_id.clone()).await? {
+                return Ok((actor, mutation, root));
+            }
+        }
+        Err(ProjectRegistryError::Actor(ProjectActorError::Operation(
+            format!("code action reference is missing or expired: {action_id}"),
+        )))
     }
 }
 

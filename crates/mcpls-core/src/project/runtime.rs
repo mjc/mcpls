@@ -1437,6 +1437,11 @@ impl CodeActionStore {
             .remove(id)
             .ok_or_else(|| format!("code action reference is missing or expired: {id}"))
     }
+
+    pub(super) fn contains(&mut self, id: &PlanId) -> bool {
+        self.prune();
+        self.entries.contains_key(id)
+    }
 }
 
 pub(super) fn call_hierarchy_snapshot_hash(items: &[CallHierarchyItemResult]) -> String {
@@ -5524,6 +5529,15 @@ impl ProjectRuntime {
                 .remove(&token);
         }
         Ok(result)
+    }
+
+    pub(super) fn has_code_action(&mut self, action_id: &PlanId) -> bool {
+        self.code_actions.contains(action_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn store_code_action(&mut self, action: StoredCodeAction) -> PlanId {
+        self.code_actions.insert(action)
     }
 
     #[allow(clippy::too_many_arguments)]
