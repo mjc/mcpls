@@ -1976,11 +1976,79 @@ impl ProjectRegistry {
         id: &ProjectId,
         plan_id: PlanId,
     ) -> Result<crate::edit_plan::EditPlanApprovalSummary, ProjectRegistryError> {
-        self.actor(id)
-            .await?
-            .inspect_edit_plan(plan_id, id.as_str().to_string())
+        let (_, _, summary) = self.locate_edit_plan(id, plan_id).await?;
+        summary.ok_or_else(|| {
+            ProjectRegistryError::Actor(ProjectActorError::Operation(
+                "edit plan not found".to_owned(),
+            ))
+        })
+    }
+
+    /// Find a pending plan or an applied receipt across all actor groups of a
+    /// logical project. Linked worktrees may deliberately use separate actors
+    /// when their language-server compatibility is unknown.
+    async fn locate_edit_plan(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<
+        (
+            ProjectHandle,
+            PathBuf,
+            Option<crate::edit_plan::EditPlanApprovalSummary>,
+        ),
+        ProjectRegistryError,
+    > {
+        let candidates = self
+            .projects
+            .read()
             .await
-            .map_err(ProjectRegistryError::from)
+            .get(id)
+            .map(|project| {
+                project
+                    .actors
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .roots
+                            .first()
+                            .map(|root| (entry.actor.clone(), root.as_path().to_path_buf()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+        for (actor, root) in candidates {
+            match actor
+                .inspect_edit_plan(plan_id.clone(), id.as_str().to_owned())
+                .await
+            {
+                Ok(summary) => return Ok((actor, root, Some(summary))),
+                Err(error) if error.to_string().contains("edit plan not found") => {
+                    if actor
+                        .has_edit_plan_receipt_or_conflict(plan_id.clone())
+                        .await
+                        .map_err(ProjectRegistryError::from)?
+                    {
+                        return Ok((actor, root, None));
+                    }
+                }
+                Err(error) => return Err(ProjectRegistryError::from(error)),
+            }
+        }
+        Err(ProjectRegistryError::Actor(ProjectActorError::Operation(
+            "edit plan not found".to_owned(),
+        )))
+    }
+
+    /// Resolve the actor that owns a plan for session-scoped edit resources.
+    pub(crate) async fn actor_for_edit_plan(
+        &self,
+        id: &ProjectId,
+        plan_id: PlanId,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.locate_edit_plan(id, plan_id)
+            .await
+            .map(|(actor, _, _)| actor)
     }
 
     /// Consume and apply a project-owned edit plan while recording audit context.
@@ -2096,40 +2164,11 @@ impl ProjectRegistry {
         principal: Option<String>,
         wait: Duration,
     ) -> Result<ApplyEditPlanOutcome, ProjectRegistryError> {
-        let (identity, actor, _mutation) = self.entry(id).await?;
-        let summary = match actor
-            .inspect_edit_plan(plan_id.clone(), id.as_str().to_string())
-            .await
-        {
-            Ok(summary) => summary,
-            Err(error) if error.to_string().contains("edit plan not found") => {
-                // A committed plan is retained as a receipt by the actor. It
-                // has no live snapshot to reserve, so let the actor resolve
-                // the receipt (or return the original not-found error) rather
-                // than turning an idempotent retry into a protocol failure.
-                let lease = self
-                    .edit_coordinator
-                    .try_acquire(plan_id.as_str(), Vec::new())
-                    .map_err(|contention| {
-                        ProjectRegistryError::Actor(ProjectActorError::Operation(format!(
-                            "edit plan is busy: {contention:?}"
-                        )))
-                    })?;
-                return actor
-                    .apply_edit_plan_with_lease(
-                        plan_id,
-                        id.as_str().to_string(),
-                        identity.root().as_path().to_path_buf(),
-                        session_id,
-                        principal,
-                        lease,
-                    )
-                    .await
-                    .map_err(ProjectRegistryError::from);
-            }
-            Err(error) => return Err(ProjectRegistryError::from(error)),
-        };
-        let resources = summary.coordination_resources();
+        let (actor, root, summary) = self.locate_edit_plan(id, plan_id.clone()).await?;
+        let resources = summary.as_ref().map_or_else(
+            Vec::new,
+            crate::edit_plan::EditPlanApprovalSummary::coordination_resources,
+        );
         let lease = match self
             .edit_coordinator
             .acquire_for(plan_id.as_str(), resources, wait)
@@ -2148,7 +2187,7 @@ impl ProjectRegistry {
             .apply_edit_plan_with_lease(
                 plan_id,
                 id.as_str().to_string(),
-                identity.root().as_path().to_path_buf(),
+                root,
                 session_id,
                 principal,
                 lease,

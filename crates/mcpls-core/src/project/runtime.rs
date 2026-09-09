@@ -3239,6 +3239,16 @@ impl ProjectRuntime {
             })
     }
 
+    pub(super) fn has_edit_plan_receipt_or_conflict(&self, plan_id: &PlanId) -> bool {
+        self.applied_edit_receipts
+            .iter()
+            .any(|receipt| &receipt.plan_id == plan_id)
+            || self
+                .edit_conflicts
+                .iter()
+                .any(|conflict| &conflict.plan_id == plan_id)
+    }
+
     pub(super) fn configure_edit_safety(
         &mut self,
         boundary: &WorkspaceBoundary,

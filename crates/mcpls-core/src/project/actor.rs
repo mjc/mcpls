@@ -439,6 +439,10 @@ pub(super) enum ProjectRequest {
         project_id: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    HasEditPlanReceiptOrConflict {
+        plan_id: PlanId,
+        reply: oneshot::Sender<bool>,
+    },
     ApplyEditPlan {
         plan_id: PlanId,
         project_id: String,
@@ -763,7 +767,8 @@ impl ProjectRequest {
             Self::ValidatePath { reply, .. } | Self::StoreEditPlan { reply, .. } => {
                 reply.is_closed()
             }
-            Self::SourcePathAuthorized { reply, .. } => reply.is_closed(),
+            Self::SourcePathAuthorized { reply, .. }
+            | Self::HasEditPlanReceiptOrConflict { reply, .. } => reply.is_closed(),
             Self::AddWorkspaceRoot { reply, .. } => reply.is_closed(),
             Self::TakeEditPlan { reply, .. } => reply.is_closed(),
             Self::InspectEditPlan { reply, .. } => reply.is_closed(),
@@ -2209,6 +2214,19 @@ impl ProjectHandle {
             .await
             .map_err(|_| ProjectActorError::Cancelled)?
             .map_err(ProjectActorError::Operation)
+    }
+
+    /// Return whether an applied receipt or conflict for a plan is retained.
+    pub(crate) async fn has_edit_plan_receipt_or_conflict(
+        &self,
+        plan_id: PlanId,
+    ) -> Result<bool, ProjectActorError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ProjectRequest::HasEditPlanReceiptOrConflict { plan_id, reply })
+            .await
+            .map_err(|_| ProjectActorError::Closed)?;
+        response.await.map_err(|_| ProjectActorError::Cancelled)
     }
 
     /// Apply a plan while holding the registry-owned path reservation.
@@ -3720,6 +3738,9 @@ pub(super) async fn handle_project_request(
             reply,
         } => {
             let _ = reply.send(runtime.read_applied_edit_detail(&plan_id, &project_id));
+        }
+        ProjectRequest::HasEditPlanReceiptOrConflict { plan_id, reply } => {
+            let _ = reply.send(runtime.has_edit_plan_receipt_or_conflict(&plan_id));
         }
         ProjectRequest::ApplyEditPlan {
             plan_id,

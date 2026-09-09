@@ -2473,7 +2473,7 @@ impl McplsServer {
         let actor = self
             .context
             .project_registry
-            .actor_for_project(&project_id)
+            .actor_for_edit_plan(&project_id, plan_id.clone())
             .await
             .map_err(project_routing_error)?;
         let diff = actor
@@ -2507,7 +2507,7 @@ impl McplsServer {
         let actor = self
             .context
             .project_registry
-            .actor_for_project(&project_id)
+            .actor_for_edit_plan(&project_id, plan_id.clone())
             .await
             .map_err(project_routing_error)?;
         let detail = actor

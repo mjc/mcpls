@@ -7542,6 +7542,100 @@ async fn project_registry_keeps_unknown_worktree_in_one_logical_project() {
 }
 
 #[tokio::test]
+async fn project_registry_applies_a_plan_from_a_non_primary_worktree_actor() {
+    let repository = TempDir::new().unwrap();
+    let git_dir = repository.path().join(".git");
+    let worktree_git_dir = git_dir.join("worktrees").join("linked");
+    fs::create_dir_all(&worktree_git_dir).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(git_dir.join("config"), "[core]\n").unwrap();
+    fs::create_dir(git_dir.join("objects")).unwrap();
+    fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+    let worktree = TempDir::new().unwrap();
+    fs::write(
+        worktree.path().join(".git"),
+        format!("gitdir: {}\n", worktree_git_dir.display()),
+    )
+    .unwrap();
+    for root in [repository.path(), worktree.path()] {
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+    }
+    let file = worktree.path().join("src.rs");
+    fs::write(&file, "before\n").unwrap();
+
+    let project_id = ProjectId::new("repository").unwrap();
+    let registry = ProjectRegistry::new(2);
+    let repository_identity = GitRepositoryIdentity::discover(repository.path())
+        .unwrap()
+        .unwrap();
+    registry
+        .add(
+            ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(repository.path()).unwrap(),
+            )
+            .with_repository_identity(repository_identity),
+        )
+        .await
+        .unwrap();
+    let linked_identity = GitRepositoryIdentity::discover(worktree.path())
+        .unwrap()
+        .unwrap();
+    let linked_actor = registry
+        .add(
+            ProjectIdentity::new(
+                project_id.clone(),
+                CanonicalRoot::new(worktree.path()).unwrap(),
+            )
+            .with_repository_identity(linked_identity),
+        )
+        .await
+        .unwrap();
+
+    let plan = crate::edit_plan::EditPlan::new(
+        project_id.to_string(),
+        vec![crate::edit_plan::FileSnapshot::from_contents(
+            file.clone(),
+            crate::edit_plan::SnapshotSource::Disk,
+            None,
+            "before\n",
+            "after\n",
+        )],
+        vec!["replace src.rs".to_owned()],
+        true,
+        Duration::from_secs(60),
+    );
+    let plan_id = plan.id().clone();
+    linked_actor.store_edit_plan(plan).await.unwrap();
+
+    let summary = registry
+        .inspect_edit_plan(&project_id, plan_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(summary.affected_files, vec![file.clone()]);
+    let outcome = registry
+        .apply_edit_plan_with_wait(
+            &project_id,
+            plan_id.clone(),
+            Some("separate-worktree-test".to_owned()),
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ApplyEditPlanOutcome::Applied(_)));
+    assert_eq!(fs::read_to_string(file).unwrap(), "after\n");
+    assert!(
+        registry
+            .actor_for_edit_plan(&project_id, plan_id)
+            .await
+            .is_ok(),
+        "retained applied receipts must remain routable"
+    );
+}
+
+#[tokio::test]
 async fn linked_worktrees_share_only_when_cargo_profiles_match() {
     let (repository, worktrees, roots) = compatible_worktree_fixture();
     let project_id = ProjectId::new("profile-linked").unwrap();
