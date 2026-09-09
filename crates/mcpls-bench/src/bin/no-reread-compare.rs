@@ -16,8 +16,8 @@ struct Args {
     after: PathBuf,
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Exit unsuccessfully unless report schemas and task counts match and
-    /// both MCPLS calls and context bytes decrease.
+    /// Exit unsuccessfully unless report schemas, run-contract hashes, and
+    /// task counts match and both MCPLS calls and context bytes decrease.
     #[arg(long)]
     require_reduction: bool,
 }

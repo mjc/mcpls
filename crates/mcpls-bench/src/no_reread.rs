@@ -139,15 +139,18 @@ pub struct AccessPatternReport {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EvaluationReport {
     pub schema_version: u32,
+    /// Hash of the caller-supplied agent/model/repository/task contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_key: Option<String>,
     pub aggregate: TraceReport,
     pub by_tool: BTreeMap<String, TraceReport>,
     pub access_patterns: AccessPatternReport,
 }
 
-pub const EVALUATION_SCHEMA_VERSION: u32 = 6;
+pub const EVALUATION_SCHEMA_VERSION: u32 = 7;
 
 /// Version of the privacy-preserving before/after comparison schema.
-pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 2;
+pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 3;
 
 /// One lower-is-better metric from two like-for-like evaluations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -169,6 +172,14 @@ impl MetricComparison {
     }
 }
 
+/// Input compatibility checks required before comparing reductions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct EvaluationCompatibility {
+    pub report_schemas_match: bool,
+    pub comparison_keys_match: bool,
+    pub task_counts_match: bool,
+}
+
 /// Privacy-preserving comparison of two task evaluations.
 ///
 /// The comparison deliberately contains counts and byte totals only. The
@@ -178,8 +189,7 @@ impl MetricComparison {
 pub struct EvaluationComparison {
     pub schema_version: u32,
     pub report_schema_versions: [u32; 2],
-    pub comparable_report_schemas: bool,
-    pub comparable_task_counts: bool,
+    pub compatibility: EvaluationCompatibility,
     pub accepted: bool,
     pub mcpls_calls: MetricComparison,
     pub context_bytes: MetricComparison,
@@ -199,13 +209,14 @@ const fn model_visible_context_bytes(report: &TraceReport) -> usize {
 
 /// Compare two privacy-preserving evaluations without retaining their events.
 #[must_use]
-pub const fn compare_evaluations(
+pub fn compare_evaluations(
     before: &EvaluationReport,
     after: &EvaluationReport,
 ) -> EvaluationComparison {
-    let comparable_report_schemas = before.schema_version == after.schema_version;
-    let comparable_task_counts =
-        before.aggregate.completed_tasks == after.aggregate.completed_tasks;
+    let report_schemas_match = before.schema_version == after.schema_version;
+    let comparison_keys_match = before.comparison_key.is_some()
+        && before.comparison_key.as_deref() == after.comparison_key.as_deref();
+    let task_counts_match = before.aggregate.completed_tasks == after.aggregate.completed_tasks;
     let mcpls_calls =
         MetricComparison::new(before.aggregate.mcpls_calls, after.aggregate.mcpls_calls);
     let context_bytes = MetricComparison::new(
@@ -237,10 +248,14 @@ pub const fn compare_evaluations(
     EvaluationComparison {
         schema_version: EVALUATION_COMPARISON_SCHEMA_VERSION,
         report_schema_versions: [before.schema_version, after.schema_version],
-        comparable_report_schemas,
-        comparable_task_counts,
-        accepted: comparable_report_schemas
-            && comparable_task_counts
+        compatibility: EvaluationCompatibility {
+            report_schemas_match,
+            comparison_keys_match,
+            task_counts_match,
+        },
+        accepted: report_schemas_match
+            && comparison_keys_match
+            && task_counts_match
             && mcpls_calls.reduced
             && context_bytes.reduced,
         mcpls_calls,
@@ -528,6 +543,7 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
     }
     EvaluationReport {
         schema_version: EVALUATION_SCHEMA_VERSION,
+        comparison_key: None,
         aggregate: classify_trace(events),
         by_tool: by_tool_events
             .into_iter()
@@ -535,6 +551,19 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
             .collect(),
         access_patterns: access_pattern_report(events),
     }
+}
+
+/// Attach a privacy-preserving run-contract identity to an evaluation report.
+///
+/// The key should represent every input that must remain constant between the
+/// before and after runs, such as agent, model, repository fixture, and task
+/// corpus. Only its SHA-256 digest is retained in the report.
+#[must_use]
+pub fn with_comparison_key(mut report: EvaluationReport, key: &str) -> EvaluationReport {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    report.comparison_key = Some(format!("{:x}", hasher.finalize()));
+    report
 }
 
 pub fn parse_history(reader: impl BufRead) -> Result<Vec<TraceEvent>> {
@@ -1728,12 +1757,12 @@ mod tests {
             mcp_trace_event("workspace_symbol_search", &Value::Null, &Value::Null, 1),
             TraceEvent::TaskComplete,
         ];
-        let before = evaluate(&before_events);
-        let after = evaluate(&after_events);
+        let before = with_comparison_key(evaluate(&before_events), "same-run-contract");
+        let after = with_comparison_key(evaluate(&after_events), "same-run-contract");
 
         let comparison = compare_evaluations(&before, &after);
 
-        assert!(comparison.comparable_task_counts);
+        assert!(comparison.compatibility.task_counts_match);
         assert!(comparison.accepted);
         assert_eq!(comparison.mcpls_calls.before, 2);
         assert_eq!(comparison.mcpls_calls.after, 1);
@@ -1749,7 +1778,7 @@ mod tests {
 
         let comparison = compare_evaluations(&before, &after);
 
-        assert!(!comparison.comparable_task_counts);
+        assert!(!comparison.compatibility.task_counts_match);
         assert!(!comparison.accepted);
     }
 
@@ -1761,8 +1790,19 @@ mod tests {
 
         let comparison = compare_evaluations(&before, &after);
 
-        assert_eq!(comparison.report_schema_versions, [6, 5]);
-        assert!(!comparison.comparable_report_schemas);
+        assert_eq!(comparison.report_schema_versions, [7, 6]);
+        assert!(!comparison.compatibility.report_schemas_match);
+        assert!(!comparison.accepted);
+    }
+
+    #[test]
+    fn evaluation_comparison_requires_matching_nonempty_contract_keys() {
+        let before = with_comparison_key(evaluate(&[TraceEvent::TaskComplete]), "before");
+        let after = with_comparison_key(evaluate(&[]), "after");
+
+        let comparison = compare_evaluations(&before, &after);
+
+        assert!(!comparison.compatibility.comparison_keys_match);
         assert!(!comparison.accepted);
     }
 

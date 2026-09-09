@@ -69,6 +69,12 @@ Compare like-for-like agent, model, repository fixture, and task corpus runs;
 tool-only fixture success is necessary quality evidence but is not evidence that
 an agent stopped rereading files.
 
+Pass the same opaque `--comparison-key` to both reports. Construct it from the
+agent, model, repository fixture, and task-corpus contract; the evaluator stores
+only its SHA-256 digest. The comparison gate requires matching report schemas,
+matching non-empty contract digests, and matching completed-task counts before
+it can accept a reduction.
+
 The comparison command turns that last requirement into a privacy-preserving
 gate. Generate one report for each run, then compare them without retaining
 either event stream:
@@ -81,8 +87,9 @@ cargo run -p mcpls-bench --bin no-reread-compare -- \
   --require-reduction
 ```
 
-The gate requires matching evaluator report schemas and completed-task counts,
-plus strictly fewer MCPLS calls and fewer model-visible context bytes (`result_bytes +
+The gate requires matching evaluator report schemas, non-empty run-contract
+digests, and completed-task counts, plus strictly fewer MCPLS calls and fewer
+model-visible context bytes (`result_bytes +
 shell_output_bytes`). The JSON output also includes reductions for semantic
 calls, duplicate queries, source-context dumps, fan-out tasks, and each byte
 component. Equal task counts do not prove the histories used the same model,

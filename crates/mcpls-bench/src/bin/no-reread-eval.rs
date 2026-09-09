@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use mcpls_bench::no_reread::{TraceEvent, evaluate, parse_history};
+use mcpls_bench::no_reread::{TraceEvent, evaluate, parse_history, with_comparison_key};
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,10 @@ struct Args {
     history: Option<PathBuf>,
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Opaque identity for the agent/model/repository/task contract shared by
+    /// a before/after pair. Only its SHA-256 digest is written to the report.
+    #[arg(long)]
+    comparison_key: Option<String>,
 }
 
 fn history_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -56,7 +60,12 @@ fn run(args: &Args) -> Result<Vec<u8>> {
     } else {
         bail!("pass --trace or --history");
     }
-    serde_json::to_vec_pretty(&evaluate(&events)).map_err(Into::into)
+    let report = evaluate(&events);
+    let report = match args.comparison_key.as_deref() {
+        Some(key) => with_comparison_key(report, key),
+        None => report,
+    };
+    serde_json::to_vec_pretty(&report).map_err(Into::into)
 }
 
 fn write_report(path: &Path, report: &[u8]) -> Result<()> {
