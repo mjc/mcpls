@@ -1838,7 +1838,7 @@ fn path_rename_preview_json(result: &PathRenamePreview, project_id: &str) -> ser
     value
 }
 
-const ADVERTISED_TOOL_PAGE_SIZE: usize = 12;
+const ADVERTISED_TOOL_PAGE_SIZE: usize = 13;
 const PROJECT_LIST_PAGE_SIZE: usize = 32;
 const RESOURCE_PAGE_SIZE: usize = 64;
 const PROJECT_EVENT_PAGE_SIZE: usize = 64;
@@ -8066,6 +8066,7 @@ finally:
                 "workspace_edit_preview",
                 "workspace_edit_apply",
                 "project_list",
+                "code_action_apply",
             ]
         );
         assert!(
