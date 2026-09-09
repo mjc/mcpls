@@ -102,11 +102,15 @@ mod tests {
 
     #[test]
     fn output_creates_missing_parent_directories() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("create temporary directory: {error}"));
         let output = temp.path().join("reports/no-reread.json");
 
-        write_report(&output, b"{}").unwrap();
+        write_report(&output, b"{}").unwrap_or_else(|error| panic!("write test report: {error}"));
 
-        assert_eq!(std::fs::read(output).unwrap(), b"{}");
+        assert_eq!(
+            std::fs::read(output).unwrap_or_else(|error| panic!("read test report: {error}")),
+            b"{}"
+        );
     }
 }

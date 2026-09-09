@@ -1466,7 +1466,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let report = evaluate(&parse_history(history.as_bytes()).unwrap()).aggregate;
+        let report = evaluate(
+            &parse_history(history.as_bytes())
+                .unwrap_or_else(|error| panic!("synthetic history is valid JSONL: {error}")),
+        )
+        .aggregate;
 
         assert_eq!(report.mcpls_calls, 2);
         assert_eq!(report.semantic_calls, 1);
@@ -1493,7 +1497,7 @@ mod tests {
                         "query": "private_type",
                         "max_bytes": 4096
                     },
-                    "duration": {"secs": 1, "nanos": 250000000},
+                    "duration": {"secs": 1, "nanos": 250_000_000},
                     "status": "failed",
                     "result": {
                         "structuredContent": {
@@ -1523,7 +1527,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let events = parse_history(history.as_bytes()).unwrap();
+        let events = parse_history(history.as_bytes())
+            .unwrap_or_else(|error| panic!("synthetic history is valid JSONL: {error}"));
         let report = evaluate(&events).aggregate;
 
         assert_eq!(report.mcpls_calls, 1);
@@ -1554,14 +1559,18 @@ mod tests {
                     "server": "mcpls",
                     "tool": "project_status",
                     "arguments": {"project_id": "fixture"},
-                    "duration": {"secs": 0, "nanos": 1000000},
+                    "duration": {"secs": 0, "nanos": 1_000_000},
                     "status": "failed",
                     "result": {"isError": false}
                 }
             }
         });
 
-        let report = evaluate(&parse_history(history.to_string().as_bytes()).unwrap()).aggregate;
+        let report = evaluate(
+            &parse_history(history.to_string().as_bytes())
+                .unwrap_or_else(|error| panic!("synthetic history is valid JSONL: {error}")),
+        )
+        .aggregate;
 
         assert_eq!(report.mcpls_calls, 1);
         assert_eq!(report.semantic_calls, 0);
@@ -1580,7 +1589,8 @@ mod tests {
     fn history_parser_counts_current_top_level_compaction_records() {
         let history = r#"{"type":"compacted","thread_id":"opaque"}"#;
 
-        let events = parse_history(history.as_bytes()).unwrap();
+        let events = parse_history(history.as_bytes())
+            .unwrap_or_else(|error| panic!("synthetic history is valid JSONL: {error}"));
 
         assert_eq!(evaluate(&events).aggregate.compactions, 1);
     }
@@ -1590,7 +1600,8 @@ mod tests {
         let history =
             r#"{"type":"event_msg","payload":{"type":"task_complete","thread_id":"opaque"}}"#;
 
-        let events = parse_history(history.as_bytes()).unwrap();
+        let events = parse_history(history.as_bytes())
+            .unwrap_or_else(|error| panic!("synthetic history is valid JSONL: {error}"));
         let report = evaluate(&events).aggregate;
 
         assert_eq!(evaluate(&events).schema_version, EVALUATION_SCHEMA_VERSION);
@@ -1611,7 +1622,11 @@ mod tests {
             "\n",
         );
 
-        let report = evaluate(&parse_history(history.as_bytes()).unwrap()).aggregate;
+        let report = evaluate(
+            &parse_history(history.as_bytes())
+                .unwrap_or_else(|error| panic!("synthetic history is valid JSONL: {error}")),
+        )
+        .aggregate;
 
         assert_eq!(
             report.result_bytes,
@@ -1944,7 +1959,11 @@ mod tests {
                 .get(pattern)
                 .unwrap_or_else(|| panic!("missing MCPLS-122 access-pattern baseline: {pattern}"));
             assert!(pattern.as_object().is_some());
-            assert!(pattern.as_object().unwrap().values().all(Value::is_number));
+            assert!(
+                pattern
+                    .as_object()
+                    .is_some_and(|object| object.values().all(Value::is_number))
+            );
         }
         assert!(
             !baseline.to_string().contains("/home/")
