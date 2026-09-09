@@ -38,6 +38,8 @@ pub enum TraceEvent {
         #[serde(default)]
         result_bytes: usize,
         latency_ms: u64,
+        #[serde(default)]
+        failed: bool,
     },
     McpTool {
         tool: String,
@@ -45,6 +47,8 @@ pub enum TraceEvent {
         #[serde(default)]
         result_bytes: usize,
         latency_ms: u64,
+        #[serde(default)]
+        failed: bool,
     },
     ResourceRead {
         deferred: bool,
@@ -52,6 +56,8 @@ pub enum TraceEvent {
         #[serde(default)]
         result_bytes: usize,
         latency_ms: u64,
+        #[serde(default)]
+        failed: bool,
     },
     ShellOutput {
         bytes: usize,
@@ -61,14 +67,14 @@ pub enum TraceEvent {
 }
 
 /// Nearest-rank latency percentile summary in milliseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct LatencyPercentiles {
     pub p50_ms: u64,
     pub p90_ms: u64,
     pub p99_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TraceReport {
     /// All MCPLS calls in this task history.
     pub mcpls_calls: usize,
@@ -97,14 +103,16 @@ pub struct TraceReport {
     pub latency_ms: u64,
     pub unsupported: usize,
     pub errors: usize,
+    pub failed_calls: usize,
     pub post_semantic_same_file_read_rate: Rate,
     pub pre_coordinate_source_read_rate: Rate,
     pub truncation_rate: Rate,
     pub unsupported_rate: Rate,
     pub error_rate: Rate,
+    pub failure_rate: Rate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Rate {
     pub numerator: usize,
     pub denominator: usize,
@@ -117,7 +125,7 @@ pub struct EvaluationReport {
     pub by_tool: BTreeMap<String, TraceReport>,
 }
 
-pub const EVALUATION_SCHEMA_VERSION: u32 = 3;
+pub const EVALUATION_SCHEMA_VERSION: u32 = 4;
 
 #[must_use]
 pub fn scrub_path(path: &str) -> String {
@@ -137,67 +145,7 @@ pub fn scrub_path(path: &str) -> String {
 
 #[must_use]
 pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
-    let mut report = TraceReport {
-        mcpls_calls: 0,
-        semantic_calls: 0,
-        lifecycle_calls: 0,
-        duplicate_queries: 0,
-        request_bytes: 0,
-        post_semantic_same_file_reads: 0,
-        pre_coordinate_source_reads: 0,
-        coordinate_calls: 0,
-        result_bytes: 0,
-        deferred_bytes: 0,
-        deferred_resource_references: 0,
-        deferred_resource_reads: 0,
-        source_read_output_bytes: 0,
-        shell_output_bytes: 0,
-        shell_source_reads: 0,
-        semantic_calls_followed_by_shell_read: 0,
-        completed_tasks: 0,
-        calls_per_completed_task: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        semantic_to_shell_read_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        deferred_resource_follow_through_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        compactions: 0,
-        latency: LatencyPercentiles {
-            p50_ms: 0,
-            p90_ms: 0,
-            p99_ms: 0,
-        },
-        truncated: 0,
-        latency_ms: 0,
-        unsupported: 0,
-        errors: 0,
-        post_semantic_same_file_read_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        pre_coordinate_source_read_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        truncation_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        unsupported_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-        error_rate: Rate {
-            numerator: 0,
-            denominator: 0,
-        },
-    };
+    let mut report = TraceReport::default();
     let mut query_fingerprints = BTreeSet::new();
     let mut latencies = Vec::new();
 
@@ -237,6 +185,7 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
     report.truncation_rate = rate(report.truncated, report.semantic_calls);
     report.unsupported_rate = rate(report.unsupported, report.semantic_calls);
     report.error_rate = rate(report.errors, report.semantic_calls);
+    report.failure_rate = rate(report.failed_calls, report.mcpls_calls);
     report.latency = latency_percentiles(&mut latencies);
     report
 }
@@ -247,23 +196,27 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
             request_bytes,
             result_bytes,
             latency_ms,
+            failed,
             ..
         } => {
             report.mcpls_calls += 1;
             report.lifecycle_calls += 1;
             report.request_bytes += request_bytes;
             report.result_bytes += result_bytes;
+            report.failed_calls += usize::from(*failed);
             latencies.push(*latency_ms);
         }
         TraceEvent::McpTool {
             request_bytes,
             result_bytes,
             latency_ms,
+            failed,
             ..
         } => {
             report.mcpls_calls += 1;
             report.request_bytes += request_bytes;
             report.result_bytes += result_bytes;
+            report.failed_calls += usize::from(*failed);
             latencies.push(*latency_ms);
         }
         TraceEvent::ResourceRead {
@@ -271,10 +224,12 @@ fn record_non_semantic(report: &mut TraceReport, event: &TraceEvent, latencies: 
             request_bytes,
             result_bytes,
             latency_ms,
+            failed,
         } => {
             report.mcpls_calls += 1;
             report.request_bytes += request_bytes;
             report.result_bytes += result_bytes;
+            report.failed_calls += usize::from(*failed);
             report.deferred_resource_reads += usize::from(*deferred);
             latencies.push(*latency_ms);
         }
@@ -333,6 +288,7 @@ fn record_semantic(
     report.truncated += usize::from(*truncated);
     report.unsupported += usize::from(*unsupported);
     report.errors += usize::from(*error);
+    report.failed_calls += usize::from(*error);
     report.coordinate_calls += usize::from(*coordinate_input);
     latencies.push(*latency_ms);
     report.semantic_calls_followed_by_shell_read += usize::from(matches!(
@@ -480,12 +436,23 @@ fn current_codex_mcp_event(event: &Value) -> Option<TraceEvent> {
         item.get("result").unwrap_or(&Value::Null),
         history_latency_ms(item),
     );
-    if item_status_is_failure(item)
-        && let TraceEvent::Semantic { error, .. } = &mut trace
-    {
-        *error = true;
+    if item_status_is_failure(item) {
+        mark_trace_failure(&mut trace);
     }
     Some(trace)
+}
+
+const fn mark_trace_failure(trace: &mut TraceEvent) {
+    match trace {
+        TraceEvent::Semantic { error, .. } => *error = true,
+        TraceEvent::Lifecycle { failed, .. }
+        | TraceEvent::McpTool { failed, .. }
+        | TraceEvent::ResourceRead { failed, .. } => *failed = true,
+        TraceEvent::SourceRead { .. }
+        | TraceEvent::ShellOutput { .. }
+        | TraceEvent::TaskComplete
+        | TraceEvent::Compaction => {}
+    }
 }
 
 fn item_status_is_failure(item: &Value) -> bool {
@@ -705,6 +672,7 @@ fn mcp_trace_event(tool: &str, arguments: &Value, result: &Value, latency_ms: u6
             request_bytes,
             result_bytes,
             latency_ms,
+            failed: mcp_result_is_error(result),
         };
     }
     if tool == "read_semantic_resource" {
@@ -716,6 +684,7 @@ fn mcp_trace_event(tool: &str, arguments: &Value, result: &Value, latency_ms: u6
             request_bytes,
             result_bytes,
             latency_ms,
+            failed: mcp_result_is_error(result),
         };
     }
     TraceEvent::McpTool {
@@ -723,6 +692,7 @@ fn mcp_trace_event(tool: &str, arguments: &Value, result: &Value, latency_ms: u6
         request_bytes,
         result_bytes,
         latency_ms,
+        failed: mcp_result_is_error(result),
     }
 }
 
@@ -1103,6 +1073,7 @@ mod tests {
                 latency_ms: 24,
                 unsupported: 0,
                 errors: 0,
+                failed_calls: 0,
                 post_semantic_same_file_read_rate: Rate {
                     numerator: 1,
                     denominator: 2
@@ -1120,6 +1091,10 @@ mod tests {
                     denominator: 2
                 },
                 error_rate: Rate {
+                    numerator: 0,
+                    denominator: 2
+                },
+                failure_rate: Rate {
                     numerator: 0,
                     denominator: 2
                 },
@@ -1315,6 +1290,39 @@ mod tests {
             events
                 .iter()
                 .all(|event| !format!("{event:?}").contains("alice"))
+        );
+    }
+
+    #[test]
+    fn history_parser_counts_failed_non_semantic_mcpls_items() {
+        let history = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "McpToolCall",
+                    "server": "mcpls",
+                    "tool": "project_status",
+                    "arguments": {"project_id": "fixture"},
+                    "duration": {"secs": 0, "nanos": 1000000},
+                    "status": "failed",
+                    "result": {"isError": false}
+                }
+            }
+        });
+
+        let report = evaluate(&parse_history(history.to_string().as_bytes()).unwrap()).aggregate;
+
+        assert_eq!(report.mcpls_calls, 1);
+        assert_eq!(report.semantic_calls, 0);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.failed_calls, 1);
+        assert_eq!(
+            report.failure_rate,
+            Rate {
+                numerator: 1,
+                denominator: 1,
+            }
         );
     }
 

@@ -49,7 +49,8 @@ The aggregate report also records completed-task count and the
 MCPLS-calls/completed-task ratio, total shell source reads, semantic calls
 immediately followed by a shell read, shell output bytes, deferred-resource
 references and reads as a follow-through numerator/denominator rate,
-compactions, and latency percentiles. Current Codex histories
+all-call failures as a count/rate, compactions, and latency percentiles.
+Current Codex histories
 are read from their completed-item records; older event records remain
 supported. The report schema version is bumped when these fields change.
 
