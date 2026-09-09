@@ -22,6 +22,10 @@ path = "src/bin/rust-analyzer-memory.rs"
 name = "no-reread-eval"
 path = "src/bin/no-reread-eval.rs"
 
+[[bin]]
+name = "no-reread-compare"
+path = "src/bin/no-reread-compare.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }

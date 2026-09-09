@@ -69,6 +69,26 @@ Compare like-for-like agent, model, repository fixture, and task corpus runs;
 tool-only fixture success is necessary quality evidence but is not evidence that
 an agent stopped rereading files.
 
+The comparison command turns that last requirement into a privacy-preserving
+gate. Generate one report for each run, then compare them without retaining
+either event stream:
+
+```sh
+cargo run -p mcpls-bench --bin no-reread-compare -- \
+  --before target/benchmarks/no-reread-before.json \
+  --after target/benchmarks/no-reread-after.json \
+  --output target/benchmarks/no-reread-comparison.json \
+  --require-reduction
+```
+
+The gate requires matching completed-task counts and strictly fewer MCPLS
+calls plus fewer model-visible context bytes (`result_bytes +
+shell_output_bytes`). The JSON output also includes reductions for semantic
+calls, duplicate queries, source-context dumps, fan-out tasks, and each byte
+component. Equal task counts do not prove the histories used the same model,
+repository, or task corpus; those inputs remain an explicit responsibility of
+the acceptance run.
+
 ## Gungraun hot paths
 
 Enter the repository's pinned development shell and run:

@@ -67,14 +67,14 @@ pub enum TraceEvent {
 }
 
 /// Nearest-rank latency percentile summary in milliseconds.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LatencyPercentiles {
     pub p50_ms: u64,
     pub p90_ms: u64,
     pub p99_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TraceReport {
     /// All MCPLS calls in this task history.
     pub mcpls_calls: usize,
@@ -112,14 +112,14 @@ pub struct TraceReport {
     pub failure_rate: Rate,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Rate {
     pub numerator: usize,
     pub denominator: usize,
 }
 
 /// Task-level measurements for the two MCPLS-122 access patterns.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AccessPatternReport {
     /// Completed or trailing task segments with at least 32 semantic calls.
     pub semantic_fanout_tasks: usize,
@@ -136,7 +136,7 @@ pub struct AccessPatternReport {
     pub max_shell_output_bytes_per_task: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EvaluationReport {
     pub schema_version: u32,
     pub aggregate: TraceReport,
@@ -145,6 +145,107 @@ pub struct EvaluationReport {
 }
 
 pub const EVALUATION_SCHEMA_VERSION: u32 = 6;
+
+/// Version of the privacy-preserving before/after comparison schema.
+pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 1;
+
+/// One lower-is-better metric from two like-for-like evaluations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MetricComparison {
+    pub before: usize,
+    pub after: usize,
+    pub reduction: usize,
+    pub reduced: bool,
+}
+
+impl MetricComparison {
+    const fn new(before: usize, after: usize) -> Self {
+        Self {
+            before,
+            after,
+            reduction: before.saturating_sub(after),
+            reduced: after < before,
+        }
+    }
+}
+
+/// Privacy-preserving comparison of two task evaluations.
+///
+/// The comparison deliberately contains counts and byte totals only. The
+/// acceptance flag requires both fewer MCPLS calls and fewer model-visible
+/// context bytes, and requires the two reports to cover the same number of
+/// completed task segments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct EvaluationComparison {
+    pub schema_version: u32,
+    pub comparable_task_counts: bool,
+    pub accepted: bool,
+    pub mcpls_calls: MetricComparison,
+    pub context_bytes: MetricComparison,
+    pub result_bytes: MetricComparison,
+    pub shell_output_bytes: MetricComparison,
+    pub semantic_calls: MetricComparison,
+    pub duplicate_queries: MetricComparison,
+    pub source_context_dump_tasks: MetricComparison,
+    pub semantic_fanout_tasks: MetricComparison,
+}
+
+const fn model_visible_context_bytes(report: &TraceReport) -> usize {
+    report
+        .result_bytes
+        .saturating_add(report.shell_output_bytes)
+}
+
+/// Compare two privacy-preserving evaluations without retaining their events.
+#[must_use]
+pub const fn compare_evaluations(
+    before: &EvaluationReport,
+    after: &EvaluationReport,
+) -> EvaluationComparison {
+    let comparable_task_counts =
+        before.aggregate.completed_tasks == after.aggregate.completed_tasks;
+    let mcpls_calls =
+        MetricComparison::new(before.aggregate.mcpls_calls, after.aggregate.mcpls_calls);
+    let context_bytes = MetricComparison::new(
+        model_visible_context_bytes(&before.aggregate),
+        model_visible_context_bytes(&after.aggregate),
+    );
+    let result_bytes =
+        MetricComparison::new(before.aggregate.result_bytes, after.aggregate.result_bytes);
+    let shell_output_bytes = MetricComparison::new(
+        before.aggregate.shell_output_bytes,
+        after.aggregate.shell_output_bytes,
+    );
+    let semantic_calls = MetricComparison::new(
+        before.aggregate.semantic_calls,
+        after.aggregate.semantic_calls,
+    );
+    let duplicate_queries = MetricComparison::new(
+        before.aggregate.duplicate_queries,
+        after.aggregate.duplicate_queries,
+    );
+    let source_context_dump_tasks = MetricComparison::new(
+        before.access_patterns.source_context_dump_tasks,
+        after.access_patterns.source_context_dump_tasks,
+    );
+    let semantic_fanout_tasks = MetricComparison::new(
+        before.access_patterns.semantic_fanout_tasks,
+        after.access_patterns.semantic_fanout_tasks,
+    );
+    EvaluationComparison {
+        schema_version: EVALUATION_COMPARISON_SCHEMA_VERSION,
+        comparable_task_counts,
+        accepted: comparable_task_counts && mcpls_calls.reduced && context_bytes.reduced,
+        mcpls_calls,
+        context_bytes,
+        result_bytes,
+        shell_output_bytes,
+        semantic_calls,
+        duplicate_queries,
+        source_context_dump_tasks,
+        semantic_fanout_tasks,
+    }
+}
 
 #[must_use]
 pub fn scrub_path(path: &str) -> String {
@@ -1606,6 +1707,43 @@ mod tests {
 
         assert_eq!(report.duplicate_queries, 0);
         assert_eq!(report.completed_tasks, 1);
+    }
+
+    #[test]
+    fn evaluation_comparison_requires_fewer_calls_and_context_bytes() {
+        let before_events = [
+            mcp_trace_event("workspace_symbol_search", &Value::Null, &Value::Null, 1),
+            mcp_trace_event("workspace_symbol_search", &Value::Null, &Value::Null, 1),
+            TraceEvent::ShellOutput { bytes: 100 },
+            TraceEvent::TaskComplete,
+        ];
+        let after_events = [
+            mcp_trace_event("workspace_symbol_search", &Value::Null, &Value::Null, 1),
+            TraceEvent::TaskComplete,
+        ];
+        let before = evaluate(&before_events);
+        let after = evaluate(&after_events);
+
+        let comparison = compare_evaluations(&before, &after);
+
+        assert!(comparison.comparable_task_counts);
+        assert!(comparison.accepted);
+        assert_eq!(comparison.mcpls_calls.before, 2);
+        assert_eq!(comparison.mcpls_calls.after, 1);
+        assert_eq!(comparison.context_bytes.before, 108);
+        assert_eq!(comparison.context_bytes.after, 4);
+        assert_eq!(comparison.shell_output_bytes.reduction, 100);
+    }
+
+    #[test]
+    fn evaluation_comparison_rejects_mismatched_task_counts() {
+        let before = evaluate(&[TraceEvent::TaskComplete]);
+        let after = evaluate(&[]);
+
+        let comparison = compare_evaluations(&before, &after);
+
+        assert!(!comparison.comparable_task_counts);
+        assert!(!comparison.accepted);
     }
 
     #[test]
