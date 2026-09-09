@@ -48,7 +48,8 @@ not a model-quality score; model selection remains outside required CI.
 The aggregate report also records completed-task count and the
 MCPLS-calls/completed-task ratio, total shell source reads, semantic calls
 immediately followed by a shell read, shell output bytes, deferred-resource
-follow-through, compactions, and latency percentiles. Current Codex histories
+references and reads as a follow-through numerator/denominator rate,
+compactions, and latency percentiles. Current Codex histories
 are read from their completed-item records; older event records remain
 supported. The report schema version is bumped when these fields change.
 

@@ -20,6 +20,8 @@ pub enum TraceEvent {
         query_fingerprint: Option<String>,
         #[serde(default)]
         deferred_bytes: usize,
+        #[serde(default)]
+        deferred_resource_references: usize,
         truncated: bool,
         latency_ms: u64,
         unsupported: bool,
@@ -79,6 +81,7 @@ pub struct TraceReport {
     pub coordinate_calls: usize,
     pub result_bytes: usize,
     pub deferred_bytes: usize,
+    pub deferred_resource_references: usize,
     pub deferred_resource_reads: usize,
     pub source_read_output_bytes: usize,
     pub shell_output_bytes: usize,
@@ -87,6 +90,7 @@ pub struct TraceReport {
     pub completed_tasks: usize,
     pub calls_per_completed_task: Rate,
     pub semantic_to_shell_read_rate: Rate,
+    pub deferred_resource_follow_through_rate: Rate,
     pub compactions: usize,
     pub latency: LatencyPercentiles,
     pub truncated: usize,
@@ -113,7 +117,7 @@ pub struct EvaluationReport {
     pub by_tool: BTreeMap<String, TraceReport>,
 }
 
-pub const EVALUATION_SCHEMA_VERSION: u32 = 2;
+pub const EVALUATION_SCHEMA_VERSION: u32 = 3;
 
 #[must_use]
 pub fn scrub_path(path: &str) -> String {
@@ -144,6 +148,7 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
         coordinate_calls: 0,
         result_bytes: 0,
         deferred_bytes: 0,
+        deferred_resource_references: 0,
         deferred_resource_reads: 0,
         source_read_output_bytes: 0,
         shell_output_bytes: 0,
@@ -155,6 +160,10 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
             denominator: 0,
         },
         semantic_to_shell_read_rate: Rate {
+            numerator: 0,
+            denominator: 0,
+        },
+        deferred_resource_follow_through_rate: Rate {
             numerator: 0,
             denominator: 0,
         },
@@ -219,6 +228,10 @@ pub fn classify_trace(events: &[TraceEvent]) -> TraceReport {
     report.semantic_to_shell_read_rate = rate(
         report.semantic_calls_followed_by_shell_read,
         report.semantic_calls,
+    );
+    report.deferred_resource_follow_through_rate = rate(
+        report.deferred_resource_reads,
+        report.deferred_resource_references,
     );
     report.truncation_rate = rate(report.truncated, report.semantic_calls);
     report.unsupported_rate = rate(report.unsupported, report.semantic_calls);
@@ -290,6 +303,7 @@ fn record_semantic(
         result_bytes,
         query_fingerprint,
         deferred_bytes,
+        deferred_resource_references,
         truncated,
         latency_ms,
         unsupported,
@@ -304,6 +318,7 @@ fn record_semantic(
     report.request_bytes += request_bytes;
     report.result_bytes += result_bytes;
     report.deferred_bytes += deferred_bytes;
+    report.deferred_resource_references += deferred_resource_references;
     report.latency_ms += latency_ms;
     report.truncated += usize::from(*truncated);
     report.unsupported += usize::from(*unsupported);
@@ -660,6 +675,7 @@ fn mcp_trace_event(tool: &str, arguments: &Value, result: &Value, latency_ms: u6
             result_bytes: serialized_len(result),
             query_fingerprint: Some(query_fingerprint(tool, arguments)),
             deferred_bytes: deferred_bytes(result),
+            deferred_resource_references: deferred_resource_references(result),
             truncated: contains_true(result, "truncated"),
             latency_ms,
             unsupported: error
@@ -834,6 +850,30 @@ fn deferred_bytes(value: &Value) -> usize {
     collect_deferred_bytes(value, false)
 }
 
+fn deferred_resource_references(value: &Value) -> usize {
+    match value {
+        Value::Object(object) => {
+            let reference = object
+                .get("uri")
+                .and_then(Value::as_str)
+                .is_some_and(|uri| uri.starts_with("mcpls-deferred://"));
+            usize::from(reference)
+                + object
+                    .values()
+                    .map(deferred_resource_references)
+                    .sum::<usize>()
+        }
+        Value::Array(values) => values.iter().map(deferred_resource_references).sum(),
+        Value::String(text)
+            if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'[')) =>
+        {
+            serde_json::from_str(text.trim_start())
+                .map_or(0, |value| deferred_resource_references(&value))
+        }
+        _ => 0,
+    }
+}
+
 fn collect_deferred_bytes(value: &Value, legacy_deferred_entry: bool) -> usize {
     match value {
         Value::Object(object) => {
@@ -972,6 +1012,7 @@ mod tests {
             result_bytes: 512,
             query_fingerprint: None,
             deferred_bytes: 0,
+            deferred_resource_references: 0,
             truncated: false,
             latency_ms: 12,
             unsupported: false,
@@ -1023,6 +1064,7 @@ mod tests {
                 coordinate_calls: 1,
                 result_bytes: 1024,
                 deferred_bytes: 0,
+                deferred_resource_references: 0,
                 deferred_resource_reads: 0,
                 source_read_output_bytes: 18,
                 shell_output_bytes: 0,
@@ -1036,6 +1078,10 @@ mod tests {
                 semantic_to_shell_read_rate: Rate {
                     numerator: 2,
                     denominator: 2,
+                },
+                deferred_resource_follow_through_rate: Rate {
+                    numerator: 0,
+                    denominator: 0,
                 },
                 compactions: 0,
                 latency: LatencyPercentiles {
@@ -1320,6 +1366,37 @@ mod tests {
         assert_eq!(
             deferred_bytes(&Value::String(format!(" \n{reference}"))),
             55
+        );
+    }
+
+    #[test]
+    fn deferred_resource_follow_through_is_reported_as_a_rate() {
+        let result = serde_json::json!({
+            "content": [
+                {"resource": {"uri": "mcpls-deferred:///first", "total_bytes": 10}},
+                {"resource": {"uri": "mcpls-deferred:///second", "total_bytes": 20}}
+            ]
+        });
+        let events = [
+            mcp_trace_event("inspect_symbol", &Value::Null, &result, 10),
+            mcp_trace_event(
+                "read_semantic_resource",
+                &serde_json::json!({"uri": "mcpls-deferred:///first"}),
+                &Value::Null,
+                2,
+            ),
+        ];
+
+        let report = classify_trace(&events);
+
+        assert_eq!(report.deferred_resource_references, 2);
+        assert_eq!(report.deferred_resource_reads, 1);
+        assert_eq!(
+            report.deferred_resource_follow_through_rate,
+            Rate {
+                numerator: 1,
+                denominator: 2,
+            }
         );
     }
 
