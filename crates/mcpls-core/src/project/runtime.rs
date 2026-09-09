@@ -250,6 +250,8 @@ pub(crate) struct GeneratedEditPreview {
     pub(crate) artifact: Option<PreviewArtifact>,
 }
 
+const WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES: usize = 128;
+
 /// Coordinate target recovered from an actor-owned snapshot handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedSymbolTarget {
@@ -4396,10 +4398,14 @@ impl ProjectRuntime {
                         )
                         .await?;
                     provider_requests += 1;
-                    self.workspace_symbol_results
+                    let mut cache = self
+                        .workspace_symbol_results
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(cache_key, result.clone());
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if cache.len() >= WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES {
+                        cache.clear();
+                    }
+                    cache.insert(cache_key, result.clone());
                     result
                 };
                 entries.push(WorkspaceSymbolBatchEntry {
