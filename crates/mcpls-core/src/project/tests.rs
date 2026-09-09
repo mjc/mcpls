@@ -1222,6 +1222,82 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
 }
 
 #[tokio::test]
+async fn workspace_symbol_batch_overlaps_provider_requests() {
+    use crate::bridge::translator::testing::{
+        FakeServer, read_framed_message, translator_with_capabilities, write_response,
+    };
+
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("symbols.rs"), "fn symbol() {}\n").unwrap();
+    let capabilities = lsp_types::ServerCapabilities {
+        workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        ..lsp_types::ServerCapabilities::default()
+    };
+    let (translator, server) =
+        translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+    let FakeServer {
+        _write_half,
+        _read_half,
+        mut read_half_stdin,
+        mut write_stdout,
+    } = server;
+    let (release_responder, keep_responder_alive) = tokio::sync::oneshot::channel();
+    let responder = tokio::spawn(async move {
+        let _processes = (_write_half, _read_half);
+        let mut reader = BufReader::new(&mut write_stdout);
+        let mut requests = Vec::new();
+        while requests.len() < 2 {
+            let message = read_framed_message(&mut reader).await;
+            if message.get("method").and_then(serde_json::Value::as_str) == Some("workspace/symbol")
+            {
+                requests.push(message);
+            }
+        }
+        for request in &requests {
+            write_response(&mut read_half_stdin, &request["id"], serde_json::json!([])).await;
+        }
+        while requests.len() < 4 {
+            let message = read_framed_message(&mut reader).await;
+            if message.get("method").and_then(serde_json::Value::as_str) == Some("workspace/symbol")
+            {
+                requests.push(message);
+            }
+        }
+        for request in &requests[2..] {
+            write_response(&mut read_half_stdin, &request["id"], serde_json::json!([])).await;
+        }
+        let _ = keep_responder_alive.await;
+        requests.len()
+    });
+    let actor = spawn_project_actor_with_translator(4, translator);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        actor.workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+            queries: ["one", "two", "three", "four"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            kind_filter: None,
+            match_mode: WorkspaceSymbolMatchMode::Exact,
+            scope: WorkspaceSymbolScope::Project,
+            include_generated: false,
+            max_items: 10,
+            max_bytes: 16 * 1024,
+            page_token: None,
+        }),
+    )
+    .await
+    .expect("provider requests should overlap")
+    .unwrap();
+
+    assert_eq!(result.provider_requests, 4);
+    assert_eq!(result.entries.len(), 4);
+    release_responder.send(()).unwrap();
+    assert_eq!(responder.await.unwrap(), 4);
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn workspace_symbol_search_is_bounded_and_pageable() {
     use crate::bridge::translator::testing::{
@@ -1765,6 +1841,7 @@ async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls(
         mut read_half_stdin,
         mut write_stdout,
     } = server;
+    let (release_responder, keep_responder_alive) = tokio::sync::oneshot::channel();
     let responder = tokio::spawn(async move {
         let _processes = (_write_half, _read_half);
         let mut reader = BufReader::new(&mut write_stdout);
@@ -1796,6 +1873,7 @@ async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls(
             .await;
             queries.push(query);
         }
+        let _ = keep_responder_alive.await;
         queries
     });
     let actor = spawn_project_actor_with_translator(8, translator);
@@ -1828,6 +1906,7 @@ async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls(
 
     assert_eq!(client_calls, 5);
     assert_eq!(provider_requests, 117);
+    release_responder.send(()).unwrap();
     assert_eq!(responder.await.unwrap().len(), 117);
 }
 

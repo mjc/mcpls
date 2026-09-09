@@ -6,6 +6,7 @@
 use super::*;
 #[allow(clippy::wildcard_imports)]
 use super::{actor::*, identity::*, registry::*, state::*};
+use futures::StreamExt as _;
 
 /// Result of consuming and applying one project-owned edit plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,6 +252,7 @@ pub(crate) struct GeneratedEditPreview {
 }
 
 const WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES: usize = 128;
+const WORKSPACE_SYMBOL_BATCH_CONCURRENCY: usize = 4;
 
 /// Coordinate target recovered from an actor-owned snapshot handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4366,18 +4368,18 @@ impl ProjectRuntime {
             let filter_identity = workspace_symbol_batch_filter_identity(&request);
             let mut seen = HashMap::new();
             let mut entries = Vec::with_capacity(request.queries.len());
-            let mut provider_requests = 0;
             let mut cache_hit = false;
             let mut unique_queries = 0;
+            let mut uncached = Vec::new();
 
             for query in request.queries.iter().cloned() {
                 if let Some(&reused_from) = seen.get(&query) {
-                    entries.push(WorkspaceSymbolBatchEntry {
+                    entries.push(Some(WorkspaceSymbolBatchEntry {
                         query,
                         result: None,
                         reused_from: Some(reused_from),
                         skipped_by_budget: false,
-                    });
+                    }));
                     continue;
                 }
 
@@ -4399,37 +4401,69 @@ impl ProjectRuntime {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&cache_key)
                     .cloned();
-                let result = if let Some(result) = cached {
+                if let Some(result) = cached {
                     cache_hit = true;
-                    result
+                    entries.push(Some(WorkspaceSymbolBatchEntry {
+                        query,
+                        result: Some(result),
+                        reused_from: None,
+                        skipped_by_budget: false,
+                    }));
                 } else {
-                    let result = self
-                        .workspace_symbol_complete(
-                            query.clone(),
-                            request.kind_filter.clone(),
-                            request.match_mode,
-                            request.scope,
-                            request.include_generated,
-                        )
-                        .await?;
-                    provider_requests += 1;
-                    let mut cache = self
-                        .workspace_symbol_results
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if cache.len() >= WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES {
-                        cache.clear();
+                    let entry_index = entries.len();
+                    entries.push(None);
+                    uncached.push((entry_index, query, cache_key));
+                }
+            }
+
+            let kind_filter = request.kind_filter.clone();
+            let match_mode = request.match_mode;
+            let workspace_scope = request.scope;
+            let include_generated = request.include_generated;
+            let results = futures::stream::iter(uncached.into_iter().map(
+                |(entry_index, query, cache_key)| {
+                    let kind_filter = kind_filter.clone();
+                    async move {
+                        let result = self
+                            .workspace_symbol_complete(
+                                query.clone(),
+                                kind_filter,
+                                match_mode,
+                                workspace_scope,
+                                include_generated,
+                            )
+                            .await?;
+                        Ok::<_, String>((entry_index, query, cache_key, result))
                     }
-                    cache.insert(cache_key, result.clone());
-                    result
-                };
-                entries.push(WorkspaceSymbolBatchEntry {
+                },
+            ))
+            .buffer_unordered(WORKSPACE_SYMBOL_BATCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            let mut provider_requests = 0;
+            for result in results {
+                let (entry_index, query, cache_key, result) = result?;
+                provider_requests += 1;
+                let mut cache = self
+                    .workspace_symbol_results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cache.len() >= WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES {
+                    cache.clear();
+                }
+                cache.insert(cache_key, result.clone());
+                drop(cache);
+                entries[entry_index] = Some(WorkspaceSymbolBatchEntry {
                     query,
                     result: Some(result),
                     reused_from: None,
                     skipped_by_budget: false,
                 });
             }
+            let entries = entries
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "workspace-symbol batch entry was not populated".to_owned())?;
 
             let state = WorkspaceSymbolBatchPageState {
                 entries,
