@@ -3590,6 +3590,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Preview formatting",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -8004,6 +8010,12 @@
         "filters"
       ],
       "type": "object"
+    },
+    "annotations": {
+      "title": "Get diagnostics",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -13851,6 +13863,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Daemon health",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -16924,6 +16942,12 @@
           "$ref": "#/$defs/InspectSymbolBatchResult"
         }
       ]
+    },
+    "annotations": {
+      "title": "Inspect symbol",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -20601,6 +20625,12 @@
           "$ref": "#/$defs/LexicalSearchBatchResult"
         }
       ]
+    },
+    "annotations": {
+      "title": "Lexical search",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -21377,6 +21407,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "List projects",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -21665,6 +21701,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Project status",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -22002,6 +22044,12 @@
         "text"
       ],
       "type": "object"
+    },
+    "annotations": {
+      "title": "Read semantic resource",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -22683,6 +22731,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Server status",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -22749,6 +22803,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Preview structural replacement",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {
@@ -23192,6 +23252,12 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": true,
       "type": "object"
+    },
+    "annotations": {
+      "title": "Preview workspace edit",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
     }
   },
   {

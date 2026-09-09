@@ -3141,7 +3141,15 @@ impl McplsServer {
     }
 
     /// List all registered projects without waiting on project actors.
-    #[tool(description = "List registered projects and canonical roots in cursor pages.")]
+    #[tool(
+        description = "List registered projects and canonical roots in cursor pages.",
+        annotations(
+            title = "List projects",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn project_list(
         &self,
         Parameters(ProjectListParams { cursor }): Parameters<ProjectListParams>,
@@ -3230,7 +3238,15 @@ impl McplsServer {
     }
 
     /// Return a cheap process and project liveness snapshot.
-    #[tool(description = "Return daemon liveness and non-blocking project lifecycle counts.")]
+    #[tool(
+        description = "Return daemon liveness and non-blocking project lifecycle counts.",
+        annotations(
+            title = "Daemon health",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn health(
         &self,
         Parameters(DaemonStatusParams { cursor }): Parameters<DaemonStatusParams>,
@@ -3298,7 +3314,15 @@ impl McplsServer {
     }
 
     /// Return daemon version, uptime, and a cheap project status snapshot.
-    #[tool(description = "Return daemon version, uptime, and non-blocking project status.")]
+    #[tool(
+        description = "Return daemon version, uptime, and non-blocking project status.",
+        annotations(
+            title = "Server status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn server_status(
         &self,
         Parameters(DaemonStatusParams { cursor }): Parameters<DaemonStatusParams>,
@@ -3368,7 +3392,15 @@ impl McplsServer {
     }
 
     /// Return the current state for one registered project.
-    #[tool(description = "Return lifecycle status and the last failure for a project.")]
+    #[tool(
+        description = "Return lifecycle status and the last failure for a project.",
+        annotations(
+            title = "Project status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
     async fn project_status(
         &self,
         Parameters(ProjectIdParams { project_id, cursor }): Parameters<ProjectIdParams>,
@@ -3412,7 +3444,13 @@ impl McplsServer {
 
     /// Preview an LSP `WorkspaceEdit` without changing any files.
     #[tool(
-        description = "Preview a project-scoped LSP WorkspaceEdit. The returned plan is owned by this MCP session and includes a plan ID, unified diff, affected files, preconditions, conflicts, unsupported operations, and explicit safety state."
+        description = "Preview a project-scoped LSP WorkspaceEdit. The returned plan is owned by this MCP session and includes a plan ID, unified diff, affected files, preconditions, conflicts, unsupported operations, and explicit safety state.",
+        annotations(
+            title = "Preview workspace edit",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn workspace_edit_preview(
         &self,
@@ -3461,7 +3499,13 @@ impl McplsServer {
 
     /// Request document formatting from the project LSP and preview the edit.
     #[tool(
-        description = "Preview LSP document formatting as a session-owned workspace edit plan. Apply the returned plan from this MCP session with workspace_edit_apply."
+        description = "Preview LSP document formatting as a session-owned workspace edit plan. Apply the returned plan from this MCP session with workspace_edit_apply.",
+        annotations(
+            title = "Preview formatting",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn format_preview(
         &self,
@@ -3626,7 +3670,13 @@ impl McplsServer {
 
     /// Search or preview a replacement using one explicitly selected structural dialect.
     #[tool(
-        description = "Validate, search, or preview structural replacements without changing files. dialect is required and must be rust_analyzer_ssr (the complete rust-analyzer rule belongs in query) or ast_grep (language_id required; replacement optional for search-only). MCPLS never translates syntax or silently switches engines. A matching replacement returns a session-owned plan for workspace_edit_apply."
+        description = "Validate, search, or preview structural replacements without changing files. dialect is required and must be rust_analyzer_ssr (the complete rust-analyzer rule belongs in query) or ast_grep (language_id required; replacement optional for search-only). MCPLS never translates syntax or silently switches engines. A matching replacement returns a session-owned plan for workspace_edit_apply.",
+        annotations(
+            title = "Preview structural replacement",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn structural_replace_preview(
         &self,
@@ -4048,7 +4098,13 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = "Get diagnostics with mode=cached_preferred (default), fresh, or cache_only. cache_only never starts provider analysis."
+        description = "Get diagnostics with mode=cached_preferred (default), fresh, or cache_only. cache_only never starts provider analysis.",
+        annotations(
+            title = "Get diagnostics",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn get_diagnostics(
         &self,
@@ -4331,7 +4387,13 @@ impl McplsServer {
     /// Search project snapshots by literal text or Rust regex.
     #[tool(
         output_schema = rmcp::handler::server::tool::schema_for_output::<LexicalSearchResponse>(),
-        description = "Bounded project lexical search over current document snapshots. Use query for one search or queries for caller-ordered searches sharing one source scan and response budget."
+        description = "Bounded project lexical search over current document snapshots. Use query for one search or queries for caller-ordered searches sharing one source scan and response budget.",
+        annotations(
+            title = "Lexical search",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn lexical_search(
         &self,
@@ -4468,7 +4530,13 @@ impl McplsServer {
     /// Resolve and inspect one symbol or several symbols without rereading files.
     #[tool(
         output_schema = rmcp::handler::server::tool::schema_for_output::<InspectSymbolResponse>(),
-        description = "Inspect one query or symbol handle, or 1-16 caller-ordered targets, with bounded source frames. Multi-target results use retained 16 KiB pages; continuation reuses the original provider work."
+        description = "Inspect one query or symbol handle, or 1-16 caller-ordered targets, with bounded source frames. Multi-target results use retained 16 KiB pages; continuation reuses the original provider work.",
+        annotations(
+            title = "Inspect symbol",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn inspect_symbol(
         &self,
@@ -5036,7 +5104,13 @@ impl McplsServer {
 
     /// Read source context omitted from a bounded result when the client does not expose MCP resources.
     #[tool(
-        description = "Read a snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. Deferred payloads return lossless UTF-8 JSON pages with a continuation URI when needed. This is the callable fallback for clients that do not expose resources/read."
+        description = "Read a snapshot-bound semantic payload from an mcpls-source:// or mcpls-deferred:// URI returned by another MCPLS tool. Deferred payloads return lossless UTF-8 JSON pages with a continuation URI when needed. This is the callable fallback for clients that do not expose resources/read.",
+        annotations(
+            title = "Read semantic resource",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     async fn read_semantic_resource(
         &self,
@@ -12850,14 +12924,40 @@ while True:
     }
 
     #[test]
-    fn read_only_symbol_search_advertises_safe_annotations() {
-        let tool = McplsServer::workspace_symbol_search_tool_attr();
-        let Some(annotations) = tool.annotations else {
-            panic!("workspace symbol search annotations");
-        };
-        assert_eq!(annotations.read_only_hint, Some(true));
-        assert_eq!(annotations.destructive_hint, Some(false));
-        assert_eq!(annotations.idempotent_hint, Some(true));
+    fn read_only_tools_advertise_safe_annotations() {
+        for (name, tool) in [
+            ("project_list", McplsServer::project_list_tool_attr()),
+            ("health", McplsServer::health_tool_attr()),
+            ("server_status", McplsServer::server_status_tool_attr()),
+            ("project_status", McplsServer::project_status_tool_attr()),
+            (
+                "workspace_edit_preview",
+                McplsServer::workspace_edit_preview_tool_attr(),
+            ),
+            ("format_preview", McplsServer::format_preview_tool_attr()),
+            (
+                "structural_replace_preview",
+                McplsServer::structural_replace_preview_tool_attr(),
+            ),
+            ("get_diagnostics", McplsServer::get_diagnostics_tool_attr()),
+            ("lexical_search", McplsServer::lexical_search_tool_attr()),
+            (
+                "workspace_symbol_search",
+                McplsServer::workspace_symbol_search_tool_attr(),
+            ),
+            ("inspect_symbol", McplsServer::inspect_symbol_tool_attr()),
+            (
+                "read_semantic_resource",
+                McplsServer::read_semantic_resource_tool_attr(),
+            ),
+        ] {
+            let Some(annotations) = tool.annotations else {
+                panic!("{name} annotations");
+            };
+            assert_eq!(annotations.read_only_hint, Some(true), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(false), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
+        }
     }
 
     async fn approval_fixture() -> (TempDir, McplsServer, String) {
