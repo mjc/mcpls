@@ -417,12 +417,24 @@ fn current_codex_mcp_event(event: &Value) -> Option<TraceEvent> {
     if item.get("type")?.as_str()? != "McpToolCall" || item.get("server")?.as_str()? != "mcpls" {
         return None;
     }
-    Some(mcp_trace_event(
+    let mut trace = mcp_trace_event(
         item.get("tool")?.as_str()?,
         item.get("arguments").unwrap_or(&Value::Null),
         item.get("result").unwrap_or(&Value::Null),
         history_latency_ms(item),
-    ))
+    );
+    if item_status_is_failure(item)
+        && let TraceEvent::Semantic { error, .. } = &mut trace
+    {
+        *error = true;
+    }
+    Some(trace)
+}
+
+fn item_status_is_failure(item: &Value) -> bool {
+    item.get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "failed" | "cancelled" | "error"))
 }
 
 fn current_codex_command_events(event: &Value) -> Option<Vec<TraceEvent>> {
@@ -1149,6 +1161,7 @@ mod tests {
                         "max_bytes": 4096
                     },
                     "duration": {"secs": 1, "nanos": 250000000},
+                    "status": "failed",
                     "result": {
                         "structuredContent": {
                             "truncated": true,
@@ -1186,6 +1199,7 @@ mod tests {
         assert_eq!(report.deferred_bytes, 55);
         assert_eq!(report.latency_ms, 1_250);
         assert_eq!(report.latency.p50_ms, 1_250);
+        assert_eq!(report.errors, 1);
         assert_eq!(report.shell_output_bytes, 7);
         assert_eq!(report.source_read_output_bytes, 7);
         assert_eq!(report.post_semantic_same_file_reads, 1);
