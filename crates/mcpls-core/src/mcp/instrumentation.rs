@@ -276,6 +276,8 @@ impl RequestSpan {
             paginated = tracing::field::Empty,
             cache_hit = tracing::field::Empty,
             serialization_ms = tracing::field::Empty,
+            queue_ms = tracing::field::Empty,
+            actor_ms = tracing::field::Empty,
             actor_queue_ms = tracing::field::Empty,
             actor_execution_ms = tracing::field::Empty,
             cancelled = tracing::field::Empty,

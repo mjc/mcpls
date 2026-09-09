@@ -2837,18 +2837,16 @@ pub(super) async fn handle_timed_project_request(
     runtime: &mut ProjectRuntime,
     residency: Option<&ProjectResidency>,
 ) -> bool {
-    timing.span.record(
-        "actor_queue_ms",
-        u64::try_from(timing.queued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-    );
+    let queue_ms = u64::try_from(timing.queued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    timing.span.record("queue_ms", queue_ms);
+    timing.span.record("actor_queue_ms", queue_ms);
     let started = Instant::now();
     let stop = handle_project_request(request, actor_sender, channels, state, runtime, residency)
         .instrument(timing.span.clone())
         .await;
-    timing.span.record(
-        "actor_execution_ms",
-        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-    );
+    let actor_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    timing.span.record("actor_ms", actor_ms);
+    timing.span.record("actor_execution_ms", actor_ms);
     stop
 }
 
