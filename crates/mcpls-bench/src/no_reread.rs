@@ -85,6 +85,9 @@ pub struct TraceReport {
     pub post_semantic_same_file_reads: usize,
     pub pre_coordinate_source_reads: usize,
     pub coordinate_calls: usize,
+    /// Client-visible fixed context measured before task-specific calls.
+    #[serde(default)]
+    pub fixed_context_bytes: usize,
     pub result_bytes: usize,
     pub deferred_bytes: usize,
     pub deferred_resource_references: usize,
@@ -147,7 +150,7 @@ pub struct EvaluationReport {
     pub access_patterns: AccessPatternReport,
 }
 
-pub const EVALUATION_SCHEMA_VERSION: u32 = 7;
+pub const EVALUATION_SCHEMA_VERSION: u32 = 8;
 
 /// Version of the privacy-preserving before/after comparison schema.
 pub const EVALUATION_COMPARISON_SCHEMA_VERSION: u32 = 4;
@@ -214,7 +217,8 @@ pub struct EvaluationComparison {
 
 const fn model_visible_context_bytes(report: &TraceReport) -> usize {
     report
-        .result_bytes
+        .fixed_context_bytes
+        .saturating_add(report.result_bytes)
         .saturating_add(report.shell_output_bytes)
 }
 
@@ -580,6 +584,16 @@ pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
             .collect(),
         access_patterns: access_pattern_report(events),
     }
+}
+
+/// Add a separately measured client-visible fixed context cost to a report.
+#[must_use]
+pub const fn with_fixed_context(
+    mut report: EvaluationReport,
+    fixed_context_bytes: usize,
+) -> EvaluationReport {
+    report.aggregate.fixed_context_bytes = fixed_context_bytes;
+    report
 }
 
 /// Attach a privacy-preserving run-contract identity to an evaluation report.
@@ -1274,6 +1288,7 @@ mod tests {
                 lifecycle_calls: 0,
                 duplicate_queries: 0,
                 request_bytes: 0,
+                fixed_context_bytes: 0,
                 post_semantic_same_file_reads: 1,
                 pre_coordinate_source_reads: 1,
                 coordinate_calls: 1,
@@ -1801,6 +1816,39 @@ mod tests {
     }
 
     #[test]
+    fn fixed_context_is_included_without_changing_result_bytes() {
+        let report = with_fixed_context(
+            evaluate(&[mcp_trace_event(
+                "workspace_symbol_search",
+                &Value::Null,
+                &Value::Null,
+                1,
+            )]),
+            500,
+        );
+        assert_eq!(report.aggregate.fixed_context_bytes, 500);
+        assert_eq!(report.aggregate.result_bytes, 4);
+
+        let before = with_comparison_key(report, "same-run-contract");
+        let after = with_comparison_key(
+            with_fixed_context(
+                evaluate(&[mcp_trace_event(
+                    "workspace_symbol_search",
+                    &Value::Null,
+                    &Value::Null,
+                    1,
+                )]),
+                250,
+            ),
+            "same-run-contract",
+        );
+        let comparison = compare_evaluations(&before, &after);
+        assert_eq!(comparison.context_bytes.before, 504);
+        assert_eq!(comparison.context_bytes.after, 254);
+        assert!(!comparison.accepted);
+    }
+
+    #[test]
     fn evaluation_comparison_rejects_mismatched_task_counts() {
         let before = evaluate(&[TraceEvent::TaskComplete]);
         let after = evaluate(&[]);
@@ -1819,7 +1867,7 @@ mod tests {
 
         let comparison = compare_evaluations(&before, &after);
 
-        assert_eq!(comparison.report_schema_versions, [7, 6]);
+        assert_eq!(comparison.report_schema_versions, [8, 7]);
         assert!(!comparison.compatibility.report_schemas_match);
         assert!(!comparison.accepted);
     }

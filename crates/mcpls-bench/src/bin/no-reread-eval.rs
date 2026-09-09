@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use mcpls_bench::no_reread::{TraceEvent, evaluate, parse_history, with_comparison_key};
+use mcpls_bench::no_reread::{
+    TraceEvent, evaluate, parse_history, with_comparison_key, with_fixed_context,
+};
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +22,10 @@ struct Args {
     /// a before/after pair. Only its SHA-256 digest is written to the report.
     #[arg(long)]
     comparison_key: Option<String>,
+    /// Client-visible fixed context bytes measured before task-specific calls,
+    /// such as the initialize instructions and tools/list catalog.
+    #[arg(long, default_value_t = 0)]
+    fixed_context_bytes: usize,
 }
 
 fn history_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -60,7 +66,7 @@ fn run(args: &Args) -> Result<Vec<u8>> {
     } else {
         bail!("pass --trace or --history");
     }
-    let report = evaluate(&events);
+    let report = with_fixed_context(evaluate(&events), args.fixed_context_bytes);
     let report = match args.comparison_key.as_deref() {
         Some(key) => with_comparison_key(report, key),
         None => report,

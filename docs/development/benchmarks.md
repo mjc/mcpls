@@ -34,6 +34,7 @@ copying or exporting them:
 ```sh
 cargo run -p mcpls-bench --bin no-reread-eval -- \
   --history ~/.codex/sessions \
+  --fixed-context-bytes 0 \
   --output target/benchmarks/no-reread-history.json
 ```
 
@@ -60,6 +61,13 @@ text, prompts, source text, and paths are not retained.
 Current Codex histories
 are read from their completed-item records; older event records remain
 supported. The report schema version is bumped when these fields change.
+
+The fixed client-visible context is measured separately from task history and
+can be supplied with `--fixed-context-bytes`. Use the same measurement method
+for both runs, covering the initialize instruction surface and the serialized
+`tools/list` catalog presented to the client. The value is retained as a byte
+count only; it is not mixed into per-call result bytes. The comparison's
+model-visible context is `fixed_context_bytes + result_bytes + shell_output_bytes`.
 
 To evaluate another instrumented runner, serialize its scrubbed events as a JSON
 array of `semantic` and `source_read` records and replace `--history` with
