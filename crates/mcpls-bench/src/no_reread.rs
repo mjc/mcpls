@@ -125,7 +125,7 @@ pub struct EvaluationReport {
     pub by_tool: BTreeMap<String, TraceReport>,
 }
 
-pub const EVALUATION_SCHEMA_VERSION: u32 = 4;
+pub const EVALUATION_SCHEMA_VERSION: u32 = 5;
 
 #[must_use]
 pub fn scrub_path(path: &str) -> String {
@@ -335,18 +335,26 @@ fn latency_percentiles(latencies: &mut [u64]) -> LatencyPercentiles {
 pub fn evaluate(events: &[TraceEvent]) -> EvaluationReport {
     let mut by_tool_events = BTreeMap::<String, Vec<TraceEvent>>::new();
     for (index, event) in events.iter().enumerate() {
-        let TraceEvent::Semantic { tool, .. } = event else {
-            continue;
+        let (tool, semantic) = match event {
+            TraceEvent::Semantic { tool, .. }
+            | TraceEvent::Lifecycle { tool, .. }
+            | TraceEvent::McpTool { tool, .. } => (tool.as_str(), true),
+            TraceEvent::ResourceRead { .. } => ("read_semantic_resource", false),
+            TraceEvent::SourceRead { .. }
+            | TraceEvent::ShellOutput { .. }
+            | TraceEvent::TaskComplete
+            | TraceEvent::Compaction => continue,
         };
-        let tool_events = by_tool_events.entry(tool.clone()).or_default();
-        if let Some(TraceEvent::SourceRead { .. }) = index
-            .checked_sub(1)
-            .and_then(|previous| events.get(previous))
+        let tool_events = by_tool_events.entry(tool.to_owned()).or_default();
+        if semantic
+            && let Some(TraceEvent::SourceRead { .. }) = index
+                .checked_sub(1)
+                .and_then(|previous| events.get(previous))
         {
             tool_events.push(events[index - 1].clone());
         }
         tool_events.push(event.clone());
-        if let Some(TraceEvent::SourceRead { .. }) = events.get(index + 1) {
+        if semantic && let Some(TraceEvent::SourceRead { .. }) = events.get(index + 1) {
             tool_events.push(events[index + 1].clone());
         }
     }
@@ -1415,6 +1423,28 @@ mod tests {
                 numerator: 1,
                 denominator: 2,
             }
+        );
+    }
+
+    #[test]
+    fn evaluation_groups_lifecycle_and_resource_calls_by_tool() {
+        let events = [
+            mcp_trace_event("project_add", &Value::Null, &Value::Null, 3),
+            mcp_trace_event(
+                "read_semantic_resource",
+                &serde_json::json!({"uri": "mcpls-deferred:///opaque"}),
+                &Value::Null,
+                2,
+            ),
+        ];
+
+        let report = evaluate(&events);
+
+        assert_eq!(report.by_tool["project_add"].lifecycle_calls, 1);
+        assert_eq!(report.by_tool["read_semantic_resource"].mcpls_calls, 1);
+        assert_eq!(
+            report.by_tool["read_semantic_resource"].deferred_resource_reads,
+            1
         );
     }
 
