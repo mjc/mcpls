@@ -91,6 +91,33 @@ fn invalid_utf8_file_errors_are_skipped_through_both_error_wrappers() {
 }
 
 #[tokio::test]
+async fn workspace_snapshot_identity_is_stable_and_changes_with_content() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..64 {
+        fs::write(
+            root.path().join(format!("source-{index:02}.rs")),
+            format!("fn snapshot_marker_{index}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let mut translator = Translator::new();
+    translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+    let runtime = ProjectRuntime::new(translator);
+
+    let first = runtime.workspace_snapshot_identity().await.unwrap();
+    let second = runtime.workspace_snapshot_identity().await.unwrap();
+    assert_eq!(first, second, "snapshot hashing must be deterministic");
+
+    fs::write(
+        root.path().join("source-17.rs"),
+        "fn changed_snapshot_marker() {}\n",
+    )
+    .unwrap();
+    let changed = runtime.workspace_snapshot_identity().await.unwrap();
+    assert_ne!(first, changed, "disk changes must invalidate the identity");
+}
+
+#[tokio::test]
 async fn lexical_search_pages_replay_one_immutable_snapshot() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.rs"), "fn marker() {}\n").unwrap();

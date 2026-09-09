@@ -253,6 +253,7 @@ pub(crate) struct GeneratedEditPreview {
 
 const WORKSPACE_SYMBOL_CACHE_MAX_ENTRIES: usize = 128;
 const WORKSPACE_SYMBOL_BATCH_CONCURRENCY: usize = 4;
+const WORKSPACE_SNAPSHOT_CONCURRENCY: usize = 32;
 
 fn record_workspace_symbol_batch_metrics(
     snapshot_identity_ms: u64,
@@ -4919,9 +4920,21 @@ impl ProjectRuntime {
             }
         }
         paths.sort_unstable();
+
+        // Snapshot reads are independent. Keep the final hash order stable,
+        // but do not make a large workspace pay for every disk read serially.
+        let mut snapshots = futures::stream::iter(paths.into_iter().map(|path| async move {
+            let snapshot = self.translator.source_snapshot(&path).await;
+            (path, snapshot)
+        }))
+        .buffer_unordered(WORKSPACE_SNAPSHOT_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        snapshots.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
         let mut hasher = Sha256::new();
-        for path in paths {
-            let snapshot = match self.translator.source_snapshot(&path).await {
+        for (path, snapshot) in snapshots {
+            let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(error) if error.to_string().contains("valid UTF-8") => continue,
                 Err(error) => return Err(error.to_string()),
