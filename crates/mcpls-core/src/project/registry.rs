@@ -1579,15 +1579,7 @@ impl ProjectRegistry {
         kind_filter: Option<String>,
         page_token: Option<String>,
     ) -> Result<CodeActionsResult, ProjectRegistryError> {
-        let (identity, actor, _) = self.entry(id).await?;
-        let path = canonicalize(Path::new(&file_path))?;
-        if !path.starts_with(identity.root().as_path()) {
-            return Err(ProjectIdentityError::ProjectPathMismatch {
-                id: id.clone(),
-                path,
-            }
-            .into());
-        }
+        let (actor, _, _) = self.entry_for_path(id, Path::new(&file_path)).await?;
         actor
             .code_action_list(
                 file_path,
@@ -1607,20 +1599,9 @@ impl ProjectRegistry {
         id: &ProjectId,
         request: PathRenameRequest,
     ) -> Result<PathRenamePreview, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
-        let path = canonicalize(Path::new(&request.old_path))?;
-        let roots = identity
-            .roots()
-            .iter()
-            .map(CanonicalRoot::as_path)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        let root = longest_matching_root(&path, &roots)
-            .ok_or_else(|| ProjectIdentityError::ProjectPathMismatch {
-                id: id.clone(),
-                path: path.clone(),
-            })?
-            .to_path_buf();
+        let (actor, mutation, root) = self
+            .entry_for_path(id, Path::new(&request.old_path))
+            .await?;
         let _mutation = mutation.lock().await;
         actor
             .path_rename_preview(id.as_str().to_string(), request, root)
@@ -2209,15 +2190,15 @@ impl ProjectRegistry {
         edit: WorkspaceEdit,
         encoding: PositionEncoding,
     ) -> Result<PreviewArtifact, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
+        let (actor, mutation, root) = if let Some(path) = workspace_edit_path(&edit) {
+            self.entry_for_path(id, &path).await?
+        } else {
+            let (identity, actor, mutation) = self.entry(id).await?;
+            (actor, mutation, identity.root().as_path().to_path_buf())
+        };
         let _mutation = mutation.lock().await;
         actor
-            .preview_edit(
-                id.as_str().to_string(),
-                edit,
-                encoding,
-                identity.root().as_path().to_path_buf(),
-            )
+            .preview_edit(id.as_str().to_string(), edit, encoding, root)
             .await
             .map_err(ProjectRegistryError::from)
     }
@@ -2229,15 +2210,16 @@ impl ProjectRegistry {
         request: GeneratedEditRequest,
         encoding: PositionEncoding,
     ) -> Result<GeneratedEditPreview, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
+        let file_path = match &request {
+            GeneratedEditRequest::Rename { file_path, .. }
+            | GeneratedEditRequest::Format { file_path, .. }
+            | GeneratedEditRequest::RangeFormat { file_path, .. }
+            | GeneratedEditRequest::MoveItem { file_path, .. } => file_path,
+        };
+        let (actor, mutation, root) = self.entry_for_path(id, Path::new(file_path)).await?;
         let _mutation = mutation.lock().await;
         actor
-            .preview_generated_edit(
-                id.as_str().to_string(),
-                request,
-                encoding,
-                identity.root().as_path().to_path_buf(),
-            )
+            .preview_generated_edit(id.as_str().to_string(), request, encoding, root)
             .await
             .map_err(ProjectRegistryError::from)
     }
@@ -2260,7 +2242,7 @@ impl ProjectRegistry {
         module_position: Option<lsp_types::Position>,
         encoding: PositionEncoding,
     ) -> Result<PreviewArtifact, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
+        let (actor, mutation, root) = self.entry_for_path(id, Path::new(&file_path)).await?;
         let _mutation = mutation.lock().await;
         actor
             .move_inline_module_preview(
@@ -2269,7 +2251,7 @@ impl ProjectRegistry {
                 module_name,
                 module_position,
                 encoding,
-                identity.root().as_path().to_path_buf(),
+                root,
             )
             .await
             .map_err(ProjectRegistryError::from)
@@ -2281,20 +2263,9 @@ impl ProjectRegistry {
         id: &ProjectId,
         request: StructuralReplaceRequest,
     ) -> Result<StructuralPreview, ProjectRegistryError> {
-        let (identity, actor, mutation) = self.entry(id).await?;
-        let path = canonicalize(Path::new(&request.file_path))?;
-        let roots = identity
-            .roots()
-            .iter()
-            .map(CanonicalRoot::as_path)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        let root = longest_matching_root(&path, &roots)
-            .ok_or_else(|| ProjectIdentityError::ProjectPathMismatch {
-                id: id.clone(),
-                path: path.clone(),
-            })?
-            .to_path_buf();
+        let (actor, mutation, root) = self
+            .entry_for_path(id, Path::new(&request.file_path))
+            .await?;
         let _mutation = mutation.lock().await;
         actor
             .structural_replace_preview(id.as_str().to_string(), request, root)
@@ -2648,6 +2619,59 @@ impl ProjectRegistry {
             })
             .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))
     }
+
+    async fn entry_for_path(
+        &self,
+        id: &ProjectId,
+        path: &Path,
+    ) -> Result<(ProjectHandle, MutationGate, PathBuf), ProjectRegistryError> {
+        let path = canonicalize(path)?;
+        let projects = self.projects.read().await;
+        let result = (|| {
+            let project = projects
+                .get(id)
+                .ok_or_else(|| ProjectRegistryError::ProjectNotFound(id.clone()))?;
+            let roots = project
+                .identity
+                .roots()
+                .iter()
+                .map(CanonicalRoot::as_path)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
+            let root = longest_matching_root(&path, &roots).ok_or_else(|| {
+                ProjectIdentityError::ProjectPathMismatch {
+                    id: id.clone(),
+                    path: path.clone(),
+                }
+            })?;
+            let actor = project.actor_for_root(root).ok_or_else(|| {
+                ProjectIdentityError::ProjectPathMismatch {
+                    id: id.clone(),
+                    path: path.clone(),
+                }
+            })?;
+            Ok((
+                actor.actor.clone(),
+                actor.mutation.clone(),
+                root.to_path_buf(),
+            ))
+        })();
+        drop(projects);
+        result
+    }
+}
+
+fn workspace_edit_path(edit: &WorkspaceEdit) -> Option<PathBuf> {
+    normalize(edit.clone())
+        .ok()?
+        .operations
+        .into_iter()
+        .find_map(|operation| match operation {
+            EditOperation::Text { uri, .. }
+            | EditOperation::Create { uri, .. }
+            | EditOperation::Delete { uri, .. } => uri_to_path(&uri),
+            EditOperation::Rename { old_uri, .. } => uri_to_path(&old_uri),
+        })
 }
 
 pub(super) fn aggregate_statuses(

@@ -7582,7 +7582,7 @@ async fn project_registry_applies_a_plan_from_a_non_primary_worktree_actor() {
     let linked_identity = GitRepositoryIdentity::discover(worktree.path())
         .unwrap()
         .unwrap();
-    let linked_actor = registry
+    registry
         .add(
             ProjectIdentity::new(
                 project_id.clone(),
@@ -7593,21 +7593,25 @@ async fn project_registry_applies_a_plan_from_a_non_primary_worktree_actor() {
         .await
         .unwrap();
 
-    let plan = crate::edit_plan::EditPlan::new(
-        project_id.to_string(),
-        vec![crate::edit_plan::FileSnapshot::from_contents(
-            file.clone(),
-            crate::edit_plan::SnapshotSource::Disk,
-            None,
-            "before\n",
-            "after\n",
-        )],
-        vec!["replace src.rs".to_owned()],
-        true,
-        Duration::from_secs(60),
-    );
-    let plan_id = plan.id().clone();
-    linked_actor.store_edit_plan(plan).await.unwrap();
+    let edit = lsp_types::WorkspaceEdit {
+        changes: Some(HashMap::from([(
+            crate::bridge::path_to_uri(&file).unwrap(),
+            vec![lsp_types::TextEdit {
+                range: lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 6),
+                },
+                new_text: "after".to_owned(),
+            }],
+        )])),
+        document_changes: None,
+        change_annotations: None,
+    };
+    let artifact = registry
+        .preview_edit(&project_id, edit, PositionEncoding::Utf8)
+        .await
+        .unwrap();
+    let plan_id = artifact.plan.id().clone();
 
     let summary = registry
         .inspect_edit_plan(&project_id, plan_id.clone())
