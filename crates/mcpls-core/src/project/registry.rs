@@ -2300,6 +2300,26 @@ impl ProjectRegistry {
         Ok(actor)
     }
 
+    /// Resolve a project ID and file path to the actor owning the longest
+    /// matching registered root, waking the project when it is dormant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the project or path is not registered, or when
+    /// the owning actor cannot be activated or reached.
+    pub async fn active_actor_for_project_path(
+        &self,
+        id: &ProjectId,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        let (actor, _, _) = self.entry_for_path(id, path.as_ref()).await?;
+        if actor.query().await?.status() == ProjectStatus::Dormant {
+            self.activate(id).await?;
+        }
+        actor.wait_until_routable().await?;
+        Ok(actor)
+    }
+
     /// Resolve a dependency source previously surfaced by an active LSP.
     ///
     /// # Errors

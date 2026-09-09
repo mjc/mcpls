@@ -2184,7 +2184,9 @@ impl McplsServer {
         }
         let actor = if let Some(project_id) = project_id {
             let id = parse_project_id(project_id)?;
-            self.context.required_actor_for_project(&id).await
+            self.context
+                .required_actor_for_project_path(&id, &file_path)
+                .await
         } else {
             self.context.required_actor_for_path(&file_path).await
         }
@@ -4800,7 +4802,13 @@ impl McplsServer {
         let (actor, file_path, line, character) = if page_token.is_some() {
             let actor = if let Some(project_id) = project_id {
                 let id = parse_project_id(project_id)?;
-                self.context.required_actor_for_project(&id).await
+                if file_path.is_empty() {
+                    self.context.required_actor_for_project(&id).await
+                } else {
+                    self.context
+                        .required_actor_for_project_path(&id, &file_path)
+                        .await
+                }
             } else if file_path.is_empty() {
                 return Err(McpError::invalid_params(
                     "page_token requires project_id or file_path".to_owned(),

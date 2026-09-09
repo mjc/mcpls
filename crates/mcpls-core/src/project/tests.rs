@@ -7539,6 +7539,11 @@ async fn project_registry_keeps_unknown_worktree_in_one_logical_project() {
     let (resolved_id, resolved_actor) = registry.project_for_path(&file).await.unwrap();
     assert_eq!(resolved_id, project_id);
     assert!(resolved_actor.sender.same_channel(&linked_actor.sender));
+    let explicit_id_actor = registry
+        .active_actor_for_project_path(&project_id, &file)
+        .await
+        .unwrap();
+    assert!(explicit_id_actor.sender.same_channel(&linked_actor.sender));
 }
 
 #[tokio::test]

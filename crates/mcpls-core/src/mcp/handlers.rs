@@ -332,6 +332,17 @@ impl HandlerContext {
         Ok(actor)
     }
 
+    /// Resolve an explicit project and file path to the owning actor.
+    pub(crate) async fn required_actor_for_project_path(
+        &self,
+        id: &crate::project::ProjectId,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ProjectHandle, ProjectRegistryError> {
+        self.project_registry
+            .active_actor_for_project_path(id, path)
+            .await
+    }
+
     /// Resolve either a registered project ID or one of its registered roots.
     ///
     /// Clients commonly copy a project root from a source result into a later
