@@ -7424,6 +7424,7 @@ finally:
             "symbol_handle",
             "stale handles",
             "snapshot resources",
+            "read refs before shell",
             "preview/apply",
             "project_id",
             "attach/wake",
