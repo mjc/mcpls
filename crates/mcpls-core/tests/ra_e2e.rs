@@ -4037,6 +4037,13 @@ fn add_and_activate_project(client: &mut McpClient, project_id: &str, root: &Pat
     wait_until_ready(client, lib_rs);
 }
 
+fn project_id_for_root(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("workspace root has no UTF-8 dirname: {}", root.display()))
+}
+
 fn apply_workspace_plan(client: &mut McpClient, project_id: &str, plan_id: &str) -> Value {
     call_json(
         client,
@@ -4115,7 +4122,13 @@ fn ra_multi_project_safe_refactor_e2e() {
 }
 
 fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixture) {
-    add_and_activate_project(client, "second", &fixture.second, &fixture.second_lib);
+    let second_project_id = project_id_for_root(&fixture.second);
+    add_and_activate_project(
+        client,
+        &second_project_id,
+        &fixture.second,
+        &fixture.second_lib,
+    );
 
     let projects = call_json(client, "project_list", &json!({})).unwrap();
     assert_eq!(projects["projects"].as_array().unwrap().len(), 2);
@@ -4132,7 +4145,7 @@ fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixtur
     let second_symbols = call_json(
         client,
         "workspace_symbol_search",
-        &json!({"project_id": "second", "query": "cross_file_target"}),
+        &json!({"project_id": second_project_id, "query": "cross_file_target"}),
     )
     .unwrap();
     assert!(!second_symbols["symbols"].as_array().unwrap().is_empty());
@@ -4140,12 +4153,13 @@ fn assert_project_isolation(client: &mut McpClient, fixture: &MultiProjectFixtur
 }
 
 fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {
+    let second_project_id = project_id_for_root(&fixture.second);
     let target_line = find_line(&fixture.functions, "pub fn cross_file_target(");
     let rename = call_json(
         client,
         "rename_preview",
         &json!({
-            "project_id": "second",
+            "project_id": second_project_id,
             "file_path": fixture.functions,
             "line": target_line,
             "character": 8,
@@ -4157,7 +4171,7 @@ fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {
     assert_eq!(rename["safe_to_apply"], true);
     assert!(rename["affected_files"].as_array().unwrap().len() >= 2);
     let rename_plan = rename["plan_id"].as_str().unwrap().to_owned();
-    let applied = apply_workspace_plan(client, "second", &rename_plan);
+    let applied = apply_workspace_plan(client, &second_project_id, &rename_plan);
     assert!(applied["committed_files"].as_array().unwrap().len() >= 2);
     assert!(
         fs::read_to_string(&fixture.functions)
@@ -4173,18 +4187,19 @@ fn rename_and_apply(client: &mut McpClient, fixture: &MultiProjectFixture) {
     let retry = call_json(
         client,
         "workspace_edit_apply",
-        &json!({"project_id": "second", "plan_id": rename_plan}),
+        &json!({"project_id": second_project_id, "plan_id": rename_plan}),
     )
     .unwrap();
     assert_eq!(retry, applied, "a committed edit plan retry is idempotent");
 }
 
 fn format_and_restart(client: &mut McpClient, fixture: &MultiProjectFixture) {
+    let second_project_id = project_id_for_root(&fixture.second);
     let formatted = call_json(
         client,
         "format_preview",
         &json!({
-            "project_id": "second",
+            "project_id": second_project_id,
             "file_path": fixture.bad_format,
             "tab_size": 4,
             "insert_spaces": true,
@@ -4193,7 +4208,7 @@ fn format_and_restart(client: &mut McpClient, fixture: &MultiProjectFixture) {
     )
     .unwrap();
     let format_plan = formatted["plan_id"].as_str().unwrap().to_owned();
-    apply_workspace_plan(client, "second", &format_plan);
+    apply_workspace_plan(client, &second_project_id, &format_plan);
     let golden =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/bad_format.fmt.rs");
     assert_eq!(
@@ -4207,7 +4222,7 @@ fn format_and_restart(client: &mut McpClient, fixture: &MultiProjectFixture) {
     let restarted = call_json(
         client,
         "project_restart_lsp",
-        &json!({"project_id": "second"}),
+        &json!({"project_id": second_project_id}),
     )
     .unwrap();
     assert!(matches!(
