@@ -1445,7 +1445,7 @@ pub enum InspectSymbolResolution {
         /// Ranked source-bearing candidates; never silently choose one.
         candidates: Vec<WorkspaceSymbol>,
     },
-    /// A previously valid handle no longer matches its source snapshot.
+    /// A handle is unavailable in this project or no longer matches its snapshot.
     ///
     /// This is an expected refresh condition, not a malformed request. The
     /// caller should rerun symbol discovery and use the replacement handle.

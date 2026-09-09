@@ -4038,10 +4038,10 @@ fn add_and_activate_project(client: &mut McpClient, project_id: &str, root: &Pat
 }
 
 fn project_id_for_root(root: &Path) -> String {
-    root.file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| panic!("workspace root has no UTF-8 dirname: {}", root.display()))
+    root.file_name().and_then(|name| name.to_str()).map_or_else(
+        || panic!("workspace root has no UTF-8 dirname: {}", root.display()),
+        str::to_owned,
+    )
 }
 
 fn apply_workspace_plan(client: &mut McpClient, project_id: &str, plan_id: &str) -> Value {

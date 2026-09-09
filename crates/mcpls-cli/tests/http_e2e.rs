@@ -1181,6 +1181,164 @@ fn http_rejects_non_loopback_listener_without_binding() {
 
 #[test]
 #[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
+#[allow(clippy::too_many_lines)] // Keep the competing writes and final semantic assertions together.
+fn real_rust_analyzer_concurrent_edits_converge() {
+    let rust_analyzer = resolve_rust_analyzer_for_http().unwrap();
+    let fixture = RealRaHttpFixture::new(&rust_analyzer);
+    let daemon = HttpDaemon::spawn(&fixture.config);
+    let mut observer = HttpClient::new(daemon.address);
+    observer.initialize();
+    observer.call_tool("project_add", json!({"root": fixture.root_a}));
+    observer.call_tool("project_activate", json!({"project_id": "project-a"}));
+    wait_project_ready(&mut observer, "project-a");
+
+    let functions = fixture.root_a.join("src/functions.rs");
+    let lib = fixture.root_a.join("src/lib.rs");
+    let original_lib = std::fs::read_to_string(&lib).unwrap();
+    let before = observer.call_tool(
+        "workspace_symbol_search",
+        json!({"project_id": "project-a", "query": "only_a", "match_mode": "exact"}),
+    );
+    assert_eq!(before["symbols"].as_array().unwrap().len(), 1);
+
+    let changes = [
+        (&functions, "pub fn committed_left() -> i32 { 11 }\n", 1),
+        (&functions, "pub fn committed_right() -> i32 { 12 }\n", 1),
+        (&lib, "pub fn independent_edit() -> i32 { 13 }\n", 0),
+    ];
+    let mut writers = Vec::new();
+    for (path, text, end_line) in changes {
+        let mut client = HttpClient::new(daemon.address);
+        client.initialize();
+        let preview = client.call_tool(
+            "workspace_edit_preview",
+            json!({
+                "project_id": "project-a",
+                "workspace_edit": {"changes": {
+                    format!("file://{}", path.display()): [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": end_line, "character": 0}
+                        },
+                        "newText": text
+                    }]
+                }}
+            }),
+        );
+        assert_eq!(preview["safe_to_apply"], true, "{preview}");
+        writers.push((client, preview["plan_id"].clone()));
+    }
+
+    let barrier = std::sync::Barrier::new(writers.len());
+    let results = thread::scope(|scope| {
+        let workers: Vec<_> = writers
+            .into_iter()
+            .map(|(mut client, plan_id)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    client.call_tool(
+                        "workspace_edit_apply",
+                        json!({
+                            "project_id": "project-a", "plan_id": plan_id,
+                            "wait_timeout_ms": 5_000
+                        }),
+                    )
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let (overlapping, disjoint) = results.split_at(2);
+    assert_eq!(
+        overlapping
+            .iter()
+            .filter(|result| result["committed_files"].is_array())
+            .count(),
+        1,
+        "exactly one overlapping plan must commit: {results:?}"
+    );
+    assert_eq!(
+        overlapping
+            .iter()
+            .filter(|result| result["status"] == "conflict")
+            .count(),
+        1,
+        "the losing plan must report a conflict: {results:?}"
+    );
+    assert_eq!(disjoint[0]["committed_files"].as_array().unwrap().len(), 1);
+
+    let winner = usize::from(!overlapping[0]["committed_files"].is_array());
+    assert_eq!(
+        std::fs::read_to_string(&functions).unwrap(),
+        changes[winner].1
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lib).unwrap(),
+        format!("{}{original_lib}", changes[2].1)
+    );
+
+    // Query through a fourth session: disk writes alone do not prove LSP convergence.
+    let winner_name = ["committed_left", "committed_right"][winner];
+    for name in [winner_name, "independent_edit"] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let found = observer.call_tool(
+                "workspace_symbol_search",
+                json!({"project_id": "project-a", "query": name, "match_mode": "exact"}),
+            );
+            if found["symbols"].as_array().unwrap().len() == 1 {
+                let inspected = observer.call_tool(
+                    "inspect_symbol",
+                    json!({
+                        "project_id": "project-a",
+                        "symbol_handle": found["symbols"][0]["location"]["symbol_handle"],
+                        "sections": ["declaration", "hover"]
+                    }),
+                );
+                assert!(
+                    inspected["sections"]["declaration"]
+                        .to_string()
+                        .contains(name),
+                    "{inspected}"
+                );
+                assert!(
+                    inspected["sections"]["hover"].to_string().contains(name),
+                    "{inspected}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic state did not converge for {name}: {found}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let stale = observer.call_tool(
+        "workspace_symbol_search",
+        json!({"project_id": "project-a", "query": "only_a", "match_mode": "exact"}),
+    );
+    assert!(stale["symbols"].as_array().unwrap().is_empty(), "{stale}");
+    for handle in [
+        before["symbols"][0]["location"]["symbol_handle"].clone(),
+        json!("00000000-0000-0000-0000-000000000000"),
+    ] {
+        let refreshed = observer.call_tool(
+            "inspect_symbol",
+            json!({"project_id": "project-a", "symbol_handle": handle}),
+        );
+        assert_eq!(refreshed["resolution"]["status"], "stale", "{refreshed}");
+        assert_eq!(refreshed["resolution"]["retryable"], true);
+        assert_eq!(refreshed["sections"], json!({}));
+    }
+}
+
+#[test]
+#[ignore = "Requires rust-analyzer in PATH; set MCPLS_RUST_ANALYZER=<path>"]
 fn real_rust_analyzer_http_sessions_and_safe_refactor_e2e() {
     if std::env::var("MCPLS_SKIP_RA").ok().as_deref() == Some("1") {
         println!("real rust-analyzer HTTP suite skipped by MCPLS_SKIP_RA=1");

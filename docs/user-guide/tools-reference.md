@@ -735,7 +735,7 @@ inspect_symbol {
 
 The equivalent [machine-validated request example](../examples/source-rich-workflow.json) runs against real rust-analyzer in the MCPLS end-to-end suite.
 
-Pass returned handles directly to handle-aware tools instead of copying line/character coordinates. If the query is ambiguous, narrow with `path`, `kind`, or `container`; do not select a candidate silently. On `stale_symbol_handle`, rerun `workspace_symbol_search` or `get_document_symbols` and retry with the replacement.
+Pass returned handles directly to handle-aware tools instead of copying line/character coordinates. If the query is ambiguous, narrow with `path`, `kind`, or `container`; do not select a candidate silently. When `inspect_symbol` returns `resolution.status: "stale"`, rerun `workspace_symbol_search` and retry with the replacement handle. The reason identifies changed source (`stale_symbol_handle`) or missing, expired, or cross-project handles (`invalid_symbol_handle`); the refresh result returns no semantic sections from an unresolved handle.
 
 Use a direct file read only when intentionally requesting an uncapped full file or inspecting a non-source/generated artifact. For ordinary navigation, an available source frame is already the authoritative snapshot used by the semantic result; for truncation, first request a tighter section or larger explicit budget.
 

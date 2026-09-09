@@ -1226,7 +1226,8 @@ mod tests {
                 br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
             )
             .await;
-            assert!(listed.contains("outputSchema"), "{listed}");
+            assert!(listed.contains("inputSchema"), "{listed}");
+            assert!(!listed.contains("outputSchema"), "{listed}");
             let response = raw_http_post(
                 addr,
                 "/mcp",

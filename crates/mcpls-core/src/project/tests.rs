@@ -2158,13 +2158,12 @@ async fn inspect_symbol_batch_fetches_targets_concurrently_under_one_global_budg
             .iter()
             .all(|entry| entry.result.as_ref().unwrap().budget.max_items == 1)
     );
-    assert!(result.entries[2].result.is_none());
-    assert!(
-        result.entries[2]
-            .error
-            .as_deref()
-            .is_some_and(|error| { error.starts_with("invalid_symbol_handle:") })
-    );
+    assert!(result.entries[2].error.is_none());
+    assert!(matches!(
+        &result.entries[2].result.as_ref().unwrap().resolution,
+        crate::bridge::InspectSymbolResolution::Stale { retryable: true, reason, .. }
+            if reason.starts_with("invalid_symbol_handle:")
+    ));
     assert_eq!(
         result.entries[0].result.as_ref().unwrap().returned_bytes,
         result.entries[3].result.as_ref().unwrap().returned_bytes
@@ -2673,6 +2672,62 @@ async fn symbol_handle_rejects_a_new_dirty_document_version() {
 
     let error = runtime.resolve_symbol_target(&handle).await.unwrap_err();
     assert!(error.contains("stale_symbol_handle"));
+}
+
+#[tokio::test]
+async fn inspect_symbol_returns_refresh_result_for_unknown_or_expired_handles() {
+    let runtime = ProjectRuntime::new(Translator::new());
+    let foreign_runtime = ProjectRuntime::new(Translator::new());
+    let target = || {
+        StoredSymbolTarget::new(
+            PathBuf::from("private-other-project.rs"),
+            1,
+            1,
+            SourceSnapshot::Version(1),
+        )
+    };
+    let foreign = foreign_runtime
+        .symbol_handles
+        .lock()
+        .unwrap()
+        .insert(target());
+    let expired = {
+        let mut store = runtime.symbol_handles.lock().unwrap();
+        store.ttl = Duration::ZERO;
+        store.insert(target())
+    };
+
+    for handle in [SymbolHandle::new(), foreign, expired] {
+        let result = runtime
+            .inspect_symbol(InspectSymbolRequest {
+                symbol_handle: Some(handle.clone()),
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 5,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget::default(),
+            })
+            .await
+            .expect("unresolvable handles must return a refresh result, not an actor error");
+        let crate::bridge::InspectSymbolResolution::Stale {
+            symbol_handle,
+            reason,
+            retryable,
+        } = result.resolution
+        else {
+            panic!("unresolvable handles must produce a structured refresh result");
+        };
+        assert_eq!(symbol_handle, handle);
+        assert!(retryable);
+        assert!(reason.starts_with("invalid_symbol_handle:"));
+        assert!(!reason.contains("private-other-project.rs"));
+        assert_eq!(
+            serde_json::to_value(result.sections).unwrap(),
+            serde_json::json!({})
+        );
+    }
 }
 
 #[tokio::test]

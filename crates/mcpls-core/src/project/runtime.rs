@@ -4987,7 +4987,10 @@ impl ProjectRuntime {
         let (resolution, target) = if let Some(handle) = request.symbol_handle.clone() {
             let target = match self.resolve_symbol_target(&handle).await {
                 Ok(target) => target,
-                Err(error) if error.starts_with("stale_symbol_handle:") => {
+                Err(error)
+                    if error.starts_with("stale_symbol_handle:")
+                        || error.starts_with("invalid_symbol_handle:") =>
+                {
                     return Ok(InspectSymbolResult {
                         resolution: InspectSymbolResolution::Stale {
                             symbol_handle: handle,
@@ -5065,7 +5068,10 @@ impl ProjectRuntime {
                     let target = if let Some(handle) = symbol.location.symbol_handle.as_ref() {
                         let stored = match self.resolve_symbol_target(handle).await {
                             Ok(stored) => stored,
-                            Err(error) if error.starts_with("stale_symbol_handle:") => {
+                            Err(error)
+                                if error.starts_with("stale_symbol_handle:")
+                                    || error.starts_with("invalid_symbol_handle:") =>
+                            {
                                 return Ok(InspectSymbolResult {
                                     resolution: InspectSymbolResolution::Stale {
                                         symbol_handle: handle.clone(),
