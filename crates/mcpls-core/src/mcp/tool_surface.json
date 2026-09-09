@@ -23196,7 +23196,7 @@
   },
   {
     "name": "workspace_symbol_search",
-    "description": "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; results have bounded source frames and reusable symbol handles.",
+    "description": "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; use page_token with queries omitted to continue a bounded batch page. Results have bounded source frames and reusable symbol handles.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -23715,14 +23715,33 @@
               "minimum": 0,
               "type": "integer"
             },
+            "next_cursor": {
+              "description": "Opaque cursor for the next batch page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "provider_requests": {
               "description": "Number of downstream workspace-symbol requests actually issued.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
             },
+            "remaining_queries": {
+              "description": "Number of caller queries remaining after this page.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "returned": {
               "description": "Number of symbol payloads returned across unique queries.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "returned_queries": {
+              "description": "Number of caller queries represented on this page.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -23749,6 +23768,8 @@
             "snapshot_identity",
             "cache_hit",
             "returned",
+            "returned_queries",
+            "remaining_queries",
             "truncated",
             "max_bytes"
           ],
@@ -23923,6 +23944,14 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "page_token": {
+          "default": null,
+          "description": "Opaque cursor returned by a prior batch page; omit queries when continuing.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project_id": {
           "description": "Stable project identifier whose workspace should be searched.",
@@ -24482,14 +24511,33 @@
           "minimum": 0,
           "type": "integer"
         },
+        "next_cursor": {
+          "description": "Opaque cursor for the next batch page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider_requests": {
           "description": "Number of downstream workspace-symbol requests actually issued.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
+        "remaining_queries": {
+          "description": "Number of caller queries remaining after this page.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "returned": {
           "description": "Number of symbol payloads returned across unique queries.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "returned_queries": {
+          "description": "Number of caller queries represented on this page.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -24516,6 +24564,8 @@
         "snapshot_identity",
         "cache_hit",
         "returned",
+        "returned_queries",
+        "remaining_queries",
         "truncated",
         "max_bytes"
       ],

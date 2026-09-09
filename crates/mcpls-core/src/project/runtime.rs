@@ -1444,25 +1444,205 @@ pub(super) fn call_hierarchy_snapshot_hash(items: &[CallHierarchyItemResult]) ->
         .unwrap_or_default()
 }
 
-pub(super) fn trim_workspace_symbol_batch(batch: &mut WorkspaceSymbolBatchResult) {
-    while serde_json::to_vec(batch).map_or(usize::MAX, |encoded| encoded.len()) > batch.max_bytes {
-        let Some(result) = batch
-            .entries
-            .iter_mut()
-            .rev()
-            .filter_map(|entry| entry.result.as_mut())
-            .find(|result| !result.symbols.is_empty())
-        else {
-            batch.truncated = true;
-            return;
-        };
-        result.symbols.pop();
-        result.returned = result.symbols.len();
-        result.remaining = result.total.saturating_sub(result.returned);
-        result.truncated = true;
-        batch.returned = batch.returned.saturating_sub(1);
-        batch.truncated = true;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct WorkspaceSymbolBatchPageState {
+    entries: Vec<WorkspaceSymbolBatchEntry>,
+    unique_queries: usize,
+    provider_requests: usize,
+    snapshot_identity: String,
+    cache_hit: bool,
+    filter_identity: String,
+}
+
+fn workspace_symbol_batch_filter_identity(request: &WorkspaceSymbolBatchRequest) -> String {
+    let value = (
+        &request.kind_filter,
+        request.match_mode,
+        request.scope,
+        request.include_generated,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )
+}
+
+pub(super) fn workspace_symbol_batch_cursor(
+    token: &str,
+    entry_offset: usize,
+    symbol_offset: usize,
+) -> String {
+    format!("mcpls-workspace-symbol-batch:///{token}?entry={entry_offset}&symbol={symbol_offset}")
+}
+
+pub(super) fn parse_workspace_symbol_batch_cursor(
+    cursor: &str,
+) -> Result<(&str, usize, usize), String> {
+    let cursor = cursor
+        .strip_prefix("mcpls-workspace-symbol-batch:///")
+        .ok_or_else(|| {
+            "page_token must be the next_cursor returned by workspace_symbol_search".to_owned()
+        })?;
+    let (token, query) = cursor
+        .split_once("?entry=")
+        .ok_or_else(|| "invalid workspace-symbol batch page_token".to_owned())?;
+    let (entry_offset, symbol_offset) = query
+        .split_once("&symbol=")
+        .ok_or_else(|| "invalid workspace-symbol batch page_token".to_owned())?;
+    if token.is_empty() {
+        return Err("invalid workspace-symbol batch page_token".to_owned());
     }
+    let entry_offset = entry_offset
+        .parse::<usize>()
+        .map_err(|_| "invalid workspace-symbol batch entry offset".to_owned())?;
+    let symbol_offset = symbol_offset
+        .parse::<usize>()
+        .map_err(|_| "invalid workspace-symbol batch symbol offset".to_owned())?;
+    Ok((token, entry_offset, symbol_offset))
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn bounded_workspace_symbol_batch_page(
+    state: &WorkspaceSymbolBatchPageState,
+    token: &str,
+    entry_offset: usize,
+    symbol_offset: usize,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<WorkspaceSymbolBatchResult, String> {
+    if entry_offset > state.entries.len() {
+        return Err(
+            "workspace-symbol batch page_token entry is outside the retained result".to_owned(),
+        );
+    }
+    if max_items == 0 {
+        return Err("max_items must be positive".to_owned());
+    }
+
+    let mut page = WorkspaceSymbolBatchResult {
+        entries: Vec::new(),
+        unique_queries: state.unique_queries,
+        provider_requests: state.provider_requests,
+        snapshot_identity: state.snapshot_identity.clone(),
+        cache_hit: state.cache_hit,
+        returned: 0,
+        returned_queries: 0,
+        remaining_queries: state.entries.len().saturating_sub(entry_offset),
+        next_cursor: None,
+        truncated: false,
+        max_bytes,
+    };
+    let mut current_entry = entry_offset;
+    let mut current_symbol = symbol_offset;
+
+    'page: while current_entry < state.entries.len() {
+        let entry = &state.entries[current_entry];
+        let Some(full) = entry.result.as_ref() else {
+            let mut trial = page.clone();
+            trial.entries.push(entry.clone());
+            trial.returned_queries += 1;
+            trial.remaining_queries = state.entries.len().saturating_sub(current_entry + 1);
+            trial.next_cursor = (current_entry + 1 < state.entries.len())
+                .then(|| workspace_symbol_batch_cursor(token, current_entry + 1, 0));
+            trial.truncated = trial.next_cursor.is_some();
+            if serde_json::to_vec(&trial).map_or(usize::MAX, |encoded| encoded.len()) > max_bytes {
+                if page.entries.is_empty() {
+                    return Err(
+                        "max_bytes is too small to return one workspace-symbol batch identity"
+                            .to_owned(),
+                    );
+                }
+                break;
+            }
+            page = trial;
+            current_entry += 1;
+            current_symbol = 0;
+            continue;
+        };
+
+        if current_symbol > full.symbols.len() {
+            return Err(
+                "workspace-symbol batch page_token symbol is outside the retained result"
+                    .to_owned(),
+            );
+        }
+        let remaining_items = max_items.saturating_sub(page.returned);
+        if remaining_items == 0 && current_symbol < full.symbols.len() {
+            break;
+        }
+        let mut take = full
+            .symbols
+            .len()
+            .saturating_sub(current_symbol)
+            .min(remaining_items);
+        let next_position = |take: usize| {
+            let next_symbol = current_symbol.saturating_add(take);
+            if next_symbol < full.symbols.len() {
+                (current_entry, next_symbol)
+            } else {
+                (current_entry + 1, 0)
+            }
+        };
+
+        loop {
+            let mut bounded = full.clone();
+            bounded.symbols = full.symbols[current_symbol..current_symbol + take].to_vec();
+            bounded.returned = take;
+            bounded.remaining = full
+                .total
+                .saturating_sub(current_symbol.saturating_add(take));
+            bounded.next_cursor = None;
+            bounded.max_bytes = Some(max_bytes);
+            bounded.truncated =
+                full.truncated || current_symbol.saturating_add(take) < full.symbols.len();
+            let (next_entry, next_symbol) = next_position(take);
+            let mut trial = page.clone();
+            trial.entries.push(WorkspaceSymbolBatchEntry {
+                query: entry.query.clone(),
+                result: Some(bounded),
+                reused_from: entry.reused_from,
+                skipped_by_budget: false,
+            });
+            trial.returned = trial.returned.saturating_add(take);
+            trial.returned_queries += 1;
+            trial.remaining_queries = state.entries.len().saturating_sub(next_entry);
+            trial.next_cursor = (next_entry < state.entries.len())
+                .then(|| workspace_symbol_batch_cursor(token, next_entry, next_symbol));
+            trial.truncated = trial.next_cursor.is_some();
+            if serde_json::to_vec(&trial).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+                page = trial;
+                current_entry = next_entry;
+                current_symbol = next_symbol;
+                break;
+            }
+            if take == 0 {
+                if page.entries.is_empty() {
+                    return Err(
+                        "max_bytes is too small to return one workspace-symbol batch identity"
+                            .to_owned(),
+                    );
+                }
+                break 'page;
+            }
+            take -= 1;
+        }
+    }
+
+    if page.entries.is_empty() {
+        return Err(
+            "max_bytes is too small to return one workspace-symbol batch identity".to_owned(),
+        );
+    }
+    page.next_cursor = (current_entry < state.entries.len())
+        .then(|| workspace_symbol_batch_cursor(token, current_entry, current_symbol));
+    page.remaining_queries = state.entries.len().saturating_sub(current_entry);
+    page.truncated = page.next_cursor.is_some()
+        || state
+            .entries
+            .iter()
+            .any(|entry| entry.result.as_ref().is_some_and(|result| result.truncated));
+    debug_assert!(serde_json::to_vec(&page).is_ok_and(|encoded| encoded.len() <= max_bytes));
+    Ok(page)
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct WorkspaceSymbolPageState {
@@ -2258,18 +2438,6 @@ pub(super) fn bounded_workspace_symbol_page(
         symbols: remaining.into(),
     });
     Ok((result, remaining))
-}
-
-fn bound_workspace_symbol_result(
-    mut result: WorkspaceSymbolResult,
-    max_items: usize,
-) -> WorkspaceSymbolResult {
-    result.symbols.truncate(max_items);
-    result.returned = result.symbols.len();
-    result.remaining = result.total.saturating_sub(result.returned);
-    result.truncated = result.returned < result.total;
-    result.next_cursor = None;
-    result
 }
 
 impl ProjectRuntime {
@@ -4119,104 +4287,161 @@ impl ProjectRuntime {
         Ok(result)
     }
 
-    #[allow(clippy::significant_drop_in_scrutinee, clippy::expect_used)]
+    async fn workspace_symbol_complete(
+        &self,
+        query: String,
+        kind_filter: Option<String>,
+        match_mode: WorkspaceSymbolMatchMode,
+        scope: WorkspaceSymbolScope,
+        include_generated: bool,
+    ) -> Result<WorkspaceSymbolResult, String> {
+        let mut result = self
+            .translator
+            .handle_workspace_symbol_all_with_generated(
+                query,
+                kind_filter,
+                match_mode,
+                scope,
+                include_generated,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        discard_workspace_symbol_struct_uses(&mut result.symbols);
+        self.attach_workspace_symbol_handles(&mut result.symbols)
+            .await;
+        result.returned = result.symbols.len();
+        result.remaining = result.total.saturating_sub(result.returned);
+        result.next_cursor = None;
+        result.max_bytes = None;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn workspace_symbol_batch(
         &self,
         request: WorkspaceSymbolBatchRequest,
     ) -> Result<WorkspaceSymbolBatchResult, String> {
-        let snapshot_identity = self.workspace_snapshot_identity().await?;
-        let mut seen = HashMap::new();
-        let mut batch = WorkspaceSymbolBatchResult {
-            entries: Vec::with_capacity(request.queries.len()),
-            unique_queries: 0,
-            provider_requests: 0,
-            snapshot_identity,
-            cache_hit: false,
-            returned: 0,
-            truncated: false,
-            max_bytes: request.max_bytes,
-        };
-
-        for query in request.queries {
-            if let Some(&reused_from) = seen.get(&query) {
-                batch.entries.push(WorkspaceSymbolBatchEntry {
-                    query,
-                    result: None,
-                    reused_from: Some(reused_from),
-                    skipped_by_budget: false,
-                });
-                trim_workspace_symbol_batch(&mut batch);
-                continue;
-            }
-
-            let entry_index = batch.entries.len();
-            seen.insert(query.clone(), entry_index);
-            batch.unique_queries += 1;
-            let remaining = request.max_items.saturating_sub(batch.returned);
-            if remaining == 0 {
-                batch.truncated = true;
-                batch.entries.push(WorkspaceSymbolBatchEntry {
-                    query,
-                    result: None,
-                    reused_from: None,
-                    skipped_by_budget: true,
-                });
-                trim_workspace_symbol_batch(&mut batch);
-                continue;
-            }
-
-            let limit = u32::try_from(remaining).unwrap_or(u32::MAX);
-            let cache_key = format!(
-                "{}\0{}\0{:?}\0{}\0{:?}\0{:?}",
-                batch.snapshot_identity,
-                query,
-                request.kind_filter,
-                request.include_generated,
-                request.match_mode,
-                request.scope,
-            );
-            let cached = self
-                .workspace_symbol_results
+        let scope = self.deferred_scope.as_deref().unwrap_or_default();
+        let (state, token, entry_offset, symbol_offset) = if let Some(page_token) =
+            request.page_token.as_deref()
+        {
+            let (token, entry_offset, symbol_offset) =
+                parse_workspace_symbol_batch_cursor(page_token)?;
+            let value = self
+                .deferred_results
                 .lock()
-                .expect("workspace-symbol cache lock poisoned")
-                .get(&cache_key)
-                .cloned();
-            let result = match cached {
-                Some(result) if !result.truncated || result.returned >= remaining => {
-                    batch.cache_hit = true;
-                    bound_workspace_symbol_result(result, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_scoped(token, scope)?;
+            let state: WorkspaceSymbolBatchPageState = serde_json::from_value(value)
+                .map_err(|error| format!("invalid workspace-symbol batch page: {error}"))?;
+            if state.filter_identity != workspace_symbol_batch_filter_identity(&request) {
+                return Err(
+                    "page_token belongs to a different workspace-symbol batch request".to_owned(),
+                );
+            }
+            (state, token.to_owned(), entry_offset, symbol_offset)
+        } else {
+            let snapshot_identity = self.workspace_snapshot_identity().await?;
+            let filter_identity = workspace_symbol_batch_filter_identity(&request);
+            let mut seen = HashMap::new();
+            let mut entries = Vec::with_capacity(request.queries.len());
+            let mut provider_requests = 0;
+            let mut cache_hit = false;
+            let mut unique_queries = 0;
+
+            for query in request.queries.iter().cloned() {
+                if let Some(&reused_from) = seen.get(&query) {
+                    entries.push(WorkspaceSymbolBatchEntry {
+                        query,
+                        result: None,
+                        reused_from: Some(reused_from),
+                        skipped_by_budget: false,
+                    });
+                    continue;
                 }
-                _ => {
+
+                let entry_index = entries.len();
+                seen.insert(query.clone(), entry_index);
+                unique_queries += 1;
+                let cache_key = format!(
+                    "{}\0{}\0{:?}\0{}\0{:?}\0{:?}",
+                    snapshot_identity,
+                    query,
+                    request.kind_filter,
+                    request.include_generated,
+                    request.match_mode,
+                    request.scope,
+                );
+                let cached = self
+                    .workspace_symbol_results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&cache_key)
+                    .cloned();
+                let result = if let Some(result) = cached {
+                    cache_hit = true;
+                    result
+                } else {
                     let result = self
-                        .workspace_symbol(
+                        .workspace_symbol_complete(
                             query.clone(),
                             request.kind_filter.clone(),
-                            limit,
                             request.match_mode,
                             request.scope,
                             request.include_generated,
                         )
                         .await?;
-                    batch.provider_requests += 1;
+                    provider_requests += 1;
                     self.workspace_symbol_results
                         .lock()
-                        .expect("workspace-symbol cache lock poisoned")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(cache_key, result.clone());
                     result
-                }
-            };
-            batch.returned += result.returned;
-            batch.truncated |= result.truncated;
-            batch.entries.push(WorkspaceSymbolBatchEntry {
-                query,
-                result: Some(result),
-                reused_from: None,
-                skipped_by_budget: false,
-            });
-            trim_workspace_symbol_batch(&mut batch);
-        }
+                };
+                entries.push(WorkspaceSymbolBatchEntry {
+                    query,
+                    result: Some(result),
+                    reused_from: None,
+                    skipped_by_budget: false,
+                });
+            }
 
-        Ok(batch)
+            let state = WorkspaceSymbolBatchPageState {
+                entries,
+                unique_queries,
+                provider_requests,
+                snapshot_identity,
+                cache_hit,
+                filter_identity,
+            };
+            let value = serde_json::to_value(&state)
+                .map_err(|error| format!("failed to store workspace-symbol batch: {error}"))?;
+            let reference = self
+                .deferred_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_scoped_kind(
+                    value,
+                    state.snapshot_identity.clone(),
+                    scope,
+                    "workspace_symbol_batch_page",
+                );
+            let token = reference
+                .uri
+                .strip_prefix("mcpls-deferred:///")
+                .ok_or_else(|| "workspace-symbol batch cursor has an invalid URI".to_owned())?
+                .to_owned();
+            (state, token, 0, 0)
+        };
+
+        bounded_workspace_symbol_batch_page(
+            &state,
+            &token,
+            entry_offset,
+            symbol_offset,
+            request.max_items,
+            request.max_bytes,
+        )
     }
 
     #[allow(clippy::too_many_lines)]

@@ -1106,6 +1106,8 @@ pub struct WorkspaceSymbolBatchRequest {
     pub max_items: usize,
     /// Maximum serialized bytes returned for the complete batch.
     pub max_bytes: usize,
+    /// Opaque cursor returned by a prior batch page.
+    pub page_token: Option<String>,
 }
 
 /// One caller-ordered workspace-symbol batch entry.
@@ -1138,6 +1140,13 @@ pub struct WorkspaceSymbolBatchResult {
     pub cache_hit: bool,
     /// Number of symbol payloads returned across unique queries.
     pub returned: usize,
+    /// Number of caller queries represented on this page.
+    pub returned_queries: usize,
+    /// Number of caller queries remaining after this page.
+    pub remaining_queries: usize,
+    /// Opaque cursor for the next batch page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     /// Whether an item or byte budget omitted provider work or symbol payloads.
     pub truncated: bool,
     /// Serialized-byte budget applied to this response.

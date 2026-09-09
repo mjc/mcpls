@@ -1169,6 +1169,7 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
             include_generated: false,
             max_items: 10,
             max_bytes: 16 * 1024,
+            page_token: None,
         })
         .await
         .unwrap();
@@ -1190,6 +1191,7 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
             include_generated: false,
             max_items: 10,
             max_bytes: 16 * 1024,
+            page_token: None,
         })
         .await
         .unwrap();
@@ -1208,6 +1210,7 @@ async fn workspace_symbol_batch_deduplicates_queries_inside_one_actor_request() 
             include_generated: false,
             max_items: 10,
             max_bytes: 16 * 1024,
+            page_token: None,
         })
         .await
         .unwrap();
@@ -1771,7 +1774,10 @@ async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls(
             let Some(id) = message.get("id") else {
                 continue;
             };
-            let query = message["params"]["query"].as_str().unwrap().to_owned();
+            let Some(query) = message["params"]["query"].as_str() else {
+                panic!("unexpected fake-LSP request: {message}");
+            };
+            let query = query.to_owned();
             write_response(
                 &mut read_half_stdin,
                 id,
@@ -1811,6 +1817,7 @@ async fn workspace_symbol_batches_reuse_143_query_provider_results_across_calls(
                 include_generated: false,
                 max_items: 1_000,
                 max_bytes: 64 * 1024,
+                page_token: None,
             })
             .await
             .unwrap();
@@ -1850,7 +1857,7 @@ async fn workspace_symbol_batches_cache_truncated_results_for_the_same_limit() {
         let _processes = (_write_half, _read_half);
         let mut reader = BufReader::new(&mut write_stdout);
         let mut queries = Vec::new();
-        while queries.len() < 2 {
+        while queries.is_empty() {
             let message = read_framed_message(&mut reader).await;
             let Some(id) = message.get("id") else {
                 continue;
@@ -1898,11 +1905,24 @@ async fn workspace_symbol_batches_cache_truncated_results_for_the_same_limit() {
         include_generated: false,
         max_items,
         max_bytes: 16 * 1024,
+        page_token: None,
     };
 
     let first = actor.workspace_symbol_batch(request(1)).await.unwrap();
     assert_eq!(first.provider_requests, 1);
     assert!(first.truncated);
+    let second = actor
+        .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
+            queries: Vec::new(),
+            page_token: first.next_cursor.clone(),
+            ..request(1)
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.provider_requests, first.provider_requests);
+    assert_eq!(second.returned, 1);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(second.entries[0].result.as_ref().unwrap().symbols.len(), 1);
 
     let repeated = actor.workspace_symbol_batch(request(1)).await.unwrap();
     assert_eq!(repeated.provider_requests, 0);
@@ -1910,11 +1930,11 @@ async fn workspace_symbol_batches_cache_truncated_results_for_the_same_limit() {
     assert!(repeated.truncated);
 
     let larger = actor.workspace_symbol_batch(request(2)).await.unwrap();
-    assert_eq!(larger.provider_requests, 1);
+    assert_eq!(larger.provider_requests, 0);
     assert_eq!(larger.returned, 2);
     assert!(!larger.truncated);
     release_responder.send(()).unwrap();
-    assert_eq!(responder.await.unwrap().len(), 2);
+    assert_eq!(responder.await.unwrap().len(), 1);
 }
 
 #[tokio::test]

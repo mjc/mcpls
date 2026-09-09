@@ -507,6 +507,9 @@ pub struct WorkspaceSymbolBatchParams {
     /// Maximum serialized response bytes.
     #[serde(default = "default_workspace_symbol_batch_bytes")]
     pub max_bytes: usize,
+    /// Opaque cursor returned by a prior batch page; omit queries when continuing.
+    #[serde(default)]
+    pub page_token: Option<String>,
     /// Include symbols under generated/build-output directories.
     #[serde(default)]
     pub include_generated: bool,

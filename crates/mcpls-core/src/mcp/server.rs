@@ -443,7 +443,7 @@ where
 }
 
 fn validate_workspace_symbol_batch(params: &WorkspaceSymbolBatchParams) -> Result<(), McpError> {
-    if params.queries.is_empty() || params.queries.len() > 32 {
+    if (params.queries.is_empty() && params.page_token.is_none()) || params.queries.len() > 32 {
         return Err(McpError::invalid_params(
             "queries must contain between 1 and 32 entries",
             None,
@@ -4210,7 +4210,7 @@ impl McplsServer {
     /// Search one symbol query or several queries across the workspace.
     #[tool(
         output_schema = rmcp::handler::server::tool::schema_for_output::<WorkspaceSymbolSearchResponse>(),
-        description = "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; results have bounded source frames and reusable symbol handles."
+        description = "Search one query (query) or several caller-ordered queries (queries). Batch duplicates reuse provider work; use page_token with queries omitted to continue a bounded batch page. Results have bounded source frames and reusable symbol handles."
     )]
     async fn workspace_symbol_search(
         &self,
@@ -4222,6 +4222,23 @@ impl McplsServer {
                 None,
             ));
         }
+        if params.page_token.is_some() && params.query.is_none() {
+            return encode_tool_result(
+                self.workspace_symbol_batch_result(WorkspaceSymbolBatchParams {
+                    project_id: params.project_id,
+                    queries: Vec::new(),
+                    kind_filter: params.kind_filter,
+                    match_mode: params.match_mode,
+                    scope: params.scope,
+                    max_items: params.limit,
+                    max_bytes: params.max_bytes,
+                    page_token: params.page_token,
+                    include_generated: params.include_generated,
+                })
+                .await
+                .map(|result| WorkspaceSymbolSearchResponse::Many(Box::new(result))),
+            );
+        }
         if params.queries.len() > 1 {
             let batch = WorkspaceSymbolBatchParams {
                 project_id: params.project_id,
@@ -4231,6 +4248,7 @@ impl McplsServer {
                 scope: params.scope,
                 max_items: params.limit,
                 max_bytes: params.max_bytes,
+                page_token: None,
                 include_generated: params.include_generated,
             };
             return encode_tool_result(
@@ -4298,6 +4316,7 @@ impl McplsServer {
                 include_generated: params.include_generated,
                 max_items: params.max_items as usize,
                 max_bytes: params.max_bytes,
+                page_token: params.page_token,
             })
             .await
             .map_err(|error| error.to_string())
