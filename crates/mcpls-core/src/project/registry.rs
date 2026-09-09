@@ -30,7 +30,7 @@ pub enum ProjectRegistryError {
     /// A different project already owns this canonical root.
     #[error("project root is already registered: {0}")]
     DuplicateRoot(PathBuf),
-    /// A compatible linked worktree must use its logical project's stable ID.
+    /// A linked worktree must use its logical project's stable ID.
     #[error(
         "linked worktree {requested_root} belongs to logical project {existing_id}; use that project ID"
     )]
@@ -385,18 +385,6 @@ impl ProjectEntry {
                 actor.compatibility == ProjectCompatibility::Resolved(Some(compatibility_key))
             })
             .map(|actor| (actor.actor.clone(), actor.mutation.clone()))
-    }
-
-    pub(super) fn has_compatible_actor(
-        &self,
-        compatibility_key: Option<ProjectCompatibilityKey>,
-    ) -> bool {
-        let Some(compatibility_key) = compatibility_key else {
-            return false;
-        };
-        self.actors.iter().any(|actor| {
-            actor.compatibility == ProjectCompatibility::Resolved(Some(compatibility_key))
-        })
     }
 
     pub(super) fn status(&self) -> ProjectStatus {
@@ -1083,7 +1071,7 @@ impl ProjectRegistry {
             ));
         }
 
-        if let Some(existing) = compatible_project(&projects, &identity, compatibility_key) {
+        if let Some(existing) = repository_project(&projects, &identity) {
             return Err(ProjectRegistryError::LinkedWorktreeProject {
                 existing_id: existing.identity.id().clone(),
                 requested_root: identity.root().as_path().to_path_buf(),
@@ -2793,17 +2781,14 @@ pub(super) fn shutdown_actor_groups(
     (stopped, actors)
 }
 
-pub(super) fn compatible_project<'a>(
+pub(super) fn repository_project<'a>(
     projects: &'a HashMap<ProjectId, ProjectEntry>,
     identity: &ProjectIdentity,
-    compatibility_key: Option<ProjectCompatibilityKey>,
 ) -> Option<&'a ProjectEntry> {
     let repository = identity.repository_identity()?;
-    let compatibility_key = compatibility_key?;
-    projects.values().find(|project| {
-        project.identity.repository_identity() == Some(repository)
-            && project.has_compatible_actor(Some(compatibility_key))
-    })
+    projects
+        .values()
+        .find(|project| project.identity.repository_identity() == Some(repository))
 }
 
 pub(super) fn translator_templates_match(

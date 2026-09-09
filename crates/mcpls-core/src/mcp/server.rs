@@ -9465,6 +9465,60 @@ finally:
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_add_shares_worktree_when_compatibility_is_unknown() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+
+        let server = create_test_server();
+        let repository_identity = GitRepositoryIdentity::discover(repository.path())
+            .unwrap()
+            .unwrap();
+        server
+            .context
+            .project_registry
+            .add(
+                ProjectIdentity::new(
+                    ProjectId::new("default").unwrap(),
+                    CanonicalRoot::new(repository.path()).unwrap(),
+                )
+                .with_repository_identity(repository_identity),
+            )
+            .await
+            .unwrap();
+
+        let added = server
+            .project_add(project_add_params("ignored", worktree.path()))
+            .await
+            .unwrap();
+        let added: serde_json::Value = serde_json::from_str(&added).unwrap();
+
+        assert_eq!(added["project_id"], "default");
+        let listed: serde_json::Value = serde_json::from_str(
+            &server
+                .project_list(Parameters(ProjectListParams::default()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["projects"][0]["roots"].as_array().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn project_add_is_idempotent_for_an_already_registered_root() {
         let root = TempDir::new().unwrap();
