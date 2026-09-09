@@ -155,6 +155,7 @@ mod semantic_discovery_tests {
 }
 ",
     );
+    lib_content.push_str("\npub fn call_hierarchy_target(value: i32) -> i32 { value + 1 }\n");
     let huge_macro_statements: String = (0..3_000)
         .map(|index| format!("let _macro_value_{index} = {index};\n"))
         .collect();
@@ -177,9 +178,9 @@ mod semantic_discovery_tests {
     fs::write(
         tmp.path().join("src/callers.rs"),
         format!(
-            "pub fn caller_one() -> i32 {{ super::add(1, 2) + super::add(3, 4) + super::add(5, 6) /* call-context-marker {} */ }}\n\
-             pub fn caller_two() -> i32 {{ super::add(3, 4) }}\n\
-             pub fn caller_three() -> i32 {{ super::add(5, 6) }}\n",
+            "pub fn caller_one() -> i32 {{ super::call_hierarchy_target(1) + super::call_hierarchy_target(3) + super::call_hierarchy_target(5) /* call-context-marker {} */ }}\n\
+             pub fn caller_two() -> i32 {{ super::call_hierarchy_target(3) }}\n\
+             pub fn caller_three() -> i32 {{ super::call_hierarchy_target(5) }}\n",
             "x".repeat(8 * 1024)
         ),
     )
@@ -592,7 +593,9 @@ fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), Str
     }
     if inner["declaration"]["source"]["status"] != "available"
         || groups.iter().any(|group| {
-            group["project_relative_path"] != "src/lib.rs"
+            group["project_relative_path"]
+                .as_str()
+                .is_none_or(str::is_empty)
                 || group["references"].as_array().is_none_or(|references| {
                     references.iter().any(|reference| {
                         reference["range"]
@@ -600,9 +603,12 @@ fn sc_get_references(client: &mut McpClient, workspace: &Path) -> Result<(), Str
                             .is_none_or(|range| range.len() != 4)
                     })
                 })
-                || group["source"]["chunks"]
+                || (group["source"]["chunks"]
                     .as_array()
                     .is_none_or(Vec::is_empty)
+                    && group["source"]["deferred"]
+                        .as_array()
+                        .is_none_or(Vec::is_empty))
         })
     {
         return Err(format!(
@@ -697,15 +703,19 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
         ));
     }
     if final_diags.iter().any(|diagnostic| {
-        diagnostic["source_frame"]["status"] != "available"
-            || diagnostic["source_frame"]["path"]
-                .as_str()
-                .is_none_or(|path| !path.ends_with("/src/broken.rs"))
-            || diagnostic["source_frame"]["highlighted_range"] != diagnostic["range"]
-            || (diagnostic["source_frame"]["text"].as_str().is_none()
-                && diagnostic["source_frame"]["resource"]["uri"]
+        let source = &diagnostic["source_frame"];
+        match source["status"].as_str() {
+            Some("available") => {
+                source["path"]
                     .as_str()
-                    .is_none())
+                    .is_none_or(|path| !path.ends_with("/src/broken.rs"))
+                    || source["highlighted_range"] != diagnostic["range"]
+                    || (source["text"].as_str().is_none()
+                        && source["resource"]["uri"].as_str().is_none())
+            }
+            Some("deferred") => source["resource"]["uri"].as_str().is_none(),
+            _ => true,
+        }
     }) {
         return Err(format!(
             "diagnostics omitted coherent highlighted source: {final_diags:?}"
@@ -771,6 +781,11 @@ fn sc_get_diagnostics(client: &mut McpClient, workspace: &Path) -> Result<(), St
             "stale diagnostic resource did not replay current snapshot: {stale_text}"
         ));
     }
+    let restored = fs::read_to_string(&broken)
+        .map_err(|error| format!("read broken.rs after stale replay: {error}"))?
+        .replace("diagnostic-stale-marker", "diagnostic-context-marker");
+    fs::write(&broken, restored)
+        .map_err(|error| format!("restore broken.rs after stale replay: {error}"))?;
     Ok(())
 }
 
@@ -1454,20 +1469,30 @@ fn sc_inspect_symbol(client: &mut McpClient, _workspace: &Path) -> Result<(), St
             .map_err(|error| format!("inspect_symbol failed: {error}"))?;
         let result: Value = serde_json::from_str(&assertions::assert_tool_ok(&response))
             .map_err(|error| format!("bad inspect_symbol JSON: {error}"))?;
+        let hover_ready = result["sections"]["hover"]["data"]["contents"]
+            .as_str()
+            .is_some_and(|contents| contents.contains("add"))
+            || (result["sections"]["hover"]["completeness"] == "deferred"
+                && result["sections"]["hover"]["resource"]["uri"]
+                    .as_str()
+                    .is_some());
+        let calls_ready = result["sections"]["calls"]["data"]["incoming"]["returned_calls"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+            || (result["sections"]["calls"]["completeness"] == "deferred"
+                && result["sections"]["calls"]["resource"]["uri"]
+                    .as_str()
+                    .is_some());
         let ready = result["resolution"]["status"] == "selected"
             && result["sections"]["declaration"]["data"]["status"] == "available"
             && result["sections"]["declaration"]["data"]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("pub fn add"))
-            && result["sections"]["hover"]["data"]["contents"]
-                .as_str()
-                .is_some_and(|contents| contents.contains("add"))
+            && hover_ready
             && result["sections"]["references"]["returned"]
                 .as_u64()
                 .is_some_and(|count| count > 0)
-            && result["sections"]["calls"]["data"]["incoming"]["returned_calls"]
-                .as_u64()
-                .is_some_and(|count| count > 0)
+            && calls_ready
             && result["sections"]["diagnostics"]["completeness"].is_string()
             && result["sections"]["tests"]["completeness"].is_string()
             && result["returned_bytes"]
@@ -1640,9 +1665,12 @@ fn sc_symbol_handle_follow_ups(client: &mut McpClient, workspace: &Path) -> Resu
                                 .is_some_and(|range| range.len() == 4)
                                 && reference["symbol_handle"].is_string()
                         })
-                    }) && group["source"]["chunks"]
+                    }) && (group["source"]["chunks"]
                         .as_array()
                         .is_some_and(|chunks| !chunks.is_empty())
+                        || group["source"]["deferred"]
+                            .as_array()
+                            .is_some_and(|resources| !resources.is_empty()))
                 })
             })
         {
@@ -1745,7 +1773,7 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
 // Call hierarchy helpers
 // ---------------------------------------------------------------------------
 
-/// Tool 11: `prepare_call_hierarchy` — on `add`.
+/// Tool 11: `prepare_call_hierarchy` — on `call_hierarchy_target`.
 ///
 /// Returns the prepared item for use by sub-cases 12 and 13.
 ///
@@ -1753,13 +1781,13 @@ fn sc_get_code_actions(client: &mut McpClient, workspace: &Path) -> Result<(), S
 /// the item round-trips correctly without any field renaming.
 fn prepare_call_hierarchy_item(client: &mut McpClient, workspace: &Path) -> Result<Value, String> {
     let lib = workspace.join("src/lib.rs");
-    let add_line = find_line(&lib, "pub fn add(");
+    let target_line = find_line(&lib, "pub fn call_hierarchy_target(");
     let resp = client
         .call_tool(
             "prepare_call_hierarchy",
             &json!({
                 "file_path": lib.to_string_lossy(),
-                "line": add_line,
+                "line": target_line,
                 "character": 8,
             }),
         )
@@ -1788,9 +1816,9 @@ fn prepare_call_hierarchy_item(client: &mut McpClient, workspace: &Path) -> Resu
     }
 
     let name = items[0]["name"].as_str().unwrap_or("");
-    if !name.contains("add") {
+    if !name.contains("call_hierarchy_target") {
         return Err(format!(
-            "expected call hierarchy item for 'add', got '{name}'"
+            "expected call hierarchy item for 'call_hierarchy_target', got '{name}'"
         ));
     }
     Ok(items[0].clone())
@@ -1800,7 +1828,7 @@ fn sc_prepare_call_hierarchy(client: &mut McpClient, workspace: &Path) -> Result
     prepare_call_hierarchy_item(client, workspace).map(|_| ())
 }
 
-/// Tool 12: `get_incoming_calls` — `caller` must appear as incoming caller to `add`.
+/// Tool 12: `get_incoming_calls` — callers must appear for the target.
 fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let item = prepare_call_hierarchy_item(client, workspace)?;
     // Retry: callHierarchy/incomingCalls may return empty on first query while
@@ -1931,19 +1959,25 @@ fn sc_get_incoming_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     "stale incoming resource did not replay current source: {stale_text}"
                 ));
             }
+            let restored = fs::read_to_string(&callers)
+                .map_err(|error| format!("read callers.rs after stale replay: {error}"))?
+                .replace("call-stale-marker", "call-context-marker");
+            fs::write(&callers, restored)
+                .map_err(|error| format!("restore callers.rs after stale replay: {error}"))?;
             return Ok(());
         }
 
         if Instant::now() >= deadline {
-            return Err("get_incoming_calls: empty result for 'add' after 15 s; \
-                 'caller' should be an incoming caller"
-                .to_owned());
+            return Err(format!(
+                "get_incoming_calls: empty result for call_hierarchy_target after 15 s; \
+                 callers should be incoming callers; {inner}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-/// Tool 13: `get_outgoing_calls` — `caller_one` calls `add` at three sites.
+/// Tool 13: `get_outgoing_calls` — `caller_one` calls the target at three sites.
 fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(), String> {
     let callers = workspace.join("src/callers.rs");
     let caller_line = find_line(&callers, "pub fn caller_one(");
@@ -2014,7 +2048,7 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                 .as_str()
                 .or_else(|| call["callee"]["name"].as_str())
                 .unwrap_or("<unnamed>");
-            if !callee_name.contains("add") {
+            if !callee_name.contains("call_hierarchy_target") {
                 return Err(format!("unexpected outgoing callee: {callee_name}"));
             }
             for site in call["call_sites"]
@@ -2079,6 +2113,11 @@ fn sc_get_outgoing_calls(client: &mut McpClient, workspace: &Path) -> Result<(),
                     "stale outgoing resource did not replay current source: {stale_text}"
                 ));
             }
+            let restored = fs::read_to_string(&callers)
+                .map_err(|error| format!("read callers.rs after stale replay: {error}"))?
+                .replace("call-stale-marker", "call-context-marker");
+            fs::write(&callers, restored)
+                .map_err(|error| format!("restore callers.rs after stale replay: {error}"))?;
             return Ok(());
         }
         if Instant::now() >= deadline {

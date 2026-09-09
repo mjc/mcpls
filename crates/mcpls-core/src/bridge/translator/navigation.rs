@@ -852,7 +852,14 @@ fn compact_reference_group(group: ReferenceLocationGroup) -> ReferenceGroup {
                     document_version: frame.document_version,
                     content_hash: frame.content_hash.clone(),
                 }),
-                SourceContext::Deferred { .. } | SourceContext::Unavailable { .. } => None,
+                SourceContext::Deferred { resource } => {
+                    group.path.clone().map(|path| ReferenceSnapshot {
+                        path,
+                        document_version: resource.document_version,
+                        content_hash: resource.snapshot_hash.clone(),
+                    })
+                }
+                SourceContext::Unavailable { .. } => None,
             };
             ReferenceUse {
                 range: range_tuple(&location.range),
@@ -1331,6 +1338,36 @@ mod tests {
             Some(second_hash.as_str())
         );
         assert_eq!(source.chunks[1].document_version, Some(2));
+    }
+
+    #[test]
+    fn deferred_references_retain_snapshot_for_follow_up_handles() {
+        let mut location = unavailable_location("/workspace/src/lib.rs", 42);
+        location.source = SourceContext::Deferred {
+            resource: DeferredResourceReference {
+                uri: "mcpls-source:///workspace/src/lib.rs?start_line=42".to_owned(),
+                kind: "source_context".to_owned(),
+                snapshot_hash: "deferred-snapshot".to_owned(),
+                document_version: Some(9),
+                total_bytes: Some(8_192),
+            },
+        };
+        let group = compact_reference_group(ReferenceLocationGroup {
+            project_relative_path: "src/lib.rs".to_owned(),
+            uri: location.uri.clone(),
+            path: location.path.clone(),
+            enclosing_symbol: Some("caller".to_owned()),
+            locations: vec![location],
+        });
+
+        let snapshot = group.references[0]
+            .snapshot
+            .as_ref()
+            .expect("deferred references need a snapshot for handles");
+        assert_eq!(snapshot.path, "/workspace/src/lib.rs");
+        assert_eq!(snapshot.content_hash, "deferred-snapshot");
+        assert_eq!(snapshot.document_version, Some(9));
+        assert_eq!(group.source.deferred.len(), 1);
     }
 
     #[test]
