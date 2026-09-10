@@ -114,6 +114,16 @@ pub enum LspNotification {
         /// Progress value.
         value: serde_json::Value,
     },
+    /// The bounded response-pump queue dropped notifications and the consumer
+    /// must refresh any affected semantic state.
+    DeliveryOverflow {
+        /// Kind of the notifications dropped during this overflow episode.
+        notification_kind: &'static str,
+        /// Number of notifications dropped during this overflow episode.
+        dropped_count: usize,
+        /// Whether the dropped notifications can invalidate semantic caches.
+        semantic: bool,
+    },
     /// Unknown or unhandled notification
     Other {
         /// Method name.

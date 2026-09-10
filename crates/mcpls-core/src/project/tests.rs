@@ -4135,6 +4135,51 @@ async fn project_actor_owns_notification_cache_for_server_logs() {
 }
 
 #[tokio::test]
+async fn project_actor_exposes_semantic_notification_overflow_as_retry_state() {
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("src.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let actor = spawn_project_actor_for_root(8, &CanonicalRoot::new(root.path()).unwrap());
+    let mut events = actor.subscribe_events();
+
+    actor
+        .notify(
+            0,
+            ServerId::from("rust"),
+            LspNotification::DeliveryOverflow {
+                notification_kind: "publish_diagnostics",
+                dropped_count: 7,
+                semantic: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        ProjectEvent::NotificationOverflowed {
+            server_id: "rust".to_owned(),
+            notification_kind: "publish_diagnostics".to_owned(),
+            dropped_count: 7,
+            semantic: true,
+        }
+    );
+    let diagnostics = actor
+        .cached_diagnostics(file.display().to_string())
+        .await
+        .unwrap();
+    assert!(
+        diagnostics
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.resync_required)
+    );
+}
+
+#[tokio::test]
 async fn project_actor_publishes_diagnostics_events_for_notifications() {
     let actor = spawn_project_actor(2);
     let mut events = actor.subscribe_events();

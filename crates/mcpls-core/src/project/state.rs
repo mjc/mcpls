@@ -116,6 +116,17 @@ pub enum ProjectEvent {
         /// Number of diagnostics in the replacement set.
         diagnostic_count: usize,
     },
+    /// The bounded LSP notification transport dropped notifications.
+    NotificationOverflowed {
+        /// Language server whose notification stream overflowed.
+        server_id: String,
+        /// Kind of the notifications dropped during the overflow episode.
+        notification_kind: String,
+        /// Number of notifications dropped during the overflow episode.
+        dropped_count: usize,
+        /// Whether the dropped notifications may invalidate semantic caches.
+        semantic: bool,
+    },
     /// Files changed by a completed workspace edit.
     FilesChanged {
         /// Files written, created, renamed, or deleted by the edit.
@@ -174,6 +185,18 @@ impl ProjectEvent {
                 "uri": uri,
                 "version": version,
                 "diagnostic_count": diagnostic_count,
+            }),
+            Self::NotificationOverflowed {
+                server_id,
+                notification_kind,
+                dropped_count,
+                semantic,
+            } => serde_json::json!({
+                "kind": "notification_overflowed",
+                "server_id": server_id,
+                "notification_kind": notification_kind,
+                "dropped_count": dropped_count,
+                "semantic": semantic,
             }),
             Self::FilesChanged { paths } => serde_json::json!({
                 "kind": "files_changed",

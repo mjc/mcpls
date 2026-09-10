@@ -947,9 +947,11 @@ impl Translator {
     ) -> Result<super::DiagnosticsResult> {
         let uri = Self::cached_diagnostics_uri(&self.workspace_roots, file_path)?;
         let entry = self.actor_notification_cache.get_diagnostics(&uri);
+        let resync_required = self.actor_notification_cache.diagnostics_resync_required();
         let cache = Some(entry.map_or_else(
             || super::DiagnosticsCacheMetadata {
                 hit: false,
+                resync_required,
                 age_ms: 0,
                 snapshot_identity: None,
                 document_version: None,
@@ -957,6 +959,7 @@ impl Translator {
             |entry| {
                 super::DiagnosticsCacheMetadata {
                     hit: true,
+                    resync_required,
                     age_ms: (chrono::Utc::now() - entry.received_at)
                         .num_milliseconds()
                         .max(0)

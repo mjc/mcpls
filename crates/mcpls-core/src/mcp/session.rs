@@ -343,7 +343,9 @@ pub fn event_resource_uris(project_id: &ProjectId, event: &ProjectEvent) -> Vec<
         | ProjectEvent::ProjectRemoved { .. } => {
             uris.push(project_status_resource_uri(project_id));
         }
-        ProjectEvent::FilesChanged { .. } | ProjectEvent::EditApplied { .. } => {}
+        ProjectEvent::FilesChanged { .. }
+        | ProjectEvent::EditApplied { .. }
+        | ProjectEvent::NotificationOverflowed { .. } => {}
     }
     uris
 }

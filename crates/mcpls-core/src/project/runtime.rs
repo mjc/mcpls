@@ -6268,6 +6268,23 @@ impl ProjectRuntime {
                 }
                 None
             }
+            LspNotification::DeliveryOverflow {
+                notification_kind,
+                dropped_count,
+                semantic,
+            } => {
+                if semantic {
+                    self.translator
+                        .notification_cache_mut()
+                        .mark_diagnostics_resync_required();
+                }
+                Some(ProjectEvent::NotificationOverflowed {
+                    server_id: server_id.as_str().to_owned(),
+                    notification_kind: notification_kind.to_owned(),
+                    dropped_count,
+                    semantic,
+                })
+            }
             LspNotification::Other { .. } => None,
         }
     }

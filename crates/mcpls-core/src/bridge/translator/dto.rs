@@ -563,6 +563,10 @@ pub struct DiagnosticsResult {
 pub struct DiagnosticsCacheMetadata {
     /// Whether cached diagnostics were returned instead of fresh analysis.
     pub hit: bool,
+    /// Whether the cached snapshot may be incomplete and must be refreshed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schemars(default)]
+    pub resync_required: bool,
     /// Age of the cached notification when this result was read; zero on a miss.
     pub age_ms: u64,
     /// Opaque identity of the cached diagnostics publication, when one exists.

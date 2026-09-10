@@ -4062,6 +4062,10 @@
               "description": "Whether cached diagnostics were returned instead of fresh analysis.",
               "type": "boolean"
             },
+            "resync_required": {
+              "description": "Whether the cached snapshot may be incomplete and must be refreshed.",
+              "type": "boolean"
+            },
             "snapshot_identity": {
               "description": "Opaque identity of the cached diagnostics publication, when one exists.",
               "type": [
@@ -7616,6 +7620,10 @@
             },
             "hit": {
               "description": "Whether cached diagnostics were returned instead of fresh analysis.",
+              "type": "boolean"
+            },
+            "resync_required": {
+              "description": "Whether the cached snapshot may be incomplete and must be refreshed.",
               "type": "boolean"
             },
             "snapshot_identity": {
@@ -14583,6 +14591,10 @@
               "description": "Whether cached diagnostics were returned instead of fresh analysis.",
               "type": "boolean"
             },
+            "resync_required": {
+              "description": "Whether the cached snapshot may be incomplete and must be refreshed.",
+              "type": "boolean"
+            },
             "snapshot_identity": {
               "description": "Opaque identity of the cached diagnostics publication, when one exists.",
               "type": [
@@ -17624,6 +17636,10 @@
             },
             "hit": {
               "description": "Whether cached diagnostics were returned instead of fresh analysis.",
+              "type": "boolean"
+            },
+            "resync_required": {
+              "description": "Whether the cached snapshot may be incomplete and must be refreshed.",
               "type": "boolean"
             },
             "snapshot_identity": {

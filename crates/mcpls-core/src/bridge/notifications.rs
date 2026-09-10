@@ -658,6 +658,9 @@ impl From<lsp_types::MessageType> for MessageType {
 pub struct NotificationCache {
     /// Diagnostics indexed by document URI.
     diagnostics: HashMap<String, DiagnosticInfo>,
+    /// Whether notification delivery dropped semantic updates since the last
+    /// explicit cache resynchronization.
+    diagnostics_resync_required: bool,
     /// Server that currently owns each cached URI, so an entry's order map
     /// can be found without scanning every server's.
     diagnostics_owners: HashMap<String, ServerId>,
@@ -705,6 +708,7 @@ impl NotificationCache {
     pub fn new() -> Self {
         Self {
             diagnostics: HashMap::with_capacity(32),
+            diagnostics_resync_required: false,
             diagnostics_owners: HashMap::with_capacity(32),
             diagnostic_order: HashMap::new(),
             diagnostic_seq: HashMap::with_capacity(32),
@@ -964,6 +968,19 @@ impl NotificationCache {
     #[must_use]
     pub fn get_diagnostics(&self, uri: &str) -> Option<&DiagnosticInfo> {
         self.diagnostics.get(uri_cache_key(uri).as_ref())
+    }
+
+    /// Return whether cached diagnostics may be incomplete because semantic
+    /// notification delivery overflowed.
+    #[must_use]
+    pub const fn diagnostics_resync_required(&self) -> bool {
+        self.diagnostics_resync_required
+    }
+
+    /// Mark cached diagnostics as requiring a fresh read after semantic
+    /// notifications were dropped by the bounded response-pump queue.
+    pub const fn mark_diagnostics_resync_required(&mut self) {
+        self.diagnostics_resync_required = true;
     }
 
     /// Server that published the currently cached diagnostics for `uri`, if

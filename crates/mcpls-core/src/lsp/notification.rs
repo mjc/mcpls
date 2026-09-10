@@ -23,6 +23,7 @@ struct PendingNotifications {
     capacity: usize,
     dropped: usize,
     overflow_kind: Option<&'static str>,
+    dropped_semantic: bool,
 }
 
 impl NonBlockingNotificationSink {
@@ -36,6 +37,7 @@ impl NonBlockingNotificationSink {
                 capacity,
                 dropped: 0,
                 overflow_kind: None,
+                dropped_semantic: false,
             })),
         }
     }
@@ -66,6 +68,8 @@ impl NonBlockingNotificationSink {
                 pending.queue.push_back(notification);
                 None
             } else {
+                pending.dropped_semantic |=
+                    matches!(&notification, LspNotification::PublishDiagnostics(_));
                 pending.dropped = pending.dropped.saturating_add(1);
                 let kind = pending
                     .overflow_kind
@@ -92,46 +96,79 @@ impl NonBlockingNotificationSink {
         }
 
         if should_drain {
-            let tx = self.best_effort_tx.clone();
-            let pending = Arc::clone(&self.pending);
-            tokio::spawn(async move {
-                loop {
-                    let (next, completed_drops, queue_capacity) =
-                        pending.lock().map_or((None, 0, 0), |mut state| {
-                            let next = state.queue.pop_front();
-                            if next.is_none() {
-                                let completed_drops = state.dropped;
-                                state.dropped = 0;
-                                state.overflow_kind = None;
-                                state.draining = false;
-                                (next, completed_drops, state.capacity)
-                            } else {
-                                (next, 0, state.capacity)
-                            }
+            spawn_notification_drain(self.best_effort_tx.clone(), Arc::clone(&self.pending));
+        }
+    }
+}
+
+fn spawn_notification_drain(
+    tx: mpsc::Sender<LspNotification>,
+    pending: Arc<Mutex<PendingNotifications>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let (next, completed_overflow, queue_capacity) =
+                pending.lock().map_or((None, None, 0), |mut state| {
+                    let next = state.queue.pop_front();
+                    if next.is_none() {
+                        let completed_overflow = (state.dropped > 0).then(|| {
+                            (
+                                state.overflow_kind.unwrap_or("unknown"),
+                                state.dropped,
+                                state.dropped_semantic,
+                            )
                         });
-                    let Some(notification) = next else {
-                        if completed_drops > 1 {
-                            warn!(
-                                queue_capacity,
-                                dropped_count = completed_drops,
-                                "Notification queue overflow episode complete"
-                            );
-                        }
-                        break;
-                    };
-                    if tx.send(notification).await.is_err() {
-                        warn!("Notification channel closed; clearing pending notifications");
-                        if let Ok(mut state) = pending.lock() {
-                            state.queue.clear();
-                            state.dropped = 0;
-                            state.overflow_kind = None;
+                        state.dropped = 0;
+                        state.overflow_kind = None;
+                        state.dropped_semantic = false;
+                        if completed_overflow.is_none() {
                             state.draining = false;
                         }
-                        break;
+                        (next, completed_overflow, state.capacity)
+                    } else {
+                        (next, None, state.capacity)
                     }
+                });
+            let Some(notification) = next else {
+                let Some((notification_kind, dropped_count, semantic)) = completed_overflow else {
+                    break;
+                };
+                if dropped_count > 1 {
+                    warn!(
+                        queue_capacity,
+                        dropped_count, "Notification queue overflow episode complete"
+                    );
                 }
-            });
+                if tx
+                    .send(LspNotification::DeliveryOverflow {
+                        notification_kind,
+                        dropped_count,
+                        semantic,
+                    })
+                    .await
+                    .is_err()
+                {
+                    clear_pending_after_close(&pending);
+                    break;
+                }
+                continue;
+            };
+            if tx.send(notification).await.is_err() {
+                clear_pending_after_close(&pending);
+                break;
+            }
         }
+    });
+}
+
+fn clear_pending_after_close(pending: &Mutex<PendingNotifications>) {
+    warn!("Notification channel closed; clearing pending notifications");
+    if let Ok(mut state) = pending.lock() {
+        state.queue.clear();
+        state.dropped = 0;
+        state.overflow_kind = None;
+        state.dropped_semantic = false;
+        state.draining = false;
     }
 }
 
@@ -159,6 +196,7 @@ const fn notification_kind(notification: &LspNotification) -> &'static str {
         LspNotification::ShowMessage(_) => "show_message",
         LspNotification::ServerStatus(_) => "server_status",
         LspNotification::Progress { .. } => "progress",
+        LspNotification::DeliveryOverflow { .. } => "delivery_overflow",
         LspNotification::Other { .. } => "other",
     }
 }
@@ -245,5 +283,41 @@ mod tests {
         assert!(pending.queue.len() <= pending.capacity);
         assert!(pending.dropped > 0);
         assert_eq!(pending.overflow_kind, Some("log_message"));
+    }
+
+    #[tokio::test]
+    async fn semantic_overflow_emits_a_retry_signal_after_queued_notifications() {
+        let (sink, mut receiver) = non_blocking_notification_channel(1);
+
+        for index in 0..3 {
+            sink.forward(LspNotification::PublishDiagnostics(
+                lsp_types::PublishDiagnosticsParams {
+                    uri: format!("file:///workspace/{index}.rs").parse().unwrap(),
+                    version: Some(1),
+                    diagnostics: Vec::new(),
+                },
+            ));
+        }
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(LspNotification::PublishDiagnostics(_))
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(LspNotification::PublishDiagnostics(_))
+        ));
+        let overflow = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("overflow signal must be delivered")
+            .expect("notification channel must remain open");
+        assert!(matches!(
+            overflow,
+            LspNotification::DeliveryOverflow {
+                notification_kind: "publish_diagnostics",
+                dropped_count: 1,
+                semantic: true,
+            }
+        ));
     }
 }
