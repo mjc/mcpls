@@ -390,6 +390,8 @@ fn search_sync(
     if languages.is_empty() {
         return Vec::new();
     }
+    let max_paths_per_language = MAX_SCANNED_FILES.div_ceil(languages.len());
+    let mut path_counts = vec![0; languages.len()];
 
     let query = query.to_ascii_lowercase();
     let started = Instant::now();
@@ -403,7 +405,9 @@ fn search_sync(
         {
             if cancelled.load(Ordering::Relaxed)
                 || started.elapsed() >= MAX_SCAN_DURATION
-                || paths.len() >= MAX_SCANNED_FILES
+                || path_counts
+                    .iter()
+                    .all(|count| *count >= max_paths_per_language)
             {
                 break;
             }
@@ -416,17 +420,24 @@ fn search_sync(
             let Ok(path) = fs::canonicalize(entry.path()) else {
                 continue;
             };
-            if languages
+            let Some(language_index) = languages
                 .iter()
-                .all(|language| SupportLang::from_path(&path) != Some(*language))
-            {
+                .position(|language| SupportLang::from_path(&path) == Some(*language))
+            else {
+                continue;
+            };
+            if path_counts[language_index] >= max_paths_per_language {
                 continue;
             }
-            paths.insert(path);
+            if paths.insert(path) {
+                path_counts[language_index] += 1;
+            }
         }
         if cancelled.load(Ordering::Relaxed)
             || started.elapsed() >= MAX_SCAN_DURATION
-            || paths.len() >= MAX_SCANNED_FILES
+            || path_counts
+                .iter()
+                .all(|count| *count >= max_paths_per_language)
         {
             break;
         }
@@ -727,6 +738,55 @@ mod tests {
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "reexported_create_repo");
+    }
+
+    #[test]
+    fn extracts_swift_symbols_with_access_control_and_inheritance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("MusicProviderAdapters.swift");
+        fs::write(
+            &path,
+            "public final class SpotifyProviderAdapter: NSObject {\n    public static let providerURL = URL(string: \"spotify://\")!\n}\n",
+        )
+        .unwrap();
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["swift".to_owned()],
+            "SpotifyProviderAdapter",
+            None,
+            10,
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "SpotifyProviderAdapter");
+        assert_eq!(symbols[0].kind, "class");
+    }
+
+    #[test]
+    fn extracts_swift_symbols_inside_conditional_compilation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("MusicProviderAdapters.swift");
+        fs::write(
+            &path,
+            "import Foundation\n#if canImport(SpotifyiOS) && os(iOS)\n@MainActor\npublic final class SpotifyProviderAdapter: NSObject {\n    public static let providerURL = URL(string: \"spotify://\")!\n}\n#endif\n",
+        )
+        .unwrap();
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["swift".to_owned()],
+            "SpotifyProviderAdapter",
+            None,
+            10,
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "SpotifyProviderAdapter");
     }
 
     #[test]

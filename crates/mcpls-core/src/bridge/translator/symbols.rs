@@ -1558,7 +1558,10 @@ mod tests {
             ..lsp_types::ServerCapabilities::default()
         };
         let mut translator = Translator::new()
-            .with_extensions(HashMap::from([("swift".to_owned(), "swift".to_owned())]))
+            .with_extensions(HashMap::from([
+                ("rs".to_owned(), "rust".to_owned()),
+                ("swift".to_owned(), "swift".to_owned()),
+            ]))
             .with_router(ToolRouter::catch_all([(
                 server_id.clone(),
                 "swift".to_owned(),
