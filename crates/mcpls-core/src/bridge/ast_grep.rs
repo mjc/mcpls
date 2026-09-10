@@ -395,6 +395,7 @@ fn search_sync(
     let mut byte_counts = vec![0_u64; languages.len()];
     let mut query_file_counts = vec![0; languages.len()];
     let mut symbol_counts = vec![0; languages.len()];
+    let mut class_names = Vec::new();
 
     let query = query.to_ascii_lowercase();
     let started = Instant::now();
@@ -493,6 +494,9 @@ fn search_sync(
                 let Some(kind) = symbol_kind(&node) else {
                     continue;
                 };
+                if kind == "class" && class_names.len() < 64 {
+                    class_names.push(symbol_name(&node));
+                }
                 if kind_filter.is_some_and(|filter| !kind.eq_ignore_ascii_case(filter)) {
                     continue;
                 }
@@ -535,6 +539,7 @@ fn search_sync(
         byte_counts = ?byte_counts,
         query_file_counts = ?query_file_counts,
         symbol_counts = ?symbol_counts,
+        class_names = ?class_names,
         "AST workspace scan completed"
     );
     symbols
