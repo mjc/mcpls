@@ -915,7 +915,6 @@ impl Translator {
         }
 
         let mut candidates = Vec::new();
-        let mut provider_returned_symbols = false;
         let responses =
             futures::future::join_all(clients.into_iter().map(|(server_id, client)| {
                 let params = LspWorkspaceSymbolParams {
@@ -945,7 +944,6 @@ impl Translator {
             };
             let ctx = self.encoding_ctx(&server_id);
             for sym in response.unwrap_or_default() {
-                provider_returned_symbols = true;
                 if path.is_some_and(|path| uri_to_path(&sym.location.uri).as_deref() != Some(path))
                 {
                     continue;
@@ -987,10 +985,10 @@ impl Translator {
             }
         }
 
-        if !provider_returned_symbols {
+        if candidates.is_empty() {
             tracing::debug!(
                 query,
-                "workspace-symbol providers returned no symbols; using bounded AST fallback"
+                "workspace-symbol providers returned no usable matches; using bounded AST fallback"
             );
             return fallback().await;
         }
