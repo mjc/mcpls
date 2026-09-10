@@ -12,7 +12,7 @@ use super::dto::{
 };
 use super::encoding_ctx::EncodingCtx;
 use crate::bridge::{ast_grep, lock_std, path_to_uri, uri_to_path};
-use crate::config::ToolKind;
+use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 
 fn workspace_symbol_match(
@@ -705,6 +705,27 @@ impl Translator {
         Ok(result)
     }
 
+    fn workspace_symbol_fallback_languages(
+        &self,
+        routed_servers: Option<&[ServerId]>,
+    ) -> Vec<String> {
+        let configs = lock_std(&self.project_lsp_configs);
+        let mut languages = configs
+            .iter()
+            .filter(|config| {
+                routed_servers
+                    .is_none_or(|servers| servers.iter().any(|server| *server == config.id()))
+            })
+            .map(|config| config.language_id.clone())
+            .collect::<Vec<_>>();
+        if languages.is_empty() {
+            languages.extend(self.extension_map.values().cloned());
+        }
+        languages.sort_unstable();
+        languages.dedup();
+        languages
+    }
+
     /// Handle workspace symbol search.
     ///
     /// # Errors
@@ -841,40 +862,38 @@ impl Translator {
             });
         }
 
-        let fallback = || async {
-            let mut languages = lock_std(&self.project_lsp_configs)
-                .iter()
-                .map(|config| config.language_id.clone())
-                .chain(self.extension_map.values().cloned())
-                .collect::<Vec<_>>();
-            languages.sort_unstable();
-            languages.dedup();
-            let path_root = path.map(|path| vec![path.to_path_buf()]);
-            let roots = path_root
-                .as_deref()
-                .unwrap_or(self.workspace_roots.as_slice());
-            let result = self
-                .ast_grep_workspace_symbols(
-                    roots,
-                    &languages,
-                    &query,
-                    kind_filter.as_deref(),
-                    limit.map_or(usize::MAX, |limit| limit as usize),
-                    match_mode,
-                    include_generated,
-                    source_bytes,
-                )
-                .await;
-            tracing::info!(
-                query = %query,
-                languages = ?languages,
-                root_count = roots.len(),
-                total = result.total,
-                returned = result.returned,
-                truncated = result.truncated,
-                "workspace-symbol AST fallback completed"
+        let fallback = |routed_servers: Option<Vec<ServerId>>| {
+            let languages = self.workspace_symbol_fallback_languages(routed_servers.as_deref());
+            let roots = path.map_or_else(
+                || self.workspace_roots.to_vec(),
+                |path| vec![path.to_path_buf()],
             );
-            Ok(result)
+            let query = query.clone();
+            let kind_filter = kind_filter.clone();
+            async move {
+                let result = self
+                    .ast_grep_workspace_symbols(
+                        &roots,
+                        &languages,
+                        &query,
+                        kind_filter.as_deref(),
+                        limit.map_or(usize::MAX, |limit| limit as usize),
+                        match_mode,
+                        include_generated,
+                        source_bytes,
+                    )
+                    .await;
+                tracing::info!(
+                    query = %query,
+                    languages = ?languages,
+                    root_count = roots.len(),
+                    total = result.total,
+                    returned = result.returned,
+                    truncated = result.truncated,
+                    "workspace-symbol AST fallback completed"
+                );
+                Ok(result)
+            }
         };
 
         // Workspace search has no document, so query every language route.
@@ -883,14 +902,16 @@ impl Translator {
             Ok(server_ids) => server_ids,
             Err(reason) => {
                 tracing::debug!(?reason, "using AST workspace-symbol fallback");
-                return fallback().await;
+                return fallback(None).await;
             }
         };
         let mut clients = Vec::with_capacity(server_ids.len());
-        for server_id in server_ids {
+        for server_id in &server_ids {
             if lock_std(&self.expected_servers).contains(&server_id) {
                 tracing::debug!(%server_id, "workspace-symbol server still initializing");
-                return Err(Error::ServerInitializing { server_id });
+                return Err(Error::ServerInitializing {
+                    server_id: server_id.clone(),
+                });
             }
             if let Err(error) = self.respawn_if_dead(&server_id).await {
                 if is_invalid_utf8_error(&error) {
@@ -898,13 +919,13 @@ impl Translator {
                         %server_id,
                         "workspace-symbol provider encountered invalid UTF-8; using bounded AST fallback"
                     );
-                    return fallback().await;
+                    return fallback(Some(server_ids.clone())).await;
                 }
                 return Err(error);
             }
             let Some(client) = lock_std(&self.lsp_clients).get(&server_id).cloned() else {
                 tracing::debug!(%server_id, "workspace-symbol server unavailable; using AST fallback");
-                return fallback().await;
+                return fallback(Some(server_ids.clone())).await;
             };
             if self
                 .require_capability(&server_id, "workspaceSymbolProvider", |caps| {
@@ -919,9 +940,9 @@ impl Translator {
                     %server_id,
                     "workspace-symbol provider does not advertise the capability; using AST fallback"
                 );
-                return fallback().await;
+                return fallback(Some(server_ids.clone())).await;
             }
-            clients.push((server_id, client));
+            clients.push((server_id.clone(), client));
         }
 
         let mut candidates = Vec::new();
@@ -948,7 +969,7 @@ impl Translator {
                         %server_id,
                         "workspace-symbol provider returned invalid UTF-8; using bounded AST fallback"
                     );
-                    return fallback().await;
+                    return fallback(Some(server_ids.clone())).await;
                 }
                 Err(error) => return Err(error),
             };
@@ -1000,7 +1021,7 @@ impl Translator {
                 query,
                 "workspace-symbol providers returned no usable matches; using bounded AST fallback"
             );
-            return fallback().await;
+            return fallback(Some(server_ids.clone())).await;
         }
 
         Ok(finish_workspace_symbols(
@@ -1440,7 +1461,7 @@ mod tests {
         fake_lsp_client, read_framed_message, translator_with_capabilities, write_error_response,
         write_response,
     };
-    use crate::config::{ServerId, ToolRouter};
+    use crate::config::{ServerId, ToolRouter, builtin_server_configs};
     use crate::lsp::LspServer;
     use tempfile::TempDir;
     use tokio::io::BufReader;
@@ -1451,6 +1472,35 @@ mod tests {
         translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
         fs::write(dir.path().join("main.rs"), "fn fallback_target() {}\n").unwrap();
         translator
+    }
+
+    #[test]
+    fn workspace_symbol_fallback_uses_only_routed_languages() {
+        let swift = builtin_server_configs()
+            .into_iter()
+            .find(|config| config.language_id == "swift")
+            .unwrap();
+        let rust = builtin_server_configs()
+            .into_iter()
+            .find(|config| config.language_id == "rust")
+            .unwrap();
+        let swift_id = swift.id();
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([
+                ("python".to_owned(), "python".to_owned()),
+                ("rs".to_owned(), "rust".to_owned()),
+                ("swift".to_owned(), "swift".to_owned()),
+            ]))
+            .with_router(ToolRouter::catch_all([(
+                swift_id.clone(),
+                "swift".to_owned(),
+            )]));
+        translator.set_lsp_configs(vec![swift, rust], None);
+
+        assert_eq!(
+            translator.workspace_symbol_fallback_languages(Some(&[swift_id])),
+            vec!["swift"]
+        );
     }
 
     #[tokio::test]
