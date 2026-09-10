@@ -109,8 +109,14 @@ impl Drop for LspRequestTiming {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         );
         self.span.record("lsp_over_house_budget", over_house_budget);
+        let _entered = self.span.enter();
+        debug!(
+            target: "mcpls::lsp::request",
+            lsp_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            lsp_over_house_budget = over_house_budget,
+            "LSP request completed"
+        );
         if over_house_budget {
-            let _entered = self.span.enter();
             warn!("LSP request exceeded the five-second house budget");
         }
     }
@@ -1103,7 +1109,54 @@ impl LspClient {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use tracing::{Event, Subscriber, field::Visit};
+    use tracing_subscriber::{
+        layer::{Context, Layer},
+        prelude::*,
+        registry::LookupSpan,
+    };
+
     use super::*;
+
+    struct TimingEventCapture(Arc<StdMutex<Vec<Vec<String>>>>);
+
+    struct FieldNames(Vec<String>);
+
+    impl Visit for FieldNames {
+        fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+            self.0.push(field.name().to_owned());
+        }
+    }
+
+    impl<S> Layer<S> for TimingEventCapture
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() == "mcpls::lsp::request" {
+                let mut fields = FieldNames(Vec::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    #[test]
+    fn lsp_request_completion_is_emitted_for_compact_log_consumers() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(TimingEventCapture(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            drop(LspRequestTiming::new("test/request"));
+        });
+
+        assert_eq!(events.lock().unwrap().len(), 1);
+        let fields = &events.lock().unwrap()[0];
+        assert!(fields.iter().any(|name| name == "lsp_ms"));
+        assert!(fields.iter().any(|name| name == "lsp_over_house_budget"));
+    }
 
     #[test]
     fn test_request_id_generation() {
