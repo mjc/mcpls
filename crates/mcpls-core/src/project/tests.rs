@@ -1359,6 +1359,87 @@ async fn workspace_symbol_batch_overlaps_provider_requests() {
 }
 
 #[tokio::test]
+async fn concurrent_workspace_symbol_requests_do_not_serialize_in_the_actor() {
+    use crate::bridge::translator::testing::{
+        FakeServer, read_framed_message, translator_with_capabilities, write_response,
+    };
+
+    let root = TempDir::new().unwrap();
+    let source = root.path().join("symbols.rs");
+    fs::write(&source, "fn symbol() {}\n").unwrap();
+    let capabilities = lsp_types::ServerCapabilities {
+        workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        ..lsp_types::ServerCapabilities::default()
+    };
+    let (translator, server) =
+        translator_with_capabilities(&root, &ServerId::from("rust"), capabilities);
+    let FakeServer {
+        _write_half,
+        _read_half,
+        mut read_half_stdin,
+        mut write_stdout,
+    } = server;
+    let (release_responder, keep_responder_alive) = tokio::sync::oneshot::channel();
+    let responder = tokio::spawn(async move {
+        let _processes = (_write_half, _read_half);
+        let mut reader = BufReader::new(&mut write_stdout);
+        let mut requests = Vec::new();
+        while requests.len() < 2 {
+            let message = read_framed_message(&mut reader).await;
+            if message.get("method").and_then(serde_json::Value::as_str) == Some("workspace/symbol")
+            {
+                requests.push(message);
+            }
+        }
+        for request in requests {
+            write_response(
+                &mut read_half_stdin,
+                &request["id"],
+                serde_json::json!([{
+                    "name": request["params"]["query"],
+                    "kind": 12,
+                    "location": {
+                        "uri": path_to_uri(&source).unwrap(),
+                        "range": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 9}
+                        }
+                    }
+                }]),
+            )
+            .await;
+        }
+        let _ = keep_responder_alive.await;
+    });
+    let actor = spawn_project_actor_with_translator(4, translator);
+    let request = |query: &str| {
+        actor.workspace_symbol(WorkspaceSymbolPageRequest {
+            query: query.to_owned(),
+            kind_filter: None,
+            match_mode: WorkspaceSymbolMatchMode::Exact,
+            scope: WorkspaceSymbolScope::Project,
+            include_generated: false,
+            max_items: 10,
+            max_bytes: 16 * 1024,
+            page_token: None,
+        })
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        futures::future::try_join(request("one"), request("two")),
+    )
+    .await
+    .expect("independent workspace-symbol requests must overlap")
+    .unwrap();
+
+    assert_eq!(result.0.returned, 1);
+    assert_eq!(result.1.returned, 1);
+    release_responder.send(()).unwrap();
+    responder.await.unwrap();
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn workspace_symbol_search_is_bounded_and_pageable() {
     use crate::bridge::translator::testing::{

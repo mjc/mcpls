@@ -2885,6 +2885,7 @@ pub(super) async fn run_project_actor(
         }
     }
     if state.status != ProjectStatus::Stopped {
+        runtime.wait_for_workspace_symbol_tasks().await;
         stop_project_runtime(&channels, &mut state, &mut runtime, false).await;
     }
     if let Some(residency) = residency {
@@ -3179,6 +3180,10 @@ pub(super) async fn handle_project_request(
         return false;
     };
 
+    if !matches!(&request, ProjectRequest::WorkspaceSymbol { .. }) {
+        runtime.wait_for_workspace_symbol_tasks().await;
+    }
+
     match request {
         ProjectRequest::Timed { .. } => {
             unreachable!("timed request must be unwrapped by the actor loop")
@@ -3430,15 +3435,11 @@ pub(super) async fn handle_project_request(
                     .await,
             );
         }
-        ProjectRequest::WorkspaceSymbol { request, mut reply } => {
+        ProjectRequest::WorkspaceSymbol { request, reply } => {
             if reply.is_closed() {
                 return false;
             }
-            let result = tokio::select! {
-                () = reply.closed() => return false,
-                result = runtime.workspace_symbol_page(request) => result,
-            };
-            let _ = reply.send(result);
+            runtime.spawn_workspace_symbol_page(request, reply);
         }
         ProjectRequest::WorkspaceSymbolBatch { request, mut reply } => {
             if reply.is_closed() {

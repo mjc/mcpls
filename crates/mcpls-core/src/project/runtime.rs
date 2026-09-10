@@ -287,7 +287,8 @@ pub(super) struct ProjectRuntime {
     pub(super) edit_plans: EditPlanStore,
     edit_safety: Option<EditSafetyConfig>,
     code_actions: CodeActionStore,
-    pub(super) symbol_handles: std::sync::Mutex<SymbolHandleStore>,
+    pub(super) symbol_handles: std::sync::Arc<std::sync::Mutex<SymbolHandleStore>>,
+    workspace_symbol_tasks: Vec<tokio::task::JoinHandle<()>>,
     workspace_symbol_results: std::sync::Mutex<HashMap<String, WorkspaceSymbolResult>>,
     inspect_symbol_batch_pages: std::sync::Mutex<InspectSymbolBatchPageStore>,
     pub(super) deferred_results: std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
@@ -301,6 +302,174 @@ pub(super) struct ProjectRuntime {
     pub(super) activation_started_at: Option<Instant>,
     generation: u64,
     automatic_restart: AutomaticRestartPolicy,
+}
+
+async fn attach_workspace_symbol_handles_with_context<'a>(
+    translator: &Translator,
+    symbol_handles: &std::sync::Arc<std::sync::Mutex<SymbolHandleStore>>,
+    symbols: impl IntoIterator<Item = &'a mut WorkspaceSymbol>,
+) {
+    let mut snapshots = HashMap::new();
+    for symbol in symbols {
+        let Some(path) = symbol.location.path.as_deref().map(PathBuf::from) else {
+            continue;
+        };
+        let (line, character, snapshot) = match &symbol.location.source {
+            SourceContext::Available(frame) => {
+                let position = rendered_workspace_symbol_position(
+                    &frame.text,
+                    &symbol.name,
+                    &symbol.location.range,
+                )
+                .unwrap_or((
+                    symbol.location.range.start.line,
+                    symbol.location.range.start.character,
+                ));
+                let snapshot = frame.document_version.map_or_else(
+                    || SourceSnapshot::Hash(frame.content_hash.clone()),
+                    SourceSnapshot::Version,
+                );
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Deferred { resource } => {
+                let snapshot = resource.document_version.map_or_else(
+                    || SourceSnapshot::Hash(resource.snapshot_hash.clone()),
+                    SourceSnapshot::Version,
+                );
+                let position = workspace_symbol_position_with_context(
+                    translator,
+                    &path,
+                    &symbol.name,
+                    &symbol.location.range,
+                    &mut snapshots,
+                )
+                .await
+                .unwrap_or((
+                    symbol.location.range.start.line,
+                    symbol.location.range.start.character,
+                ));
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Unavailable {
+                reason: SourceUnavailableReason::ResponseBudgetExhausted,
+            } => {
+                let Some((document_version, content_hash, source)) =
+                    workspace_symbol_snapshot_with_context(translator, &path, &mut snapshots).await
+                else {
+                    continue;
+                };
+                let position = source_symbol_position(source, &symbol.name, &symbol.location.range)
+                    .unwrap_or((
+                        symbol.location.range.start.line,
+                        symbol.location.range.start.character,
+                    ));
+                let snapshot = document_version.map_or_else(
+                    || SourceSnapshot::Hash(content_hash.to_owned()),
+                    SourceSnapshot::Version,
+                );
+                (position.0, position.1, snapshot)
+            }
+            SourceContext::Unavailable { .. } => continue,
+        };
+        symbol.location.symbol_handle = Some(
+            symbol_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(StoredSymbolTarget::new(path, line, character, snapshot)),
+        );
+    }
+}
+
+async fn workspace_symbol_position_with_context(
+    translator: &Translator,
+    path: &Path,
+    name: &str,
+    range: &crate::bridge::Range,
+    snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
+) -> Option<(u32, u32)> {
+    let (_, _, source) =
+        workspace_symbol_snapshot_with_context(translator, path, snapshots).await?;
+    source_symbol_position(source, name, range)
+}
+
+async fn workspace_symbol_snapshot_with_context<'a>(
+    translator: &Translator,
+    path: &Path,
+    snapshots: &'a mut HashMap<PathBuf, (Option<i32>, String, String)>,
+) -> Option<&'a (Option<i32>, String, String)> {
+    if !snapshots.contains_key(path) {
+        let (_, version, hash, source) = translator.source_snapshot(path).await.ok()?;
+        snapshots.insert(path.to_path_buf(), (version, hash, source));
+    }
+    snapshots.get(path)
+}
+
+async fn workspace_symbol_page_with_context(
+    translator: &Translator,
+    symbol_handles: &std::sync::Arc<std::sync::Mutex<SymbolHandleStore>>,
+    deferred_results: &std::sync::Arc<std::sync::Mutex<DeferredResultStore>>,
+    scope: &str,
+    request: WorkspaceSymbolPageRequest,
+) -> Result<WorkspaceSymbolResult, String> {
+    if request.max_items == 0 || request.max_items > 1_000 {
+        return Err("max_items must be between 1 and 1000".to_owned());
+    }
+    if !(4_096..=1_048_576).contains(&request.max_bytes) {
+        return Err("max_bytes must be between 4096 and 1048576".to_owned());
+    }
+    let state = if let Some(page_token) = request.page_token {
+        let token = page_token
+            .strip_prefix("mcpls-deferred:///")
+            .ok_or_else(|| {
+                "page_token must be the next_cursor returned by workspace_symbol_search".to_owned()
+            })?;
+        let value = deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_scoped(token, scope)?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("invalid workspace-symbol page: {error}"))?
+    } else {
+        let mut result = translator
+            .handle_workspace_symbol_all_with_generated(
+                request.query,
+                request.kind_filter,
+                request.match_mode,
+                request.scope,
+                request.include_generated,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        discard_workspace_symbol_struct_uses(&mut result.symbols);
+        attach_workspace_symbol_handles_with_context(
+            translator,
+            symbol_handles,
+            &mut result.symbols,
+        )
+        .await;
+        let snapshot_identity = workspace_symbol_snapshot_identity(&result.symbols)?;
+        WorkspaceSymbolPageState {
+            total: result.symbols.len(),
+            snapshot_identity,
+            symbols: result.symbols,
+        }
+    };
+    let (mut result, remaining) =
+        bounded_workspace_symbol_page(state, request.max_items, request.max_bytes)?;
+    if let Some(remaining) = remaining {
+        let snapshot_identity = remaining.snapshot_identity.clone();
+        let value = serde_json::to_value(remaining)
+            .map_err(|error| format!("failed to store workspace-symbol page: {error}"))?;
+        let reference = deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert_scoped(value, snapshot_identity, scope);
+        result.next_cursor = Some(reference.uri);
+    }
+    debug_assert!(
+        serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() <= request.max_bytes)
+    );
+    Ok(result)
 }
 
 #[derive(Debug, Clone)]
@@ -2505,7 +2674,8 @@ impl ProjectRuntime {
             edit_plans: EditPlanStore::for_project(),
             edit_safety,
             code_actions: CodeActionStore::new(),
-            symbol_handles: std::sync::Mutex::new(SymbolHandleStore::new()),
+            symbol_handles: std::sync::Arc::new(std::sync::Mutex::new(SymbolHandleStore::new())),
+            workspace_symbol_tasks: Vec::new(),
             workspace_symbol_results: std::sync::Mutex::new(HashMap::new()),
             inspect_symbol_batch_pages: std::sync::Mutex::new(InspectSymbolBatchPageStore::new()),
             deferred_results,
@@ -2532,6 +2702,43 @@ impl ProjectRuntime {
 
     pub(super) const fn begin_transition(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub(super) async fn wait_for_workspace_symbol_tasks(&mut self) {
+        for task in std::mem::take(&mut self.workspace_symbol_tasks) {
+            let _ = task.await;
+        }
+    }
+
+    pub(super) fn spawn_workspace_symbol_page(
+        &mut self,
+        request: WorkspaceSymbolPageRequest,
+        mut reply: tokio::sync::oneshot::Sender<Result<WorkspaceSymbolResult, String>>,
+    ) {
+        let translator = self.translator.clone_for_concurrent_read();
+        let symbol_handles = std::sync::Arc::clone(&self.symbol_handles);
+        let deferred_results = std::sync::Arc::clone(&self.deferred_results);
+        let deferred_scope = self.deferred_scope.clone();
+        let span = tracing::Span::current();
+        self.workspace_symbol_tasks.push(tokio::spawn(
+            async move {
+                if reply.is_closed() {
+                    return;
+                }
+                let result = tokio::select! {
+                    () = reply.closed() => return,
+                    result = workspace_symbol_page_with_context(
+                        &translator,
+                        &symbol_handles,
+                        &deferred_results,
+                        deferred_scope.as_deref().unwrap_or_default(),
+                        request,
+                    ) => result,
+                };
+                let _ = reply.send(result);
+            }
+            .instrument(span),
+        ));
     }
 
     pub(super) fn begin_activation(&mut self) {
@@ -2590,95 +2797,18 @@ impl ProjectRuntime {
             .for_each(|location| self.attach_location_handle(location));
     }
 
+    #[cfg(test)]
     pub(super) async fn attach_workspace_symbol_handle(
         &self,
         symbol: &mut WorkspaceSymbol,
-        snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
+        _snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
     ) {
-        let location = &mut symbol.location;
-        let Some(path) = location.path.as_deref().map(PathBuf::from) else {
-            return;
-        };
-        let (line, character, snapshot) = match &location.source {
-            SourceContext::Available(frame) => {
-                let position =
-                    rendered_workspace_symbol_position(&frame.text, &symbol.name, &location.range)
-                        .unwrap_or((location.range.start.line, location.range.start.character));
-                let snapshot = frame.document_version.map_or_else(
-                    || SourceSnapshot::Hash(frame.content_hash.clone()),
-                    SourceSnapshot::Version,
-                );
-                (position.0, position.1, snapshot)
-            }
-            SourceContext::Deferred { resource } => {
-                let snapshot = resource.document_version.map_or_else(
-                    || SourceSnapshot::Hash(resource.snapshot_hash.clone()),
-                    SourceSnapshot::Version,
-                );
-                let position = self
-                    .workspace_symbol_position(&path, &symbol.name, &location.range, snapshots)
-                    .await
-                    .unwrap_or((location.range.start.line, location.range.start.character));
-                (position.0, position.1, snapshot)
-            }
-            SourceContext::Unavailable {
-                reason: SourceUnavailableReason::ResponseBudgetExhausted,
-            } => {
-                let Some((document_version, content_hash, source)) =
-                    self.workspace_symbol_snapshot(&path, snapshots).await
-                else {
-                    return;
-                };
-                let position = source_symbol_position(source, &symbol.name, &location.range)
-                    .unwrap_or((location.range.start.line, location.range.start.character));
-                let snapshot = document_version.map_or_else(
-                    || SourceSnapshot::Hash(content_hash.to_owned()),
-                    SourceSnapshot::Version,
-                );
-                (position.0, position.1, snapshot)
-            }
-            SourceContext::Unavailable { .. } => return,
-        };
-        location.symbol_handle = Some(
-            self.symbol_handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(StoredSymbolTarget::new(path, line, character, snapshot)),
-        );
-    }
-
-    pub(super) async fn attach_workspace_symbol_handles<'a>(
-        &self,
-        symbols: impl IntoIterator<Item = &'a mut WorkspaceSymbol>,
-    ) {
-        let mut snapshots = HashMap::new();
-        for symbol in symbols {
-            self.attach_workspace_symbol_handle(symbol, &mut snapshots)
-                .await;
-        }
-    }
-
-    pub(super) async fn workspace_symbol_position(
-        &self,
-        path: &Path,
-        name: &str,
-        range: &crate::bridge::Range,
-        snapshots: &mut HashMap<PathBuf, (Option<i32>, String, String)>,
-    ) -> Option<(u32, u32)> {
-        let (_, _, source) = self.workspace_symbol_snapshot(path, snapshots).await?;
-        source_symbol_position(source, name, range)
-    }
-
-    pub(super) async fn workspace_symbol_snapshot<'a>(
-        &self,
-        path: &Path,
-        snapshots: &'a mut HashMap<PathBuf, (Option<i32>, String, String)>,
-    ) -> Option<&'a (Option<i32>, String, String)> {
-        if !snapshots.contains_key(path) {
-            let (_, version, hash, source) = self.translator.source_snapshot(path).await.ok()?;
-            snapshots.insert(path.to_path_buf(), (version, hash, source));
-        }
-        snapshots.get(path)
+        attach_workspace_symbol_handles_with_context(
+            &self.translator,
+            &self.symbol_handles,
+            std::iter::once(symbol),
+        )
+        .await;
     }
 
     pub(super) fn attach_reference_handle(&self, reference: &mut crate::bridge::ReferenceUse) {
@@ -4260,76 +4390,27 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         discard_workspace_symbol_struct_uses(&mut result.symbols);
         result.returned = result.symbols.len();
-        self.attach_workspace_symbol_handles(&mut result.symbols)
-            .await;
+        attach_workspace_symbol_handles_with_context(
+            &self.translator,
+            &self.symbol_handles,
+            &mut result.symbols,
+        )
+        .await;
         Ok(result)
     }
+    #[cfg(test)]
     pub(super) async fn workspace_symbol_page(
         &self,
         request: WorkspaceSymbolPageRequest,
     ) -> Result<WorkspaceSymbolResult, String> {
-        if request.max_items == 0 || request.max_items > 1_000 {
-            return Err("max_items must be between 1 and 1000".to_owned());
-        }
-        if !(4_096..=1_048_576).contains(&request.max_bytes) {
-            return Err("max_bytes must be between 4096 and 1048576".to_owned());
-        }
-
-        let scope = self.deferred_scope.as_deref().unwrap_or_default();
-        let state = if let Some(page_token) = request.page_token {
-            let token = page_token
-                .strip_prefix("mcpls-deferred:///")
-                .ok_or_else(|| {
-                    "page_token must be the next_cursor returned by workspace_symbol_search"
-                        .to_owned()
-                })?;
-            let value = self
-                .deferred_results
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .read_scoped(token, scope)?;
-            serde_json::from_value(value)
-                .map_err(|error| format!("invalid workspace-symbol page: {error}"))?
-        } else {
-            let mut result = self
-                .translator
-                .handle_workspace_symbol_all_with_generated(
-                    request.query,
-                    request.kind_filter,
-                    request.match_mode,
-                    request.scope,
-                    request.include_generated,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            discard_workspace_symbol_struct_uses(&mut result.symbols);
-            self.attach_workspace_symbol_handles(&mut result.symbols)
-                .await;
-            let snapshot_identity = workspace_symbol_snapshot_identity(&result.symbols)?;
-            WorkspaceSymbolPageState {
-                total: result.symbols.len(),
-                snapshot_identity,
-                symbols: result.symbols,
-            }
-        };
-
-        let (mut result, remaining) =
-            bounded_workspace_symbol_page(state, request.max_items, request.max_bytes)?;
-        if let Some(remaining) = remaining {
-            let snapshot_identity = remaining.snapshot_identity.clone();
-            let value = serde_json::to_value(remaining)
-                .map_err(|error| format!("failed to store workspace-symbol page: {error}"))?;
-            let reference = self
-                .deferred_results
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_scoped(value, snapshot_identity, scope);
-            result.next_cursor = Some(reference.uri);
-        }
-        debug_assert!(
-            serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() <= request.max_bytes)
-        );
-        Ok(result)
+        workspace_symbol_page_with_context(
+            &self.translator,
+            &self.symbol_handles,
+            &self.deferred_results,
+            self.deferred_scope.as_deref().unwrap_or_default(),
+            request,
+        )
+        .await
     }
 
     async fn workspace_symbol_complete(
@@ -4352,8 +4433,12 @@ impl ProjectRuntime {
             .await
             .map_err(|error| error.to_string())?;
         discard_workspace_symbol_struct_uses(&mut result.symbols);
-        self.attach_workspace_symbol_handles(&mut result.symbols)
-            .await;
+        attach_workspace_symbol_handles_with_context(
+            &self.translator,
+            &self.symbol_handles,
+            &mut result.symbols,
+        )
+        .await;
         result.returned = result.symbols.len();
         result.remaining = result.total.saturating_sub(result.returned);
         result.next_cursor = None;
@@ -4971,8 +5056,12 @@ impl ProjectRuntime {
             .map_err(|error| error.to_string())?;
         discard_workspace_symbol_struct_uses(&mut result.symbols);
         result.returned = result.symbols.len();
-        self.attach_workspace_symbol_handles(&mut result.symbols)
-            .await;
+        attach_workspace_symbol_handles_with_context(
+            &self.translator,
+            &self.symbol_handles,
+            &mut result.symbols,
+        )
+        .await;
         Ok(result)
     }
 

@@ -158,6 +158,39 @@ pub struct Translator {
 const SERVER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Translator {
+    /// Clone the shared translator state for a concurrent read-only request.
+    ///
+    /// Project actors serialize lifecycle and edit mutations, but independent
+    /// workspace-symbol lookups must not wait behind one another. The maps and
+    /// trackers remain shared; immutable configuration is copied so a worker
+    /// can outlive the actor dispatch turn without borrowing actor state.
+    pub(crate) fn clone_for_concurrent_read(&self) -> Self {
+        Self {
+            lsp_clients: Arc::clone(&self.lsp_clients),
+            lsp_servers: Arc::clone(&self.lsp_servers),
+            document_tracker: Arc::clone(&self.document_tracker),
+            resource_limits: self.resource_limits,
+            workspace_roots: Arc::clone(&self.workspace_roots),
+            approved_source_paths: Arc::clone(&self.approved_source_paths),
+            extension_map: Arc::clone(&self.extension_map),
+            expected_servers: Arc::clone(&self.expected_servers),
+            router: Arc::clone(&self.router),
+            active_language_aliases: Arc::clone(&self.active_language_aliases),
+            server_configs: Arc::clone(&self.server_configs),
+            respawn_locks: Arc::clone(&self.respawn_locks),
+            respawn_backoffs: Arc::clone(&self.respawn_backoffs),
+            notification_cache: self.notification_cache.clone(),
+            actor_notification_cache: NotificationCache::new(),
+            project_lsp_configs: Arc::clone(&self.project_lsp_configs),
+            project_lsp_roots: Arc::clone(&self.project_lsp_roots),
+            evaluated_lsp_roots: Arc::clone(&self.evaluated_lsp_roots),
+            redaction_policy: self.redaction_policy.clone(),
+            heuristics_max_depth: self.heuristics_max_depth,
+            position_encodings: self.position_encodings.clone(),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+
     /// Create a new translator.
     ///
     /// Starts with an empty router: nothing is routable until [`Self::with_router`]
