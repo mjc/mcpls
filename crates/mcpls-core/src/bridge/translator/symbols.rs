@@ -915,6 +915,7 @@ impl Translator {
         }
 
         let mut candidates = Vec::new();
+        let mut provider_returned_symbols = false;
         let responses =
             futures::future::join_all(clients.into_iter().map(|(server_id, client)| {
                 let params = LspWorkspaceSymbolParams {
@@ -944,6 +945,7 @@ impl Translator {
             };
             let ctx = self.encoding_ctx(&server_id);
             for sym in response.unwrap_or_default() {
+                provider_returned_symbols = true;
                 if path.is_some_and(|path| uri_to_path(&sym.location.uri).as_deref() != Some(path))
                 {
                     continue;
@@ -983,6 +985,14 @@ impl Translator {
                     is_generated,
                 });
             }
+        }
+
+        if !provider_returned_symbols {
+            tracing::debug!(
+                query,
+                "workspace-symbol providers returned no symbols; using bounded AST fallback"
+            );
+            return fallback().await;
         }
 
         Ok(finish_workspace_symbols(
@@ -1537,6 +1547,53 @@ mod tests {
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(result.symbols[0].name, "fallback_target");
         let _ = responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_lsp_workspace_symbols_degrade_to_ast_results() {
+        let dir = TempDir::new().unwrap();
+        let swift_path = dir.path().join("main.swift");
+        fs::write(&swift_path, "class SwiftTarget {}\n").unwrap();
+        let server_id = ServerId::from("swift");
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([("swift".to_owned(), "swift".to_owned())]))
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                "swift".to_owned(),
+            )]));
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+        let (client, mut server) = fake_lsp_client();
+        translator.register_client(server_id.clone(), client);
+        translator.register_server(server_id, LspServer::new_for_test(capabilities));
+        let responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let request = read_framed_message(&mut wire).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!([]),
+            )
+            .await;
+        });
+
+        let result = translator
+            .handle_workspace_symbol(
+                "SwiftTarget".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::Exact,
+                WorkspaceSymbolScope::Project,
+            )
+            .await
+            .unwrap();
+
+        responder.await.unwrap();
+        assert_eq!(result.symbols.len(), 1);
+        assert_eq!(result.symbols[0].name, "SwiftTarget");
     }
 
     #[tokio::test]
