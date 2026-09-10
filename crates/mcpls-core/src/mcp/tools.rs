@@ -465,10 +465,10 @@ pub struct LexicalSearchParams {
     /// Include generated/build-output files.
     #[serde(default)]
     pub include_generated: bool,
-    /// Optional project-relative globs to include.
+    /// Optional relative or absolute file, directory, or glob paths to include.
     #[serde(default)]
     pub include_paths: Vec<String>,
-    /// Project-relative globs to exclude after inclusion.
+    /// Relative or absolute file, directory, or glob paths to exclude after inclusion.
     #[serde(default)]
     pub exclude_paths: Vec<String>,
 }

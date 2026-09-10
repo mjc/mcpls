@@ -847,6 +847,8 @@ pub(super) struct LexicalSearchPageState {
     scanned_bytes: usize,
     snapshot_identity: String,
     request_identity: String,
+    #[serde(default)]
+    scan_truncated: bool,
 }
 
 pub(super) struct LexicalFileSnapshot {
@@ -4582,12 +4584,13 @@ impl ProjectRuntime {
                 &request.exclude_paths,
             )
             .await?;
+            let scan_truncated = paths.truncated;
             let mut matches = Vec::new();
             let mut total_matches: usize = 0;
             let mut scanned_bytes: usize = 0;
             let mut scanned_files: usize = 0;
             let mut source_budget = SourceBudget::new(LEXICAL_CONTEXT_BYTES);
-            for path in paths {
+            for path in paths.paths {
                 scanned_files += 1;
                 let (path, document_version, content_hash, source) =
                     match self.translator.source_snapshot(&path).await {
@@ -4679,6 +4682,7 @@ impl ProjectRuntime {
                 scanned_bytes,
                 snapshot_identity,
                 request_identity,
+                scan_truncated,
             };
             let value = serde_json::to_value(&state)
                 .map_err(|error| format!("failed to store lexical page: {error}"))?;
@@ -4714,6 +4718,7 @@ impl ProjectRuntime {
             offset,
             page_token: token,
             snapshot_identity: state.snapshot_identity,
+            scan_truncated: state.scan_truncated,
         })
     }
 
@@ -4733,10 +4738,11 @@ impl ProjectRuntime {
             &request.exclude_paths,
         )
         .await?;
-        let mut files = Vec::with_capacity(paths.len());
+        let scan_truncated = paths.truncated;
+        let mut files = Vec::with_capacity(paths.paths.len());
         let mut scanned_bytes: usize = 0;
         let mut scanned_files: usize = 0;
-        for path in paths {
+        for path in paths.paths {
             scanned_files += 1;
             let (path, document_version, content_hash, source) =
                 match self.translator.source_snapshot(&path).await {
@@ -4886,6 +4892,7 @@ impl ProjectRuntime {
                     snapshot_identity: format!("{snapshot_identity}:{query_identity}"),
                     max_bytes: request.max_bytes,
                     truncated: query_truncated,
+                    scan_truncated,
                     next_cursor: None,
                     matches,
                 }),
@@ -4903,6 +4910,7 @@ impl ProjectRuntime {
             max_matches: request.max_matches,
             max_bytes: request.max_bytes,
             snapshot_identity,
+            scan_truncated,
         })
     }
 

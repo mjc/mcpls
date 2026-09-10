@@ -44,6 +44,40 @@ async fn lexical_search_skips_non_utf8_files() {
     assert_eq!(scan.total_matches, 2);
     assert_eq!(scan.scanned_files, 2);
     assert_eq!(scan.matches[0].project_relative_path, "source.rs");
+    assert!(!scan.scan_truncated);
+}
+
+#[tokio::test]
+async fn lexical_search_reports_file_scan_truncation_separately_from_match_pages() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.path().join(name), "fn marker() {}\n").unwrap();
+    }
+    let mut translator = Translator::new();
+    translator.set_workspace_roots(vec![root.path().to_path_buf()]);
+    let runtime = ProjectRuntime::new(translator);
+
+    let scan = runtime
+        .lexical_search(LexicalSearchRequest {
+            query: "absent".to_owned(),
+            mode: crate::bridge::LexicalMatchMode::Literal,
+            case: crate::bridge::LexicalCaseMode::Sensitive,
+            multiline: false,
+            max_files: 2,
+            max_matches: 10,
+            include_generated: false,
+            include_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            context_lines: 0,
+            page_token: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(scan.scanned_files, 2);
+    assert_eq!(scan.total_matches, 0);
+    assert!(!scan.matches.iter().any(|entry| entry.source.is_some()));
+    assert!(scan.scan_truncated);
 }
 
 #[tokio::test]

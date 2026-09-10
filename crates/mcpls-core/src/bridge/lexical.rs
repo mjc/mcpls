@@ -2,7 +2,11 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
-use std::{collections::BTreeSet, ops::Range, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -52,9 +56,9 @@ pub(crate) struct LexicalSearchRequest {
     pub max_matches: usize,
     /// Whether generated paths are in scope.
     pub include_generated: bool,
-    /// Project-relative globs that include files; empty includes every file.
+    /// Project-relative or absolute file, directory, or glob includes; empty includes every file.
     pub include_paths: Vec<String>,
-    /// Project-relative globs that exclude files after inclusion.
+    /// Project-relative or absolute file, directory, or glob excludes after inclusion.
     pub exclude_paths: Vec<String>,
     /// Context lines around each match.
     pub context_lines: usize,
@@ -115,6 +119,8 @@ pub(crate) struct LexicalSearchScan {
     pub page_token: String,
     /// Hash of the immutable snapshot used for every page.
     pub snapshot_identity: String,
+    /// Whether the file scan stopped at the requested file limit.
+    pub scan_truncated: bool,
 }
 
 /// One caller-ordered entry in a shared-budget lexical batch.
@@ -140,6 +146,10 @@ pub(crate) struct LexicalSearchBatchResult {
     pub max_matches: usize,
     pub max_bytes: usize,
     pub snapshot_identity: String,
+    /// Whether the shared file scan stopped at the requested file limit.
+    #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
+    pub scan_truncated: bool,
 }
 
 /// One bounded lexical-search page with deterministic continuation metadata.
@@ -163,9 +173,24 @@ pub(crate) struct LexicalSearchResult {
     pub max_bytes: usize,
     /// Whether another page is available.
     pub truncated: bool,
+    /// Whether the file scan stopped at the requested file limit.
+    #[serde(skip_serializing_if = "is_false")]
+    #[schemars(default)]
+    pub scan_truncated: bool,
     /// Opaque snapshot-owned cursor for the next page, when `truncated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ProjectPathScan {
+    pub paths: Vec<PathBuf>,
+    pub truncated: bool,
 }
 
 /// Find every non-overlapping match using the selected lexical semantics.
@@ -202,33 +227,33 @@ pub(crate) fn find_matches(
         .collect())
 }
 
-/// Collect canonical project files with optional project-relative glob filters.
+/// Collect canonical project files with optional relative or absolute path filters.
 pub(crate) async fn collect_project_paths_filtered(
     roots: &[PathBuf],
     include_generated: bool,
     max_files: usize,
     includes: &[String],
     excludes: &[String],
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<ProjectPathScan, String> {
     if max_files == 0 {
-        return Ok(Vec::new());
+        return Ok(ProjectPathScan {
+            paths: Vec::new(),
+            truncated: false,
+        });
     }
-    let includes = build_glob_set(includes)?;
-    let excludes = build_glob_set(excludes)?;
-    let has_includes = !includes.is_empty();
+    let includes = PathGlobs::build(includes)?;
+    let excludes = PathGlobs::build(excludes)?;
     let roots = roots.to_vec();
     Ok(tokio::task::spawn_blocking(move || {
         let mut paths = BTreeSet::new();
-        for root in roots {
+        let mut truncated = false;
+        'roots: for root in roots {
             for entry in WalkBuilder::new(&root)
                 .standard_filters(true)
                 .filter_entry(move |entry| include_generated || !is_generated_path(entry.path()))
                 .build()
                 .flatten()
             {
-                if paths.len() >= max_files {
-                    break;
-                }
                 if !entry
                     .file_type()
                     .is_some_and(|file_type| file_type.is_file())
@@ -238,18 +263,25 @@ pub(crate) async fn collect_project_paths_filtered(
                 let Ok(relative) = entry.path().strip_prefix(&root) else {
                     continue;
                 };
-                if (has_includes && !includes.is_match(relative)) || excludes.is_match(relative) {
+                if (!includes.is_empty() && !includes.is_match(entry.path(), relative))
+                    || excludes.is_match(entry.path(), relative)
+                {
                     continue;
                 }
                 if let Ok(path) = std::fs::canonicalize(entry.path()) {
-                    paths.insert(path);
+                    if paths.len() < max_files {
+                        paths.insert(path);
+                    } else if paths.insert(path) {
+                        truncated = true;
+                        break 'roots;
+                    }
                 }
             }
-            if paths.len() >= max_files {
-                break;
-            }
         }
-        paths.into_iter().collect()
+        ProjectPathScan {
+            paths: paths.into_iter().take(max_files).collect(),
+            truncated,
+        }
     })
     .await
     .unwrap_or_default())
@@ -262,10 +294,52 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet, String> {
             Glob::new(pattern)
                 .map_err(|error| format!("invalid lexical path glob {pattern:?}: {error}"))?,
         );
+        if !pattern.ends_with("/**") {
+            let descendants = format!("{pattern}/**");
+            builder.add(
+                Glob::new(&descendants)
+                    .map_err(|error| format!("invalid lexical path glob {pattern:?}: {error}"))?,
+            );
+        }
     }
     builder
         .build()
         .map_err(|error| format!("invalid lexical path globs: {error}"))
+}
+
+#[derive(Debug)]
+struct PathGlobs {
+    relative: GlobSet,
+    absolute: GlobSet,
+    has_patterns: bool,
+}
+
+impl PathGlobs {
+    fn build(patterns: &[String]) -> Result<Self, String> {
+        let relative = patterns
+            .iter()
+            .filter(|pattern| !Path::new(pattern).is_absolute())
+            .cloned()
+            .collect::<Vec<_>>();
+        let absolute = patterns
+            .iter()
+            .filter(|pattern| Path::new(pattern).is_absolute())
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Self {
+            relative: build_glob_set(&relative)?,
+            absolute: build_glob_set(&absolute)?,
+            has_patterns: !patterns.is_empty(),
+        })
+    }
+
+    const fn is_empty(&self) -> bool {
+        !self.has_patterns
+    }
+
+    fn is_match(&self, absolute: &Path, relative: &Path) -> bool {
+        self.relative.is_match(relative) || self.absolute.is_match(absolute)
+    }
 }
 
 /// Reject malformed path filters before queuing an actor request.
@@ -354,12 +428,27 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            paths,
+            paths.paths,
             vec![
                 root.path().join("a.rs").canonicalize().unwrap(),
                 root.path().join("z.rs").canonicalize().unwrap(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn project_paths_report_a_scan_truncation_at_the_file_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(root.path().join(name), name).unwrap();
+        }
+
+        let scan = collect_project_paths_filtered(&[root.path().to_path_buf()], false, 2, &[], &[])
+            .await
+            .unwrap();
+
+        assert_eq!(scan.paths.len(), 2);
+        assert!(scan.truncated);
     }
 
     #[tokio::test]
@@ -381,8 +470,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            paths,
+            paths.paths,
             vec![root.path().join("src/lib.rs").canonicalize().unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn project_paths_accept_absolute_files_and_directory_includes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "lib").unwrap();
+        fs::write(root.path().join("src/test.rs"), "test").unwrap();
+        let absolute_file = root.path().join("src/lib.rs").display().to_string();
+        let absolute_directory = root.path().join("src").display().to_string();
+
+        let file_paths = collect_project_paths_filtered(
+            &[root.path().to_path_buf()],
+            false,
+            16,
+            &[absolute_file],
+            &[],
+        )
+        .await
+        .unwrap();
+        let directory_paths = collect_project_paths_filtered(
+            &[root.path().to_path_buf()],
+            false,
+            16,
+            &[absolute_directory],
+            &[],
+        )
+        .await
+        .unwrap();
+        let relative_directory_paths = collect_project_paths_filtered(
+            &[root.path().to_path_buf()],
+            false,
+            16,
+            &["src".to_owned()],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            file_paths.paths,
+            vec![root.path().join("src/lib.rs").canonicalize().unwrap()]
+        );
+        assert_eq!(
+            directory_paths.paths,
+            vec![
+                root.path().join("src/lib.rs").canonicalize().unwrap(),
+                root.path().join("src/test.rs").canonicalize().unwrap(),
+            ]
+        );
+        assert_eq!(relative_directory_paths.paths, directory_paths.paths);
     }
 }

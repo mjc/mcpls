@@ -20032,7 +20032,7 @@
         },
         "exclude_paths": {
           "default": [],
-          "description": "Project-relative globs to exclude after inclusion.",
+          "description": "Relative or absolute file, directory, or glob paths to exclude after inclusion.",
           "items": {
             "type": "string"
           },
@@ -20045,7 +20045,7 @@
         },
         "include_paths": {
           "default": [],
-          "description": "Optional project-relative globs to include.",
+          "description": "Optional relative or absolute file, directory, or glob paths to include.",
           "items": {
             "type": "string"
           },
@@ -20217,6 +20217,10 @@
               "minimum": 0,
               "type": "integer"
             },
+            "scan_truncated": {
+              "description": "Whether the shared file scan stopped at the requested file limit.",
+              "type": "boolean"
+            },
             "scanned_bytes": {
               "format": "uint",
               "minimum": 0,
@@ -20333,6 +20337,10 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "scan_truncated": {
+              "description": "Whether the file scan stopped at the requested file limit.",
+              "type": "boolean"
             },
             "scanned_bytes": {
               "description": "UTF-8 bytes scanned to produce this page.",

@@ -569,6 +569,7 @@ fn bounded_lexical_page(
         total_matches,
         0,
         0,
+        false,
         None,
         "test-snapshot",
     )
@@ -583,6 +584,7 @@ fn bounded_lexical_page_with_accounting(
     total_matches: usize,
     scanned_files: usize,
     scanned_bytes: usize,
+    scan_truncated: bool,
     cursor_token: Option<&str>,
     snapshot_identity: &str,
 ) -> Result<crate::bridge::lexical::LexicalSearchResult, usize> {
@@ -597,6 +599,7 @@ fn bounded_lexical_page_with_accounting(
             scanned_bytes,
             max_bytes,
             snapshot_identity: snapshot_identity.to_owned(),
+            scan_truncated,
             next_cursor: truncated.then(|| {
                 cursor_token.map_or_else(
                     || offset.saturating_add(matches.len()).to_string(),
@@ -4520,6 +4523,7 @@ impl McplsServer {
                 scan.total_matches,
                 scan.scanned_files,
                 scan.scanned_bytes,
+                scan.scan_truncated,
                 Some(&scan.page_token),
                 &scan.snapshot_identity,
             )
@@ -8251,6 +8255,21 @@ finally:
         assert_eq!(page.max_bytes, 16 * 1024);
         assert!(serde_json::to_vec(&page).unwrap().len() <= page.max_bytes);
         assert!(page.next_cursor.is_some());
+
+        let page = bounded_lexical_page_with_accounting(
+            Vec::new(),
+            0,
+            false,
+            16 * 1024,
+            0,
+            2,
+            0,
+            true,
+            None,
+            "test-snapshot",
+        )
+        .unwrap();
+        assert!(page.scan_truncated);
     }
 
     #[test]
