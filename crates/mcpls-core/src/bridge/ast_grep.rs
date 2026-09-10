@@ -494,7 +494,7 @@ fn search_sync(
                 let Some(kind) = symbol_kind(&node) else {
                     continue;
                 };
-                if kind == "class" && class_names.len() < 64 {
+                if kind == "class" && class_names.len() < 512 {
                     class_names.push(symbol_name(&node));
                 }
                 if kind_filter.is_some_and(|filter| !kind.eq_ignore_ascii_case(filter)) {
