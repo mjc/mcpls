@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout_at};
-use tracing::{Instrument as _, debug, debug_span, error, trace, warn};
+use tracing::{Instrument as _, debug, debug_span, error, info, trace, warn};
 
 use crate::config::LspServerConfig;
 use crate::error::{Error, Result};
@@ -110,7 +110,7 @@ impl Drop for LspRequestTiming {
         );
         self.span.record("lsp_over_house_budget", over_house_budget);
         let _entered = self.span.enter();
-        debug!(
+        info!(
             target: "mcpls::lsp::request",
             lsp_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             lsp_over_house_budget = over_house_budget,
