@@ -2489,9 +2489,10 @@ impl ProjectRegistry {
                 Ok(target) => return Ok((actor, target)),
                 Err(error) => {
                     let error = error.to_string();
-                    if !error.starts_with("invalid_symbol_handle") {
-                        return Err(error);
+                    if error.contains("invalid_symbol_handle:") {
+                        continue;
                     }
+                    return Err(error);
                 }
             }
         }

@@ -5720,12 +5720,28 @@ impl McplsServer {
             .resolve_project_selector(&params.project_id)
             .await
             .map_err(project_operation_error)?;
-        let actor = self
-            .context
-            .project_registry
-            .actor_for_project(&id)
-            .await
-            .map_err(project_operation_error)?;
+        let actor = if let Some(handle) = params.symbol_handle.clone() {
+            match self.context.resolve_symbol_handle(&id, handle).await {
+                Ok((actor, _)) => actor,
+                Err(error)
+                    if error.contains("invalid_symbol_handle:")
+                        || error.contains("stale_symbol_handle:") =>
+                {
+                    self.context
+                        .project_registry
+                        .actor_for_project(&id)
+                        .await
+                        .map_err(project_operation_error)?
+                }
+                Err(error) => return Err(McpError::invalid_params(error, None)),
+            }
+        } else {
+            self.context
+                .project_registry
+                .actor_for_project(&id)
+                .await
+                .map_err(project_operation_error)?
+        };
         let result = actor
             .inspect_symbol(crate::bridge::InspectSymbolRequest {
                 symbol_handle: params.symbol_handle,
@@ -8596,6 +8612,47 @@ finally:
         assert!(
             uris.iter()
                 .any(|uri| uri.contains(worktree.path().to_str().unwrap()))
+        );
+
+        let linked_symbol = result["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| {
+                symbol["location"]["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.contains(worktree.path().to_str().unwrap()))
+            })
+            .unwrap();
+        let linked_handle: SymbolHandle =
+            serde_json::from_value(linked_symbol["location"]["symbol_handle"].clone()).unwrap();
+        let inspected = server
+            .inspect_symbol(Parameters(InspectSymbolParams {
+                project_id: project_id.clone(),
+                symbol_handle: Some(linked_handle),
+                targets: Vec::new(),
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 16 * 1024,
+                    max_items: 20,
+                },
+                page_token: None,
+            }))
+            .await
+            .unwrap();
+        let inspected: serde_json::Value = serde_json::from_str(&inspected).unwrap();
+        assert_eq!(inspected["resolution"]["status"], "selected", "{inspected}");
+        assert!(
+            inspected["resolution"]["symbol_handle"].is_string()
+                && inspected["returned_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes > 0),
+            "{inspected}"
         );
 
         let batch = server
