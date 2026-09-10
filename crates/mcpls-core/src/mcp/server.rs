@@ -442,6 +442,16 @@ where
     )
 }
 
+fn encode_semantic_resource_result(
+    value: SemanticResourceReadResult,
+) -> Result<Json<SemanticResourceReadResult>, McpError> {
+    let structured = serde_json::to_value(&value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    let legacy = serde_json::to_string(&value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    Ok(Json::with_summary(structured, legacy, value.text))
+}
+
 fn validate_workspace_symbol_batch(params: &WorkspaceSymbolBatchParams) -> Result<(), McpError> {
     if (params.queries.is_empty() && params.page_token.is_none()) || params.queries.len() > 32 {
         return Err(McpError::invalid_params(
@@ -5201,7 +5211,7 @@ impl McplsServer {
             }
         };
 
-        encode_tool_result(Ok::<_, String>(result))
+        encode_semantic_resource_result(result)
     }
 }
 
@@ -8775,6 +8785,30 @@ finally:
         assert_eq!(
             result.content[0].as_text().unwrap().text,
             "Structured result available in structuredContent."
+        );
+    }
+
+    #[test]
+    fn semantic_resource_tool_exposes_raw_text_in_default_content() {
+        let output = encode_semantic_resource_result(SemanticResourceReadResult {
+            uri: "mcpls-source:///workspace/lib.rs".to_owned(),
+            mime_type: "text/x-rust".to_owned(),
+            text: "fn main() {}\n".to_owned(),
+            source: None,
+            next_uri: None,
+            total_bytes: None,
+            offset_bytes: None,
+            returned_bytes: None,
+            remaining_bytes: None,
+            snapshot_hash: None,
+        })
+        .unwrap();
+        let result = output.into_result(false);
+
+        assert_eq!(result.content[0].as_text().unwrap().text, "fn main() {}\n");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["text"],
+            "fn main() {}\n"
         );
     }
 
