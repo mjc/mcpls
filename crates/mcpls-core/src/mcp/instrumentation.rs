@@ -330,31 +330,49 @@ impl RequestSpan {
             self.span.record("result_bytes", result_bytes);
             self.span.record("inline_bytes", result_bytes);
         }
-        if let Some(result_metrics) = result_metrics {
-            self.span
-                .record("deferred_bytes", result_metrics.deferred_bytes);
-            self.span.record("item_count", result_metrics.item_count);
-            self.span.record("truncated", result_metrics.truncated);
-            self.span.record("paginated", result_metrics.paginated);
-            if let Some(cache_hit) = result_metrics.cache_hit {
+        if let Some(metrics) = result_metrics.as_ref() {
+            self.span.record("deferred_bytes", metrics.deferred_bytes);
+            self.span.record("item_count", metrics.item_count);
+            self.span.record("truncated", metrics.truncated);
+            self.span.record("paginated", metrics.paginated);
+            if let Some(cache_hit) = metrics.cache_hit {
                 self.span.record("cache_hit", cache_hit);
             }
         }
-        if let Some(serialization_started) = serialization_started {
-            self.span.record(
-                "serialization_ms",
-                serialization_started.elapsed().as_secs_f64() * 1_000.0,
-            );
+        let metrics = result_metrics.unwrap_or_default();
+        let serialization_ms =
+            serialization_started.map(|started| started.elapsed().as_secs_f64() * 1_000.0);
+        if let Some(serialization_ms) = serialization_ms {
+            self.span.record("serialization_ms", serialization_ms);
         }
-        self.span.record(
-            "duration_ms",
-            self.started.elapsed().as_secs_f64() * 1_000.0,
-        );
-        self.span
-            .record("cancelled", self.cancellation.is_cancelled());
-        self.span.record("success", result.is_ok() && !tool_error);
-        self.span.record("protocol_error", result.is_err());
+        let duration_ms = self.started.elapsed().as_secs_f64() * 1_000.0;
+        let cancelled = self.cancellation.is_cancelled();
+        let success = result.is_ok() && !tool_error;
+        let protocol_error = result.is_err();
+        self.span.record("duration_ms", duration_ms);
+        self.span.record("cancelled", cancelled);
+        self.span.record("success", success);
+        self.span.record("protocol_error", protocol_error);
         self.span.record("tool_error", tool_error);
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "mcpls::mcp::request",
+                duration_ms,
+                result_bytes = result_bytes.unwrap_or_default(),
+                inline_bytes = result_bytes.unwrap_or_default(),
+                deferred_bytes = metrics.deferred_bytes,
+                item_count = metrics.item_count,
+                truncated = metrics.truncated,
+                paginated = metrics.paginated,
+                cache_hit = ?metrics.cache_hit,
+                serialization_ms = serialization_ms.unwrap_or_default(),
+                cancelled,
+                success,
+                protocol_error,
+                tool_error,
+                "MCP request completed"
+            );
+        });
     }
 
     fn record_request_bytes(&self, request_bytes: usize) {
@@ -831,7 +849,78 @@ impl<H: ServerHandler> ServerHandler for InstrumentedServer<H> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{Event, Subscriber, field::Visit};
+    use tracing_subscriber::{
+        layer::{Context, Layer},
+        prelude::*,
+        registry::LookupSpan,
+    };
+
     use super::*;
+
+    struct EventCapture(Arc<Mutex<Vec<Vec<String>>>>);
+
+    struct FieldNames(Vec<String>);
+
+    impl Visit for FieldNames {
+        fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+            self.0.push(field.name().to_owned());
+        }
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber + for<'span> LookupSpan<'span>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() == "mcpls::mcp::request" {
+                let mut fields = FieldNames(Vec::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    #[test]
+    fn request_completion_is_emitted_for_compact_log_consumers() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventCapture(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = RequestSpan {
+            span: tracing::info_span!("mcp.request"),
+            started: std::time::Instant::now(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        request.finish(
+            &Ok::<_, rmcp::ErrorData>(()),
+            false,
+            Some(12),
+            Some(ToolResultMetrics {
+                cache_hit: Some(true),
+                item_count: 3,
+                deferred_bytes: 9,
+                truncated: true,
+                paginated: true,
+            }),
+            None,
+        );
+
+        assert_eq!(events.lock().unwrap().len(), 1,);
+        let fields = &events.lock().unwrap()[0];
+        for field in [
+            "duration_ms",
+            "result_bytes",
+            "deferred_bytes",
+            "serialization_ms",
+            "cancelled",
+            "success",
+        ] {
+            assert!(fields.iter().any(|name| name == field), "missing {field}");
+        }
+    }
 
     #[test]
     fn accepts_valid_traceparent_and_rejects_zero_ids() {
