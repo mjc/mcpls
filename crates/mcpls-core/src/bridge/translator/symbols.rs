@@ -709,15 +709,17 @@ impl Translator {
         &self,
         routed_servers: Option<&[ServerId]>,
     ) -> Vec<String> {
-        let configs = lock_std(&self.project_lsp_configs);
-        let mut languages = configs
-            .iter()
-            .filter(|config| {
-                routed_servers
-                    .is_none_or(|servers| servers.iter().any(|server| *server == config.id()))
-            })
-            .map(|config| config.language_id.clone())
-            .collect::<Vec<_>>();
+        let mut languages = {
+            let configs = lock_std(&self.project_lsp_configs);
+            configs
+                .iter()
+                .filter(|config| {
+                    routed_servers
+                        .is_none_or(|servers| servers.iter().any(|server| *server == config.id()))
+                })
+                .map(|config| config.language_id.clone())
+                .collect::<Vec<_>>()
+        };
         if languages.is_empty() {
             languages.extend(self.extension_map.values().cloned());
         }
@@ -907,13 +909,13 @@ impl Translator {
         };
         let mut clients = Vec::with_capacity(server_ids.len());
         for server_id in &server_ids {
-            if lock_std(&self.expected_servers).contains(&server_id) {
+            if lock_std(&self.expected_servers).contains(server_id) {
                 tracing::debug!(%server_id, "workspace-symbol server still initializing");
                 return Err(Error::ServerInitializing {
                     server_id: server_id.clone(),
                 });
             }
-            if let Err(error) = self.respawn_if_dead(&server_id).await {
+            if let Err(error) = self.respawn_if_dead(server_id).await {
                 if is_invalid_utf8_error(&error) {
                     tracing::warn!(
                         %server_id,
@@ -923,12 +925,12 @@ impl Translator {
                 }
                 return Err(error);
             }
-            let Some(client) = lock_std(&self.lsp_clients).get(&server_id).cloned() else {
+            let Some(client) = lock_std(&self.lsp_clients).get(server_id).cloned() else {
                 tracing::debug!(%server_id, "workspace-symbol server unavailable; using AST fallback");
                 return fallback(Some(server_ids.clone())).await;
             };
             if self
-                .require_capability(&server_id, "workspaceSymbolProvider", |caps| {
+                .require_capability(server_id, "workspaceSymbolProvider", |caps| {
                     matches!(
                         caps.workspace_symbol_provider,
                         Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
@@ -1050,9 +1052,10 @@ impl Translator {
             .next()
             .map(|character| character.to_string())
             .unwrap_or_default();
-        let matches = ast_grep::search(
+        let matches = ast_grep::search_with_prefilter(
             roots,
             languages,
+            query,
             &candidate_query,
             kind_filter,
             4_096,

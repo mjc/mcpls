@@ -326,10 +326,38 @@ fn structural_search_sync(
 /// Parsing is isolated on a blocking worker because tree-sitter parsing and
 /// filesystem traversal are synchronous. A failed read or parse only removes
 /// that file from the degraded lookup result.
+#[allow(dead_code)]
 pub async fn search(
     roots: &[PathBuf],
     languages: &[String],
     query: &str,
+    kind_filter: Option<&str>,
+    limit: usize,
+    include_generated: bool,
+) -> Vec<Symbol> {
+    search_with_prefilter(
+        roots,
+        languages,
+        query,
+        query,
+        kind_filter,
+        limit,
+        include_generated,
+    )
+    .await
+}
+
+/// Search configured workspace roots using a separate source prefilter.
+///
+/// The prefilter may be a cheap necessary condition (for example, the first
+/// character of a fuzzy symbol query), while `query` remains the exact name
+/// predicate used for returned symbols. Keeping those predicates separate
+/// prevents unrelated symbols from consuming the bounded result cap.
+pub async fn search_with_prefilter(
+    roots: &[PathBuf],
+    languages: &[String],
+    query: &str,
+    prefilter_query: &str,
     kind_filter: Option<&str>,
     limit: usize,
     include_generated: bool,
@@ -341,15 +369,17 @@ pub async fn search(
     let roots = roots.to_vec();
     let languages = languages.to_vec();
     let query = query.to_string();
+    let prefilter_query = prefilter_query.to_string();
     let kind_filter = kind_filter.map(str::to_owned);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
     let cancellation_guard = CancellationGuard(cancelled);
     let result = tokio::task::spawn_blocking(move || {
-        search_sync(
+        search_sync_with_prefilter(
             &roots,
             &languages,
             &query,
+            &prefilter_query,
             kind_filter.as_deref(),
             limit,
             include_generated,
@@ -371,10 +401,34 @@ impl Drop for CancellationGuard {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 fn search_sync(
     roots: &[PathBuf],
     languages: &[String],
     query: &str,
+    kind_filter: Option<&str>,
+    limit: usize,
+    include_generated: bool,
+    cancelled: &AtomicBool,
+) -> Vec<Symbol> {
+    search_sync_with_prefilter(
+        roots,
+        languages,
+        query,
+        query,
+        kind_filter,
+        limit,
+        include_generated,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn search_sync_with_prefilter(
+    roots: &[PathBuf],
+    languages: &[String],
+    query: &str,
+    prefilter_query: &str,
     kind_filter: Option<&str>,
     limit: usize,
     include_generated: bool,
@@ -398,6 +452,7 @@ fn search_sync(
     let mut class_names = Vec::new();
 
     let query = query.to_ascii_lowercase();
+    let prefilter_query = prefilter_query.to_ascii_lowercase();
     let started = Instant::now();
     let mut paths_by_language = (0..languages.len())
         .map(|_| BTreeSet::new())
@@ -481,7 +536,7 @@ fn search_sync(
             let Ok(source) = fs::read_to_string(path) else {
                 continue;
             };
-            if !contains_ascii_case_insensitive(&source, &query) {
+            if !contains_ascii_case_insensitive(&source, &prefilter_query) {
                 continue;
             }
             query_file_counts[language_index] += 1;
@@ -860,10 +915,11 @@ mod tests {
         )
         .unwrap();
 
-        let symbols = search_sync(
+        let symbols = search_sync_with_prefilter(
             &[temp.path().to_path_buf()],
             &["rust".to_owned(), "swift".to_owned()],
             "SwiftTarget",
+            "S",
             None,
             10,
             false,
