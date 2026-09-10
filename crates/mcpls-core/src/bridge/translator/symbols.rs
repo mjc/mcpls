@@ -67,6 +67,7 @@ struct WorkspaceSymbolCandidate {
     name: String,
     kind: String,
     location: lsp_types::Location,
+    encoding_ctx: EncodingCtx,
     container_name: Option<String>,
     match_class: WorkspaceSymbolMatch,
     origin: WorkspaceSymbolOrigin,
@@ -97,14 +98,16 @@ fn is_invalid_utf8_error(error: &Error) -> bool {
 
 async fn convert_workspace_symbol(
     symbol: WorkspaceSymbolCandidate,
-    ctx: &EncodingCtx,
     roots: &[std::path::PathBuf],
     budget: &mut super::source_context::SourceBudget,
 ) -> WorkspaceSymbol {
     WorkspaceSymbol {
         name: symbol.name,
         kind: symbol.kind,
-        location: ctx.location(roots, symbol.location, budget).await,
+        location: symbol
+            .encoding_ctx
+            .location(roots, symbol.location, budget)
+            .await,
         container_name: symbol.container_name,
         match_class: symbol.match_class,
         score: symbol.match_class.score(),
@@ -135,7 +138,6 @@ async fn finish_workspace_symbols(
     mut candidates: Vec<WorkspaceSymbolCandidate>,
     limit: usize,
     source_bytes: Option<usize>,
-    ctx: &EncodingCtx,
     roots: &[std::path::PathBuf],
 ) -> WorkspaceSymbolResult {
     candidates.sort_by(|left, right| {
@@ -168,7 +170,7 @@ async fn finish_workspace_symbols(
     );
     let mut symbols = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        symbols.push(convert_workspace_symbol(candidate, ctx, roots, &mut budget).await);
+        symbols.push(convert_workspace_symbol(candidate, roots, &mut budget).await);
     }
     let returned = symbols.len();
     WorkspaceSymbolResult {
@@ -865,121 +867,128 @@ impl Translator {
                 .await)
         };
 
-        // Workspace search has no document, so it resolves via `resolve_any`
-        // rather than a per-language route. If the resolved server is not
-        // registered yet but is expected, tell the caller to wait and retry
-        // rather than implying nothing is configured.
-        let routed = {
-            lock_std(&self.router)
-                .resolve_any(ToolKind::WorkspaceSymbols)
-                .cloned()
-        };
-        let server_id = match routed {
-            Ok(server_id) => server_id,
+        // Workspace search has no document, so query every language route.
+        let routed = lock_std(&self.router).resolve_all(ToolKind::WorkspaceSymbols);
+        let server_ids = match routed {
+            Ok(server_ids) => server_ids,
             Err(reason) => {
                 tracing::debug!(?reason, "using AST workspace-symbol fallback");
                 return fallback().await;
             }
         };
-        if lock_std(&self.expected_servers).contains(&server_id) {
-            tracing::debug!(%server_id, "workspace-symbol server still initializing");
-            return Err(Error::ServerInitializing { server_id });
-        }
-        if let Err(error) = self.respawn_if_dead(&server_id).await {
-            if is_invalid_utf8_error(&error) {
-                tracing::warn!(
-                    %server_id,
-                    "workspace-symbol provider encountered invalid UTF-8; using bounded AST fallback"
-                );
+        let mut clients = Vec::with_capacity(server_ids.len());
+        for server_id in server_ids {
+            if lock_std(&self.expected_servers).contains(&server_id) {
+                tracing::debug!(%server_id, "workspace-symbol server still initializing");
+                return Err(Error::ServerInitializing { server_id });
+            }
+            if let Err(error) = self.respawn_if_dead(&server_id).await {
+                if is_invalid_utf8_error(&error) {
+                    tracing::warn!(
+                        %server_id,
+                        "workspace-symbol provider encountered invalid UTF-8; using bounded AST fallback"
+                    );
+                    return fallback().await;
+                }
+                return Err(error);
+            }
+            let Some(client) = lock_std(&self.lsp_clients).get(&server_id).cloned() else {
+                tracing::debug!(%server_id, "workspace-symbol server unavailable; using AST fallback");
                 return fallback().await;
-            }
-            return Err(error);
-        }
-        let client = lock_std(&self.lsp_clients).get(&server_id).cloned();
-        let Some(client) = client else {
-            tracing::debug!(%server_id, "workspace-symbol server unavailable; using AST fallback");
-            return fallback().await;
-        };
-        if self
-            .require_capability(&server_id, "workspaceSymbolProvider", |caps| {
-                matches!(
-                    caps.workspace_symbol_provider,
-                    Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
-                )
-            })
-            .is_err()
-        {
-            tracing::debug!(
-                %server_id,
-                "workspace-symbol provider does not advertise the capability; using AST fallback"
-            );
-            return fallback().await;
-        }
-
-        let params = LspWorkspaceSymbolParams {
-            query: query.clone(),
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response: Option<Vec<lsp_types::SymbolInformation>> = match client
-            .request("workspace/symbol", params, client.request_timeout())
-            .await
-        {
-            Ok(response) => response,
-            Err(error) if is_invalid_utf8_error(&error) => {
-                tracing::warn!(
-                    %server_id,
-                    "workspace-symbol provider returned invalid UTF-8; using bounded AST fallback"
-                );
-                return fallback().await;
-            }
-            Err(error) => return Err(error),
-        };
-
-        let ctx = self.encoding_ctx(&server_id);
-        let mut candidates = Vec::new();
-        for sym in response.unwrap_or_default() {
-            if path.is_some_and(|path| uri_to_path(&sym.location.uri).as_deref() != Some(path)) {
-                continue;
-            }
-            let Some(match_class) = workspace_symbol_match(&sym.name, &query, match_mode) else {
-                continue;
             };
-            let (origin, project_relative_path) =
-                workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
-            let is_generated =
-                uri_to_path(&sym.location.uri).is_some_and(|path| is_generated_path(&path));
-            if is_generated && !include_generated {
-                continue;
-            }
-            if scope == WorkspaceSymbolScope::Project && origin == WorkspaceSymbolOrigin::External {
-                continue;
-            }
-            let kind = format!("{:?}", sym.kind);
-            if kind_filter
-                .as_deref()
-                .is_some_and(|filter| !kind.eq_ignore_ascii_case(filter))
+            if self
+                .require_capability(&server_id, "workspaceSymbolProvider", |caps| {
+                    matches!(
+                        caps.workspace_symbol_provider,
+                        Some(lsp_types::OneOf::Left(true) | lsp_types::OneOf::Right(_))
+                    )
+                })
+                .is_err()
             {
-                continue;
+                tracing::debug!(
+                    %server_id,
+                    "workspace-symbol provider does not advertise the capability; using AST fallback"
+                );
+                return fallback().await;
             }
-            candidates.push(WorkspaceSymbolCandidate {
-                name: sym.name,
-                kind,
-                location: sym.location,
-                container_name: sym.container_name,
-                match_class,
-                origin,
-                project_relative_path,
-                is_generated,
-            });
+            clients.push((server_id, client));
+        }
+
+        let mut candidates = Vec::new();
+        let responses =
+            futures::future::join_all(clients.into_iter().map(|(server_id, client)| {
+                let params = LspWorkspaceSymbolParams {
+                    query: query.clone(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                async move {
+                    let response = client
+                        .request("workspace/symbol", params, client.request_timeout())
+                        .await;
+                    (server_id, response)
+                }
+            }))
+            .await;
+        for (server_id, response) in responses {
+            let response: Option<Vec<lsp_types::SymbolInformation>> = match response {
+                Ok(response) => response,
+                Err(error) if is_invalid_utf8_error(&error) => {
+                    tracing::warn!(
+                        %server_id,
+                        "workspace-symbol provider returned invalid UTF-8; using bounded AST fallback"
+                    );
+                    return fallback().await;
+                }
+                Err(error) => return Err(error),
+            };
+            let ctx = self.encoding_ctx(&server_id);
+            for sym in response.unwrap_or_default() {
+                if path.is_some_and(|path| uri_to_path(&sym.location.uri).as_deref() != Some(path))
+                {
+                    continue;
+                }
+                let Some(match_class) = workspace_symbol_match(&sym.name, &query, match_mode)
+                else {
+                    continue;
+                };
+                let (origin, project_relative_path) =
+                    workspace_symbol_origin(&sym.location.uri, &self.workspace_roots);
+                let is_generated =
+                    uri_to_path(&sym.location.uri).is_some_and(|path| is_generated_path(&path));
+                if is_generated && !include_generated {
+                    continue;
+                }
+                if scope == WorkspaceSymbolScope::Project
+                    && origin == WorkspaceSymbolOrigin::External
+                {
+                    continue;
+                }
+                let kind = format!("{:?}", sym.kind);
+                if kind_filter
+                    .as_deref()
+                    .is_some_and(|filter| !kind.eq_ignore_ascii_case(filter))
+                {
+                    continue;
+                }
+                candidates.push(WorkspaceSymbolCandidate {
+                    name: sym.name,
+                    kind,
+                    location: sym.location,
+                    encoding_ctx: ctx.clone(),
+                    container_name: sym.container_name,
+                    match_class,
+                    origin,
+                    project_relative_path,
+                    is_generated,
+                });
+            }
         }
 
         Ok(finish_workspace_symbols(
             candidates,
             limit.map_or(usize::MAX, |limit| limit as usize),
             source_bytes,
-            &ctx,
             &self.workspace_roots,
         )
         .await)
@@ -1047,6 +1056,7 @@ impl Translator {
                 name: symbol.name,
                 kind: kind.to_string(),
                 location,
+                encoding_ctx: ctx.clone(),
                 container_name: None,
                 match_class,
                 project_relative_path,
@@ -1054,7 +1064,7 @@ impl Translator {
                 is_generated,
             });
         }
-        finish_workspace_symbols(candidates, limit, source_bytes, &ctx, &self.workspace_roots).await
+        finish_workspace_symbols(candidates, limit, source_bytes, &self.workspace_roots).await
     }
 }
 
@@ -1409,9 +1419,11 @@ mod tests {
 
     use super::*;
     use crate::bridge::translator::testing::{
-        read_framed_message, translator_with_capabilities, write_error_response, write_response,
+        fake_lsp_client, read_framed_message, translator_with_capabilities, write_error_response,
+        write_response,
     };
     use crate::config::{ServerId, ToolRouter};
+    use crate::lsp::LspServer;
     use tempfile::TempDir;
     use tokio::io::BufReader;
 
@@ -1738,6 +1750,98 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.origin == WorkspaceSymbolOrigin::External)
         );
+    }
+
+    #[tokio::test]
+    async fn lsp_workspace_symbols_merge_results_across_language_servers() {
+        let dir = TempDir::new().unwrap();
+        let rust_path = dir.path().join("main.rs");
+        let swift_path = dir.path().join("main.swift");
+        fs::write(&rust_path, "fn RustTarget() {}\n").unwrap();
+        fs::write(&swift_path, "class SwiftTarget {}\n").unwrap();
+
+        let rust_id = ServerId::from("rust");
+        let swift_id = ServerId::from("swift");
+        let router = ToolRouter::catch_all([
+            (rust_id.clone(), "rust".to_owned()),
+            (swift_id.clone(), "swift".to_owned()),
+        ]);
+        let mut translator = Translator::new()
+            .with_extensions(HashMap::from([
+                ("rs".to_owned(), "rust".to_owned()),
+                ("swift".to_owned(), "swift".to_owned()),
+            ]))
+            .with_router(router);
+        translator.set_workspace_roots(vec![dir.path().to_path_buf()]);
+
+        let capabilities = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..lsp_types::ServerCapabilities::default()
+        };
+        let (rust_client, mut rust_server) = fake_lsp_client();
+        let (swift_client, mut swift_server) = fake_lsp_client();
+        translator.register_client(rust_id.clone(), rust_client);
+        translator.register_server(
+            rust_id.clone(),
+            LspServer::new_for_test(capabilities.clone()),
+        );
+        translator.register_client(swift_id.clone(), swift_client);
+        translator.register_server(swift_id, LspServer::new_for_test(capabilities));
+
+        let rust_responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut rust_server.write_stdout);
+            let request = read_framed_message(&mut wire).await;
+            write_response(
+                &mut rust_server.read_half_stdin,
+                &request["id"],
+                serde_json::json!([{
+                    "name": "RustTarget",
+                    "kind": 5,
+                    "location": {
+                        "uri": path_to_uri(&rust_path).unwrap().to_string(),
+                        "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 13}}
+                    }
+                }]),
+            )
+            .await;
+        });
+        let swift_responder = tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut swift_server.write_stdout);
+            let request = read_framed_message(&mut wire).await;
+            write_response(
+                &mut swift_server.read_half_stdin,
+                &request["id"],
+                serde_json::json!([{
+                    "name": "SwiftTarget",
+                    "kind": 5,
+                    "location": {
+                        "uri": path_to_uri(&swift_path).unwrap().to_string(),
+                        "range": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 17}}
+                    }
+                }]),
+            )
+            .await;
+        });
+
+        let result = translator
+            .handle_workspace_symbol(
+                "Target".to_owned(),
+                None,
+                100,
+                WorkspaceSymbolMatchMode::default(),
+                WorkspaceSymbolScope::Project,
+            )
+            .await
+            .unwrap();
+
+        rust_responder.await.unwrap();
+        swift_responder.await.unwrap();
+        let names = result
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["RustTarget", "SwiftTarget"]);
     }
 
     /// #242/S4 regression: a server is configured and still spawning (large

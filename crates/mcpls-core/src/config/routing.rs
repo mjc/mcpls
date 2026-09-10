@@ -468,6 +468,38 @@ impl ToolRouter {
             })
     }
 
+    /// Resolve every server that claims `tool`, in config declaration order.
+    ///
+    /// Workspace-wide tools such as `workspace_symbol_search` need to query
+    /// every language provider because no document is available to select one
+    /// language route. A catch-all or explicit claim in one language is still
+    /// scoped to that language; this method only removes the single-server
+    /// limitation of [`Self::resolve_any`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same no-claimant reasons as [`Self::resolve_any`].
+    pub fn resolve_all(
+        &self,
+        tool: ToolKind,
+    ) -> std::result::Result<Vec<ServerId>, NoServerReason> {
+        let claims = |id: &ServerId| {
+            self.by_language
+                .values()
+                .any(|r| r.explicit.get(&tool) == Some(id) || r.default.as_ref() == Some(id))
+        };
+        let servers: Vec<_> = self.order.iter().filter(|id| claims(id)).cloned().collect();
+        if servers.is_empty() {
+            Err(if self.order.is_empty() {
+                NoServerReason::NothingRegistered
+            } else {
+                NoServerReason::NoClaimant
+            })
+        } else {
+            Ok(servers)
+        }
+    }
+
     /// Whether `language_id` currently has at least one live-or-configured
     /// route (a catch-all or an explicit claim), used to distinguish
     /// `NoServerForTool` (some server handles this language, just not this
@@ -565,6 +597,21 @@ mod tests {
         assert_eq!(
             router.resolve_any(ToolKind::WorkspaceSymbols),
             Ok(&ServerId::from("python-explicit"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_all_returns_workspace_symbol_providers_across_languages() {
+        let configs = vec![
+            cfg("rust", Some("rust"), None),
+            cfg("swift", Some("swift"), None),
+            cfg("python", Some("python-narrow"), Some(vec![ToolKind::Hover])),
+        ];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+
+        assert_eq!(
+            router.resolve_all(ToolKind::WorkspaceSymbols),
+            Ok(vec![ServerId::from("rust"), ServerId::from("swift")])
         );
     }
 
