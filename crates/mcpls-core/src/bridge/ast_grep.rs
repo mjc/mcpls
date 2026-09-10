@@ -790,6 +790,33 @@ mod tests {
     }
 
     #[test]
+    fn extracts_swift_symbols_with_realistic_sdk_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("MusicProviderAdapters.swift");
+        fs::write(
+            &path,
+            "import CutoutMobileFFI\nimport Foundation\n#if canImport(SpotifyiOS) && os(iOS)\n@preconcurrency import SpotifyiOS\n#endif\n#if canImport(SpotifyiOS) && os(iOS)\n@MainActor\npublic final class SpotifyProviderAdapter: NSObject {\n    public static let providerURL = URL(string: \"spotify://\")!\n    private final class AppRemoteBridge: NSObject {\n        weak var owner: SpotifyProviderAdapter?\n    }\n}\n#endif\n",
+        )
+        .unwrap();
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["swift".to_owned()],
+            "SpotifyProviderAdapter",
+            None,
+            10,
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            symbols.iter().any(|symbol| {
+                symbol.name == "SpotifyProviderAdapter" && symbol.kind == "class"
+            })
+        );
+    }
+
+    #[test]
     fn mixed_language_scan_does_not_starve_later_language_paths() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..MAX_SCANNED_FILES {

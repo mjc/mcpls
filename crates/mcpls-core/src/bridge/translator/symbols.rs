@@ -853,7 +853,7 @@ impl Translator {
             let roots = path_root
                 .as_deref()
                 .unwrap_or(self.workspace_roots.as_slice());
-            Ok(self
+            let result = self
                 .ast_grep_workspace_symbols(
                     roots,
                     &languages,
@@ -864,7 +864,17 @@ impl Translator {
                     include_generated,
                     source_bytes,
                 )
-                .await)
+                .await;
+            tracing::info!(
+                query = %query,
+                languages = ?languages,
+                root_count = roots.len(),
+                total = result.total,
+                returned = result.returned,
+                truncated = result.truncated,
+                "workspace-symbol AST fallback completed"
+            );
+            Ok(result)
         };
 
         // Workspace search has no document, so query every language route.
