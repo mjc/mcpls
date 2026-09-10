@@ -393,6 +393,8 @@ fn search_sync(
     let max_paths_per_language = MAX_SCANNED_FILES;
     let mut path_counts = vec![0; languages.len()];
     let mut byte_counts = vec![0_u64; languages.len()];
+    let mut query_file_counts = vec![0; languages.len()];
+    let mut symbol_counts = vec![0; languages.len()];
 
     let query = query.to_ascii_lowercase();
     let started = Instant::now();
@@ -471,6 +473,7 @@ fn search_sync(
         if !contains_ascii_case_insensitive(&source, &query) {
             continue;
         }
+        query_file_counts[language_index] += 1;
 
         let tree = language.ast_grep(&source);
         for node in tree.root().dfs() {
@@ -509,11 +512,20 @@ fn search_sync(
                 end_line,
                 end_character,
             });
+            symbol_counts[language_index] += 1;
             if symbols.len() >= limit {
                 return symbols;
             }
         }
     }
+    tracing::info!(
+        languages = ?languages,
+        path_counts = ?path_counts,
+        byte_counts = ?byte_counts,
+        query_file_counts = ?query_file_counts,
+        symbol_counts = ?symbol_counts,
+        "AST workspace scan completed"
+    );
     symbols
 }
 
