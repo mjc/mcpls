@@ -703,7 +703,7 @@ fn write_real_ra_config(
     std::fs::write(
         &path,
         format!(
-            "[workspace]\nroots = [\"/definitely/missing/mcpls-real-ra\"]\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"{}\"\nargs = []\nfile_patterns = [\"**/*.rs\"]\ntimeout_seconds = 15\nenv = {{ MCPLS_SPAWN_COUNTER = \"{}\" }}\n\n[daemon]\nstate_file = \"{}\"\n",
+            "[workspace]\nroots = [\"/definitely/missing/mcpls-real-ra\"]\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"{}\"\nargs = []\nfile_patterns = [\"**/*.rs\"]\ntimeout_seconds = 15\nenv = {{ MCPLS_SPAWN_COUNTER = \"{}\" }}\n\n[daemon]\nrust_analyzer_resident_groups = 2\nstate_file = \"{}\"\n",
             lsp_command.display(),
             spawn_counter.display(),
             state_file.display(),
@@ -1486,9 +1486,20 @@ fn assert_real_ra_navigation(
             "include_declaration": true
         }),
     );
-    assert!(references["locations"].as_array().unwrap().len() >= 2);
+    let grouped_reference_count = references["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["references"].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    let reference_count =
+        grouped_reference_count + usize::from(references["declaration"].is_object());
+    assert!(reference_count >= 2, "{references}");
 
-    let diagnostics = second.call_tool("get_diagnostics", json!({"file_path": fixture.broken_b}));
+    let diagnostics = second.call_tool(
+        "get_diagnostics",
+        json!({"file_path": fixture.broken_b, "mode": "fresh"}),
+    );
     assert!(!diagnostics["diagnostics"].as_array().unwrap().is_empty());
 }
 
@@ -1548,11 +1559,11 @@ fn apply_real_ra_rename_and_format(
         "rename did not produce a project resource notification"
     );
     drop(events);
-    let stale = client.call_tool_response(
+    let retry = client.call_tool(
         "workspace_edit_apply",
         json!({"project_id": "project-b", "plan_id": rename_plan}),
     );
-    assert!(stale.get("error").is_some());
+    assert_eq!(retry, applied, "a committed rename retry is idempotent");
 
     let formatted = client.call_tool(
         "format_preview",
