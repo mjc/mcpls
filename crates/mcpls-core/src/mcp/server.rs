@@ -108,6 +108,17 @@ struct ProjectWorkspaceSymbolPageState {
     request_identity: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectWorkspaceSymbolBatchPageState {
+    project_id: String,
+    entries: Vec<crate::bridge::translator::WorkspaceSymbolBatchEntry>,
+    unique_queries: usize,
+    provider_requests: usize,
+    snapshot_identity: String,
+    cache_hit: bool,
+    filter_identity: String,
+}
+
 fn project_lexical_request_identity(request: &LexicalSearchRequest) -> String {
     let value = (
         &request.query,
@@ -169,6 +180,456 @@ fn project_workspace_symbol_request_identity(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
     )
+}
+
+fn project_workspace_symbol_batch_filter_identity(request: &WorkspaceSymbolBatchRequest) -> String {
+    let value = (
+        &request.kind_filter,
+        request.match_mode,
+        request.scope,
+        request.include_generated,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )
+}
+
+fn parse_project_workspace_symbol_batch_cursor(
+    cursor: &str,
+) -> Result<(String, usize, usize), String> {
+    let uri = Url::parse(cursor).map_err(|_| {
+        "page_token must be the next_cursor returned by workspace_symbol_search".to_owned()
+    })?;
+    if uri.scheme() != "mcpls-deferred" {
+        return Err(
+            "page_token must be the next_cursor returned by workspace_symbol_search".to_owned(),
+        );
+    }
+    let token = uri
+        .path()
+        .strip_prefix('/')
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "invalid workspace-symbol batch page_token".to_owned())?
+        .to_owned();
+    let mut entry = None;
+    let mut symbol = None;
+    for (key, value) in uri.query_pairs() {
+        match key.as_ref() {
+            "entry" => {
+                entry = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid workspace-symbol batch entry offset".to_owned())?,
+                );
+            }
+            "symbol" => {
+                symbol = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid workspace-symbol batch symbol offset".to_owned())?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok((
+        token,
+        entry.ok_or_else(|| "invalid workspace-symbol batch page_token".to_owned())?,
+        symbol.ok_or_else(|| "invalid workspace-symbol batch page_token".to_owned())?,
+    ))
+}
+
+fn project_workspace_symbol_batch_cursor(
+    token: &str,
+    entry_offset: usize,
+    symbol_offset: usize,
+) -> String {
+    format!("mcpls-deferred:///{token}?entry={entry_offset}&symbol={symbol_offset}")
+}
+
+#[allow(clippy::too_many_lines)]
+fn bounded_project_workspace_symbol_batch_page(
+    state: &ProjectWorkspaceSymbolBatchPageState,
+    token: &str,
+    entry_offset: usize,
+    symbol_offset: usize,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<crate::bridge::WorkspaceSymbolBatchResult, String> {
+    if entry_offset > state.entries.len() {
+        return Err(
+            "workspace-symbol batch page_token entry is outside the retained result".to_owned(),
+        );
+    }
+    if max_items == 0 {
+        return Err("max_items must be positive".to_owned());
+    }
+
+    let mut page = crate::bridge::WorkspaceSymbolBatchResult {
+        entries: Vec::new(),
+        unique_queries: state.unique_queries,
+        provider_requests: state.provider_requests,
+        snapshot_identity: state.snapshot_identity.clone(),
+        cache_hit: state.cache_hit,
+        returned: 0,
+        returned_queries: 0,
+        remaining_queries: state.entries.len().saturating_sub(entry_offset),
+        next_cursor: None,
+        truncated: false,
+        max_bytes,
+    };
+    let mut current_entry = entry_offset;
+    let mut current_symbol = symbol_offset;
+
+    'page: while current_entry < state.entries.len() {
+        let entry = &state.entries[current_entry];
+        let Some(full) = entry.result.as_ref() else {
+            let mut trial = page.clone();
+            trial.entries.push(entry.clone());
+            trial.returned_queries += 1;
+            trial.remaining_queries = state.entries.len().saturating_sub(current_entry + 1);
+            trial.next_cursor = (current_entry + 1 < state.entries.len())
+                .then(|| project_workspace_symbol_batch_cursor(token, current_entry + 1, 0));
+            trial.truncated = trial.next_cursor.is_some();
+            if serde_json::to_vec(&trial).map_or(usize::MAX, |encoded| encoded.len()) > max_bytes {
+                if page.entries.is_empty() {
+                    return Err(
+                        "max_bytes is too small to return one workspace-symbol batch identity"
+                            .to_owned(),
+                    );
+                }
+                break;
+            }
+            page = trial;
+            current_entry += 1;
+            current_symbol = 0;
+            continue;
+        };
+
+        if current_symbol > full.symbols.len() {
+            return Err(
+                "workspace-symbol batch page_token symbol is outside the retained result"
+                    .to_owned(),
+            );
+        }
+        let remaining_items = max_items.saturating_sub(page.returned);
+        if remaining_items == 0 && current_symbol < full.symbols.len() {
+            break;
+        }
+        let mut take = full
+            .symbols
+            .len()
+            .saturating_sub(current_symbol)
+            .min(remaining_items);
+        let next_position = |take: usize| {
+            let next_symbol = current_symbol.saturating_add(take);
+            if next_symbol < full.symbols.len() {
+                (current_entry, next_symbol)
+            } else {
+                (current_entry + 1, 0)
+            }
+        };
+
+        loop {
+            let mut bounded = full.clone();
+            bounded.symbols = full.symbols[current_symbol..current_symbol + take].to_vec();
+            bounded.returned = take;
+            bounded.remaining = full
+                .total
+                .saturating_sub(current_symbol.saturating_add(take));
+            bounded.next_cursor = None;
+            bounded.max_bytes = Some(max_bytes);
+            bounded.truncated =
+                full.truncated || current_symbol.saturating_add(take) < full.symbols.len();
+            let (next_entry, next_symbol) = next_position(take);
+            let mut trial = page.clone();
+            trial
+                .entries
+                .push(crate::bridge::WorkspaceSymbolBatchEntry {
+                    query: entry.query.clone(),
+                    result: Some(bounded),
+                    reused_from: entry.reused_from,
+                    skipped_by_budget: false,
+                });
+            trial.returned = trial.returned.saturating_add(take);
+            trial.returned_queries += 1;
+            trial.remaining_queries = state.entries.len().saturating_sub(next_entry);
+            trial.next_cursor = (next_entry < state.entries.len())
+                .then(|| project_workspace_symbol_batch_cursor(token, next_entry, next_symbol));
+            trial.truncated = trial.next_cursor.is_some();
+            if serde_json::to_vec(&trial).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+                page = trial;
+                current_entry = next_entry;
+                current_symbol = next_symbol;
+                break;
+            }
+            if take == 0 {
+                if page.entries.is_empty() {
+                    return Err(
+                        "max_bytes is too small to return one workspace-symbol batch identity"
+                            .to_owned(),
+                    );
+                }
+                break 'page;
+            }
+            take -= 1;
+        }
+    }
+
+    if page.entries.is_empty() {
+        return Err(
+            "max_bytes is too small to return one workspace-symbol batch identity".to_owned(),
+        );
+    }
+    page.next_cursor = (current_entry < state.entries.len())
+        .then(|| project_workspace_symbol_batch_cursor(token, current_entry, current_symbol));
+    page.remaining_queries = state.entries.len().saturating_sub(current_entry);
+    page.truncated = page.next_cursor.is_some()
+        || state
+            .entries
+            .iter()
+            .any(|entry| entry.result.as_ref().is_some_and(|result| result.truncated));
+    debug_assert!(serde_json::to_vec(&page).is_ok_and(|encoded| encoded.len() <= max_bytes));
+    Ok(page)
+}
+
+fn aggregate_project_snapshot_identity<T: Serialize>(values: &[T]) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(values).unwrap_or_default())
+    )
+}
+
+fn merge_project_lexical_batches(
+    request: &LexicalSearchBatchRequest,
+    batches: &[crate::bridge::lexical::LexicalSearchBatchResult],
+) -> crate::bridge::lexical::LexicalSearchBatchResult {
+    let snapshot_identity = aggregate_project_snapshot_identity(
+        &batches
+            .iter()
+            .map(|batch| batch.snapshot_identity.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let scanned_files = batches.iter().map(|batch| batch.scanned_files).sum();
+    let scanned_bytes = batches.iter().map(|batch| batch.scanned_bytes).sum();
+    let scan_truncated = batches.iter().any(|batch| batch.scan_truncated);
+    let mut returned_budget = request.max_matches;
+    let mut returned: usize = 0;
+    let mut truncated = scan_truncated;
+    let mut entries = Vec::with_capacity(request.queries.len());
+
+    for (index, query) in request.queries.iter().cloned().enumerate() {
+        if let Some(reused_from) = request.queries[..index]
+            .iter()
+            .position(|previous| previous == &query)
+        {
+            entries.push(crate::bridge::lexical::LexicalSearchBatchEntry {
+                query,
+                result: None,
+                reused_from: Some(reused_from),
+                skipped_by_budget: false,
+            });
+            continue;
+        }
+
+        if returned_budget == 0 {
+            truncated = true;
+            entries.push(crate::bridge::lexical::LexicalSearchBatchEntry {
+                query,
+                result: None,
+                reused_from: None,
+                skipped_by_budget: true,
+            });
+            continue;
+        }
+
+        let actor_results = batches
+            .iter()
+            .filter_map(|batch| batch.entries[index].result.as_ref());
+        let total_matches: usize = actor_results.clone().map(|result| result.total).sum();
+        let actor_truncated = actor_results.clone().any(|result| result.truncated);
+        let mut matches = actor_results
+            .flat_map(|result| result.matches.iter().cloned())
+            .take(returned_budget)
+            .collect::<Vec<_>>();
+        let retained = matches.len();
+        returned_budget = returned_budget.saturating_sub(retained);
+        returned = returned.saturating_add(retained);
+        let query_truncated = scan_truncated
+            || actor_truncated
+            || total_matches > retained
+            || matches.len() < total_matches.min(request.max_matches);
+        truncated |= query_truncated;
+        let query_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&matches).unwrap_or_default())
+        );
+        let result = crate::bridge::lexical::LexicalSearchResult {
+            returned: retained,
+            total: total_matches,
+            remaining: total_matches.saturating_sub(retained),
+            scanned_files,
+            scanned_bytes,
+            snapshot_identity: format!("{snapshot_identity}:{query_identity}"),
+            max_bytes: request.max_bytes,
+            truncated: query_truncated,
+            scan_truncated,
+            next_cursor: None,
+            matches: std::mem::take(&mut matches),
+        };
+        entries.push(crate::bridge::lexical::LexicalSearchBatchEntry {
+            query,
+            result: Some(result),
+            reused_from: None,
+            skipped_by_budget: false,
+        });
+    }
+
+    let unique_queries = entries
+        .iter()
+        .filter(|entry| entry.reused_from.is_none())
+        .count();
+    crate::bridge::lexical::LexicalSearchBatchResult {
+        entries,
+        unique_queries,
+        scanned_files,
+        scanned_bytes,
+        returned,
+        truncated,
+        max_matches: request.max_matches,
+        max_bytes: request.max_bytes,
+        snapshot_identity,
+        scan_truncated,
+    }
+}
+
+async fn collect_actor_workspace_symbol_batch(
+    actor: ProjectHandle,
+    mut request: WorkspaceSymbolBatchRequest,
+) -> Result<crate::bridge::WorkspaceSymbolBatchResult, String> {
+    let mut complete = actor
+        .workspace_symbol_batch(request.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    while let Some(next_cursor) = complete.next_cursor.clone() {
+        request.queries.clear();
+        request.page_token = Some(next_cursor);
+        let page = actor
+            .workspace_symbol_batch(request.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        for page_entry in page.entries {
+            let Some(page_result) = page_entry.result else {
+                continue;
+            };
+            let Some(complete_entry) = complete
+                .entries
+                .iter_mut()
+                .find(|entry| entry.query == page_entry.query)
+            else {
+                continue;
+            };
+            let Some(complete_result) = complete_entry.result.as_mut() else {
+                complete_entry.result = Some(page_result);
+                continue;
+            };
+            complete_result.symbols.extend(page_result.symbols);
+            complete_result.returned = complete_result.symbols.len();
+            complete_result.remaining = complete_result
+                .total
+                .saturating_sub(complete_result.returned);
+            complete_result.truncated = page_result.truncated;
+            complete_result.next_cursor = None;
+        }
+        complete.next_cursor = page.next_cursor;
+        complete.truncated = complete.next_cursor.is_some()
+            || complete
+                .entries
+                .iter()
+                .any(|entry| entry.result.as_ref().is_some_and(|result| result.truncated));
+    }
+    complete.truncated = complete
+        .entries
+        .iter()
+        .any(|entry| entry.result.as_ref().is_some_and(|result| result.truncated));
+    Ok(complete)
+}
+
+fn merge_project_workspace_symbol_batches(
+    request: &WorkspaceSymbolBatchRequest,
+    batches: &[crate::bridge::WorkspaceSymbolBatchResult],
+) -> ProjectWorkspaceSymbolBatchPageState {
+    let snapshot_identity = aggregate_project_snapshot_identity(
+        &batches
+            .iter()
+            .map(|batch| batch.snapshot_identity.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let mut entries = Vec::with_capacity(request.queries.len());
+    for (index, query) in request.queries.iter().cloned().enumerate() {
+        if let Some(reused_from) = request.queries[..index]
+            .iter()
+            .position(|previous| previous == &query)
+        {
+            entries.push(crate::bridge::translator::WorkspaceSymbolBatchEntry {
+                query,
+                result: None,
+                reused_from: Some(reused_from),
+                skipped_by_budget: false,
+            });
+            continue;
+        }
+
+        let results = batches
+            .iter()
+            .filter_map(|batch| batch.entries[index].result.as_ref())
+            .collect::<Vec<_>>();
+        let mut symbols = results
+            .iter()
+            .flat_map(|result| result.symbols.iter().cloned())
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.location.uri.cmp(&right.location.uri))
+        });
+        let total: usize = results.iter().map(|result| result.total).sum();
+        let truncated = results.iter().any(|result| result.truncated) || total > symbols.len();
+        let query_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&symbols).unwrap_or_default())
+        );
+        entries.push(crate::bridge::translator::WorkspaceSymbolBatchEntry {
+            query,
+            result: Some(crate::bridge::WorkspaceSymbolResult {
+                returned: symbols.len(),
+                remaining: total.saturating_sub(symbols.len()),
+                symbols,
+                total,
+                next_cursor: None,
+                snapshot_identity: Some(format!("{snapshot_identity}:{query_identity}")),
+                max_bytes: Some(request.max_bytes),
+                truncated,
+            }),
+            reused_from: None,
+            skipped_by_budget: false,
+        });
+    }
+    ProjectWorkspaceSymbolBatchPageState {
+        project_id: String::new(),
+        unique_queries: entries
+            .iter()
+            .filter(|entry| entry.reused_from.is_none())
+            .count(),
+        provider_requests: batches.iter().map(|batch| batch.provider_requests).sum(),
+        snapshot_identity,
+        cache_hit: batches.iter().any(|batch| batch.cache_hit),
+        filter_identity: project_workspace_symbol_batch_filter_identity(request),
+        entries,
+    }
 }
 
 async fn collect_actor_workspace_symbols(
@@ -4625,12 +5086,40 @@ impl McplsServer {
         params: WorkspaceSymbolBatchParams,
     ) -> Result<crate::bridge::WorkspaceSymbolBatchResult, String> {
         validate_workspace_symbol_batch(&params).map_err(|error| error.to_string())?;
-        let actor = self
+        let id = self
             .context
-            .required_actor_for_project_selector(&params.project_id)
+            .resolve_project_selector(&params.project_id)
             .await
             .map_err(project_routing_error)
             .map_err(|error| error.to_string())?;
+        let actors = self
+            .context
+            .required_actors_for_project_selector(&params.project_id)
+            .await
+            .map_err(project_routing_error)
+            .map_err(|error| error.to_string())?;
+        if actors.len() > 1 {
+            return self
+                .project_workspace_symbol_batch_result(
+                    &id,
+                    &actors,
+                    WorkspaceSymbolBatchRequest {
+                        queries: params.queries,
+                        kind_filter: params.kind_filter,
+                        match_mode: params.match_mode,
+                        scope: params.scope,
+                        include_generated: params.include_generated,
+                        max_items: params.max_items as usize,
+                        max_bytes: params.max_bytes,
+                        page_token: params.page_token,
+                    },
+                )
+                .await;
+        }
+        let actor = actors
+            .into_iter()
+            .next()
+            .ok_or_else(|| "project has no routable actor".to_owned())?;
         actor
             .workspace_symbol_batch(WorkspaceSymbolBatchRequest {
                 queries: params.queries,
@@ -4644,6 +5133,83 @@ impl McplsServer {
             })
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn project_workspace_symbol_batch_result(
+        &self,
+        id: &ProjectId,
+        actors: &[ProjectHandle],
+        request: WorkspaceSymbolBatchRequest,
+    ) -> Result<crate::bridge::WorkspaceSymbolBatchResult, String> {
+        let filter_identity = project_workspace_symbol_batch_filter_identity(&request);
+        let (state, token, entry_offset, symbol_offset) =
+            if let Some(page_token) = request.page_token.as_deref() {
+                let (token, entry_offset, symbol_offset) =
+                    parse_project_workspace_symbol_batch_cursor(page_token)?;
+                let value = self
+                    .context
+                    .project_registry
+                    .read_deferred_resource(&token)?;
+                let state: ProjectWorkspaceSymbolBatchPageState =
+                    serde_json::from_value(value.value)
+                        .map_err(|error| format!("invalid workspace-symbol batch page: {error}"))?;
+                if state.project_id != id.as_str() || state.filter_identity != filter_identity {
+                    return Err(
+                        "page_token belongs to a different project workspace-symbol batch request"
+                            .to_owned(),
+                    );
+                }
+                (state, token, entry_offset, symbol_offset)
+            } else {
+                let provider_request = WorkspaceSymbolBatchRequest {
+                    queries: request.queries.clone(),
+                    kind_filter: request.kind_filter.clone(),
+                    match_mode: request.match_mode,
+                    scope: request.scope,
+                    include_generated: request.include_generated,
+                    max_items: 1_000,
+                    max_bytes: 1_048_576,
+                    page_token: None,
+                };
+                let batches =
+                    futures::future::try_join_all(actors.iter().cloned().map(|actor| {
+                        let provider_request = provider_request.clone();
+                        async move {
+                            collect_actor_workspace_symbol_batch(actor, provider_request).await
+                        }
+                    }))
+                    .await?;
+                let mut state = merge_project_workspace_symbol_batches(&request, &batches);
+                id.as_str().clone_into(&mut state.project_id);
+                let value = serde_json::to_value(&state)
+                    .map_err(|error| format!("failed to store workspace-symbol batch: {error}"))?;
+                let reference = self.context.project_registry.store_deferred_resource(
+                    id,
+                    "workspace_symbol_project_batch_page",
+                    value,
+                )?;
+                let token = reference
+                    .uri
+                    .strip_prefix("mcpls-deferred:///")
+                    .ok_or_else(|| "workspace-symbol batch cursor has an invalid URI".to_owned())?
+                    .to_owned();
+                (state, token, 0, 0)
+            };
+
+        let page = bounded_project_workspace_symbol_batch_page(
+            &state,
+            &token,
+            entry_offset,
+            symbol_offset,
+            request.max_items,
+            request.max_bytes,
+        )?;
+        if page.next_cursor.is_none() {
+            self.context
+                .project_registry
+                .remove_deferred_resource(&token);
+        }
+        Ok(page)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4767,6 +5333,58 @@ impl McplsServer {
                 .remove_deferred_resource(&token);
         }
         Ok(page)
+    }
+
+    async fn project_lexical_search_batch(
+        &self,
+        actors: &[ProjectHandle],
+        request: LexicalSearchBatchRequest,
+        max_bytes: usize,
+    ) -> Result<crate::bridge::lexical::LexicalSearchBatchResult, McpError> {
+        let limits = project_search_file_limits(request.max_files, actors.len());
+        let provider_max_matches = request
+            .max_matches
+            .saturating_mul(request.queries.len().max(1));
+        let queries = request.queries.clone();
+        let include_paths = request.include_paths.clone();
+        let exclude_paths = request.exclude_paths.clone();
+        let batches = futures::future::try_join_all(actors.iter().cloned().zip(limits).map(
+            |(actor, max_files)| {
+                let queries = queries.clone();
+                let include_paths = include_paths.clone();
+                let exclude_paths = exclude_paths.clone();
+                async move {
+                    actor
+                        .lexical_search_batch(LexicalSearchBatchRequest {
+                            queries,
+                            mode: request.mode,
+                            case: request.case,
+                            multiline: request.multiline,
+                            max_files,
+                            max_matches: provider_max_matches,
+                            include_generated: request.include_generated,
+                            include_paths,
+                            exclude_paths,
+                            context_lines: request.context_lines,
+                            max_bytes: request.max_bytes,
+                        })
+                        .await
+                }
+            },
+        ))
+        .await
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let batch = merge_project_lexical_batches(&request, &batches);
+        bounded_lexical_batch(batch, effective_lexical_page_bytes(max_bytes)).map_err(
+            |required_bytes| {
+                McpError::invalid_params(
+                    format!(
+                        "max_bytes must be at least {required_bytes} for lexical batch metadata"
+                    ),
+                    None,
+                )
+            },
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4993,27 +5611,33 @@ impl McplsServer {
             };
             serde_json::to_value(LexicalSearchResponse::One(Box::new(page)))
         } else {
-            let actor = self
+            let actors = self
                 .context
-                .required_actor_for_project_selector(&params.project_id)
+                .required_actors_for_project_selector(&params.project_id)
                 .await
                 .map_err(project_routing_error)?;
-            let batch = actor
-                .lexical_search_batch(LexicalSearchBatchRequest {
-                    queries,
-                    mode: params.mode,
-                    case: params.case,
+            let request = LexicalSearchBatchRequest {
+                queries,
+                mode: params.mode,
+                case: params.case,
                     multiline: params.multiline,
                     max_files: params.max_files,
                     max_matches: limit,
                     include_generated: params.include_generated,
                     include_paths: params.include_paths,
-                    exclude_paths: params.exclude_paths,
-                    context_lines: params.context_lines,
-                    max_bytes,
-                })
-                .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                exclude_paths: params.exclude_paths,
+                context_lines: params.context_lines,
+                max_bytes,
+            };
+            let batch = if actors.len() > 1 {
+                self.project_lexical_search_batch(&actors, request, params.max_bytes)
+                    .await?
+            } else {
+                actors[0]
+                    .lexical_search_batch(request)
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            };
             serde_json::to_value(LexicalSearchResponse::Many(Box::new(
                 bounded_lexical_batch(batch, max_bytes).map_err(|required_bytes| {
                     McpError::invalid_params(
@@ -7772,6 +8396,34 @@ finally:
                 .contains(worktree.path().to_str().unwrap())
         );
 
+        let batch = server
+            .lexical_search(Parameters(LexicalSearchParams {
+                project_id: project_id.clone(),
+                query: None,
+                queries: vec!["linked_only".to_owned(), "not_present".to_owned()],
+                mode: crate::bridge::lexical::LexicalMatchMode::Literal,
+                case: crate::bridge::lexical::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 1_024,
+                max_matches: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                context_lines: 0,
+                include_generated: false,
+                include_paths: vec![worktree.path().join("src/main.rs").display().to_string()],
+                exclude_paths: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let batch: serde_json::Value = serde_json::from_str(&batch).unwrap();
+        assert_eq!(batch["entries"][0]["result"]["returned"], 1, "{batch}");
+        assert!(
+            batch["entries"][0]["result"]["matches"][0]["source_uri"]
+                .as_str()
+                .unwrap()
+                .contains(worktree.path().to_str().unwrap())
+        );
+
         std::fs::write(
             repository.path().join("src/main.rs"),
             "fn shared_marker() {}\n",
@@ -7782,6 +8434,30 @@ finally:
             "fn shared_marker() {}\n",
         )
         .unwrap();
+
+        let batch = server
+            .lexical_search(Parameters(LexicalSearchParams {
+                project_id: project_id.clone(),
+                query: None,
+                queries: vec!["shared_marker".to_owned(), "not_present".to_owned()],
+                mode: crate::bridge::lexical::LexicalMatchMode::Literal,
+                case: crate::bridge::lexical::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 1_024,
+                max_matches: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                context_lines: 0,
+                include_generated: false,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let batch: serde_json::Value = serde_json::from_str(&batch).unwrap();
+        assert_eq!(batch["entries"][0]["result"]["total"], 2, "{batch}");
+        assert_eq!(batch["entries"][0]["result"]["returned"], 2, "{batch}");
+
         let first_page = server
             .lexical_search(Parameters(LexicalSearchParams {
                 project_id: project_id.clone(),
@@ -7921,6 +8597,64 @@ finally:
             uris.iter()
                 .any(|uri| uri.contains(worktree.path().to_str().unwrap()))
         );
+
+        let batch = server
+            .workspace_symbol_search_batch(Parameters(WorkspaceSymbolBatchParams {
+                project_id: project_id.clone(),
+                queries: vec!["linked_only_symbol".to_owned(), "not_present".to_owned()],
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::Exact,
+                scope: crate::bridge::WorkspaceSymbolScope::Project,
+                max_items: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .unwrap();
+        let batch: serde_json::Value = serde_json::from_str(&batch).unwrap();
+        assert_eq!(batch["entries"][0]["result"]["total"], 2, "{batch}");
+        assert_eq!(batch["entries"][0]["result"]["returned"], 2, "{batch}");
+
+        let first_batch_page = server
+            .workspace_symbol_search_batch(Parameters(WorkspaceSymbolBatchParams {
+                project_id: project_id.clone(),
+                queries: vec!["linked_only_symbol".to_owned(), "not_present".to_owned()],
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::Exact,
+                scope: crate::bridge::WorkspaceSymbolScope::Project,
+                max_items: 1,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .unwrap();
+        let first_batch_page: serde_json::Value = serde_json::from_str(&first_batch_page).unwrap();
+        assert_eq!(first_batch_page["returned"], 1, "{first_batch_page}");
+        let next_batch_cursor = first_batch_page["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing batch cursor in {first_batch_page}"))
+            .to_owned();
+        let second_batch_page = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: project_id.clone(),
+                query: None,
+                queries: Vec::new(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::Exact,
+                scope: crate::bridge::WorkspaceSymbolScope::Project,
+                limit: 1,
+                max_bytes: 16 * 1024,
+                page_token: Some(next_batch_cursor),
+                include_generated: false,
+            }))
+            .await
+            .unwrap();
+        let second_batch_page: serde_json::Value =
+            serde_json::from_str(&second_batch_page).unwrap();
+        assert_eq!(second_batch_page["returned"], 1, "{second_batch_page}");
+        assert_eq!(second_batch_page["truncated"], false, "{second_batch_page}");
 
         let first_page = server
             .workspace_symbol_search(Parameters(WorkspaceSymbolParams {

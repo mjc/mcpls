@@ -374,23 +374,6 @@ impl HandlerContext {
             .map(|(id, _)| id)
     }
 
-    /// Return the active actor selected by a stable ID or registered root.
-    pub(crate) async fn required_actor_for_project_selector(
-        &self,
-        selector: &str,
-    ) -> Result<ProjectHandle, ProjectRegistryError> {
-        if let Ok(id) = ProjectId::new(selector.to_owned()) {
-            match self.required_actor_for_project(&id).await {
-                Ok(actor) => return Ok(actor),
-                Err(_) if !looks_like_path(selector) => {
-                    return Err(ProjectRegistryError::ProjectNotFound(id));
-                }
-                Err(_) => {}
-            }
-        }
-        self.required_actor_for_path(selector).await
-    }
-
     /// Return every actor group for an explicit project ID, or the owning
     /// actor for a path selector.
     pub(crate) async fn required_actors_for_project_selector(
