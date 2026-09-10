@@ -2597,7 +2597,12 @@ fn compact_advertised_schema_value(value: &mut Value) {
 }
 
 fn compact_advertised_description(name: &str) -> String {
-    format!("MCPLS {}.", name.replace('_', " "))
+    match name {
+        "workspace_symbol_search" => "MCPLS workspace symbol search. Continue with next_cursor as page_token; read source.resource.uri with read_semantic_resource.".to_owned(),
+        "lexical_search" => "MCPLS lexical search. Continue with next_cursor as page_token; read source.resource.uri with read_semantic_resource.".to_owned(),
+        "read_semantic_resource" => "MCPLS read_semantic_resource. Pass source.resource.uri here; pass a search next_cursor back as page_token on that same search tool.".to_owned(),
+        _ => format!("MCPLS {}.", name.replace('_', " ")),
+    }
 }
 
 #[cfg(test)]
@@ -9684,6 +9689,37 @@ finally:
                     .map(|properties| properties.keys().collect::<Vec<_>>())
             );
         }
+    }
+
+    #[test]
+    fn advertised_search_descriptions_distinguish_cursors_from_resources() {
+        let advertised = advertised_tools();
+        let description = |name: &str| {
+            advertised
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.description.as_deref())
+                .unwrap_or_default()
+        };
+
+        for name in ["workspace_symbol_search", "lexical_search"] {
+            let description = description(name);
+            assert!(description.contains("next_cursor"), "{name}: {description}");
+            assert!(description.contains("page_token"), "{name}: {description}");
+            assert!(
+                description.contains("source.resource.uri"),
+                "{name}: {description}"
+            );
+            assert!(
+                description.contains("read_semantic_resource"),
+                "{name}: {description}"
+            );
+        }
+
+        let description = description("read_semantic_resource");
+        assert!(description.contains("source.resource.uri"));
+        assert!(description.contains("next_cursor"));
+        assert!(description.contains("page_token"));
     }
 
     #[test]
