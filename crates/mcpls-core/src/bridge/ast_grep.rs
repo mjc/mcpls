@@ -390,7 +390,7 @@ fn search_sync(
     if languages.is_empty() {
         return Vec::new();
     }
-    let max_paths_per_language = MAX_SCANNED_FILES.div_ceil(languages.len());
+    let max_paths_per_language = MAX_SCANNED_FILES;
     let mut path_counts = vec![0; languages.len()];
 
     let query = query.to_ascii_lowercase();
@@ -787,6 +787,36 @@ mod tests {
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "SpotifyProviderAdapter");
+    }
+
+    #[test]
+    fn mixed_language_scan_does_not_starve_later_language_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..MAX_SCANNED_FILES {
+            fs::write(
+                temp.path().join(format!("noise_{index:04}.rs")),
+                format!("struct RustNoise{index};\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            temp.path().join("target.swift"),
+            "public final class SwiftTarget {}\n",
+        )
+        .unwrap();
+
+        let symbols = search_sync(
+            &[temp.path().to_path_buf()],
+            &["rust".to_owned(), "swift".to_owned()],
+            "SwiftTarget",
+            None,
+            10,
+            false,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "SwiftTarget");
     }
 
     #[test]
