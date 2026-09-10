@@ -21,6 +21,8 @@ struct PendingNotifications {
     queue: VecDeque<LspNotification>,
     draining: bool,
     capacity: usize,
+    dropped: usize,
+    overflow_kind: Option<&'static str>,
 }
 
 impl NonBlockingNotificationSink {
@@ -32,6 +34,8 @@ impl NonBlockingNotificationSink {
                 queue: VecDeque::with_capacity(capacity),
                 draining: false,
                 capacity,
+                dropped: 0,
+                overflow_kind: None,
             })),
         }
     }
@@ -46,47 +50,72 @@ impl NonBlockingNotificationSink {
             }
         };
 
-        let should_drain = {
+        let (should_drain, overflow_notice, queue_capacity) = {
             let Ok(mut pending) = self.pending.lock() else {
                 warn!("Notification queue lock poisoned; preserving delivery is impossible");
                 return;
             };
-            if let Some(index) = pending
+            let overflow_notice = if let Some(index) = pending
                 .queue
                 .iter()
                 .position(|queued| can_coalesce(queued, &notification))
             {
                 pending.queue[index] = notification;
+                None
             } else if pending.queue.len() < pending.capacity {
                 pending.queue.push_back(notification);
+                None
             } else {
-                warn!(
-                    notification_kind = notification_kind(&notification),
-                    queue_capacity = pending.capacity,
-                    "Notification queue full; dropping non-coalescible notification"
-                );
-                return;
-            }
-            if pending.draining {
+                pending.dropped = pending.dropped.saturating_add(1);
+                let kind = pending
+                    .overflow_kind
+                    .unwrap_or_else(|| notification_kind(&notification));
+                pending.overflow_kind = Some(kind);
+                (pending.dropped == 1).then_some((kind, pending.dropped))
+            };
+            let should_drain = if pending.draining {
                 false
             } else {
                 pending.draining = true;
                 true
-            }
+            };
+            (should_drain, overflow_notice, pending.capacity)
         };
+
+        if let Some((kind, dropped_count)) = overflow_notice {
+            warn!(
+                notification_kind = kind,
+                queue_capacity,
+                dropped_count,
+                "Notification queue full; dropping non-coalescible notifications"
+            );
+        }
 
         if should_drain {
             let tx = self.best_effort_tx.clone();
             let pending = Arc::clone(&self.pending);
             tokio::spawn(async move {
                 loop {
-                    let next = pending
-                        .lock()
-                        .ok()
-                        .and_then(|mut state| state.queue.pop_front());
+                    let (next, completed_drops, queue_capacity) =
+                        pending.lock().map_or((None, 0, 0), |mut state| {
+                            let next = state.queue.pop_front();
+                            if next.is_none() {
+                                let completed_drops = state.dropped;
+                                state.dropped = 0;
+                                state.overflow_kind = None;
+                                state.draining = false;
+                                (next, completed_drops, state.capacity)
+                            } else {
+                                (next, 0, state.capacity)
+                            }
+                        });
                     let Some(notification) = next else {
-                        if let Ok(mut state) = pending.lock() {
-                            state.draining = false;
+                        if completed_drops > 1 {
+                            warn!(
+                                queue_capacity,
+                                dropped_count = completed_drops,
+                                "Notification queue overflow episode complete"
+                            );
                         }
                         break;
                     };
@@ -94,6 +123,8 @@ impl NonBlockingNotificationSink {
                         warn!("Notification channel closed; clearing pending notifications");
                         if let Ok(mut state) = pending.lock() {
                             state.queue.clear();
+                            state.dropped = 0;
+                            state.overflow_kind = None;
                             state.draining = false;
                         }
                         break;
@@ -197,5 +228,22 @@ mod tests {
             Some(LspNotification::PublishDiagnostics(params)) if params.version == Some(10_000)
         ));
         assert!(pending.queue.len() <= pending.capacity);
+    }
+
+    #[tokio::test]
+    async fn pending_queue_is_bounded_for_non_coalescible_bursts() {
+        let (sink, _receiver) = non_blocking_notification_channel(1);
+
+        for index in 0..10_000 {
+            sink.forward(LspNotification::LogMessage(lsp_types::LogMessageParams {
+                typ: lsp_types::MessageType::INFO,
+                message: format!("message-{index}"),
+            }));
+        }
+
+        let pending = sink.pending.lock().unwrap();
+        assert!(pending.queue.len() <= pending.capacity);
+        assert!(pending.dropped > 0);
+        assert_eq!(pending.overflow_kind, Some("log_message"));
     }
 }
