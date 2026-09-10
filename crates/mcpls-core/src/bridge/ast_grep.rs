@@ -392,6 +392,7 @@ fn search_sync(
     }
     let max_paths_per_language = MAX_SCANNED_FILES;
     let mut path_counts = vec![0; languages.len()];
+    let mut byte_counts = vec![0_u64; languages.len()];
 
     let query = query.to_ascii_lowercase();
     let started = Instant::now();
@@ -444,27 +445,26 @@ fn search_sync(
     }
 
     let mut symbols = Vec::new();
-    let mut total_bytes: u64 = 0;
     for path in paths {
         if cancelled.load(Ordering::Relaxed) || started.elapsed() >= MAX_SCAN_DURATION {
             break;
         }
+        let Some(language_index) = languages
+            .iter()
+            .position(|language| SupportLang::from_path(&path) == Some(*language))
+        else {
+            continue;
+        };
         let Ok(metadata) = fs::metadata(&path) else {
             continue;
         };
         if metadata.len() > MAX_FILE_BYTES
-            || total_bytes.saturating_add(metadata.len()) > MAX_TOTAL_BYTES
+            || byte_counts[language_index].saturating_add(metadata.len()) > MAX_TOTAL_BYTES
         {
             continue;
         }
-        total_bytes = total_bytes.saturating_add(metadata.len());
-        let Some(language) = languages
-            .iter()
-            .find(|language| SupportLang::from_path(&path) == Some(**language))
-            .copied()
-        else {
-            continue;
-        };
+        byte_counts[language_index] = byte_counts[language_index].saturating_add(metadata.len());
+        let language = languages[language_index];
         let Ok(source) = fs::read_to_string(&path) else {
             continue;
         };
