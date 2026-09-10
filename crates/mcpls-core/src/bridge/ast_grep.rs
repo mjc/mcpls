@@ -398,7 +398,9 @@ fn search_sync(
 
     let query = query.to_ascii_lowercase();
     let started = Instant::now();
-    let mut paths = BTreeSet::new();
+    let mut paths_by_language = (0..languages.len())
+        .map(|_| BTreeSet::new())
+        .collect::<Vec<_>>();
     for root in roots {
         for entry in WalkBuilder::new(root)
             .standard_filters(true)
@@ -432,7 +434,7 @@ fn search_sync(
             if path_counts[language_index] >= max_paths_per_language {
                 continue;
             }
-            if paths.insert(path) {
+            if paths_by_language[language_index].insert(path) {
                 path_counts[language_index] += 1;
             }
         }
@@ -446,75 +448,84 @@ fn search_sync(
         }
     }
 
+    let paths_by_language = paths_by_language
+        .into_iter()
+        .map(|paths| paths.into_iter().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let max_paths = paths_by_language
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or_default();
     let mut symbols = Vec::new();
-    for path in paths {
-        if cancelled.load(Ordering::Relaxed) || started.elapsed() >= MAX_SCAN_DURATION {
-            break;
-        }
-        let Some(language_index) = languages
-            .iter()
-            .position(|language| SupportLang::from_path(&path) == Some(*language))
-        else {
-            continue;
-        };
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
-        };
-        if metadata.len() > MAX_FILE_BYTES
-            || byte_counts[language_index].saturating_add(metadata.len()) > MAX_TOTAL_BYTES
-        {
-            continue;
-        }
-        byte_counts[language_index] = byte_counts[language_index].saturating_add(metadata.len());
-        let language = languages[language_index];
-        let Ok(source) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if !contains_ascii_case_insensitive(&source, &query) {
-            continue;
-        }
-        query_file_counts[language_index] += 1;
-
-        let tree = language.ast_grep(&source);
-        for node in tree.root().dfs() {
+    'scan: for path_index in 0..max_paths {
+        for (language_index, paths) in paths_by_language.iter().enumerate() {
+            let Some(path) = paths.get(path_index) else {
+                continue;
+            };
             if cancelled.load(Ordering::Relaxed) || started.elapsed() >= MAX_SCAN_DURATION {
-                return symbols;
+                break 'scan;
             }
-            let Some(kind) = symbol_kind(&node) else {
+            let Ok(metadata) = fs::metadata(path) else {
                 continue;
             };
-            if kind_filter.is_some_and(|filter| !kind.eq_ignore_ascii_case(filter)) {
-                continue;
-            }
-            let Some(name) = symbol_name(&node) else {
-                continue;
-            };
-            if !contains_ascii_case_insensitive(&name, &query) {
+            if metadata.len() > MAX_FILE_BYTES
+                || byte_counts[language_index].saturating_add(metadata.len()) > MAX_TOTAL_BYTES
+            {
                 continue;
             }
-            let range = node.range();
-            let Some((start_line, start_character)) =
-                byte_offset_to_fallback_position(&source, range.start)
-            else {
+            byte_counts[language_index] =
+                byte_counts[language_index].saturating_add(metadata.len());
+            let language = languages[language_index];
+            let Ok(source) = fs::read_to_string(path) else {
                 continue;
             };
-            let Some((end_line, end_character)) =
-                byte_offset_to_fallback_position(&source, range.end)
-            else {
+            if !contains_ascii_case_insensitive(&source, &query) {
                 continue;
-            };
-            symbols.push(Symbol {
-                name,
-                kind: kind.to_string(),
-                path: path.clone(),
-                start_line,
-                start_character,
-                end_line,
-                end_character,
-            });
-            symbol_counts[language_index] += 1;
-            if symbols.len() >= limit {
-                return symbols;
+            }
+            query_file_counts[language_index] += 1;
+
+            let tree = language.ast_grep(&source);
+            for node in tree.root().dfs() {
+                if cancelled.load(Ordering::Relaxed) || started.elapsed() >= MAX_SCAN_DURATION {
+                    break 'scan;
+                }
+                let Some(kind) = symbol_kind(&node) else {
+                    continue;
+                };
+                if kind_filter.is_some_and(|filter| !kind.eq_ignore_ascii_case(filter)) {
+                    continue;
+                }
+                let Some(name) = symbol_name(&node) else {
+                    continue;
+                };
+                if !contains_ascii_case_insensitive(&name, &query) {
+                    continue;
+                }
+                let range = node.range();
+                let Some((start_line, start_character)) =
+                    byte_offset_to_fallback_position(&source, range.start)
+                else {
+                    continue;
+                };
+                let Some((end_line, end_character)) =
+                    byte_offset_to_fallback_position(&source, range.end)
+                else {
+                    continue;
+                };
+                symbols.push(Symbol {
+                    name,
+                    kind: kind.to_string(),
+                    path: path.clone(),
+                    start_line,
+                    start_character,
+                    end_line,
+                    end_character,
+                });
+                symbol_counts[language_index] += 1;
+                if symbols.len() >= limit {
+                    break 'scan;
+                }
             }
         }
     }
