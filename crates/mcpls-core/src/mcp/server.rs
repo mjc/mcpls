@@ -5770,13 +5770,19 @@ impl McplsServer {
             .await
             .map_err(project_operation_error)
             .map_err(|error| error.to_string())?;
-        let actor = self
+        let actors = self
             .context
-            .project_registry
-            .actor_for_project(&id)
+            .required_actors_for_project_selector(&params.project_id)
             .await
             .map_err(project_operation_error)
             .map_err(|error| error.to_string())?;
+        if actors.len() > 1 && params.page_token.is_none() {
+            return self.project_inspect_symbol_batch_result(&id, params).await;
+        }
+        let actor = actors
+            .into_iter()
+            .next()
+            .ok_or_else(|| "project has no routable actor".to_owned())?;
         actor
             .inspect_symbol_batch(crate::bridge::InspectSymbolBatchRequest {
                 targets: params.targets,
@@ -5788,6 +5794,161 @@ impl McplsServer {
             .await
             .map_err(operation_error)
             .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn project_inspect_symbol_batch_result(
+        &self,
+        id: &ProjectId,
+        params: InspectSymbolBatchParams,
+    ) -> Result<crate::bridge::InspectSymbolBatchResult, String> {
+        let target_count = params.targets.len();
+        let identity_bytes = serde_json::to_vec(&params.targets)
+            .map_err(|error| error.to_string())?
+            .len();
+        let available_bytes = params.budget.max_bytes.saturating_sub(
+            identity_bytes
+                + crate::bridge::translator::INSPECT_SYMBOL_BATCH_RESPONSE_OVERHEAD_BYTES,
+        );
+        let target_budget = crate::bridge::InspectSymbolBudget {
+            max_bytes: (available_bytes / target_count)
+                .min(crate::bridge::translator::INSPECT_SYMBOL_BATCH_MAX_ENTRY_BYTES),
+            max_items: params.budget.max_items / target_count,
+        };
+        if target_budget.max_bytes
+            < crate::bridge::translator::INSPECT_SYMBOL_BATCH_MIN_BYTES_PER_TARGET
+            || target_budget.max_items == 0
+        {
+            return Err("batch budget is too small for every symbol target".to_owned());
+        }
+
+        let primary = self
+            .context
+            .project_registry
+            .actor_for_project(id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut unique_targets = Vec::new();
+        let mut target_sources = Vec::with_capacity(target_count);
+        let mut target_indexes = std::collections::HashMap::new();
+        for target in &params.targets {
+            let actor = if let Some(handle) = target.symbol_handle.clone() {
+                match self.context.resolve_symbol_handle(id, handle).await {
+                    Ok((actor, _)) => actor,
+                    Err(error)
+                        if error.contains("invalid_symbol_handle:")
+                            || error.contains("stale_symbol_handle:") =>
+                    {
+                        primary.clone()
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                primary.clone()
+            };
+            let source = target_indexes.get(target).copied().unwrap_or_else(|| {
+                let source = unique_targets.len();
+                target_indexes.insert(target.clone(), source);
+                unique_targets.push((target.clone(), actor));
+                source
+            });
+            target_sources.push(source);
+        }
+
+        let candidate_limit = params.candidate_limit;
+        let sections = params.sections.clone();
+        let unique_results =
+            futures::future::join_all(unique_targets.into_iter().map(|(target, actor)| {
+                let sections = sections.clone();
+                async move {
+                    actor
+                        .inspect_symbol(crate::bridge::InspectSymbolRequest {
+                            symbol_handle: target.symbol_handle,
+                            query: target.query,
+                            kind: target.kind,
+                            path: target.path,
+                            container: target.container,
+                            candidate_limit,
+                            sections,
+                            budget: target_budget,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            }))
+            .await;
+        let mut entries = params
+            .targets
+            .into_iter()
+            .zip(target_sources)
+            .map(|(target, source)| match &unique_results[source] {
+                Ok(result) => crate::bridge::InspectSymbolBatchEntry {
+                    target,
+                    result: Some(result.clone()),
+                    error: None,
+                    resource: None,
+                },
+                Err(error) => crate::bridge::InspectSymbolBatchEntry {
+                    target,
+                    result: None,
+                    error: Some(error.clone()),
+                    resource: None,
+                },
+            })
+            .collect::<Vec<_>>();
+        let snapshot_identity = aggregate_project_snapshot_identity(&entries);
+        let max_bytes = params
+            .budget
+            .max_bytes
+            .min(crate::bridge::translator::INSPECT_SYMBOL_RESULT_MAX_BYTES);
+        loop {
+            let mut result = crate::bridge::InspectSymbolBatchResult {
+                inspections_started: unique_results.len(),
+                total_targets: entries.len(),
+                returned_targets: entries.len(),
+                remaining_targets: 0,
+                next_cursor: None,
+                snapshot_identity: snapshot_identity.clone(),
+                returned_items: entries
+                    .iter()
+                    .filter_map(|entry| entry.result.as_ref())
+                    .map(|entry| entry.sections.returned_items())
+                    .sum(),
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes,
+                    max_items: params.budget.max_items,
+                },
+                returned_bytes: 0,
+                truncated: entries
+                    .iter()
+                    .filter_map(|entry| entry.result.as_ref())
+                    .any(|result| result.truncated),
+                entries: entries.clone(),
+            };
+            for _ in 0..4 {
+                let returned_bytes =
+                    serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len());
+                if result.returned_bytes == returned_bytes {
+                    break;
+                }
+                result.returned_bytes = returned_bytes;
+            }
+            if result.returned_bytes <= max_bytes {
+                return Ok(result);
+            }
+            let Some(index) = entries.iter().rposition(|entry| entry.result.is_some()) else {
+                return Err("inspect batch metadata exceeds the response budget".to_owned());
+            };
+            let value = serde_json::to_value(&entries[index])
+                .map_err(|error| format!("failed to defer inspect batch entry: {error}"))?;
+            let resource = self.context.project_registry.store_deferred_resource(
+                id,
+                "inspect_symbol_batch_entry",
+                value,
+            )?;
+            entries[index].result = None;
+            entries[index].resource = Some(resource);
+        }
     }
 
     /// Inspect several symbols concurrently without repeating actor round trips.
@@ -8653,6 +8814,45 @@ finally:
                     .as_u64()
                     .is_some_and(|bytes| bytes > 0),
             "{inspected}"
+        );
+
+        let inspect_targets = result["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| crate::bridge::InspectSymbolTarget {
+                symbol_handle: Some(
+                    serde_json::from_value(symbol["location"]["symbol_handle"].clone()).unwrap(),
+                ),
+                query: None,
+                kind: None,
+                path: None,
+                container: None,
+            })
+            .collect::<Vec<_>>();
+        let inspected_batch = server
+            .inspect_symbol_batch(Parameters(InspectSymbolBatchParams {
+                project_id: project_id.clone(),
+                targets: inspect_targets,
+                candidate_limit: 10,
+                sections: Vec::new(),
+                budget: crate::bridge::InspectSymbolBudget {
+                    max_bytes: 16 * 1024,
+                    max_items: 20,
+                },
+                page_token: None,
+            }))
+            .await
+            .unwrap();
+        let inspected_batch: serde_json::Value = serde_json::from_str(&inspected_batch).unwrap();
+        assert_eq!(inspected_batch["returned_targets"], 2, "{inspected_batch}");
+        assert!(
+            inspected_batch["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["result"]["resolution"]["status"] == "selected"),
+            "{inspected_batch}"
         );
 
         let batch = server
