@@ -28,7 +28,7 @@ use rmcp::model::{
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -87,6 +87,197 @@ use crate::transport::{SessionManagerHandle, TransportSnapshot};
 
 const MAX_SEMANTIC_RESOURCE_RESULT_BYTES: usize = 16 * 1024;
 const PROJECT_STATE_PAGE_SIZE: usize = 16;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectLexicalSearchPageState {
+    project_id: String,
+    matches: Vec<crate::bridge::lexical::LexicalSearchMatch>,
+    total_matches: usize,
+    scanned_files: usize,
+    scanned_bytes: usize,
+    snapshot_identity: String,
+    request_identity: String,
+    scan_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectWorkspaceSymbolPageState {
+    project_id: String,
+    symbols: Vec<crate::bridge::translator::WorkspaceSymbol>,
+    snapshot_identity: String,
+    request_identity: String,
+}
+
+fn project_lexical_request_identity(request: &LexicalSearchRequest) -> String {
+    let value = (
+        &request.query,
+        request.mode,
+        request.case,
+        request.multiline,
+        request.max_files,
+        request.include_generated,
+        &request.include_paths,
+        &request.exclude_paths,
+        request.context_lines,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )
+}
+
+fn parse_project_lexical_cursor(cursor: &str) -> Result<(String, usize), String> {
+    let uri = Url::parse(cursor)
+        .map_err(|_| "page_token must be the next_cursor returned by lexical_search".to_owned())?;
+    if uri.scheme() != "mcpls-deferred" {
+        return Err("page_token must be the next_cursor returned by lexical_search".to_owned());
+    }
+    let token = uri
+        .path()
+        .strip_prefix('/')
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "invalid lexical_search page_token".to_owned())?
+        .to_owned();
+    let offset = uri
+        .query_pairs()
+        .find_map(|(key, value)| (key == "offset").then(|| value.into_owned()))
+        .ok_or_else(|| "invalid lexical_search page_token".to_owned())?
+        .parse::<usize>()
+        .map_err(|_| "invalid lexical_search page_token offset".to_owned())?;
+    Ok((token, offset))
+}
+
+fn project_search_file_limits(max_files: usize, actor_count: usize) -> Vec<usize> {
+    let base = max_files / actor_count;
+    let remainder = max_files % actor_count;
+    (0..actor_count)
+        .map(|index| base + usize::from(index < remainder))
+        .collect()
+}
+
+fn project_workspace_symbol_request_identity(
+    request: &crate::bridge::WorkspaceSymbolPageRequest,
+) -> String {
+    let value = (
+        &request.query,
+        &request.kind_filter,
+        request.match_mode,
+        request.scope,
+        request.include_generated,
+    );
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )
+}
+
+async fn collect_actor_workspace_symbols(
+    actor: ProjectHandle,
+    mut request: crate::bridge::WorkspaceSymbolPageRequest,
+) -> Result<
+    (
+        Vec<crate::bridge::translator::WorkspaceSymbol>,
+        Option<String>,
+    ),
+    String,
+> {
+    let mut symbols = Vec::new();
+    let mut snapshot_identity = None;
+    loop {
+        let result = actor
+            .workspace_symbol(request.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        symbols.extend(result.symbols);
+        snapshot_identity.clone_from(&result.snapshot_identity);
+        let Some(next_cursor) = result.next_cursor else {
+            return Ok((symbols, snapshot_identity));
+        };
+        request.page_token = Some(next_cursor);
+    }
+}
+
+fn bounded_project_workspace_symbol_page(
+    symbols: &[crate::bridge::translator::WorkspaceSymbol],
+    offset: usize,
+    max_items: usize,
+    max_bytes: usize,
+    snapshot_identity: &str,
+    token: &str,
+) -> Result<crate::bridge::WorkspaceSymbolResult, String> {
+    let total = symbols.len();
+    let mut count = total.saturating_sub(offset).min(max_items);
+    loop {
+        let end = offset.saturating_add(count).min(total);
+        let truncated = end < total;
+        let result = crate::bridge::WorkspaceSymbolResult {
+            returned: end.saturating_sub(offset),
+            remaining: total.saturating_sub(end),
+            symbols: symbols[offset..end].to_vec(),
+            total,
+            next_cursor: truncated.then(|| crate::project::lexical_page_cursor(token, end)),
+            snapshot_identity: Some(snapshot_identity.to_owned()),
+            max_bytes: Some(max_bytes),
+            truncated,
+        };
+        if serde_json::to_vec(&result).map_or(usize::MAX, |encoded| encoded.len()) <= max_bytes {
+            return Ok(result);
+        }
+        if count == 0 {
+            return Err("max_bytes is too small to return one workspace symbol".to_owned());
+        }
+        count -= 1;
+    }
+}
+
+async fn collect_actor_lexical_matches(
+    actor: ProjectHandle,
+    mut request: LexicalSearchRequest,
+    max_files: usize,
+) -> Result<crate::bridge::lexical::LexicalSearchScan, String> {
+    if max_files == 0 {
+        return Ok(crate::bridge::lexical::LexicalSearchScan {
+            matches: Vec::new(),
+            total_matches: 0,
+            scanned_files: 0,
+            scanned_bytes: 0,
+            offset: 0,
+            page_token: String::new(),
+            snapshot_identity: String::new(),
+            scan_truncated: true,
+        });
+    }
+
+    request.max_files = max_files;
+    request.page_token = None;
+    let mut all_matches = Vec::new();
+    let mut first_scan = None;
+    loop {
+        let scan = actor
+            .lexical_search(request.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let next_offset = scan.offset.saturating_add(scan.matches.len());
+        if first_scan.is_none() {
+            first_scan = Some(scan.clone());
+        }
+        all_matches.extend(scan.matches);
+        if next_offset >= scan.total_matches {
+            let Some(mut result) = first_scan else {
+                return Err("lexical search returned no initial page".to_owned());
+            };
+            result.matches = all_matches;
+            return Ok(result);
+        }
+        if next_offset == scan.offset {
+            return Err("lexical search page made no progress".to_owned());
+        }
+        request.page_token = Some(crate::project::lexical_page_cursor(
+            &scan.page_token,
+            next_offset,
+        ));
+    }
+}
 
 fn source_mime_type(language_id: Option<&str>) -> String {
     match language_id {
@@ -4395,25 +4586,36 @@ impl McplsServer {
                 None,
             ));
         }
-        let actor = self
+        let id = self
             .context
-            .required_actor_for_project_selector(&params.project_id)
+            .resolve_project_selector(&params.project_id)
             .await
             .map_err(project_routing_error)?;
-        let result = actor
-            .workspace_symbol(crate::bridge::WorkspaceSymbolPageRequest {
-                query,
-                kind_filter: params.kind_filter,
-                match_mode: params.match_mode,
-                scope: params.scope,
-                include_generated: params.include_generated,
-                max_items: params.limit as usize,
-                max_bytes: params.max_bytes,
-                page_token: params.page_token,
-            })
+        let actors = self
+            .context
+            .required_actors_for_project_selector(&params.project_id)
             .await
-            .map_err(|error| error.to_string())
-            .map(|result| WorkspaceSymbolSearchResponse::One(Box::new(result)));
+            .map_err(project_routing_error)?;
+        let request = crate::bridge::WorkspaceSymbolPageRequest {
+            query,
+            kind_filter: params.kind_filter,
+            match_mode: params.match_mode,
+            scope: params.scope,
+            include_generated: params.include_generated,
+            max_items: params.limit as usize,
+            max_bytes: params.max_bytes,
+            page_token: params.page_token,
+        };
+        let result = if actors.len() > 1 {
+            self.project_workspace_symbol_search(&id, &actors, request)
+                .await
+        } else {
+            actors[0]
+                .workspace_symbol(request)
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))
+        }
+        .map(|result| WorkspaceSymbolSearchResponse::One(Box::new(result)));
 
         encode_tool_result(result)
     }
@@ -4442,6 +4644,239 @@ impl McplsServer {
             })
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn project_lexical_search(
+        &self,
+        id: &ProjectId,
+        actors: &[ProjectHandle],
+        request: LexicalSearchRequest,
+        max_bytes: usize,
+    ) -> Result<crate::bridge::lexical::LexicalSearchResult, McpError> {
+        let request_identity = project_lexical_request_identity(&request);
+        let (state, token, offset) = if let Some(page_token) = request.page_token.as_deref() {
+            let (token, offset) = parse_project_lexical_cursor(page_token)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            let value = self
+                .context
+                .project_registry
+                .read_deferred_resource(&token)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            let state: ProjectLexicalSearchPageState = serde_json::from_value(value.value)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            if state.project_id != id.as_str() || state.request_identity != request_identity {
+                return Err(McpError::invalid_params(
+                    "page_token belongs to a different project lexical_search request",
+                    None,
+                ));
+            }
+            (state, token, offset)
+        } else {
+            let limits = project_search_file_limits(request.max_files, actors.len());
+            let scans = futures::future::try_join_all(
+                actors
+                    .iter()
+                    .cloned()
+                    .zip(limits.iter().copied())
+                    .map(|(actor, max_files)| {
+                        collect_actor_lexical_matches(actor, request.clone(), max_files)
+                    }),
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error, None))?;
+            let scan_truncated =
+                limits.contains(&0) || scans.iter().any(|scan| scan.scan_truncated);
+            let matches = scans
+                .iter()
+                .flat_map(|scan| scan.matches.iter().cloned())
+                .collect::<Vec<_>>();
+            let total_matches = scans.iter().map(|scan| scan.total_matches).sum::<usize>();
+            let scanned_files = scans.iter().map(|scan| scan.scanned_files).sum();
+            let scanned_bytes = scans.iter().map(|scan| scan.scanned_bytes).sum();
+            let actor_snapshots = scans
+                .iter()
+                .map(|scan| &scan.snapshot_identity)
+                .collect::<Vec<_>>();
+            let snapshot_identity = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&actor_snapshots).unwrap_or_default())
+            );
+            let state = ProjectLexicalSearchPageState {
+                project_id: id.as_str().to_owned(),
+                matches,
+                total_matches,
+                scanned_files,
+                scanned_bytes,
+                snapshot_identity,
+                request_identity,
+                scan_truncated,
+            };
+            let value = serde_json::to_value(&state)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let reference = self
+                .context
+                .project_registry
+                .store_deferred_resource(id, "lexical_search_project_page", value)
+                .map_err(|error| McpError::internal_error(error, None))?;
+            let token = reference
+                .uri
+                .strip_prefix("mcpls-deferred:///")
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "project lexical_search cursor has an invalid URI",
+                        None,
+                    )
+                })?
+                .to_owned();
+            (state, token, 0)
+        };
+
+        if offset > state.matches.len() {
+            return Err(McpError::invalid_params(
+                "lexical_search page_token offset is outside the retained result",
+                None,
+            ));
+        }
+        let end = offset
+            .saturating_add(request.max_matches)
+            .min(state.matches.len());
+        let page = bounded_lexical_page_with_accounting(
+            state.matches[offset..end].to_vec(),
+            offset,
+            end < state.matches.len(),
+            effective_lexical_page_bytes(max_bytes),
+            state.total_matches,
+            state.scanned_files,
+            state.scanned_bytes,
+            state.scan_truncated,
+            Some(&token),
+            &state.snapshot_identity,
+        )
+        .map_err(|required_bytes| {
+            McpError::invalid_params(
+                format!(
+                    "max_bytes must be at least {required_bytes} to return one lexical match identity"
+                ),
+                None,
+            )
+        })?;
+        if page.next_cursor.is_none() {
+            self.context
+                .project_registry
+                .remove_deferred_resource(&token);
+        }
+        Ok(page)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn project_workspace_symbol_search(
+        &self,
+        id: &ProjectId,
+        actors: &[ProjectHandle],
+        request: crate::bridge::WorkspaceSymbolPageRequest,
+    ) -> Result<crate::bridge::WorkspaceSymbolResult, McpError> {
+        let request_identity = project_workspace_symbol_request_identity(&request);
+        let (state, token, offset) = if let Some(page_token) = request.page_token.as_deref() {
+            let (token, offset) = parse_project_lexical_cursor(page_token)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            let value = self
+                .context
+                .project_registry
+                .read_deferred_resource(&token)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            let state: ProjectWorkspaceSymbolPageState = serde_json::from_value(value.value)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            if state.project_id != id.as_str() || state.request_identity != request_identity {
+                return Err(McpError::invalid_params(
+                    "page_token belongs to a different project workspace-symbol request",
+                    None,
+                ));
+            }
+            (state, token, offset)
+        } else {
+            let results = futures::future::try_join_all(actors.iter().cloned().map(|actor| {
+                collect_actor_workspace_symbols(
+                    actor,
+                    crate::bridge::WorkspaceSymbolPageRequest {
+                        query: request.query.clone(),
+                        kind_filter: request.kind_filter.clone(),
+                        match_mode: request.match_mode,
+                        scope: request.scope,
+                        include_generated: request.include_generated,
+                        max_items: request.max_items,
+                        max_bytes: request.max_bytes,
+                        page_token: None,
+                    },
+                )
+            }))
+            .await
+            .map_err(|error| McpError::internal_error(error, None))?;
+            let mut symbols = results
+                .iter()
+                .flat_map(|(symbols, _)| symbols.iter().cloned())
+                .collect::<Vec<_>>();
+            symbols.sort_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| left.name.cmp(&right.name))
+                    .then_with(|| left.location.uri.cmp(&right.location.uri))
+            });
+            let actor_snapshots = results
+                .iter()
+                .map(|(_, snapshot)| snapshot.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>();
+            let snapshot_identity = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&actor_snapshots).unwrap_or_default())
+            );
+            let state = ProjectWorkspaceSymbolPageState {
+                project_id: id.as_str().to_owned(),
+                symbols,
+                snapshot_identity,
+                request_identity,
+            };
+            let value = serde_json::to_value(&state)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let reference = self
+                .context
+                .project_registry
+                .store_deferred_resource(id, "workspace_symbol_project_page", value)
+                .map_err(|error| McpError::internal_error(error, None))?;
+            let token = reference
+                .uri
+                .strip_prefix("mcpls-deferred:///")
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "project workspace-symbol cursor has an invalid URI",
+                        None,
+                    )
+                })?
+                .to_owned();
+            (state, token, 0)
+        };
+        if offset > state.symbols.len() {
+            return Err(McpError::invalid_params(
+                "workspace-symbol page_token offset is outside the retained result",
+                None,
+            ));
+        }
+        let result = bounded_project_workspace_symbol_page(
+            &state.symbols,
+            offset,
+            request.max_items,
+            request.max_bytes,
+            &state.snapshot_identity,
+            &token,
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+        if result.next_cursor.is_none() {
+            self.context
+                .project_registry
+                .remove_deferred_resource(&token);
+        }
+        Ok(result)
     }
 
     /// Search project snapshots by literal text or Rust regex.
@@ -4500,53 +4935,69 @@ impl McplsServer {
         validate_path_globs(&params.include_paths, &params.exclude_paths)
             .map_err(|error| McpError::invalid_params(error, None))?;
         let limit = params.max_matches;
-        let actor = self
-            .context
-            .required_actor_for_project_selector(&params.project_id)
-            .await
-            .map_err(project_routing_error)?;
         let max_bytes = effective_lexical_page_bytes(params.max_bytes);
         let value = if queries.len() == 1 {
-            let scan = actor
-                .lexical_search(LexicalSearchRequest {
-                    query: queries.remove(0),
-                    mode: params.mode,
-                    case: params.case,
-                    multiline: params.multiline,
-                    max_files: params.max_files,
-                    max_matches: limit,
-                    include_generated: params.include_generated,
-                    include_paths: params.include_paths,
-                    exclude_paths: params.exclude_paths,
-                    context_lines: params.context_lines,
-                    page_token: params.page_token,
-                })
+            let id = self
+                .context
+                .resolve_project_selector(&params.project_id)
                 .await
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let has_next_page =
-                scan.offset.saturating_add(scan.matches.len()) < scan.total_matches;
-            let page = bounded_lexical_page_with_accounting(
-                scan.matches,
-                scan.offset,
-                has_next_page,
-                max_bytes,
-                scan.total_matches,
-                scan.scanned_files,
-                scan.scanned_bytes,
-                scan.scan_truncated,
-                Some(&scan.page_token),
-                &scan.snapshot_identity,
-            )
-            .map_err(|required_bytes| {
-                McpError::invalid_params(
-                    format!(
-                        "max_bytes must be at least {required_bytes} to return one lexical match identity"
-                    ),
-                    None,
+                .map_err(project_routing_error)?;
+            let actors = self
+                .context
+                .required_actors_for_project_selector(&params.project_id)
+                .await
+                .map_err(project_routing_error)?;
+            let request = LexicalSearchRequest {
+                query: queries.remove(0),
+                mode: params.mode,
+                case: params.case,
+                multiline: params.multiline,
+                max_files: params.max_files,
+                max_matches: limit,
+                include_generated: params.include_generated,
+                include_paths: params.include_paths,
+                exclude_paths: params.exclude_paths,
+                context_lines: params.context_lines,
+                page_token: params.page_token,
+            };
+            let page = if actors.len() > 1 {
+                self.project_lexical_search(&id, &actors, request, params.max_bytes)
+                    .await?
+            } else {
+                let scan = actors[0]
+                    .lexical_search(request)
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let has_next_page =
+                    scan.offset.saturating_add(scan.matches.len()) < scan.total_matches;
+                bounded_lexical_page_with_accounting(
+                    scan.matches,
+                    scan.offset,
+                    has_next_page,
+                    max_bytes,
+                    scan.total_matches,
+                    scan.scanned_files,
+                    scan.scanned_bytes,
+                    scan.scan_truncated,
+                    Some(&scan.page_token),
+                    &scan.snapshot_identity,
                 )
-            })?;
+                .map_err(|required_bytes| {
+                    McpError::invalid_params(
+                        format!(
+                            "max_bytes must be at least {required_bytes} to return one lexical match identity"
+                        ),
+                        None,
+                    )
+                })?
+            };
             serde_json::to_value(LexicalSearchResponse::One(Box::new(page)))
         } else {
+            let actor = self
+                .context
+                .required_actor_for_project_selector(&params.project_id)
+                .await
+                .map_err(project_routing_error)?;
             let batch = actor
                 .lexical_search_batch(LexicalSearchBatchRequest {
                     queries,
@@ -7239,6 +7690,278 @@ finally:
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
         assert_eq!(status["actor_groups"].as_array().unwrap().len(), 2);
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_search_routes_an_absolute_include_to_its_worktree_actor() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        write_rust_fixture(repository.path());
+        write_rust_fixture(worktree.path());
+        std::fs::write(worktree.path().join("src/main.rs"), "fn linked_only() {}\n").unwrap();
+        std::fs::write(
+            repository.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+
+        let project_id = project_id_for_root(repository.path());
+        let counter = repository.path().join("spawn-count");
+        let config = write_concurrency_lsp(repository.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        server
+            .project_add(project_add_params("ignored", repository.path()))
+            .await
+            .unwrap();
+        server
+            .project_add(project_add_params("ignored", worktree.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server
+                .context
+                .project_registry
+                .actor_group_count(&ProjectId::new(project_id.clone()).unwrap())
+                .await
+                .unwrap(),
+            2
+        );
+
+        let result = server
+            .lexical_search(Parameters(LexicalSearchParams {
+                project_id: project_id.clone(),
+                query: Some("linked_only".to_owned()),
+                queries: Vec::new(),
+                mode: crate::bridge::lexical::LexicalMatchMode::Literal,
+                case: crate::bridge::lexical::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 1_024,
+                max_matches: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                context_lines: 0,
+                include_generated: false,
+                include_paths: vec![worktree.path().join("src/main.rs").display().to_string()],
+                exclude_paths: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["returned"], 1, "{result}");
+        assert_eq!(result["scanned_files"], 1);
+        assert!(
+            result["matches"][0]["source_uri"]
+                .as_str()
+                .unwrap()
+                .contains(worktree.path().to_str().unwrap())
+        );
+
+        std::fs::write(
+            repository.path().join("src/main.rs"),
+            "fn shared_marker() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            worktree.path().join("src/main.rs"),
+            "fn shared_marker() {}\n",
+        )
+        .unwrap();
+        let first_page = server
+            .lexical_search(Parameters(LexicalSearchParams {
+                project_id: project_id.clone(),
+                query: Some("shared_marker".to_owned()),
+                queries: Vec::new(),
+                mode: crate::bridge::lexical::LexicalMatchMode::Literal,
+                case: crate::bridge::lexical::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 1_024,
+                max_matches: 1,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                context_lines: 0,
+                include_generated: false,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let first_page: serde_json::Value = serde_json::from_str(&first_page).unwrap();
+        assert_eq!(first_page["returned"], 1, "{first_page}");
+        assert_eq!(first_page["total"], 2, "{first_page}");
+        let next_cursor = first_page["next_cursor"].as_str().unwrap().to_owned();
+        let second_page = server
+            .lexical_search(Parameters(LexicalSearchParams {
+                project_id,
+                query: Some("shared_marker".to_owned()),
+                queries: Vec::new(),
+                mode: crate::bridge::lexical::LexicalMatchMode::Literal,
+                case: crate::bridge::lexical::LexicalCaseMode::Sensitive,
+                multiline: false,
+                max_files: 1_024,
+                max_matches: 1,
+                max_bytes: 16 * 1024,
+                page_token: Some(next_cursor),
+                context_lines: 0,
+                include_generated: false,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let second_page: serde_json::Value = serde_json::from_str(&second_page).unwrap();
+        assert_eq!(second_page["returned"], 1, "{second_page}");
+        assert_eq!(second_page["truncated"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_symbol_search_includes_separate_worktree_actors() {
+        let repository = TempDir::new().unwrap();
+        let git_dir = repository.path().join(".git");
+        let worktree_git_dir = git_dir.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let worktree = TempDir::new().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        write_rust_fixture(repository.path());
+        write_rust_fixture(worktree.path());
+        std::fs::write(
+            worktree.path().join("src/main.rs"),
+            "fn linked_only_symbol() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.path().join("src/main.rs"),
+            "fn linked_only_symbol() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+
+        let project_id = project_id_for_root(repository.path());
+        let counter = repository.path().join("spawn-count");
+        let config = write_concurrency_lsp(repository.path(), &counter, None, None, None);
+        let registry = ProjectRegistry::with_translator_template(4, concurrency_template(config));
+        let server =
+            McplsServer::new_with_registry(Arc::new(ResourceSubscriptions::new()), registry);
+        server
+            .project_add(project_add_params("ignored", repository.path()))
+            .await
+            .unwrap();
+        server
+            .project_add(project_add_params("ignored", worktree.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server
+                .context
+                .project_registry
+                .actor_group_count(&ProjectId::new(project_id.clone()).unwrap())
+                .await
+                .unwrap(),
+            2
+        );
+
+        let result = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: project_id.clone(),
+                query: Some("linked_only_symbol".to_owned()),
+                queries: Vec::new(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::Exact,
+                scope: crate::bridge::WorkspaceSymbolScope::Project,
+                limit: 20,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["returned"], 2, "{result}");
+        let uris = result["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["location"]["uri"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            uris.iter()
+                .any(|uri| uri.contains(repository.path().to_str().unwrap()))
+        );
+        assert!(
+            uris.iter()
+                .any(|uri| uri.contains(worktree.path().to_str().unwrap()))
+        );
+
+        let first_page = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: project_id_for_root(repository.path()),
+                query: Some("linked".to_owned()),
+                queries: Vec::new(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::Prefix,
+                scope: crate::bridge::WorkspaceSymbolScope::Project,
+                limit: 1,
+                max_bytes: 16 * 1024,
+                page_token: None,
+                include_generated: false,
+            }))
+            .await
+            .unwrap();
+        let first_page: serde_json::Value = serde_json::from_str(&first_page).unwrap();
+        assert_eq!(first_page["returned"], 1, "{first_page}");
+        let next_cursor = first_page["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing cursor in {first_page}"))
+            .to_owned();
+
+        let second_page = server
+            .workspace_symbol_search(Parameters(WorkspaceSymbolParams {
+                project_id: project_id_for_root(repository.path()),
+                query: Some("linked".to_owned()),
+                queries: Vec::new(),
+                kind_filter: None,
+                match_mode: crate::bridge::WorkspaceSymbolMatchMode::Prefix,
+                scope: crate::bridge::WorkspaceSymbolScope::Project,
+                limit: 1,
+                max_bytes: 16 * 1024,
+                page_token: Some(next_cursor),
+                include_generated: false,
+            }))
+            .await
+            .unwrap();
+        let second_page: serde_json::Value = serde_json::from_str(&second_page).unwrap();
+        assert_eq!(second_page["returned"], 1, "{second_page}");
+        assert_eq!(second_page["truncated"], false);
     }
 
     #[cfg(unix)]

@@ -2508,6 +2508,13 @@ impl ProjectRegistry {
             .read(token)
     }
 
+    pub(crate) fn remove_deferred_resource(&self, token: &str) {
+        self.deferred_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(token);
+    }
+
     pub(crate) fn store_deferred_resource(
         &self,
         id: &ProjectId,

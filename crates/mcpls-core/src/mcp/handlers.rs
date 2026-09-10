@@ -391,6 +391,27 @@ impl HandlerContext {
         self.required_actor_for_path(selector).await
     }
 
+    /// Return every actor group for an explicit project ID, or the owning
+    /// actor for a path selector.
+    pub(crate) async fn required_actors_for_project_selector(
+        &self,
+        selector: &str,
+    ) -> Result<Vec<ProjectHandle>, ProjectRegistryError> {
+        if let Ok(id) = ProjectId::new(selector.to_owned()) {
+            if self.project_registry.actor_for_project(&id).await.is_ok() {
+                let actors = self.project_registry.actors_for_project(&id).await?;
+                for actor in &actors {
+                    actor.wait_until_routable().await?;
+                }
+                return Ok(actors);
+            }
+            if !looks_like_path(selector) {
+                return Err(ProjectRegistryError::ProjectNotFound(id));
+            }
+        }
+        Ok(vec![self.required_actor_for_path(selector).await?])
+    }
+
     /// Return the owning project identity and actor for a path.
     pub async fn required_project_for_path(
         &self,
